@@ -1,6 +1,7 @@
 use super::compiler::{
     derived_window_cost, gcd, retained_state_count, CollectorMaterialization,
-    MaterializationLifecycleEstimate, PhysicalCompilationRequest, RuntimeRulePolicy,
+    MaterializationLifecycleEstimate, OutputComputation, PhysicalCompilationRequest,
+    RuntimeRulePolicy,
 };
 use asap_types::WindowMaterializationLayout;
 use planner_types::post_asap::{PostAsapNodeId, SummaryWindowFramework};
@@ -17,8 +18,10 @@ pub(super) fn share_additive_panes(
     bindings: &mut BTreeMap<(usize, PostAsapNodeId), asap_types::PolicyFingerprint>,
     policies: &mut BTreeMap<asap_types::PolicyFingerprint, RuntimeRulePolicy>,
     estimates: &mut BTreeMap<asap_types::PolicyFingerprint, MaterializationLifecycleEstimate>,
+    computations: &mut BTreeMap<asap_types::PolicyFingerprint, OutputComputation>,
 ) {
-    use asap_types::{AggregationType, WindowKind};
+    use asap_types::WindowKind;
+    use planner_types::post_asap::{ExactKind, SummaryFamilyType};
     let derived_sources = materializations
         .iter()
         .filter_map(|m| m.derived_input.as_ref())
@@ -34,7 +37,10 @@ pub(super) fn share_additive_panes(
         if !seen.insert(old)
             || m.derived_input.is_some()
             || derived_sources.contains(&old)
-            || !matches!(m.aggregation_type, AggregationType::Sum)
+            || !matches!(
+                computations.get(&old),
+                Some((SummaryFamilyType::ExactAggregate(ExactKind::Sum, _), _))
+            )
         {
             continue;
         }
@@ -87,6 +93,7 @@ pub(super) fn share_additive_panes(
         canonical.window_type = WindowKind::Tumbling;
         canonical.window_layout = WindowMaterializationLayout::Pane { pane_secs: 1 };
         canonical.pane_origin_ms = Some(0);
+        canonical.allocate_stored_output_id(&computations[&old]);
         let key = (
             canonical.policy_fingerprint(),
             serde_json::to_string(&lifecycle).unwrap(),
@@ -114,6 +121,8 @@ pub(super) fn share_additive_panes(
                 pane_secs: group.pane_secs,
             };
             canonical.pane_origin_ms = Some(group.origin);
+            let computation = &computations[&physical[index].0];
+            physical[index].1.allocate_stored_output_id(computation);
         }
     }
     let mut target_counts = BTreeMap::new();
@@ -154,6 +163,8 @@ pub(super) fn share_additive_panes(
         combined.expected_updates = 0.0;
         combined.lifecycle_cost = group.cost;
         combined.window_realization_id = format!("shared-pane-{}", new.0);
+        let computation = computations[&physical[group.members[0]].0].clone();
+        computations.insert(new, computation);
         for index in group.members {
             let old = physical[index].0;
             if let Some(estimate) = estimates.remove(&old) {

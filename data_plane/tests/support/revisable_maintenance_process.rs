@@ -58,10 +58,17 @@ async fn run_revisions(multi_source: bool) {
         .iter()
         .find(|m| m.derived_input.is_some())
         .unwrap();
-    let relative_error = match derived.aggregation_type {
-        asap_types::AggregationType::DDSketch => derived.parameters["alpha"].as_f64().unwrap(),
-        asap_types::AggregationType::DatasketchesKLL => 0.0,
-        ref other => panic!("singleton revision oracle missing for {other:?}"),
+    let family = installed
+        .precompute_plan
+        .state_family(derived.stored_output_id)
+        .unwrap();
+    let relative_error = match family {
+        planner_types::post_asap::SummaryFamilyType::Sketch(kind, _) => match kind.params() {
+            planner_types::post_asap::SketchParams::DDSketch { alpha } => *alpha,
+            planner_types::post_asap::SketchParams::Kll { .. } => 0.0,
+            other => panic!("singleton oracle missing for {other:?}"),
+        },
+        other => panic!("singleton revision oracle missing for {other:?}"),
     };
     std::fs::write(&artifact, serde_json::to_vec(&installed).unwrap()).unwrap();
     let spawn = |port: u16| {

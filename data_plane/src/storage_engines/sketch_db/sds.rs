@@ -78,30 +78,8 @@ fn legacy_summary(kind: &AggKind) -> SummaryDescriptor {
 // A valid deployment reference does not authorize bytes in another state format.
 fn operator_matches(summary: &SummaryDescriptor, actual: &AggKind) -> bool {
     match &summary.operator {
-        SummaryOperator::Configured {
-            aggregation_type,
-            aggregation_sub_type,
-            parameters,
-            ..
-        } => {
-            let config = asap_types::PrecomputeMaterialization::new(
-                *aggregation_type,
-                aggregation_sub_type.clone(),
-                parameters.clone().into_iter().collect(),
-                asap_types::KeyByLabelNames::empty(),
-                asap_types::KeyByLabelNames::empty(),
-                asap_types::KeyByLabelNames::empty(),
-                String::new(),
-                1,
-                1,
-                asap_types::WindowKind::Tumbling,
-                String::new(),
-                String::new(),
-                None,
-                None,
-                None,
-            );
-            super::data::agg_kind_for_config(&config).operator_canonical_string()
+        SummaryOperator::Configured { family } => {
+            super::data::agg_kind_for_family(family, "").operator_canonical_string()
                 == actual.operator_canonical_string()
         }
         SummaryOperator::ExactAgg {

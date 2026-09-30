@@ -852,7 +852,7 @@ fn state_fingerprints(
                 &physical_aggregation(query, state, query.query_id.clone(), target),
                 &state.node,
             )
-            .map(|config| config.policy_fingerprint())
+            .map(|(config, _)| config.policy_fingerprint())
             .map_err(|error| error.to_string())
         })
         .collect()
@@ -1634,6 +1634,7 @@ impl DeploymentPlanCompiler {
         }
         let population_operators = super::maintained_population::operators(&request)?;
         let mut compiled_materializations = Vec::with_capacity(request.queries.len());
+        let mut output_computations = BTreeMap::<_, OutputComputation>::new();
         let mut collector_materializations = Vec::with_capacity(request.queries.len());
         let mut plan_materializations = Vec::with_capacity(request.queries.len());
         let mut shared_materializations = BTreeMap::new();
@@ -1843,7 +1844,7 @@ impl DeploymentPlanCompiler {
                         .or_default()
                         .push(kind.algorithm().clone());
                 }
-                let precompute_materialization =
+                let (precompute_materialization, _) =
                     scoped_materialization(&aggregation, &selected.node)?;
                 let materialization = precompute_materialization.policy_fingerprint();
                 let consumer_indices = consumers[&materialization]
@@ -1911,7 +1912,7 @@ impl DeploymentPlanCompiler {
                 // Preserve semantic window and evaluation cadence independently
                 // from the selected storage representation.
                 aggregation.window_secs = window_implementation.window_secs;
-                let mut runtime_materialization =
+                let (mut runtime_materialization, computation) =
                     scoped_materialization(&aggregation, &selected.node)?;
                 if canonical_nodes.contains(&(Rc::as_ptr(&selected.node) as usize)) {
                     runtime_materialization.population_key_encoding =
@@ -2059,7 +2060,9 @@ impl DeploymentPlanCompiler {
                         reason,
                     })?,
                 );
+                runtime_materialization.allocate_stored_output_id(&computation);
                 let materialization = runtime_materialization.policy_fingerprint();
+                output_computations.insert(materialization, computation.clone());
                 let consumer_query_ids = state_consumers
                     .iter()
                     .map(|query| query.query_id.clone())
@@ -2173,6 +2176,7 @@ impl DeploymentPlanCompiler {
                 &mut node_bindings,
                 &mut runtime_policies,
                 &mut lifecycle_estimates,
+                &mut output_computations,
             );
         }
 
@@ -2293,11 +2297,15 @@ impl DeploymentPlanCompiler {
                         })?;
                     let (_, source_window, _) = selected_input_contract(node)
                         .map_err(crate::query_plan::QueryPlanError::Invalid)?;
-                    let materialization_family = materialization.accumulator_spec()
-                        .map_err(|error| crate::query_plan::QueryPlanError::Invalid(error.to_string()))?
-                        .family;
+                    let materialization_family = &output_computations
+                        .get(&fingerprint)
+                        .ok_or_else(|| crate::query_plan::QueryPlanError::Invalid(format!(
+                            "compiled binding {} has no state family",
+                            fingerprint.0
+                        )))?
+                        .0;
                     let window_ms = materialization.window_size.saturating_mul(1_000);
-                    if materialization_family != *node_family
+                    if materialization_family != node_family
                         || window_ms == 0
                         || source_window.map(|seconds| seconds.saturating_mul(1_000)).unwrap_or(query.query_lookback_ms)
                             % window_ms != 0
@@ -2316,7 +2324,12 @@ impl DeploymentPlanCompiler {
                         output_grouping: PhysicalGrouping::Reduce(
                             materialization.grouping_labels.names(),
                         ),
-                        item_labels: materialization.aggregated_labels.labels.clone(),
+                        item_labels: output_computations[&fingerprint].1["item_labels"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|label| label.as_str().map(str::to_owned))
+                            .collect(),
                         window_ms: stored_interval_ms,
                         pane_origin_ms: materialization.pane_origin_ms,
                     })
@@ -2703,7 +2716,7 @@ impl DeploymentPlanCompiler {
             }
         }
         validate_retained_summary_footprint(
-            &materializations,
+            &with_families(materializations.clone(), &output_computations),
             request
                 .data_workload
                 .as_ref()
@@ -2746,19 +2759,20 @@ impl DeploymentPlanCompiler {
             })
             .collect::<Result<_, _>>()?;
         let mut precompute_plan = match environment.target {
-            PhysicalDeploymentTarget::DistributedCollectors => {
-                PrecomputePlan::build(envelope.clone(), materializations, &producer_ids).and_then(
-                    |mut plan| {
-                        plan.executable_dags = installed_dags;
-                        plan.validate()?;
-                        Ok(plan)
-                    },
-                )
-            }
+            PhysicalDeploymentTarget::DistributedCollectors => PrecomputePlan::build(
+                envelope.clone(),
+                with_families(materializations, &output_computations),
+                &producer_ids,
+            )
+            .and_then(|mut plan| {
+                plan.executable_dags = installed_dags;
+                plan.validate()?;
+                Ok(plan)
+            }),
             PhysicalDeploymentTarget::BackendLocalRemoteWrite => {
                 PrecomputePlan::build_backend_local_with_dags(
                     envelope.clone(),
-                    materializations,
+                    with_families(materializations, &output_computations),
                     installed_dags,
                 )
             }
@@ -2792,12 +2806,8 @@ impl DeploymentPlanCompiler {
                 materializations: collector_materializations.clone(),
             })
             .collect::<Vec<_>>();
-        let summary_catalog = super::summary_catalog::SummaryCatalog::from_materializations(
-            envelope.plan_id,
-            envelope.plan_version,
-            &precompute_plan.materializations,
-        )
-        .map_err(|error| CompileError::Query {
+        let summary_catalog = super::summary_catalog::SummaryCatalog::from_plan(&precompute_plan)
+            .map_err(|error| CompileError::Query {
             query_id: "summary-catalog".into(),
             reason: error.to_string(),
         })?;
@@ -3796,11 +3806,36 @@ pub(super) fn retained_state_count(
 /// Estimate the encoded bytes retained by one physical state. Sketch matrix
 /// cells use two words here, covering the counter plus observed serialization
 /// overhead. Heap and exact-state estimates include container slack.
-fn retained_state_bytes(materialization: &asap_types::PrecomputeMaterialization) -> u128 {
-    estimated_state_bytes(
-        &materialization.aggregation_type,
-        &materialization.parameters,
-    )
+fn retained_state_bytes(family: &SummaryFamilyType) -> u128 {
+    let parameters = match family {
+        SummaryFamilyType::Sketch(kind, _) => sketch_params_json(kind.params()),
+        _ => json!({}),
+    };
+    asap_types::aggregation_type_for_family(family).map_or(256, |aggregation_type| {
+        estimated_state_bytes(
+            &aggregation_type,
+            &parameters
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        )
+    })
+}
+
+/// Pair each output with its state family for the installed plan.
+fn with_families(
+    materializations: Vec<asap_types::PrecomputeMaterialization>,
+    computations: &BTreeMap<asap_types::PolicyFingerprint, OutputComputation>,
+) -> Vec<(asap_types::PrecomputeMaterialization, SummaryFamilyType)> {
+    materializations
+        .into_iter()
+        .map(|config| {
+            let family = computations[&config.policy_fingerprint()].0.clone();
+            (config, family)
+        })
+        .collect()
 }
 
 pub(crate) fn estimated_state_bytes(
@@ -3849,23 +3884,25 @@ pub(crate) fn estimated_state_bytes(
 
 pub(crate) fn retained_partition_count(
     materialization: &asap_types::PrecomputeMaterialization,
+    family: &SummaryFamilyType,
     input_cardinality: Option<u64>,
 ) -> u128 {
     use asap_types::AggregationType as A;
+    let aggregation_type = asap_types::aggregation_type_for_family(family);
 
     // Reset-aware and min/max state remains source-series scoped even with an
     // empty output grouping. Grouped states have at most one partition per
     // input series. Other empty groupings are the Reduce([]) global singleton.
     if materialization.partitioning == Some(asap_types::sds::PopulationPartitioning::PerEntity)
         || matches!(
-            materialization.aggregation_type,
-            A::Increase | A::Rate | A::Min | A::Max
+            aggregation_type,
+            Some(A::Increase | A::Rate | A::Min | A::Max)
         )
         || !materialization.grouping_labels.names().is_empty()
         || (materialization.derived_input.is_some()
             && matches!(
-                materialization.aggregation_type,
-                A::CountMinSketchWithHeap | A::CountSketchWithHeap | A::Sum
+                aggregation_type,
+                Some(A::CountMinSketchWithHeap | A::CountSketchWithHeap | A::Sum)
             ))
     {
         u128::from(input_cardinality.unwrap_or(1).max(1))
@@ -3875,19 +3912,23 @@ pub(crate) fn retained_partition_count(
 }
 
 fn validate_retained_summary_footprint(
-    materializations: &[asap_types::PrecomputeMaterialization],
+    outputs: &[(asap_types::PrecomputeMaterialization, SummaryFamilyType)],
     input_cardinality: Option<u64>,
     budget_bytes: u64,
 ) -> Result<(), CompileError> {
-    let estimated_bytes = materializations
+    let estimated_bytes = outputs
         .iter()
-        .fold(0u128, |total, materialization| {
+        .fold(0u128, |total, (materialization, family)| {
             total.saturating_add(
-                retained_state_bytes(materialization)
+                retained_state_bytes(family)
                     .saturating_mul(u128::from(
                         materialization.num_aggregates_to_retain.unwrap_or(1),
                     ))
-                    .saturating_mul(retained_partition_count(materialization, input_cardinality)),
+                    .saturating_mul(retained_partition_count(
+                        materialization,
+                        family,
+                        input_cardinality,
+                    )),
             )
         });
     if estimated_bytes > u128::from(budget_bytes) {
@@ -4156,71 +4197,7 @@ pub(crate) fn raw_materialization_input_contract(
     )
 }
 
-pub fn raw_time_series_input_contract(
-    expr: &QueryExpr,
-    exact: bool,
-) -> Result<(String, Option<u64>, String), String> {
-    use planner_types::pre_asap::{CompareOpKind, ScalarValue};
-    let (source, window_secs) = match expr {
-        QueryExpr::TimeRange { child, range } => {
-            if range.as_millis() == 0 || range.as_millis() % 1000 != 0 {
-                return Err("warm producer requires a positive whole-second range".into());
-            }
-            (child.as_ref(), Some(range.as_secs()))
-        }
-        QueryExpr::Scan { .. } if exact => {
-            return Err(
-                "instantaneous sample selection is not a temporal accumulator readout".into(),
-            );
-        }
-        source => (source, None),
-    };
-    match source {
-        QueryExpr::Scan {
-            source: Source::TimeSeries { metric },
-            predicates,
-            schema,
-        } if !metric.is_empty() => {
-            let mut matchers = Vec::with_capacity(predicates.len());
-            for predicate in predicates {
-                let QueryExpr::Compare { left, op, right } = predicate.0.as_ref() else {
-                    return Err("materialization filter is not a label comparison".into());
-                };
-                let (QueryExpr::Column(column), QueryExpr::Literal(ScalarValue::Utf8(value))) =
-                    (left.as_ref(), right.as_ref())
-                else {
-                    return Err("materialization filter must compare a label with a string".into());
-                };
-                let label = schema
-                    .columns
-                    .get(*column)
-                    .map(|field| field.name.as_str())
-                    .ok_or_else(|| {
-                        "materialization filter references an unknown column".to_string()
-                    })?;
-                let operator = match op {
-                    CompareOpKind::Eq => "=",
-                    CompareOpKind::Ne => "!=",
-                    CompareOpKind::Regex => "=~",
-                    CompareOpKind::NotRegex => "!~",
-                    _ => return Err("materialization filter uses a non-PromQL comparison".into()),
-                };
-                let encoded = serde_json::to_string(value).map_err(|error| error.to_string())?;
-                matchers.push(format!("{label}{operator}{encoded}"));
-            }
-            matchers.sort();
-            let spatial_filter = if matchers.is_empty() {
-                String::new()
-            } else {
-                format!("{{{}}}", matchers.join(","))
-            };
-            Ok((metric.clone(), window_secs, spatial_filter))
-        }
-        _ => {
-            Err("source predicates or temporal modifiers require a Prometheus exact subtree".into())
-        }
-    }
-}
+pub use asap_types::precompute_plan::raw_time_series_input_contract;
 
 /// Immutable inputs may combine explicit exact accumulator readouts using
 /// maintenance-time arithmetic. Population and window closure are checked by
@@ -4438,11 +4415,11 @@ fn physical_aggregation(
 fn scoped_materialization(
     aggregation: &BackendAggregation,
     node: &SummaryNode,
-) -> anyhow::Result<asap_types::PrecomputeMaterialization> {
-    let mut config =
+) -> anyhow::Result<(asap_types::PrecomputeMaterialization, OutputComputation)> {
+    let (mut config, computation) =
         aggregation_config_for_materialization(aggregation, asap_types::QueryLanguage::PromQl)?;
     if !matches!(aggregation.aggregation_input, AggregationInput::Raw) {
-        return Ok(config);
+        return Ok((config, computation));
     }
     let SummaryExpr::SummaryAgg { reduction, .. } = &node.expr else {
         anyhow::bail!("materialization lacks SummaryAgg partition contract");
@@ -4471,33 +4448,58 @@ fn scoped_materialization(
             asap_types::sds::PopulationPartitioning::Grouped
         }
     });
-    Ok(config)
+    config.allocate_stored_output_id(&computation);
+    Ok((config, computation))
+}
+
+/// The Planner computation a stored output id is allocated from: the
+/// output's state family and its canonical producer description (update,
+/// input predicate and item projection). The compiler keeps it beside each
+/// output so later layout decisions can reallocate the id; installed plans
+/// carry neither, since the bound DAG node defines the computation.
+pub(crate) type OutputComputation = (SummaryFamilyType, Value);
+
+pub(crate) fn output_computation(
+    aggregation: &BackendAggregation,
+    language: asap_types::QueryLanguage,
+) -> OutputComputation {
+    let json = crate::emit::backend_wire::build_backend_aggregation_json(aggregation);
+    let mut parameters = json["parameters"].clone();
+    if language == asap_types::QueryLanguage::ClickHouseSql {
+        // Raw input does not imply PromQL's (start,end] convention. SQL bounds
+        // are normalized and bound explicitly by the SQL compiler.
+        parameters
+            .as_object_mut()
+            .expect("emitter parameters are an object")
+            .remove("promql_right_closed");
+    }
+    // Deployment fields (metric, grouping, window) are hashed from the
+    // materialization itself, so layout changes can reallocate the id.
+    (
+        aggregation.family.clone(),
+        serde_json::json!({
+            "aggregation_type": json["aggregationType"],
+            "parameters": parameters,
+            "item_labels": json["labels"]["aggregated"],
+            "spatial_filter": asap_types::utils::normalize_spatial_filter(&aggregation.spatial_filter),
+        }),
+    )
 }
 
 pub(crate) fn aggregation_config_for_materialization(
     aggregation: &BackendAggregation,
     language: asap_types::QueryLanguage,
-) -> anyhow::Result<asap_types::PrecomputeMaterialization> {
-    use anyhow::Context as _;
-    let mut json = crate::emit::backend_wire::build_backend_aggregation_json(aggregation);
-    // The selected physical duration is authoritative. The legacy edge emitter's
-    // 5..60 second clamp must not silently change a backend materialization.
-    json["windowSize"] = serde_json::json!(aggregation.window_secs);
-    if language == asap_types::QueryLanguage::ClickHouseSql {
-        // Raw input does not imply PromQL's (start,end] convention. SQL bounds
-        // are normalized and bound explicitly by the SQL compiler.
-        json["parameters"]
-            .as_object_mut()
-            .expect("emitter parameters are an object")
-            .remove("promql_right_closed");
-    }
-    let yaml = serde_yaml::to_value(json).context("convert physical aggregation fields")?;
-    asap_types::PrecomputeMaterialization::from_yaml_data(
-        &yaml,
-        None,
-        asap_types::QueryLanguage::PromQl,
-    )
-    .context("build materialization from physical aggregation")
+) -> anyhow::Result<(asap_types::PrecomputeMaterialization, OutputComputation)> {
+    let computation = output_computation(aggregation, language);
+    let mut config = asap_types::PrecomputeMaterialization::new(
+        aggregation.metric_name.clone(),
+        asap_types::KeyByLabelNames::new(aggregation.grouping.clone()),
+        aggregation.window_secs,
+        aggregation.window_secs,
+        asap_types::WindowKind::Tumbling,
+    );
+    config.allocate_stored_output_id(&computation);
+    Ok((config, computation))
 }
 
 fn materialization_consumers<'a>(
@@ -4532,7 +4534,7 @@ fn materialization_consumers<'a>(
             {
                 continue;
             }
-            let config = scoped_materialization(
+            let (config, _) = scoped_materialization(
                 &physical_aggregation(query, &state, query.query_id.clone(), target),
                 &state.node,
             )?;
@@ -5030,6 +5032,29 @@ impl QueryFrontend {
 }
 #[cfg(test)]
 pub(crate) mod tests {
+    /// The Planner update of the DAG node that produces `output`.
+    fn bound_summary_update(
+        plan: &PrecomputePlan,
+        output: asap_types::sds::StoredOutputId,
+    ) -> planner_types::post_asap::SummaryUpdate {
+        use asap_types::executable_plan::BackendNodeBinding;
+        plan.executable_dags
+            .values()
+            .find_map(|installed| {
+                let (node, _) = installed.binding.nodes.iter().find(|(_, binding)| {
+                    matches!(binding, BackendNodeBinding::Materialization { stored_output } if *stored_output == output)
+                })?;
+                let dag = installed.document.decode().unwrap();
+                match &dag.nodes.iter().find(|candidate| candidate.id == *node)?.payload {
+                    planner_types::post_asap::PostAsapOperatorPayload::SummaryAgg { input, .. } => {
+                        Some(input.clone())
+                    }
+                    _ => None,
+                }
+            })
+            .expect("output has a Planner SummaryAgg producer")
+    }
+
     use super::*;
 
     /// Multiple current-value quantiles and TopK limits share one maintained population.
@@ -5200,8 +5225,12 @@ pub(crate) mod tests {
         let plan = DeploymentPlanCompiler.compile_promql(input, env).unwrap();
         assert_eq!(plan.precompute_plan.materializations.len(), 1);
         assert_eq!(
-            plan.precompute_plan.materializations[0].aggregation_type,
-            asap_types::AggregationType::Min
+            asap_types::aggregation_type_for_family(
+                plan.precompute_plan
+                    .state_family(plan.precompute_plan.materializations[0].stored_output_id)
+                    .unwrap()
+            ),
+            Some(asap_types::AggregationType::Min)
         );
         assert!(plan
             .query_plan
@@ -5844,10 +5873,18 @@ pub(crate) mod tests {
                 .compile_promql(request, environment(10000))
                 .unwrap();
             assert_eq!(plan.precompute_plan.materializations.len(), 1, "{query}");
-            assert_eq!(
-                plan.precompute_plan.materializations[0].parameters["weight_mode"], mode,
-                "{query}"
-            );
+            let weight = bound_summary_update(
+                &plan.precompute_plan,
+                plan.precompute_plan.materializations[0].stored_output_id,
+            )
+            .weight;
+            let expected = match mode {
+                "count" => planner_types::post_asap::SummaryInputExpr::Constant(1.0),
+                _ => planner_types::post_asap::SummaryInputExpr::Column(
+                    planner_types::pre_asap::ColumnRef::SampleValue,
+                ),
+            };
+            assert_eq!(weight, expected, "{query}");
         }
     }
 
@@ -5935,38 +5972,71 @@ pub(crate) mod tests {
                 environment(10_000),
             )
             .unwrap();
-        let mut materializations = plan.precompute_plan.materializations;
-        let cms = materializations
-            .iter_mut()
-            .find(|materialization| {
-                materialization.aggregation_type
-                    == asap_types::AggregationType::CountMinSketchWithHeap
+        let mut outputs = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .map(|config| {
+                let family = plan
+                    .precompute_plan
+                    .state_family(config.stored_output_id)
+                    .unwrap();
+                (config.clone(), family.clone())
+            })
+            .collect::<Vec<_>>();
+        let heap_size = outputs
+            .iter()
+            .find_map(|(_, family)| match family {
+                SummaryFamilyType::Sketch(kind, _) => match kind.params() {
+                    planner_types::post_asap::SketchParams::CmsWithHeap { heap_size, .. } => {
+                        Some(*heap_size)
+                    }
+                    _ => None,
+                },
+                _ => None,
             })
             .unwrap();
-        cms.parameters.remove("width");
-        cms.parameters.remove("depth");
-        cms.parameters.insert("w".into(), json!(524_288));
-        cms.parameters.insert("d".into(), json!(7));
-        cms.num_aggregates_to_retain = Some(80);
+        let heap = |width| {
+            SummaryFamilyType::Sketch(
+                planner_types::post_asap::SketchKind::new(
+                    SketchAlgorithm::CmsWithHeap,
+                    planner_types::post_asap::SketchParams::CmsWithHeap {
+                        width,
+                        depth: 7,
+                        heap_size,
+                    },
+                ),
+                planner_types::post_asap::GroupingStrategy::PerSubpopulationInstance,
+            )
+        };
+        let cms = outputs
+            .iter_mut()
+            .find(|(_, family)| {
+                asap_types::aggregation_type_for_family(family)
+                    == Some(asap_types::AggregationType::CountMinSketchWithHeap)
+            })
+            .unwrap();
+        cms.1 = heap(524_288);
+        cms.0.num_aggregates_to_retain = Some(80);
 
         let error = validate_retained_summary_footprint(
-            &materializations,
+            &outputs,
             Some(5),
             DEFAULT_RETAINED_SUMMARY_MEMORY_BUDGET_BYTES,
         )
         .unwrap_err();
         assert!(error.to_string().contains("exceeds budget"));
 
-        let cms = materializations
+        let cms = outputs
             .iter_mut()
-            .find(|materialization| {
-                materialization.aggregation_type
-                    == asap_types::AggregationType::CountMinSketchWithHeap
+            .find(|(_, family)| {
+                asap_types::aggregation_type_for_family(family)
+                    == Some(asap_types::AggregationType::CountMinSketchWithHeap)
             })
             .unwrap();
-        cms.parameters.insert("w".into(), json!(4_096));
+        cms.1 = heap(4_096);
         validate_retained_summary_footprint(
-            &materializations,
+            &outputs,
             Some(5),
             DEFAULT_RETAINED_SUMMARY_MEMORY_BUDGET_BYTES,
         )
@@ -6055,7 +6125,7 @@ pub(crate) mod tests {
             plan_version: 1,
             activation_unix_ms: now,
             expiry_unix_ms: None,
-            backend_compat: "asap-query-backend.v1".into(),
+            backend_compat: "asap-query-backend.v2".into(),
         }
     }
 
@@ -7554,12 +7624,12 @@ pub(crate) mod tests {
             .compile_promql(request("q", "sum_over_time(m[1m])"), environment(10_000))
             .unwrap();
         let mut source = bundle.precompute_plan.materializations[0].clone();
-        source.stored_output_id = Some(asap_types::sds::StoredOutputId(1));
+        source.stored_output_id = asap_types::sds::StoredOutputId(1);
         source.population_key_encoding = asap_types::PopulationKeyEncoding::CanonicalLabelsV1;
         let mut configs = vec![source.clone()];
         for id in [3, 4] {
             let mut output = source.clone();
-            output.stored_output_id = Some(asap_types::sds::StoredOutputId(id));
+            output.stored_output_id = asap_types::sds::StoredOutputId(id);
             output.derived_input = Some(asap_types::derived_input::DerivedInputIdentity {
                 inputs: BTreeSet::from([asap_types::sds::StoredOutputId(1)]),
                 program_sha256: "0".repeat(64),
@@ -8876,9 +8946,19 @@ pub(crate) mod tests {
                 environment(10_000),
             )
             .unwrap();
-        let mut materializations = bundle.precompute_plan.materializations;
-        materializations[0].aggregation_type = asap_types::AggregationType::HLL;
-        materializations[0].parameters.clear();
+        let hll = SummaryFamilyType::Sketch(
+            planner_types::post_asap::SketchKind::new(
+                SketchAlgorithm::Hll,
+                planner_types::post_asap::SketchParams::Hll { precision: 14 },
+            ),
+            planner_types::post_asap::GroupingStrategy::PerSubpopulationInstance,
+        );
+        let materializations = bundle
+            .precompute_plan
+            .materializations
+            .into_iter()
+            .map(|config| (config, hll.clone()))
+            .collect::<Vec<_>>();
         let mut envelope_plan = PrecomputePlan::build(
             bundle.envelope.clone(),
             materializations.clone(),
@@ -8909,7 +8989,15 @@ pub(crate) mod tests {
             .expect("compile");
         let plan = PrecomputePlan::build_backend_local(
             bundle.envelope.clone(),
-            bundle.precompute_plan.materializations.clone(),
+            bundle
+                .precompute_plan
+                .materializations
+                .iter()
+                .map(|config| {
+                    let family = bundle.precompute_plan.state_family(config.stored_output_id);
+                    (config.clone(), family.unwrap().clone())
+                })
+                .collect(),
         )
         .expect("backend-local contract");
 
@@ -9106,7 +9194,10 @@ pub(crate) mod tests {
             if expected_readout == crate::query_plan::ExactReadout::Rate {
                 let materialization = plan.precompute_plan.materializations.first().unwrap();
                 assert_eq!(
-                    materialization.accumulator_spec().unwrap().family,
+                    plan.precompute_plan
+                        .state_family(materialization.stored_output_id)
+                        .unwrap()
+                        .clone(),
                     SummaryFamilyType::ExactAggregate(
                         planner_types::post_asap::ExactKind::Rate,
                         planner_types::post_asap::ExactParams::Rate,

@@ -13,6 +13,24 @@ use asap_types::PrecomputeMaterialization;
 use control_plane::physical::compiler::PLANNER_REVISION;
 use std::{collections::BTreeMap, sync::Arc};
 
+thread_local! {
+    /// Stored state family of each fixture output, keyed by its allocated id.
+    static FAMILIES: std::cell::RefCell<
+        std::collections::HashMap<
+            asap_types::sds::StoredOutputId,
+            planner_types::post_asap::SummaryFamilyType,
+        >,
+    > = Default::default();
+}
+
+/// The stored state family a fixture output was allocated with.
+pub(super) fn family_of(
+    config: &PrecomputeMaterialization,
+) -> planner_types::post_asap::SummaryFamilyType {
+    FAMILIES.with(|families| families.borrow()[&config.stored_output_id].clone())
+}
+
+/// A per-entity output of the `aggregation` kernel with these dimensions.
 pub(super) fn materialization(
     metric: &str,
     aggregation: &str,
@@ -21,18 +39,26 @@ pub(super) fn materialization(
     pane_ms: u64,
 ) -> PrecomputeMaterialization {
     assert_eq!(pane_ms % 1000, 0);
-    serde_json::from_value(serde_json::json!({
-        "aggregation_type": aggregation, "aggregation_sub_type": "",
+    let mut config: PrecomputeMaterialization = serde_json::from_value(serde_json::json!({
+        "stored_output_id": 0,
         "metric": metric, "window_size": pane_ms / 1000, "slide_interval": pane_ms / 1000,
         "window_type": "tumbling", "num_aggregates_to_retain": 100,
-        "parameters": parameters, "pane_origin_ms": 0,
+        "pane_origin_ms": 0,
         "partitioning": "per_entity",
         "window_layout": {"kind": "pane", "pane_secs": pane_ms / 1000},
-        "grouping_labels": {"labels": labels}, "aggregated_labels": {"labels": []},
-        "rollup_labels": {"labels": []}, "spatial_filter": "",
-        "spatial_filter_normalized": "", "original_yaml": ""
+        "grouping_labels": {"labels": labels},
+        "table_name": null
     }))
-    .unwrap()
+    .unwrap();
+    let family =
+        crate::tests::test_utilities::outputs::family(aggregation.parse().unwrap(), &parameters);
+    config.allocate_stored_output_id(&family);
+    FAMILIES.with(|families| {
+        families
+            .borrow_mut()
+            .insert(config.stored_output_id, family)
+    });
+    config
 }
 
 pub(super) fn entry(
@@ -62,16 +88,16 @@ pub(super) fn entry(
                         .then_some(config.slide_interval * 1000),
                         materialization: config.policy_fingerprint().into(),
                         stored_output_reference:
-                            asap_types::summary_catalog::SummaryCatalog::from_materializations(
+                            asap_types::summary_catalog::SummaryCatalog::from_outputs(
                                 1,
                                 1,
-                                &[config.clone()],
+                                vec![(config, &family_of(config), String::new())],
                             )
                             .unwrap()
                             .output_reference(config.policy_fingerprint().into())
                             .unwrap(),
                         output_grouping: grouping,
-                        item_labels: config.aggregated_labels.labels.clone(),
+                        item_labels: Vec::new(),
                         window_ms: config.stored_window_ms(),
                         pane_origin_ms: config.pane_origin_ms,
                         readout_lookback_ms: Some(lookback_ms),
@@ -104,12 +130,13 @@ pub(super) fn install(
         planner_revision: PLANNER_REVISION.into(),
         capability_snapshot_id: "runtime-fixture".into(),
     };
-    let materializations: Vec<_> = configs.iter().map(|(c, _)| c.clone()).collect();
-    let catalog =
-        asap_types::summary_catalog::SummaryCatalog::from_materializations(1, 1, &materializations)
-            .unwrap();
+    let outputs: Vec<_> = configs
+        .iter()
+        .map(|(c, _)| (c.clone(), family_of(c)))
+        .collect();
     let mut precompute =
-        PrecomputePlan::build(envelope.clone(), materializations, &["fixture".into()]).unwrap();
+        PrecomputePlan::build(envelope.clone(), outputs, &["fixture".into()]).unwrap();
+    let catalog = asap_types::summary_catalog::SummaryCatalog::from_plan(&precompute).unwrap();
     precompute.bind_catalog(&catalog).unwrap();
     let mut transmission = control_plane::physical::compiler::build_transmission_plan(
         envelope,

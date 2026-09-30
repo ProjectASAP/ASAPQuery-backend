@@ -1548,26 +1548,29 @@ mod tests {
     #[test]
     fn metricsql_quantile_preserves_catalog_metric_name_only_per_entity() {
         use control_plane::query_plan::*;
-        let config: asap_types::PrecomputeMaterialization =
+        let mut config: asap_types::PrecomputeMaterialization =
             serde_json::from_value(serde_json::json!({
-                "aggregation_type": "DDSketch", "aggregation_sub_type": "",
+                "stored_output_id": 0,
                 "metric": "latency_ms", "window_size": 1, "slide_interval": 1,
                 "window_type": "tumbling", "num_aggregates_to_retain": 3,
-                "parameters": {"alpha": 0.01}, "pane_origin_ms": 0,
+                "pane_origin_ms": 0,
                 "partitioning": "per_entity", "window_layout": {"kind": "pane", "pane_secs": 1},
-                "grouping_labels": {"labels": []}, "aggregated_labels": {"labels": []},
-                "rollup_labels": {"labels": []}, "spatial_filter": "",
-                "spatial_filter_normalized": "", "original_yaml": ""
+                "grouping_labels": {"labels": []}, "table_name": null
             }))
             .unwrap();
+        let family = crate::tests::test_utilities::outputs::family(
+            asap_types::AggregationType::DDSketch,
+            &serde_json::json!({"alpha": 0.01}),
+        );
+        config.allocate_stored_output_id(&family);
         let idx = ddsketch_fixture();
         let mut metadata = (*idx.instance(1).unwrap()).clone();
         metadata.policy_fp = config.policy_fingerprint();
         idx.install_summary_catalog(std::sync::Arc::new(
-            asap_types::summary_catalog::SummaryCatalog::from_materializations(
+            asap_types::summary_catalog::SummaryCatalog::from_outputs(
                 1,
                 1,
-                &[config.clone()],
+                vec![(&config, &family, String::new())],
             )
             .unwrap(),
         ))
@@ -1848,8 +1851,11 @@ mod tests {
                         metric_name: "a".into(),
                         group_by_keys: Default::default(),
                         capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
-                        agg_kind: crate::storage_engines::sketch_db::data::agg_kind_for_config(
-                            config,
+                        agg_kind: crate::storage_engines::sketch_db::data::agg_kind_for_family(
+                            plan.precompute_plan
+                                .state_family(config.stored_output_id)
+                                .unwrap(),
+                            &plan.precompute_plan.population_filter(config).unwrap(),
                         ),
                         accuracy: None,
                         first_seen_unix_ms: 0,
@@ -1917,7 +1923,12 @@ mod tests {
             metric_name: "a".into(),
             group_by_keys: Default::default(),
             capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
-            agg_kind: crate::storage_engines::sketch_db::data::agg_kind_for_config(config),
+            agg_kind: crate::storage_engines::sketch_db::data::agg_kind_for_family(
+                plan.precompute_plan
+                    .state_family(config.stored_output_id)
+                    .unwrap(),
+                &plan.precompute_plan.population_filter(config).unwrap(),
+            ),
             accuracy: None,
             first_seen_unix_ms: 0,
             retired_at_ms: None,

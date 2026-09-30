@@ -78,7 +78,7 @@ impl PrecomputedOutput {
     ///
     /// `policy_fp` is the content-addressed handle on the source
     /// [`asap_types::PrecomputeMaterialization`]; sinks use it to look up the
-    /// config via `PolicyRegistry::get(policy_fp)`. Construction sites
+    /// installed output by it. Construction sites
     /// that lack a source config (raw-mode fast-path) pass
     /// [`PolicyFingerprint::UNSET`]; sinks then skip the output.
     pub fn new(

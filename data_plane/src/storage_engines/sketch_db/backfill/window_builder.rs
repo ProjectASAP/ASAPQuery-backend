@@ -12,8 +12,6 @@ use crate::storage_engines::types::AggregateCore;
 use crate::tests::accumulator_fixture::create_fixture_accumulator;
 #[cfg(test)]
 use asap_physical_operators::factory::AccumulatorUpdater;
-#[cfg(test)]
-use asap_types::aggregation_config::PrecomputeMaterialization;
 
 /// Construct the accumulator for one `(agg_id, window)` pair by
 /// feeding `samples` in order into a fresh `AccumulatorUpdater`.
@@ -30,17 +28,18 @@ use asap_types::aggregation_config::PrecomputeMaterialization;
 /// implementation without worrying about the async runtime.
 #[cfg(test)]
 pub fn build_backfilled_accumulator(
-    config: &PrecomputeMaterialization,
+    family: &planner_types::post_asap::SummaryFamilyType,
+    update: &planner_types::post_asap::SummaryUpdate,
     samples: &[RawSample],
 ) -> Box<dyn AggregateCore> {
-    let mut updater: Box<dyn AccumulatorUpdater> = create_fixture_accumulator(config);
+    let mut updater: Box<dyn AccumulatorUpdater> = create_fixture_accumulator(family, update);
     for sample in samples {
         apply_sample(
             &mut *updater,
             &sample.labels,
             sample.value,
             sample.timestamp_ms,
-            config,
+            family,
         );
     }
     updater.take_accumulator()
@@ -49,30 +48,16 @@ pub fn build_backfilled_accumulator(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asap_types::aggregation_config::PrecomputeMaterialization;
-    use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
-    use asap_types::KeyByLabelNames;
-    use std::collections::HashMap;
+    use planner_types::post_asap::{SummaryInputExpr, SummaryUpdate};
+    use planner_types::pre_asap::ColumnRef;
 
-    fn sum_config() -> PrecomputeMaterialization {
-        PrecomputeMaterialization::new(
-            AggregationType::Sum,
-            String::new(),
-            HashMap::new(),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            String::new(),
-            60,
-            60,
-            WindowKind::Tumbling,
-            String::new(),
-            "m".to_string(),
-            None,
-            None,
-            None,
-        )
+    fn value_update() -> SummaryUpdate {
+        SummaryUpdate::column(ColumnRef::SampleValue)
+    }
+
+    fn sum_family() -> planner_types::post_asap::SummaryFamilyType {
+        AggregationType::Sum.planner_exact_family().unwrap()
     }
 
     fn raw(labels: &str, ts: i64, v: f64) -> RawSample {
@@ -94,18 +79,20 @@ mod tests {
             AggregationType::CountSketchWithHeap,
         ] {
             for mode in ["count", "value"] {
-                let mut config = sum_config();
-                config.aggregation_type = kind;
-                config.parameters = serde_json::from_value(serde_json::json!({
-                    "d": 4, "w": 1024, "heap_size": 10, "weight_mode": mode
-                }))
-                .unwrap();
+                let family = crate::tests::test_utilities::outputs::family(
+                    kind,
+                    &serde_json::json!({"d": 4, "w": 1024, "heap_size": 10}),
+                );
+                let mut update = value_update();
+                if mode == "count" {
+                    update.weight = SummaryInputExpr::Constant(1.0);
+                }
                 let samples = vec![
                     raw("m{svc=\"a\"}", 10, 100.0),
                     raw("m{svc=\"b\"}", 20, 2.0),
                     raw("m{svc=\"b\"}", 30, 3.0),
                 ];
-                let acc = build_backfilled_accumulator(&config, &samples);
+                let acc = build_backfilled_accumulator(&family, &update, &samples);
                 let mut ranked: Vec<(String, f64)> = if let Some(heap) =
                     acc.as_any()
                         .downcast_ref::<CountMinSketchWithHeapAccumulator>()
@@ -138,21 +125,18 @@ mod tests {
 
     #[test]
     fn sum_accumulator_sums_all_samples_in_order() {
-        let config = sum_config();
         let samples = vec![
             raw("m{svc=\"a\"}", 10, 1.0),
             raw("m{svc=\"a\"}", 20, 2.0),
             raw("m{svc=\"a\"}", 30, 3.0),
         ];
-        let acc = build_backfilled_accumulator(&config, &samples);
+        let acc = build_backfilled_accumulator(&sum_family(), &value_update(), &samples);
         assert_eq!(crate::tests::accumulator_fixture::sum_of(acc.as_ref()), 6.0);
     }
 
     #[test]
     fn empty_samples_produce_empty_accumulator() {
-        let config = sum_config();
-        let acc = build_backfilled_accumulator(&config, &[]);
-        // An empty exact Sum is the additive identity.
+        let acc = build_backfilled_accumulator(&sum_family(), &value_update(), &[]);
         assert_eq!(crate::tests::accumulator_fixture::sum_of(acc.as_ref()), 0.0);
     }
 }

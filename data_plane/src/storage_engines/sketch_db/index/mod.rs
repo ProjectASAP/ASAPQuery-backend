@@ -40,8 +40,8 @@ use crate::storage_engines::sketch_db::sds::{
 };
 
 pub use crate::storage_engines::sketch_db::data::{
-    canonical_parameters, AccuracyBound, AggKind, AggPayload, AggregationType, Capability,
-    SketchAlgorithm, SketchConfig, SketchEncoding, SketchSampleState, SketchTimeSeries,
+    AccuracyBound, AggKind, AggPayload, AggregationType, Capability, SketchAlgorithm, SketchConfig,
+    SketchEncoding, SketchSampleState, SketchTimeSeries,
 };
 
 fn now_ms() -> u64 {
@@ -764,6 +764,7 @@ impl SummaryPublicationWriter<'_> {
         address: &asap_types::sds::StoredSummaryKey,
         resolver: &crate::drivers::ingest::series_resolver::SeriesIdResolver,
         config: &asap_types::PrecomputeMaterialization,
+        kind: &AggKind,
         output: &crate::storage_engines::types::PrecomputedOutput,
         state: &dyn crate::storage_engines::types::AggregateCore,
     ) -> Option<u64> {
@@ -813,7 +814,7 @@ impl SummaryPublicationWriter<'_> {
             return None;
         }
         self.0
-            .ingest_precompute_with_admission(handle, config, output, state)
+            .ingest_precompute_with_admission(handle, config, kind, output, state)
     }
 
     #[cfg(test)]
@@ -821,11 +822,12 @@ impl SummaryPublicationWriter<'_> {
         &self,
         sid: u64,
         config: &asap_types::PrecomputeMaterialization,
+        kind: &AggKind,
         output: &crate::storage_engines::types::PrecomputedOutput,
         state: &dyn crate::storage_engines::types::AggregateCore,
     ) -> Option<u64> {
         self.0
-            .ingest_precompute_with_admission(sid, config, output, state)
+            .ingest_precompute_with_admission(sid, config, kind, output, state)
     }
 
     #[cfg(test)]
@@ -3180,6 +3182,7 @@ impl SketchStore {
         &self,
         mint_sid: impl FnOnce(&str, &str, &str) -> R,
         agg_cfg: &asap_types::aggregation_config::PrecomputeMaterialization,
+        kind: &AggKind,
         output: &crate::storage_engines::types::PrecomputedOutput,
         accumulator: &dyn crate::storage_engines::types::AggregateCore,
     ) -> Option<u64> {
@@ -3187,7 +3190,7 @@ impl SketchStore {
         if admission.is_finite_closed() {
             return None;
         }
-        self.ingest_precompute_config_with_admission(mint_sid, agg_cfg, output, accumulator)
+        self.ingest_precompute_config_with_admission(mint_sid, agg_cfg, kind, output, accumulator)
     }
 
     #[cfg(test)]
@@ -3195,6 +3198,7 @@ impl SketchStore {
         &self,
         mint_sid: impl FnOnce(&str, &str, &str) -> R,
         agg_cfg: &asap_types::PrecomputeMaterialization,
+        kind: &AggKind,
         output: &crate::storage_engines::types::PrecomputedOutput,
         accumulator: &dyn crate::storage_engines::types::AggregateCore,
     ) -> Option<u64> {
@@ -3206,31 +3210,33 @@ impl SketchStore {
         // invoking the sid-direct sibling.
         let (attrs_fp, _label_values_map) = build_attrs_fp_and_label_map(agg_cfg, output).ok()?;
         let agg_kind_canonical =
-            crate::storage_engines::sketch_db::data::materialization_kind_for_config(agg_cfg);
+            crate::storage_engines::sketch_db::data::materialization_kind(agg_cfg, kind);
         let sid = mint_sid(&agg_cfg.metric, &attrs_fp, &agg_kind_canonical).into()?;
-        self.ingest_precompute_with_admission(sid, agg_cfg, output, accumulator)
+        self.ingest_precompute_with_admission(sid, agg_cfg, kind, output, accumulator)
     }
 
     fn register_precompute_output(
         &self,
         sid: u64,
         agg_cfg: &asap_types::PrecomputeMaterialization,
+        kind: &AggKind,
         output: &crate::storage_engines::types::PrecomputedOutput,
     ) -> Option<BTreeMap<String, String>> {
         let mut instances = self.instances.write().ok()?;
-        self.register_precompute_output_with_instances(sid, agg_cfg, output, &mut instances)
+        self.register_precompute_output_with_instances(sid, agg_cfg, kind, output, &mut instances)
     }
 
     fn register_precompute_output_with_instances(
         &self,
         sid: u64,
         agg_cfg: &asap_types::PrecomputeMaterialization,
+        kind: &AggKind,
         output: &crate::storage_engines::types::PrecomputedOutput,
         instances: &mut HashMap<u64, SdsBinding>,
     ) -> Option<BTreeMap<String, String>> {
         let (_attrs_fp, label_values_map) = build_attrs_fp_and_label_map(agg_cfg, output).ok()?;
         let key_names = &agg_cfg.grouping_labels.names();
-        let agg_kind = crate::storage_engines::sketch_db::data::agg_kind_for_config(agg_cfg);
+        let agg_kind = kind.clone();
         let (capability, accuracy) = agg_kind.capability_and_accuracy();
 
         match instances.get(&sid) {
@@ -3314,6 +3320,7 @@ impl SketchStore {
         &self,
         sid: u64,
         agg_cfg: &asap_types::aggregation_config::PrecomputeMaterialization,
+        kind: &AggKind,
         output: &crate::storage_engines::types::PrecomputedOutput,
         accumulator: &dyn crate::storage_engines::types::AggregateCore,
     ) -> Option<u64> {
@@ -3321,13 +3328,14 @@ impl SketchStore {
         if admission.is_finite_closed() {
             return None;
         }
-        self.ingest_precompute_with_admission(sid, agg_cfg, output, accumulator)
+        self.ingest_precompute_with_admission(sid, agg_cfg, kind, output, accumulator)
     }
 
     fn ingest_precompute_with_admission(
         &self,
         sid: u64,
         agg_cfg: &asap_types::PrecomputeMaterialization,
+        kind: &AggKind,
         output: &crate::storage_engines::types::PrecomputedOutput,
         accumulator: &dyn crate::storage_engines::types::AggregateCore,
     ) -> Option<u64> {
@@ -3335,19 +3343,14 @@ impl SketchStore {
             tracing::warn!(sid, %error, "rejecting summary state without a stored codec");
             return None;
         }
-        let expected = agg_cfg.accumulator_spec().ok()?.family;
-        if matches!(
-            expected,
-            planner_types::post_asap::SummaryFamilyType::ExactAggregate(..)
-        ) && accumulator
-            .get_accumulator_type()
-            .planner_exact_family()
-            .as_ref()
-            != Some(&expected)
-        {
-            return None;
+        if let AggKind::ExactAgg { agg_type, .. } = kind {
+            if accumulator.get_accumulator_type().planner_exact_family()
+                != agg_type.planner_exact_family()
+            {
+                return None;
+            }
         }
-        let label_values_map = self.register_precompute_output(sid, agg_cfg, output)?;
+        let label_values_map = self.register_precompute_output(sid, agg_cfg, kind, output)?;
 
         // Keep the physical lifetime alive through publication. Removal takes
         // this same lock exclusively, so it cannot race metadata validation and
@@ -3398,7 +3401,7 @@ impl SketchStore {
         }
 
         let window = (output.start_timestamp, output.end_timestamp);
-        let accepted = match crate::storage_engines::sketch_db::data::agg_kind_for_config(agg_cfg) {
+        let accepted = match kind {
             AggKind::Sketch { .. } => self.append_sample_with_binding(
                 sid,
                 label_values_map,
@@ -3933,9 +3936,13 @@ mod tests {
     fn meta_for_config(
         sid: u64,
         config: &asap_types::PrecomputeMaterialization,
+        plan: &asap_types::precompute_plan::PrecomputePlan,
     ) -> SummarySeriesMetadata {
         let mut metadata = meta_with_policy(sid, config.policy_fingerprint());
-        metadata.agg_kind = crate::storage_engines::sketch_db::data::agg_kind_for_config(config);
+        metadata.agg_kind = crate::storage_engines::sketch_db::data::agg_kind_for_family(
+            plan.state_family(config.stored_output_id).unwrap(),
+            &plan.population_filter(config).unwrap(),
+        );
         metadata
     }
 
@@ -4049,7 +4056,10 @@ mod tests {
             .iter()
             .find(|config| {
                 matches!(
-                    config.accumulator_spec().unwrap().family,
+                    plan.precompute_plan
+                        .state_family(config.stored_output_id)
+                        .unwrap()
+                        .clone(),
                     planner_types::post_asap::SummaryFamilyType::Sketch(..)
                 )
             })
@@ -4060,7 +4070,7 @@ mod tests {
         store
             .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
             .unwrap();
-        store.register(meta_for_config(41, &state_config));
+        store.register(meta_for_config(41, &state_config, &plan.precompute_plan));
         store.append_sample(
             41,
             BTreeMap::from([("job".to_string(), "api".to_string())]),
@@ -4143,7 +4153,10 @@ mod tests {
             .iter()
             .find(|config| {
                 matches!(
-                    config.accumulator_spec().unwrap().family,
+                    plan.precompute_plan
+                        .state_family(config.stored_output_id)
+                        .unwrap()
+                        .clone(),
                     planner_types::post_asap::SummaryFamilyType::Sketch(..)
                 )
             })
@@ -4154,7 +4167,7 @@ mod tests {
         store
             .install_summary_catalog(Arc::new(plan.summary_catalog))
             .unwrap();
-        store.register(meta_for_config(42, &state_config));
+        store.register(meta_for_config(42, &state_config, &plan.precompute_plan));
         let producers = BTreeMap::from([(
             StoredOutputId::from(fingerprint),
             (
@@ -4234,7 +4247,7 @@ mod tests {
             identity_version: 1,
             plan_id: 7,
             plan_version: 2,
-            backend_compat: "asap-query-backend.v1".into(),
+            backend_compat: "asap-query-backend.v2".into(),
             materialization: PolicyFingerprint(41).into(),
             series_identity: "service=checkout,zone=a".into(),
             schema_id: "schema-41".into(),
@@ -4626,17 +4639,6 @@ mod tests {
     //    enum, so two variants whose fields differ produce different
     //    canonical strings → different resolver cache keys → different
     //    sids by construction.
-
-    #[test]
-    fn canonical_parameters_is_insertion_order_independent() {
-        let mut p_ab = std::collections::HashMap::new();
-        p_ab.insert("alpha".to_string(), serde_json::json!(1));
-        p_ab.insert("beta".to_string(), serde_json::json!(2));
-        let mut p_ba = std::collections::HashMap::new();
-        p_ba.insert("beta".to_string(), serde_json::json!(2));
-        p_ba.insert("alpha".to_string(), serde_json::json!(1));
-        assert_eq!(canonical_parameters(&p_ab), canonical_parameters(&p_ba));
-    }
 
     // Unkeyed Planner exact MIN panes feed the MIN rollup.
     #[test]
@@ -5349,14 +5351,17 @@ mod tests {
             .iter()
             .find(|config| {
                 matches!(
-                    config.accumulator_spec().unwrap().family,
+                    plan.precompute_plan
+                        .state_family(config.stored_output_id)
+                        .unwrap()
+                        .clone(),
                     planner_types::post_asap::SummaryFamilyType::Sketch(..)
                 )
             })
             .unwrap()
             .clone();
         let fingerprint = state_config.policy_fingerprint();
-        let metadata = meta_for_config(507, &state_config);
+        let metadata = meta_for_config(507, &state_config, &plan.precompute_plan);
         let record = StoredOutputMetadataRecord::new(
             metadata.storage_handle,
             metadata.metric_name.clone(),
@@ -5403,7 +5408,10 @@ mod tests {
             .iter()
             .find(|config| {
                 matches!(
-                    config.accumulator_spec().unwrap().family,
+                    plan.precompute_plan
+                        .state_family(config.stored_output_id)
+                        .unwrap()
+                        .clone(),
                     planner_types::post_asap::SummaryFamilyType::Sketch(..)
                 )
             })
@@ -5414,7 +5422,7 @@ mod tests {
         store
             .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
             .unwrap();
-        store.register(meta_for_config(509, &state_config));
+        store.register(meta_for_config(509, &state_config, &plan.precompute_plan));
         store.append_sample(509, BTreeMap::new(), (0, 10_000), sample(1));
         let mut next = plan.summary_catalog;
         next.plan_version += 1;
@@ -5445,13 +5453,13 @@ mod tests {
             )
             .unwrap();
         assert!(inventory.instances.is_empty());
-        store.register(meta_for_config(510, &state_config));
+        store.register(meta_for_config(510, &state_config, &plan.precompute_plan));
         store.append_sample(510, BTreeMap::new(), (0, 10_000), sample(2));
         assert_eq!(store.series_ids_for_policy(fingerprint), vec![510]);
-        let incompatible = asap_types::summary_catalog::SummaryCatalog::from_materializations(
+        let incompatible = asap_types::summary_catalog::SummaryCatalog::from_outputs(
             plan.precompute_plan.envelope.plan_id,
             plan.precompute_plan.envelope.plan_version + 2,
-            &[],
+            Vec::new(),
         )
         .unwrap();
         store
@@ -5477,7 +5485,10 @@ mod tests {
             .iter()
             .find(|config| {
                 matches!(
-                    config.accumulator_spec().unwrap().family,
+                    plan.precompute_plan
+                        .state_family(config.stored_output_id)
+                        .unwrap()
+                        .clone(),
                     planner_types::post_asap::SummaryFamilyType::Sketch(..)
                 )
             })
@@ -5500,7 +5511,11 @@ mod tests {
                 .unwrap();
             let mut persistence = store.start_persistence(durable_cfg(disk.clone())).unwrap();
             old_sid = resolver.resolve("metric", "group", "family");
-            store.register(meta_for_config(old_sid, &state_config));
+            store.register(meta_for_config(
+                old_sid,
+                &state_config,
+                &plan.precompute_plan,
+            ));
             for pane in 0..4 {
                 store.append_sample(
                     old_sid,
@@ -5527,7 +5542,11 @@ mod tests {
                 })
                 .unwrap();
             assert_ne!(new_sid, old_sid);
-            store.register(meta_for_config(new_sid, &state_config));
+            store.register(meta_for_config(
+                new_sid,
+                &state_config,
+                &plan.precompute_plan,
+            ));
             for pane in 0..4 {
                 store.append_sample(
                     new_sid,
@@ -5602,7 +5621,10 @@ mod tests {
             .iter()
             .find(|config| {
                 matches!(
-                    config.accumulator_spec().unwrap().family,
+                    plan.precompute_plan
+                        .state_family(config.stored_output_id)
+                        .unwrap()
+                        .clone(),
                     planner_types::post_asap::SummaryFamilyType::Sketch(..)
                 )
             })
@@ -5614,7 +5636,7 @@ mod tests {
         store
             .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
             .unwrap();
-        store.register(meta_for_config(850, &state_config));
+        store.register(meta_for_config(850, &state_config, &plan.precompute_plan));
         let generation = store.active_catalog_generation().unwrap();
         let writer = Arc::new(persistence::metadata::StoredOutputMetadataFile::new(
             directory.path(),
@@ -5711,7 +5733,10 @@ mod tests {
             .iter()
             .find(|config| {
                 matches!(
-                    config.accumulator_spec().unwrap().family,
+                    plan.precompute_plan
+                        .state_family(config.stored_output_id)
+                        .unwrap()
+                        .clone(),
                     planner_types::post_asap::SummaryFamilyType::Sketch(..)
                 )
             })
@@ -5724,7 +5749,7 @@ mod tests {
             store
                 .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
                 .unwrap();
-            store.register(meta_for_config(851, &state_config));
+            store.register(meta_for_config(851, &state_config, &plan.precompute_plan));
             let mut config = durable_cfg(directory.path().to_path_buf());
             config.hot_window_ms = None;
             config.seal_window_count = 100;
@@ -5833,7 +5858,10 @@ mod tests {
             .iter()
             .find(|config| {
                 matches!(
-                    config.accumulator_spec().unwrap().family,
+                    plan.precompute_plan
+                        .state_family(config.stored_output_id)
+                        .unwrap()
+                        .clone(),
                     planner_types::post_asap::SummaryFamilyType::Sketch(..)
                 )
             })
@@ -5849,7 +5877,7 @@ mod tests {
                 .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
                 .unwrap();
             for sid in [801, 802, 803] {
-                store.register(meta_for_config(sid, &state_config));
+                store.register(meta_for_config(sid, &state_config, &plan.precompute_plan));
             }
             let mut persistence = store.start_persistence(durable_cfg(disk.clone())).unwrap();
             for sid in [801, 802, 803] {
@@ -5876,7 +5904,7 @@ mod tests {
             expected_retirement = store.force_retire(801, Duration::from_secs(3600)).unwrap();
             assert!(store.force_expire(802).is_some());
             assert!(store.remove_instance(803).is_some());
-            store.register(meta_for_config(803, &state_config));
+            store.register(meta_for_config(803, &state_config, &plan.precompute_plan));
             assert!(
                 store.instance(803).is_none(),
                 "removed SID reused before restart"
@@ -5906,7 +5934,7 @@ mod tests {
             recovered.instance(803).is_none(),
             "removed state resurrected"
         );
-        recovered.register(meta_for_config(803, &state_config));
+        recovered.register(meta_for_config(803, &state_config, &plan.precompute_plan));
         assert!(
             recovered.instance(803).is_none(),
             "removed SID reused after restart"
@@ -5929,7 +5957,10 @@ mod tests {
             .iter()
             .find(|config| {
                 matches!(
-                    config.accumulator_spec().unwrap().family,
+                    plan.precompute_plan
+                        .state_family(config.stored_output_id)
+                        .unwrap()
+                        .clone(),
                     planner_types::post_asap::SummaryFamilyType::Sketch(..)
                 )
             })
@@ -5946,7 +5977,7 @@ mod tests {
         )]);
         let tmp = tempfile::TempDir::new().unwrap();
         let disk = tmp.path().to_path_buf();
-        let mut metadata = meta_for_config(506, &state_config);
+        let mut metadata = meta_for_config(506, &state_config, &plan.precompute_plan);
         metadata.group_by_keys = ["job".to_string()].into_iter().collect();
 
         {
@@ -6715,7 +6746,10 @@ mod tests {
             .iter()
             .find(|config| {
                 matches!(
-                    config.accumulator_spec().unwrap().family,
+                    plan.precompute_plan
+                        .state_family(config.stored_output_id)
+                        .unwrap()
+                        .clone(),
                     planner_types::post_asap::SummaryFamilyType::Sketch(..)
                 )
             })
@@ -6756,7 +6790,7 @@ mod tests {
                 )
                 .unwrap();
             assert_ne!(handle, other_population);
-            store.register(meta_for_config(handle, &config));
+            store.register(meta_for_config(handle, &config, &plan.precompute_plan));
             let mut persistence = store.start_persistence(durable_cfg(disk.clone())).unwrap();
             for pane in 0..4 {
                 store.append_sample(
@@ -6843,6 +6877,7 @@ mod tests {
                 .iter()
                 .find(|config| config.policy_fingerprint() == output.stored_output_id.fingerprint())
                 .unwrap(),
+            &plan.precompute_plan,
         ));
         assert_eq!(store.storage_handles_for_output(&output), vec![100]);
         let mut next = plan.summary_catalog;
@@ -6942,31 +6977,38 @@ impl SketchStore {
             output.population_labels = Some(record.group.clone());
             output.catalog_generation = Some(Arc::clone(&generation));
             output.stored_output_reference = Some(record.reference.clone());
-            let state = crate::precompute_engine::revisions::decode_state(record, config)?;
+            let family = plan
+                .precompute_plan
+                .state_family(definition)
+                .ok_or("revision view lacks output state schema")?;
+            let kind = plan
+                .installed_precompute_plan
+                .agg_kind(definition)
+                .ok_or("revision view lacks output state schema")?;
+            let state = crate::precompute_engine::revisions::decode_state(record, family)?;
             let labels = view
-                .register_precompute_output(sid, config, &output)
+                .register_precompute_output(sid, config, &kind, &output)
                 .ok_or("revision view rejected output metadata")?;
             // This is an immutable read view of already committed revisions,
             // not additive producer admission (which correctly rejects derived
             // writes). Every payload was decoded against its installed family.
-            let accepted =
-                match crate::storage_engines::sketch_db::data::agg_kind_for_config(config) {
-                    AggKind::Sketch { .. } => view.append_sample_with_binding(
-                        sid,
-                        labels,
-                        (record.start_ms, record.end_ms),
-                        SketchSampleState {
-                            bytes: state.serialize_to_bytes(),
-                            encoding: SketchEncoding::full_frame_for(state.as_ref()),
-                        },
-                    ),
-                    AggKind::ExactAgg { .. } => view.append_precompute_with_binding(
-                        sid,
-                        labels,
-                        (record.start_ms, record.end_ms),
-                        state.clone_boxed_core(),
-                    ),
-                };
+            let accepted = match kind {
+                AggKind::Sketch { .. } => view.append_sample_with_binding(
+                    sid,
+                    labels,
+                    (record.start_ms, record.end_ms),
+                    SketchSampleState {
+                        bytes: state.serialize_to_bytes(),
+                        encoding: SketchEncoding::full_frame_for(state.as_ref()),
+                    },
+                ),
+                AggKind::ExactAgg { .. } => view.append_precompute_with_binding(
+                    sid,
+                    labels,
+                    (record.start_ms, record.end_ms),
+                    state.clone_boxed_core(),
+                ),
+            };
             if !accepted {
                 return Err("revision view rejected committed payload".into());
             }

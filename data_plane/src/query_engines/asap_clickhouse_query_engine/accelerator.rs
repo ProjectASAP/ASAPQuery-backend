@@ -811,25 +811,22 @@ mod tests {
             "SELECT sum(value) FROM requests".into()
         };
         let mut config = PrecomputeMaterialization::new(
-            AggregationType::Sum,
-            String::new(),
-            Default::default(),
+            "requests",
             KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            String::new(),
             1,
             1,
             WindowKind::Tumbling,
-            String::new(),
-            "requests".into(),
-            None,
-            Some("asap_e2e.samples".into()),
-            Some("value".into()),
         );
+        config.table_name = Some("asap_e2e.samples".into());
+        config.value_projection = Some(asap_types::sds::ValueProjectionIdentity::Column {
+            name: "value".into(),
+        });
         config.pane_origin_ms = Some(0);
         config.table_timestamp_column = Some("timestamp_ms".into());
-        let sds = SummaryCatalog::from_materializations(41, 1, &[config.clone()]).unwrap();
+        let family = AggregationType::Sum.planner_exact_family().unwrap();
+        config.allocate_stored_output_id(&family);
+        let sds =
+            SummaryCatalog::from_outputs(41, 1, vec![(&config, &family, String::new())]).unwrap();
         let materialization = *sds.outputs.keys().next().unwrap();
         let read = QueryNodeId(0);
         let readout = QueryNodeId(1);
@@ -1022,7 +1019,7 @@ mod tests {
         };
         let mut precompute = asap_types::precompute_plan::PrecomputePlan::build(
             envelope.clone(),
-            vec![config],
+            vec![(config, family)],
             &["fixture".into()],
         )
         .unwrap();
@@ -1271,21 +1268,11 @@ mod tests {
             assert!(request.send().await.unwrap().status().is_success());
         }
         let mut cfg = PrecomputeMaterialization::new(
-            AggregationType::Sum,
-            String::new(),
-            Default::default(),
+            "requests",
             KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            String::new(),
             1,
             1,
             WindowKind::Tumbling,
-            String::new(),
-            "requests".into(),
-            None,
-            None,
-            None,
         );
         cfg.pane_origin_ms = Some(0);
         cfg.table_name = Some("asap_e2e.samples".into());
@@ -1293,10 +1280,12 @@ mod tests {
         cfg.value_projection = Some(asap_types::sds::ValueProjectionIdentity::Column {
             name: "value".into(),
         });
+        let (cfg, family) = crate::tests::test_utilities::outputs::allocated(
+            cfg,
+            AggregationType::Sum.planner_exact_family().unwrap(),
+        );
         let hot = crate::storage_engines::types::InstalledPrecomputePlanHandle::from_arc(Arc::new(
-            crate::storage_engines::types::InstalledPrecomputePlan::from_raw_ids(HashMap::from([
-                (cfg.policy_fp_u64(), cfg.clone()),
-            ])),
+            crate::storage_engines::types::InstalledPrecomputePlan::new([(cfg.clone(), family)]),
         ));
         let registry =
             Arc::new(crate::storage_engines::sketch_db::backfill::BackfillRegistry::new());

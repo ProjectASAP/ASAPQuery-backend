@@ -107,7 +107,12 @@ fn envelope(metric: &str, data: Data) -> ExportMetricsServiceRequest {
     }
 }
 
-async fn start_backend(materialization: &asap_types::PrecomputeMaterialization) -> Backend {
+async fn start_backend(
+    materialization: &(
+        asap_types::PrecomputeMaterialization,
+        planner_types::post_asap::SummaryFamilyType,
+    ),
+) -> Backend {
     let query_port = unused_port();
     let otlp_http_port = unused_port();
     let otlp_grpc_port = unused_port();
@@ -124,11 +129,12 @@ async fn start_backend(materialization: &asap_types::PrecomputeMaterialization) 
                 .find(|s| s.materialization == rule.materialization)
                 .unwrap()
                 .family,
-            control_plane::physical::compiler::StateFamilyContract::Sketch {
-                algorithm: planner_types::post_asap::SketchAlgorithm::Cms
-                    | planner_types::post_asap::SketchAlgorithm::CountSketch,
-                ..
-            }
+            planner_types::post_asap::SummaryFamilyType::Sketch(ref kind, _)
+                if matches!(
+                    kind.algorithm(),
+                    planner_types::post_asap::SketchAlgorithm::Cms
+                        | planner_types::post_asap::SketchAlgorithm::CountSketch
+                )
         ) {
             rule.encoding = control_plane::physical::compiler::StateEncoding::SketchCoreMsgpackV1;
         }
@@ -281,11 +287,18 @@ fn scalar_values(response: &Value) -> Vec<(HashMap<String, String>, f64)> {
         .collect()
 }
 
-fn config(metric: &str, kind: &str, parameters: &str) -> asap_types::PrecomputeMaterialization {
+fn config(
+    metric: &str,
+    kind: &str,
+    parameters: &str,
+) -> (
+    asap_types::PrecomputeMaterialization,
+    planner_types::post_asap::SummaryFamilyType,
+) {
+    let parameters: serde_json::Value = serde_yaml::from_str(parameters).unwrap();
     physical_fixture::materialization(
         metric,
-        kind.parse().unwrap(),
-        serde_yaml::from_str(parameters).unwrap(),
+        physical_fixture::sketch_family(kind.parse().unwrap(), &parameters),
     )
 }
 

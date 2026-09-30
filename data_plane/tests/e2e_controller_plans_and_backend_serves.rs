@@ -45,6 +45,7 @@
 //!    metric.
 
 use asap_types::PrecomputeMaterialization;
+use planner_types::post_asap::SummaryFamilyType;
 use std::sync::Arc;
 use std::time::Duration;
 #[path = "support/physical_fixture.rs"]
@@ -72,23 +73,27 @@ fn phase_aligned_now_ns() -> u64 {
     now - now % 5_000_000_000 + 3_000_000_000
 }
 
+/// A stored output with its state family.
+type Output = (PrecomputeMaterialization, SummaryFamilyType);
+
 async fn post_full_config(
     client: &reqwest::Client,
     stack: &FullStack,
-    materializations: &[PrecomputeMaterialization],
+    materializations: &[Output],
 ) {
     let mut configs = materializations.to_vec();
     // The transport payloads below carry one-second states, so pin the
     // physical layout to match them.
-    for config in &mut configs {
+    for (config, family) in &mut configs {
         config.window_size = 1;
         config.slide_interval = 1;
         config.window_layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 };
+        config.allocate_stored_output_id(family);
     }
     let mut artifact = physical_fixture::artifact_from_materializations(configs.clone());
     if configs
         .iter()
-        .any(|c| c.metric == "http_requests_total_latency_ms")
+        .any(|(c, _)| c.metric == "http_requests_total_latency_ms")
     {
         for rule in &mut artifact.transmission_plan.rules {
             rule.mode = asap_types::producer_plan::TransmissionMode::Delta;
@@ -170,7 +175,7 @@ use prost::Message;
 /// target and read back whichever family and parameters Planner committed to,
 /// rather than pinning a family. Family selection itself is covered by the
 /// control-plane compiler tests.
-fn plan_materializations(query: &str, accuracy: JsonValue) -> Vec<PrecomputeMaterialization> {
+fn plan_materializations(query: &str, accuracy: JsonValue) -> Vec<Output> {
     use control_plane::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
 
     let mut fixture: JsonValue = serde_json::from_str(include_str!(
@@ -204,32 +209,39 @@ fn plan_materializations(query: &str, accuracy: JsonValue) -> Vec<PrecomputeMate
     let plan = DeploymentPlanCompiler
         .compile_promql(request, environment)
         .expect("physical compilation succeeds");
-    plan.precompute_plan.materializations
+    plan.precompute_plan
+        .materializations
+        .iter()
+        .map(|config| {
+            let family = plan.precompute_plan.state_family(config.stored_output_id);
+            (config.clone(), family.unwrap().clone())
+        })
+        .collect()
 }
 
 /// Wire fixtures provide CMS bytes directly. Total-count planning can select
 /// an exact accumulator, so it must not be used to infer this payload's format.
-fn imported_cms_materializations(metric: &str) -> Vec<PrecomputeMaterialization> {
-    vec![PrecomputeMaterialization::new(
-        asap_types::AggregationType::CountMinSketch,
-        String::new(),
-        std::collections::HashMap::from([
-            ("w".into(), serde_json::json!(512)),
-            ("d".into(), serde_json::json!(5)),
-        ]),
+fn imported_cms_materializations(metric: &str) -> Vec<Output> {
+    let family = SummaryFamilyType::Sketch(
+        planner_types::post_asap::SketchKind::new(
+            planner_types::post_asap::SketchAlgorithm::Cms,
+            planner_types::post_asap::SketchParams::Cms {
+                width: 512,
+                depth: 5,
+            },
+        ),
+        planner_types::post_asap::GroupingStrategy::PerSubpopulationInstance,
+    );
+    let mut config = PrecomputeMaterialization::new(
+        metric,
         asap_types::KeyByLabelNames::new(vec!["service".into()]),
-        asap_types::KeyByLabelNames::empty(),
-        asap_types::KeyByLabelNames::empty(),
-        String::new(),
         5,
         5,
         asap_types::enums::WindowKind::Tumbling,
-        String::new(),
-        metric.into(),
-        Some(12),
-        None,
-        None,
-    )]
+    );
+    config.num_aggregates_to_retain = Some(12);
+    config.allocate_stored_output_id(&family);
+    vec![(config, family)]
 }
 
 /// Epsilon-delta accuracy target in the shape `QueryRequirements` expects.
@@ -654,7 +666,7 @@ async fn controller_streaming_config_round_trips_through_backend_http() {
         1,
         "expected exactly one materialization: {materializations:#?}"
     );
-    let agg = &materializations[0];
+    let agg = &materializations[0].0;
     assert_eq!(agg.metric, "http_latency_ms");
     assert!(agg.window_size > 0, "window size must be > 0: {agg:#?}");
 
@@ -681,7 +693,7 @@ async fn controller_plans_with_grouping_and_backend_parses_grouping_labels() {
 
     // The planner must thread the query's grouping into the materialization
     // the backend keys its per-population state by.
-    let agg = &materializations[0];
+    let agg = &materializations[0].0;
     assert!(
         agg.grouping_labels
             .names()
@@ -698,6 +710,7 @@ async fn controller_plans_with_grouping_and_backend_parses_grouping_labels() {
     // endpoint that reports only plan phase.
     assert!(
         materializations[0]
+            .0
             .grouping_labels
             .names()
             .iter()
@@ -905,9 +918,12 @@ async fn controller_plan_to_query_full_roundtrip_kll() {
     );
     post_full_config(&client, &stack, &materializations).await;
 
-    let alpha = materializations[0].parameters["alpha"]
-        .as_f64()
-        .expect("planner sized a relative-accuracy quantile summary");
+    let SummaryFamilyType::Sketch(kind, _) = &materializations[0].1 else {
+        panic!("planner selected a quantile sketch")
+    };
+    let planner_types::post_asap::SketchParams::DDSketch { alpha } = kind.params().clone() else {
+        panic!("planner sized a relative-accuracy quantile summary")
+    };
     let dd_state = build_dd_sketch_state(alpha, vec![5u64, 10, 15, 20], -1);
     let sketch_bytes = encode_dd_full_state(dd_state);
 
@@ -1230,14 +1246,14 @@ async fn imported_cms_frequency_wire_roundtrip() {
 /// content match probes `parameters.w` and `parameters.d`).
 /// Sketch width/depth the planner sized this materialization to. The test
 /// payloads are built against these, never against pinned constants.
-fn extract_w_d(agg: &PrecomputeMaterialization) -> (u32, u32) {
-    let w = agg.parameters["w"]
-        .as_u64()
-        .expect("materialization must carry parameters.w") as u32;
-    let d = agg.parameters["d"]
-        .as_u64()
-        .expect("materialization must carry parameters.d") as u32;
-    (w, d)
+fn extract_w_d(agg: &Output) -> (u32, u32) {
+    let SummaryFamilyType::Sketch(kind, _) = &agg.1 else {
+        panic!("materialization stores a sketch")
+    };
+    let planner_types::post_asap::SketchParams::Cms { width, depth } = kind.params() else {
+        panic!("materialization stores a CMS")
+    };
+    (*width, *depth)
 }
 
 // Heap TopK serving acceptance lives in asapquery_compatibility_process_e2e:

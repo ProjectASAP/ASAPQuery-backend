@@ -1004,7 +1004,7 @@ mod tests {
                 generated_at_unix_ms: 1,
                 activation_unix_ms: 1,
                 expiry_unix_ms: None,
-                backend_compat: "asap-query-backend.v1".into(),
+                backend_compat: "asap-query-backend.v2".into(),
                 planner_revision: crate::physical::compiler::PLANNER_REVISION.into(),
                 capability_snapshot_id: "caps-1".into(),
             },
@@ -1033,7 +1033,7 @@ mod tests {
             transmission_rules: vec![crate::physical::compiler::TransmissionRule {
                 materialization: asap_types::PolicyFingerprint(1).into(),
                 producer_id: collector_id.into(),
-                schema_id: "asap-query-backend.v1:summary-state:v1:1".into(),
+                schema_id: "asap-query-backend.v2:summary-state:v1:1".into(),
                 mode: crate::physical::compiler::TransmissionMode::Full,
                 encoding: crate::physical::compiler::StateEncoding::SketchlibProtobufV1,
                 emit_every_ms: 60_000,

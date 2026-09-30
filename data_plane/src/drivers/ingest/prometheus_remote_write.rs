@@ -452,11 +452,7 @@ impl PrometheusRemoteWriteReceiver {
                     .zip(group_key.values().labels)
                     .collect();
             }
-            let right_closed = config
-                .parameters
-                .get("promql_right_closed")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            let right_closed = snapshot.right_closed_panes((*policy_fp).into());
             let affected = crate::precompute_engine::maintenance_runtime::affected_materializations(
                 &physical_plan.precompute_plan,
                 (*policy_fp).into(),
@@ -726,7 +722,7 @@ fn route_messages(
         .values()
         .filter(|config| config.derived_input.is_none())
         .filter_map(|config| {
-            compile_spatial_filter(&config.spatial_filter_normalized)
+            compile_spatial_filter(snapshot.population_filter(config.stored_output_id))
                 .ok()
                 .map(|filter| (config, filter))
         })
@@ -754,11 +750,14 @@ fn route_messages(
                 == Some(asap_types::sds::PopulationPartitioning::PerEntity)
                 || (config.partitioning.is_none()
                     && matches!(
-                        config.aggregation_type,
-                        asap_types::AggregationType::Increase
-                            | asap_types::AggregationType::Rate
-                            | asap_types::AggregationType::Min
-                            | asap_types::AggregationType::Max
+                        snapshot.state_family(config.stored_output_id),
+                        Some(planner_types::post_asap::SummaryFamilyType::ExactAggregate(
+                            planner_types::post_asap::ExactKind::Increase
+                                | planner_types::post_asap::ExactKind::Rate
+                                | planner_types::post_asap::ExactKind::Min
+                                | planner_types::post_asap::ExactKind::Max,
+                            _
+                        ))
                     ));
             let grouping_pairs: Vec<(&str, &str)> = if series_scoped {
                 Vec::new()
@@ -986,14 +985,25 @@ mod tests {
             planner_revision: PLANNER_REVISION.into(),
             capability_snapshot_id: "test".into(),
         };
-        let configs = streaming
-            .materializations_by_output
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
         let catalog = Arc::new(
-            asap_types::summary_catalog::SummaryCatalog::from_materializations(7, 3, &configs)
-                .unwrap(),
+            asap_types::summary_catalog::SummaryCatalog::from_outputs(
+                7,
+                3,
+                streaming
+                    .materializations_by_output
+                    .values()
+                    .map(|config| {
+                        (
+                            config,
+                            streaming.state_family(config.stored_output_id).unwrap(),
+                            streaming
+                                .population_filter(config.stored_output_id)
+                                .to_owned(),
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap(),
         );
         let reference = catalog.reference().unwrap();
         let generation = asap_types::sds::CatalogGeneration {
@@ -1066,37 +1076,19 @@ mod tests {
     fn configured_receiver() -> (PrometheusRemoteWriteReceiver, mpsc::Receiver<WorkerMessage>) {
         use asap_types::enums::WindowKind;
         use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization};
-        let aggregation = PrecomputeMaterialization {
-            stored_output_id: None,
-            semantic_fragment: None,
-            population_key_encoding: Default::default(),
-            aggregation_type: AggregationType::Sum,
-            aggregation_sub_type: String::new(),
-            parameters: HashMap::new(),
-            grouping_labels: KeyByLabelNames::new(vec!["job".into()]).into(),
-            aggregated_labels: KeyByLabelNames::empty(),
-            rollup_labels: KeyByLabelNames::empty(),
-            original_yaml: String::new(),
-            window_size: 60,
-            slide_interval: 60,
-            window_type: WindowKind::Tumbling,
-            window_layout: asap_types::WindowMaterializationLayout::Pane { pane_secs: 60 },
-            pane_origin_ms: None,
-            spatial_filter: String::new(),
-            spatial_filter_normalized: String::new(),
-            metric: "requests_total".into(),
-            num_aggregates_to_retain: None,
-            table_name: None,
-            value_projection: None,
-            table_population: None,
-            derived_input: None,
-            table_timestamp_column: None,
-            partitioning: None,
-            value_source_column: None,
-        };
-        let policy_fp = aggregation.policy_fp_u64();
+        let mut aggregation = PrecomputeMaterialization::new(
+            "requests_total",
+            KeyByLabelNames::new(vec!["job".into()]),
+            60,
+            60,
+            WindowKind::Tumbling,
+        );
+        aggregation.window_layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 60 };
         let streaming =
-            InstalledPrecomputePlan::from_raw_ids(HashMap::from([(policy_fp, aggregation)]));
+            InstalledPrecomputePlan::new([crate::tests::test_utilities::outputs::allocated(
+                aggregation,
+                AggregationType::Sum.planner_exact_family().unwrap(),
+            )]);
         let (sender, receiver) = mpsc::channel(8);
         let ingest = Arc::new(IngestState {
             router: SeriesRouter::new(vec![sender]),
@@ -1134,10 +1126,13 @@ mod tests {
         let mut config = snapshot.precompute_plan.materializations[0].clone();
         config.population_key_encoding = asap_types::PopulationKeyEncoding::CanonicalLabelsV1;
         config.partitioning = Some(asap_types::sds::PopulationPartitioning::Grouped);
-        let hot = physical_config(InstalledPrecomputePlan::from_raw_ids(HashMap::from([(
-            config.policy_fp_u64(),
-            config.clone(),
-        )])));
+        let (config, family) = crate::tests::test_utilities::outputs::allocated(
+            config,
+            asap_types::AggregationType::Sum
+                .planner_exact_family()
+                .unwrap(),
+        );
+        let hot = physical_config(InstalledPrecomputePlan::new([(config.clone(), family)]));
         let physical = hot.active_physical_plan_snapshot().unwrap();
         // A direct routing fixture; public installation remains intentionally gated.
         let (sender, _worker) = mpsc::channel(8);
@@ -1195,67 +1190,42 @@ mod tests {
         use asap_types::enums::WindowKind;
         use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization};
 
-        let config = |aggregation_type, grouping: Vec<String>, aggregated: Vec<String>| {
-            PrecomputeMaterialization {
-                stored_output_id: None,
-                semantic_fragment: None,
-                population_key_encoding: Default::default(),
+        let config = |aggregation_type: AggregationType, grouping: Vec<String>, partitioning| {
+            let family = crate::tests::test_utilities::outputs::family(
                 aggregation_type,
-                aggregation_sub_type: String::new(),
-                parameters: match aggregation_type {
-                    AggregationType::CountMinSketchWithHeap => HashMap::from([
-                        ("w".into(), serde_json::json!(128)),
-                        ("d".into(), serde_json::json!(5)),
-                        ("heap_size".into(), serde_json::json!(2)),
-                    ]),
-                    AggregationType::DatasketchesKLL => {
-                        HashMap::from([("k".into(), serde_json::json!(200))])
-                    }
-                    _ => HashMap::new(),
-                },
-                grouping_labels: KeyByLabelNames::new(grouping).into(),
-                aggregated_labels: KeyByLabelNames::new(aggregated),
-                rollup_labels: KeyByLabelNames::empty(),
-                original_yaml: String::new(),
-                window_size: 60,
-                slide_interval: 60,
-                window_type: WindowKind::Tumbling,
-                window_layout: asap_types::WindowMaterializationLayout::Pane { pane_secs: 60 },
-                pane_origin_ms: Some(0),
-                spatial_filter: String::new(),
-                spatial_filter_normalized: String::new(),
-                metric: "cpu_seconds_total".into(),
-                num_aggregates_to_retain: Some(80),
-                table_name: None,
-                value_projection: None,
-                table_population: None,
-                derived_input: None,
-                table_timestamp_column: None,
-                partitioning: None,
-                value_source_column: None,
-            }
+                &serde_json::json!({"w": 128, "d": 5, "heap_size": 2, "k": 200}),
+            );
+            let mut config = PrecomputeMaterialization::new(
+                "cpu_seconds_total",
+                KeyByLabelNames::new(grouping),
+                60,
+                60,
+                WindowKind::Tumbling,
+            );
+            config.window_layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 60 };
+            config.pane_origin_ms = Some(0);
+            config.num_aggregates_to_retain = Some(80);
+            config.partitioning = partitioning;
+            crate::tests::test_utilities::outputs::allocated(config, family)
         };
-        let cms = config(
-            AggregationType::CountMinSketchWithHeap,
+        let cms = config(AggregationType::CountMinSketchWithHeap, vec![], None);
+        let counter = config(AggregationType::Increase, vec!["job".into()], None);
+        let kll = config(
+            AggregationType::DatasketchesKLL,
             vec![],
-            vec!["job".into()],
+            Some(asap_types::sds::PopulationPartitioning::PerEntity),
         );
-        let counter = config(AggregationType::Increase, vec!["job".into()], vec![]);
-        let mut kll = config(AggregationType::DatasketchesKLL, vec![], vec![]);
-        kll.partitioning = Some(asap_types::sds::PopulationPartitioning::PerEntity);
-        let kll_fp = kll.policy_fingerprint();
-        let mut pooled_kll = kll.clone();
-        pooled_kll.partitioning = Some(asap_types::sds::PopulationPartitioning::Grouped);
-        let pooled_kll_fp = pooled_kll.policy_fingerprint();
+        let kll_fp = kll.0.policy_fingerprint();
+        let pooled_kll = config(
+            AggregationType::DatasketchesKLL,
+            vec![],
+            Some(asap_types::sds::PopulationPartitioning::Grouped),
+        );
+        let pooled_kll_fp = pooled_kll.0.policy_fingerprint();
         assert_ne!(kll_fp, pooled_kll_fp);
-        let cms_fp = cms.policy_fingerprint();
-        let counter_fp = counter.policy_fingerprint();
-        let streaming = InstalledPrecomputePlan::from_raw_ids(HashMap::from([
-            (cms_fp.0, cms),
-            (counter_fp.0, counter),
-            (kll_fp.0, kll),
-            (pooled_kll_fp.0, pooled_kll),
-        ]));
+        let cms_fp = cms.0.policy_fingerprint();
+        let counter_fp = counter.0.policy_fingerprint();
+        let streaming = InstalledPrecomputePlan::new([cms, counter, kll, pooled_kll]);
         let hot_reload = physical_config(streaming);
         let physical_plan = hot_reload.active_physical_plan_snapshot().unwrap();
         let (sender, _worker) = mpsc::channel(8);
@@ -1824,7 +1794,9 @@ impl PrometheusRemoteWriteReceiver {
                 return Err(crate::precompute_engine::revisions::AdmissionRejected("Remote Write request exceeds the correction horizon or contains future input").into());
             }
             for config in plan.precompute_plan.materializations.iter().filter(|c| c.derived_input.is_none()) {
-                let filter = compile_spatial_filter(&config.spatial_filter_normalized)?;
+                let filter = compile_spatial_filter(
+                    plan.installed_precompute_plan.population_filter(config.stored_output_id),
+                )?;
                 let program = plan.installed_precompute_plan.raw_programs.get(&config.policy_fp_u64()).ok_or("revision raw program missing")?;
                 let mut matching = samples.iter().filter_map(|sample| {
                     let labels = sample.labels.iter().map(|(k,v)|(k.clone(),v.clone())).collect();
@@ -1921,7 +1893,7 @@ impl PrometheusRemoteWriteReceiver {
                 if let Some(previous) = committed.get(&output.0) {
                     let config = plan.precompute_plan.materializations.iter().find(|c| c.policy_fp_u64() == output.0).ok_or("committed raw output missing")?;
                     let mut groups: BTreeMap<BTreeMap<String,String>, BTreeMap<(u64,u64),Arc<dyn crate::storage_engines::types::AggregateCore>>> = BTreeMap::new();
-                    for record in previous { groups.entry(record.group.clone()).or_default().insert((record.start_ms,record.end_ms),crate::precompute_engine::revisions::decode_state(record,config)?); }
+                    for record in previous { groups.entry(record.group.clone()).or_default().insert((record.start_ms,record.end_ms),crate::precompute_engine::revisions::decode_state(record, plan.precompute_plan.state_family(config.stored_output_id).ok_or("committed raw output has no state schema")?)?); }
                     for (group,windows) in groups {
                         frozen.push(crate::storage_engines::sketch_db::index::FrozenExactWindows {
                             stored_output_reference: plan.installed_precompute_plan.stored_output_reference(output).ok_or("committed raw binding missing")?, storage_handle: output.0, definition: output, generation:Arc::new(generation.clone()), group, windows, singleton_population_complete:true,

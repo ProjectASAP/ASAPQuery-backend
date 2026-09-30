@@ -12,7 +12,7 @@ pub fn empty() -> asap_types::plan_publication::PhysicalPlanInstallRequest {
         capability_snapshot_id: "empty-bootstrap".into(),
     };
     let catalog =
-        control_plane::physical::summary_catalog::SummaryCatalog::from_materializations(0, 0, &[])
+        control_plane::physical::summary_catalog::SummaryCatalog::from_outputs(0, 0, Vec::new())
             .unwrap();
     let mut precompute_plan = PrecomputePlan::build(envelope.clone(), vec![], &[]).unwrap();
     precompute_plan.summary_catalog = Some(catalog.reference().unwrap());

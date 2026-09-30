@@ -1,13 +1,8 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use serde_yaml;
-use std::collections::HashMap;
 
-use crate::enums::{QueryLanguage, WindowKind};
+use crate::enums::WindowKind;
 use crate::policy_fingerprint::PolicyFingerprint;
-use crate::utils::normalize_spatial_filter;
 use crate::AggregationType;
-use crate::KeyByLabelNames;
 
 /// Physical maintenance layout for one semantic windowed summary.
 ///
@@ -86,21 +81,19 @@ impl WindowMaterializationLayout {
     }
 }
 
-/// Physical materialization metadata with content-derived identity.
-/// This descriptor cannot authorize execution: the enclosing PrecomputePlan
-/// must bind it to a compatible Planner DAG producer.
+/// Deployment metadata for one stored output: its identity, source binding,
+/// window cadence and layout, retention and storage codec. What the output
+/// computes (state family, update, input predicate and reduction) is defined
+/// only by the Planner DAG node the enclosing PrecomputePlan binds to it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrecomputeMaterialization {
-    /// Explicit deployment output allocation; independent of semantic identity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stored_output_id: Option<crate::sds::StoredOutputId>,
+    /// Deployment output allocation. Several outputs may share one semantic
+    /// definition; see [`Self::allocate_stored_output_id`].
+    pub stored_output_id: crate::sds::StoredOutputId,
     /// Planner-selected dependency closure ending at the persisted output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_fragment: Option<crate::semantic_fragment::SemanticFragment>,
-    pub aggregation_type: AggregationType,
-    pub aggregation_sub_type: String,
-    pub parameters: HashMap<String, Value>,
     #[serde(serialize_with = "crate::grouping_projection::serialize_config_grouping")]
     pub grouping_labels: crate::GroupingProjection,
     #[serde(
@@ -112,9 +105,6 @@ pub struct PrecomputeMaterialization {
     pub partitioning: Option<crate::sds::PopulationPartitioning>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derived_input: Option<crate::derived_input::DerivedInputIdentity>,
-    pub aggregated_labels: KeyByLabelNames,
-    pub rollup_labels: KeyByLabelNames,
-    pub original_yaml: String,
 
     pub window_size: u64,        // Window size in seconds (e.g., 900s for 15m)
     pub slide_interval: u64,     // Slide/hop interval in seconds (e.g., 30s)
@@ -126,8 +116,6 @@ pub struct PrecomputeMaterialization {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_origin_ms: Option<i64>,
 
-    pub spatial_filter: String,
-    pub spatial_filter_normalized: String,
     pub metric: String, // PromQL mode: metric name; SQL mode: derived from table_name.value_column
     pub num_aggregates_to_retain: Option<u64>,
 
@@ -145,13 +133,11 @@ pub struct PrecomputeMaterialization {
     ///
     /// **Why this is separate from [`Self::value_projection`]**: the
     /// projection is the materialization's *identity* — which column or
-    /// constant is summarised, and part of the policy fingerprint. This is how
-    /// the ingest path must *read* that column, which the identity does not
-    /// determine: an integer column needs an exactness guard on its way into
-    /// f64 summary state, and a nullable column needs SQL's "aggregates skip
-    /// NULL" rule reproduced at the reader rather than a decode failure on the
-    /// first NULL row. Two materializations over the same column are the same
-    /// policy either way, so this deliberately stays out of the fingerprint.
+    /// constant is summarised. This is how the ingest path must *read* that
+    /// column, which the identity does not determine: an integer column needs
+    /// an exactness guard on its way into f64 summary state, and a nullable
+    /// column needs SQL's "aggregates skip NULL" rule reproduced at the reader
+    /// rather than a decode failure on the first NULL row.
     ///
     /// `None` ⇒ PromQL-mode materializations and legacy SQL definitions, which
     /// keep the pre-typed behaviour (read the column as it comes).
@@ -163,17 +149,11 @@ pub struct PrecomputeMaterialization {
 /// query. For single-population queries, key and value share the same
 /// fingerprint and type. For multi-population queries (e.g. Topk), they
 /// differ.
-///
-/// **PR 5**: the `aggregation_id_for_*: u64` fields now carry the
-/// `PolicyFingerprint::as_u64()` form of the matched config, NOT a
-/// controller-allocated id. Callers that need typed identity can call
-/// [`AggregationIdInfo::policy_fp_for_key`] /
-/// [`AggregationIdInfo::policy_fp_for_value`].
 #[derive(Debug, Clone)]
 pub struct AggregationIdInfo {
-    /// `PolicyFingerprint::as_u64()` of the key aggregation's config.
+    /// Stored output id of the key aggregation.
     pub key_policy_fingerprint: u64,
-    /// `PolicyFingerprint::as_u64()` of the value aggregation's config.
+    /// Stored output id of the value aggregation.
     pub value_policy_fingerprint: u64,
     pub aggregation_type_for_key: AggregationType,
     pub aggregation_type_for_value: AggregationType,
@@ -182,6 +162,43 @@ pub struct AggregationIdInfo {
 impl AggregationIdInfo {}
 
 impl PrecomputeMaterialization {
+    /// An unallocated output over `metric`; the caller must allocate its id
+    /// with [`Self::allocate_stored_output_id`] once the deployment fields are final.
+    pub fn new(
+        metric: impl Into<String>,
+        grouping_labels: impl Into<crate::GroupingProjection>,
+        window_size: u64,
+        slide_interval: u64,
+        window_type: WindowKind,
+    ) -> Self {
+        Self {
+            stored_output_id: crate::sds::StoredOutputId(0),
+            semantic_fragment: None,
+            grouping_labels: grouping_labels.into(),
+            population_key_encoding: Default::default(),
+            partitioning: None,
+            derived_input: None,
+            window_size,
+            slide_interval,
+            window_type,
+            window_layout: WindowMaterializationLayout::Pane {
+                pane_secs: if slide_interval == 0 {
+                    window_size
+                } else {
+                    slide_interval
+                },
+            },
+            pane_origin_ms: None,
+            metric: metric.into(),
+            num_aggregates_to_retain: None,
+            table_name: None,
+            value_projection: None,
+            table_timestamp_column: None,
+            table_population: None,
+            value_source_column: None,
+        }
+    }
+
     pub fn effective_value_projection(&self) -> &crate::sds::ValueProjectionIdentity {
         self.value_projection
             .as_ref()
@@ -214,13 +231,15 @@ impl PrecomputeMaterialization {
         }
     }
 
-    pub fn population_filter_canonical(&self) -> Result<String, String> {
+    /// Validate the source binding. Returns the canonical typed table
+    /// population, which is part of the table source binding; a time-series
+    /// predicate belongs to the Planner DAG's scan.
+    pub fn table_population_canonical(&self) -> Result<String, String> {
         if let Some(input) = &self.derived_input {
             input.validate()?;
             if self.table_name.is_some()
                 || self.table_population.is_some()
                 || self.table_timestamp_column.is_some()
-                || !self.spatial_filter.is_empty()
             {
                 return Err("derived inputs cannot also declare a raw source/filter".into());
             }
@@ -238,78 +257,15 @@ impl PrecomputeMaterialization {
             }
             crate::table_population::validate_column_name(column)?;
         }
-        if self.table_name.is_some() && !self.spatial_filter.is_empty() {
-            return Err("table populations cannot use a PromQL label filter".into());
-        }
-        if let Some(population) = &self.table_population {
-            if self.table_name.is_none() || !self.spatial_filter.is_empty() {
-                return Err(
-                    "typed table population requires a table and no PromQL label filter".into(),
-                );
+        match &self.table_population {
+            Some(population) => {
+                if self.table_name.is_none() {
+                    return Err("typed table population requires a table".into());
+                }
+                population.validate()?;
+                Ok(population.canonical())
             }
-            population.validate()?;
-            Ok(population.canonical())
-        } else {
-            Ok(normalize_spatial_filter(&self.spatial_filter))
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        aggregation_type: AggregationType,
-        aggregation_sub_type: String,
-        parameters: HashMap<String, Value>,
-        grouping_labels: impl Into<crate::GroupingProjection>,
-        aggregated_labels: KeyByLabelNames,
-        rollup_labels: KeyByLabelNames,
-        original_yaml: String,
-        window_size: u64,
-        slide_interval: u64,
-        window_type: WindowKind,
-        spatial_filter: String,
-        metric: String,
-        num_aggregates_to_retain: Option<u64>,
-        // SQL-specific fields
-        table_name: Option<String>,
-        value_column: Option<String>,
-    ) -> Self {
-        // Generate normalized spatial filter (placeholder implementation)
-        let spatial_filter_normalized = normalize_spatial_filter(&spatial_filter);
-
-        Self {
-            stored_output_id: None,
-            semantic_fragment: None,
-            aggregation_type,
-            aggregation_sub_type,
-            parameters,
-            grouping_labels: grouping_labels.into(),
-            population_key_encoding: Default::default(),
-            partitioning: None,
-            derived_input: None,
-            aggregated_labels,
-            rollup_labels,
-            original_yaml,
-            window_size,
-            slide_interval,
-            window_type,
-            window_layout: WindowMaterializationLayout::Pane {
-                pane_secs: if slide_interval == 0 {
-                    window_size
-                } else {
-                    slide_interval
-                },
-            },
-            pane_origin_ms: None,
-            spatial_filter,
-            spatial_filter_normalized,
-            metric,
-            num_aggregates_to_retain,
-            table_name,
-            value_projection: value_column
-                .map(|name| crate::sds::ValueProjectionIdentity::Column { name }),
-            table_population: None,
-            table_timestamp_column: None,
-            value_source_column: None,
+            None => Ok(String::new()),
         }
     }
 
@@ -319,223 +275,127 @@ impl PrecomputeMaterialization {
         PolicyFingerprint::from_config(self)
     }
 
-    /// `PolicyFingerprint::as_u64()` — the u64-form handle used by the
-    /// policy-fingerprint-keyed call sites (e.g. `InstalledPrecomputePlan`'s
-    /// `HashMap<StoredOutputId, PrecomputeMaterialization>` keys). **Always** equal to
-    /// `self.policy_fingerprint().as_u64()`. The value is content-
-    /// addressed identity, NOT a controller-allocated counter id.
+    /// The stored output id as a raw u64.
     pub fn policy_fp_u64(&self) -> u64 {
         self.policy_fingerprint().as_u64()
     }
 
-    pub fn from_yaml_data(
-        aggregation_data: &serde_yaml::Value,
-        num_aggregates_to_retain: Option<u64>,
-        query_language: QueryLanguage,
-    ) -> Result<Self, anyhow::Error> {
-        // `aggregationId` is silently dropped — identity is
-        // content-addressed via PolicyFingerprint (PR 5). Pre-PR-5
-        // fixtures that still spell out the field parse cleanly.
+    /// Allocate the deterministic default id from the current deployment
+    /// fields and `computation`, the producer's computation identity taken
+    /// from the Planner DAG (state family, update, input predicate). Outputs
+    /// with equal deployment fields and computation share one id; any
+    /// difference, including pane layout or phase, yields a distinct output.
+    pub fn allocate_stored_output_id(&mut self, computation: &impl Serialize) {
+        let computation = crate::semantic_fragment::canonical_bytes(computation)
+            .expect("computation identity serializes");
+        let id = self.deployment_digest(&computation);
+        // Zero is the unallocated sentinel.
+        self.stored_output_id = crate::sds::StoredOutputId(id.max(1));
+    }
 
-        let labels = &aggregation_data["labels"];
-        let grouping_labels: crate::GroupingProjection =
-            serde_yaml::from_value(labels["grouping"].clone())?;
-        let aggregated_labels = KeyByLabelNames::new(
-            labels["aggregated"]
-                .as_sequence()
-                .ok_or_else(|| anyhow::anyhow!("Missing aggregated labels"))?
-                .iter()
-                .filter_map(|v| v.as_str())
-                .map(|s| s.to_string())
-                .collect(),
-        );
-        let rollup_labels = KeyByLabelNames::new(
-            labels["rollup"]
-                .as_sequence()
-                .ok_or_else(|| anyhow::anyhow!("Missing rollup labels"))?
-                .iter()
-                .filter_map(|v| v.as_str())
-                .map(|s| s.to_string())
-                .collect(),
-        );
-
-        let aggregation_type: AggregationType = aggregation_data["aggregationType"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing aggregationType"))?
-            .parse()
-            .map_err(|e: String| anyhow::anyhow!(e))?;
-
-        let aggregation_sub_type = aggregation_data["aggregationSubType"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing aggregationSubType"))?
-            .to_string();
-
-        // Convert serde_yaml::Value to serde_json::Value for parameters
-        let parameters: HashMap<String, Value> = aggregation_data["parameters"]
-            .as_mapping()
-            .ok_or_else(|| anyhow::anyhow!("Missing parameters"))?
-            .iter()
-            .map(|(k, v)| {
-                let key = k.as_str().unwrap_or("").to_string();
-                let value = serde_json::to_value(v).unwrap_or(Value::Null);
-                (key, value)
-            })
-            .collect();
-
-        let window_size = aggregation_data["windowSize"]
-            .as_u64()
-            .ok_or_else(|| anyhow::anyhow!("Missing windowSize"))?;
-
-        let window_type = aggregation_data
-            .get("windowType")
-            .and_then(|v| v.as_str())
-            .unwrap_or("tumbling")
-            .parse::<WindowKind>()
-            .unwrap_or_default();
-
-        let slide_interval = aggregation_data
-            .get("slideInterval")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(window_size);
-
-        let pane_origin_ms = aggregation_data
-            .get("paneOriginMs")
-            .or_else(|| aggregation_data.get("pane_origin_ms"))
-            .and_then(|v| v.as_i64());
-
-        let spatial_filter = aggregation_data["spatialFilter"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-
-        if [
-            "valueColumn",
-            "value_column",
-            "valueProjection",
-            "value_projection",
-        ]
-        .iter()
-        .filter(|key| {
-            aggregation_data
-                .get(**key)
-                .is_some_and(|value| !value.is_null())
-        })
-        .count()
-            > 1
-        {
-            return Err(anyhow::anyhow!(
-                "multiple value projection fields are not allowed"
-            ));
+    fn deployment_digest(&self, computation: &[u8]) -> u64 {
+        use xxhash_rust::xxh64::xxh64;
+        let mut buf: Vec<u8> = Vec::with_capacity(512);
+        if !self.population_key_encoding.is_legacy() {
+            // UTF-8 raw metrics cannot alias this nonlegacy domain prefix.
+            buf.extend_from_slice(b"\xffpopulation-key-canonical-labels-v1\0");
         }
-        let typed_projection: Option<crate::sds::ValueProjectionIdentity> = aggregation_data
-            .get("valueProjection")
-            .or_else(|| aggregation_data.get("value_projection"))
-            .filter(|value| !value.is_null())
-            .map(|value| serde_json::to_value(value).and_then(serde_json::from_value))
-            .transpose()?;
-        let (metric, table_name, value_column) = match query_language {
-            QueryLanguage::PromQl | QueryLanguage::MetricsQl => {
-                let metric = aggregation_data["metric"]
-                    .as_str()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Missing metric for time-series query language")
-                    })?
-                    .to_string();
-                (metric, None, None)
+        if self.derived_input.is_some() {
+            // Raw policies start with UTF-8 metric bytes; 0xff is impossible
+            // there, so a metric cannot impersonate this source domain.
+            buf.extend_from_slice(b"\xffderived-input-v1:");
+            buf.extend_from_slice(
+                &serde_json::to_vec(&self.source_identity()).expect("typed source identity"),
+            );
+        } else {
+            buf.extend_from_slice(self.metric.as_bytes());
+        }
+        buf.push(0);
+        buf.extend_from_slice(computation);
+        buf.push(0);
+        if let Some(partitioning) = self.partitioning {
+            buf.extend_from_slice(format!("partition:{partitioning:?}\0").as_bytes());
+        }
+        for label in &self.grouping_labels.names() {
+            buf.extend_from_slice(label.as_bytes());
+            buf.push(b',');
+        }
+        buf.push(0);
+        if self.table_name.is_some() && !self.grouping_labels.is_empty() {
+            buf.extend_from_slice(
+                crate::grouping_projection::TABLE_GROUP_OBSERVATION_SEMANTICS.as_bytes(),
+            );
+            buf.push(0);
+        }
+        if !self.grouping_labels.is_legacy_labels() {
+            buf.extend_from_slice(b"typed-grouping:");
+            buf.extend_from_slice(
+                serde_json::to_string(&self.grouping_labels)
+                    .expect("group projection serializes")
+                    .as_bytes(),
+            );
+            buf.push(0);
+        }
+        buf.extend_from_slice(&self.window_size.to_le_bytes());
+        buf.push(0);
+        buf.extend_from_slice(&self.slide_interval.to_le_bytes());
+        buf.push(0);
+        buf.extend_from_slice(
+            serde_json::to_string(&self.window_type)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        buf.push(0);
+        // A full overlapping window and a mergeable pane layout may share
+        // semantic descriptors but never share payload instances or lifecycle
+        // accounting.
+        buf.extend_from_slice(
+            serde_json::to_string(&self.window_layout)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        buf.push(0);
+        // Presence is explicit so an unknown phase cannot alias an
+        // epoch-aligned definition.
+        match self.pane_origin_ms {
+            Some(origin) => {
+                buf.push(1);
+                buf.extend_from_slice(&origin.to_le_bytes());
             }
-            QueryLanguage::ClickHouseSql => {
-                let table = aggregation_data["tableName"]
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("Missing tableName for ClickHouse SQL"))?
-                    .to_string();
-                let column = aggregation_data["valueColumn"]
-                    .as_str()
-                    .or_else(|| {
-                        typed_projection
-                            .as_ref()
-                            .and_then(|projection| projection.column())
-                    })
-                    .map(str::to_owned);
-                if column.is_none() && typed_projection.is_none() {
-                    return Err(anyhow::anyhow!(
-                        "Missing value projection for ClickHouse SQL"
-                    ));
-                }
-                (
-                    format!("{table}.{}", column.as_deref().unwrap_or("constant")),
-                    Some(table),
-                    column,
-                )
+            None => buf.push(0),
+        }
+        buf.push(0);
+        if let Some(table) = &self.table_name {
+            buf.extend_from_slice(b"\0sql-source-v1\0");
+            buf.extend_from_slice(table.as_bytes());
+            buf.push(0);
+            if let Some(column) = self.effective_value_projection().column() {
+                buf.extend_from_slice(column.as_bytes());
             }
-        };
-
-        let mut config = Self::new(
-            aggregation_type,
-            aggregation_sub_type,
-            parameters,
-            grouping_labels,
-            aggregated_labels,
-            rollup_labels,
-            String::new(), // original_yaml - empty as in Python
-            window_size,
-            slide_interval,
-            window_type,
-            spatial_filter,
-            metric,
-            num_aggregates_to_retain,
-            table_name,
-            value_column,
-        );
-        if aggregation_data.get("windowLayout").is_some()
-            && aggregation_data.get("window_layout").is_some()
-        {
-            anyhow::bail!("multiple window layout fields are not allowed");
+            if matches!(
+                self.effective_value_projection(),
+                crate::sds::ValueProjectionIdentity::Constant { .. }
+            ) {
+                buf.extend_from_slice(b"\0constant-projection-v1\0");
+                buf.extend_from_slice(
+                    serde_json::to_string(self.effective_value_projection())
+                        .expect("finite validated projection serializes")
+                        .as_bytes(),
+                );
+            }
         }
-        if let Some(layout) = aggregation_data
-            .get("windowLayout")
-            .or_else(|| aggregation_data.get("window_layout"))
-        {
-            config.window_layout = serde_yaml::from_value(layout.clone())?;
-            config
-                .window_layout
-                .validate(config.window_size, config.slide_interval)
-                .map_err(anyhow::Error::msg)?;
+        if let Some(population) = &self.table_population {
+            let canonical = population.canonical();
+            if !canonical.is_empty() {
+                buf.push(0);
+                buf.extend_from_slice(canonical.as_bytes());
+            }
         }
-        config.population_key_encoding = aggregation_data
-            .get("population_key_encoding")
-            .map(|value| serde_yaml::from_value(value.clone()))
-            .transpose()?
-            .unwrap_or_default();
-        config.derived_input = aggregation_data
-            .get("derived_input")
-            .filter(|v| !v.is_null())
-            .map(|v| serde_yaml::from_value(v.clone()))
-            .transpose()?;
-        config.partitioning = aggregation_data
-            .get("partitioning")
-            .filter(|value| !value.is_null())
-            .map(|value| serde_yaml::from_value(value.clone()))
-            .transpose()?;
-        if let Some(projection) = typed_projection {
-            config.value_projection = Some(projection);
+        if let Some(column) = &self.table_timestamp_column {
+            buf.extend_from_slice(b"\0timestamp-ms\0");
+            buf.extend_from_slice(column.as_bytes());
         }
-        config.pane_origin_ms = pane_origin_ms;
-        config.table_timestamp_column = aggregation_data
-            .get("tableTimestampColumn")
-            .or_else(|| aggregation_data.get("table_timestamp_column"))
-            .and_then(serde_yaml::Value::as_str)
-            .map(str::to_owned);
-        config.table_population = aggregation_data
-            .get("tablePopulation")
-            .or_else(|| aggregation_data.get("table_population"))
-            .filter(|value| !value.is_null())
-            .cloned()
-            .map(serde_yaml::from_value)
-            .transpose()?;
-        config
-            .population_filter_canonical()
-            .map_err(anyhow::Error::msg)?;
-        Ok(config)
+        xxh64(&buf, 0)
     }
 }
 
@@ -575,68 +435,22 @@ mod window_layout_tests {
 mod tests {
     use super::*;
 
-    fn sample_yaml(with_id: bool) -> serde_yaml::Value {
-        let id_line = if with_id { "aggregationId: 42\n" } else { "" };
-        let yaml = format!(
-            "{id_line}aggregationType: DDSketch\naggregationSubType: ''\nmetric: http_latency_ms\nlabels:\n  grouping: [zone]\n  rollup: []\n  aggregated: []\nparameters:\n  relative_accuracy: 0.01\nwindowSize: 30\nwindowType: tumbling\nspatialFilter: ''\n",
-            id_line = id_line
+    fn config() -> PrecomputeMaterialization {
+        let mut config = PrecomputeMaterialization::new(
+            "http_latency_ms",
+            crate::KeyByLabelNames::new(vec!["zone".into()]),
+            60,
+            10,
+            WindowKind::Sliding,
         );
-        serde_yaml::from_str(&yaml).expect("yaml parses")
+        config.allocate_stored_output_id(&"ddsketch");
+        config
     }
 
-    /// PR 5: `aggregationId` in the YAML is silently dropped — identity
-    /// is derived from content. A fixture with the field parses to the
-    /// SAME config as a fixture without it.
+    // Window layout and pane origin survive the canonical JSON wire, and
+    // derived-style spellings are rejected.
     #[test]
-    fn explicit_aggregation_id_in_yaml_is_ignored() {
-        let with = PrecomputeMaterialization::from_yaml_data(
-            &sample_yaml(true),
-            None,
-            QueryLanguage::PromQl,
-        )
-        .expect("parse ok");
-        let without = PrecomputeMaterialization::from_yaml_data(
-            &sample_yaml(false),
-            None,
-            QueryLanguage::PromQl,
-        )
-        .expect("parse ok");
-        assert_eq!(
-            with.policy_fingerprint(),
-            without.policy_fingerprint(),
-            "explicit aggregationId in the YAML must not change the policy fingerprint",
-        );
-    }
-
-    /// Round-tripping the same content yields the same fingerprint.
-    #[test]
-    fn fingerprint_is_deterministic_per_content() {
-        let a = PrecomputeMaterialization::from_yaml_data(
-            &sample_yaml(false),
-            None,
-            QueryLanguage::PromQl,
-        )
-        .expect("parse a");
-        let b = PrecomputeMaterialization::from_yaml_data(
-            &sample_yaml(false),
-            None,
-            QueryLanguage::PromQl,
-        )
-        .expect("parse b");
-        assert_eq!(a.policy_fingerprint(), b.policy_fingerprint());
-        assert_ne!(
-            a.policy_fingerprint().as_u64(),
-            0,
-            "fingerprint is never the 0 sentinel for a real config",
-        );
-    }
-
-    #[test]
-    fn explicit_window_layout_survives_custom_json_and_yaml_transport() {
-        use super::WindowMaterializationLayout;
-        let mut yaml = sample_yaml(false);
-        yaml["windowSize"] = serde_yaml::to_value(60).unwrap();
-        yaml["slideInterval"] = serde_yaml::to_value(10).unwrap();
+    fn window_layout_and_pane_origin_survive_canonical_json() {
         for layout in [
             WindowMaterializationLayout::FullWindow,
             WindowMaterializationLayout::Pane { pane_secs: 5 },
@@ -645,110 +459,39 @@ mod tests {
                 levels_secs: vec![10, 30],
             },
         ] {
-            yaml["windowLayout"] = serde_yaml::to_value(&layout).unwrap();
-            let config =
-                PrecomputeMaterialization::from_yaml_data(&yaml, None, QueryLanguage::PromQl)
-                    .unwrap();
-            assert_eq!(config.window_layout, layout);
+            let mut config = config();
+            config.window_layout = layout.clone();
+            config.pane_origin_ms = Some(7_000);
             let mut wire = serde_json::to_value(&config).unwrap();
             let decoded: PrecomputeMaterialization = serde_json::from_value(wire.clone()).unwrap();
             assert_eq!(decoded.window_layout, layout);
+            assert_eq!(decoded.pane_origin_ms, Some(7_000));
             assert_eq!(decoded.stored_window_ms(), config.stored_window_ms());
             assert_eq!(decoded.policy_fingerprint(), config.policy_fingerprint());
             wire["windowLayout"] = wire["window_layout"].clone();
             assert!(serde_json::from_value::<PrecomputeMaterialization>(wire).is_err());
         }
-        yaml.as_mapping_mut()
-            .unwrap()
-            .remove(serde_yaml::Value::from("windowLayout"));
-        let legacy =
-            PrecomputeMaterialization::from_yaml_data(&yaml, None, QueryLanguage::PromQl).unwrap();
-        assert_eq!(
-            legacy.window_layout,
-            WindowMaterializationLayout::Pane { pane_secs: 10 }
-        );
-        yaml["window_layout"] = serde_yaml::from_str("{kind: pane, pane_secs: 7}").unwrap();
-        assert!(
-            PrecomputeMaterialization::from_yaml_data(&yaml, None, QueryLanguage::PromQl).is_err()
-        );
     }
 
-    #[test]
-    fn pane_origin_round_trips_and_changes_definition_identity() {
-        let mut epoch = PrecomputeMaterialization::from_yaml_data(
-            &sample_yaml(false),
-            None,
-            QueryLanguage::PromQl,
-        )
-        .expect("parse");
-        let unknown = epoch.policy_fingerprint();
-        epoch.pane_origin_ms = Some(7_000);
-        let planned = epoch.policy_fingerprint();
-        assert_ne!(unknown, planned);
-
-        let wire = serde_json::to_value(&epoch).unwrap();
-        assert_eq!(wire["pane_origin_ms"], serde_json::json!(7_000));
-        let mut derived = serde_json::to_value(&epoch).unwrap();
-        let origin = derived
-            .as_object_mut()
-            .unwrap()
-            .remove("pane_origin_ms")
-            .unwrap();
-        derived
-            .as_object_mut()
-            .unwrap()
-            .insert("paneOriginMs".into(), origin);
-        assert!(serde_json::from_value::<PrecomputeMaterialization>(derived).is_err());
-        let decoded: PrecomputeMaterialization =
-            serde_json::from_value(serde_json::to_value(&epoch).unwrap()).unwrap();
-        assert_eq!(decoded.pane_origin_ms, Some(7_000));
-    }
-
-    /// The `policy_fp_u64()` accessor is exactly the fingerprint u64.
-    #[test]
-    fn policy_fp_u64_accessor_equals_fingerprint_u64() {
-        let cfg = PrecomputeMaterialization::from_yaml_data(
-            &sample_yaml(false),
-            None,
-            QueryLanguage::PromQl,
-        )
-        .expect("parse");
-        assert_eq!(cfg.policy_fp_u64(), cfg.policy_fingerprint().as_u64());
-    }
-
-    /// Installed materializations reject the removed externally assigned identity.
+    // The removed externally assigned identity is not accepted on the wire.
     #[test]
     fn canonical_wire_rejects_aggregation_id() {
-        let cfg = PrecomputeMaterialization::from_yaml_data(
-            &sample_yaml(false),
-            None,
-            QueryLanguage::PromQl,
-        )
-        .expect("parse");
-        let mut json = serde_json::to_value(&cfg).unwrap();
-        assert!(
-            json.get("aggregationId").is_none(),
-            "aggregationId must not appear in the canonical wire format"
-        );
+        let mut json = serde_json::to_value(config()).unwrap();
+        assert!(json.get("aggregationId").is_none());
         json["aggregationId"] = serde_json::json!(42);
         assert!(serde_json::from_value::<PrecomputeMaterialization>(json).is_err());
     }
 
+    // Table value projections are typed, and a non-finite constant is invalid.
     #[test]
     fn typed_projection_roundtrips_and_untyped_column_is_rejected() {
         use crate::sds::ValueProjectionIdentity;
         use planner_types::pre_asap::ScalarValue;
-        let mut config = PrecomputeMaterialization::from_yaml_data(
-            &sample_yaml(false),
-            None,
-            QueryLanguage::PromQl,
-        )
-        .unwrap();
+        let mut config = config();
         config.table_name = Some("telemetry".into());
         config.value_projection = Some(ValueProjectionIdentity::Column {
             name: "value".into(),
         });
-        let column_identity = config.policy_fingerprint();
         let mut legacy = serde_json::to_value(&config).unwrap();
         legacy.as_object_mut().unwrap().remove("value_projection");
         legacy["value_column"] = serde_json::json!("value");
@@ -759,34 +502,16 @@ mod tests {
         config.value_projection = Some(ValueProjectionIdentity::Constant {
             value: ScalarValue::Int64(1),
         });
-        let wire = serde_json::to_value(&config).unwrap();
-        let decoded: PrecomputeMaterialization = serde_json::from_value(wire).unwrap();
+        let decoded: PrecomputeMaterialization =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
         assert_eq!(
             decoded.effective_value_projection(),
             config.effective_value_projection()
         );
-        let mut yaml = sample_yaml(false);
-        yaml["tableName"] = serde_yaml::to_value("telemetry").unwrap();
-        yaml["valueProjection"] =
-            serde_yaml::to_value(serde_json::to_value(&config.value_projection).unwrap()).unwrap();
-        let decoded =
-            PrecomputeMaterialization::from_yaml_data(&yaml, None, QueryLanguage::ClickHouseSql)
-                .unwrap();
-        assert_eq!(
-            decoded.effective_value_projection(),
-            config.effective_value_projection()
-        );
-        yaml["valueColumn"] = serde_yaml::to_value("other_column").unwrap();
-        assert!(PrecomputeMaterialization::from_yaml_data(
-            &yaml,
-            None,
-            QueryLanguage::ClickHouseSql
-        )
-        .is_err());
-        assert_ne!(config.policy_fingerprint(), column_identity);
+        assert!(config.table_population_canonical().is_ok());
         config.value_projection = Some(ValueProjectionIdentity::Constant {
             value: ScalarValue::Float64(f64::NAN),
         });
-        assert!(config.population_filter_canonical().is_err());
+        assert!(config.table_population_canonical().is_err());
     }
 }

@@ -27,32 +27,17 @@
 #[cfg(test)]
 use std::collections::HashMap;
 
-use asap_types::aggregation_config::PrecomputeMaterialization;
-use asap_types::enums::WindowKind;
 use asap_types::AggregationType;
-use asap_types::KeyByLabelNames;
 use serde_json::{json, Value};
 
 use crate::storage_engines::sketch_db::accuracy::{derive, AccuracyKind};
 
-fn cfg(agg_type: AggregationType, params: HashMap<String, Value>) -> PrecomputeMaterialization {
-    PrecomputeMaterialization::new(
-        agg_type,
-        String::new(),
-        params,
-        KeyByLabelNames::empty(),
-        KeyByLabelNames::empty(),
-        KeyByLabelNames::empty(),
-        String::new(),
-        60,
-        60,
-        WindowKind::Tumbling,
-        String::new(),
-        "m".to_string(),
-        None,
-        None,
-        None,
-    )
+/// The state family a kernel fixture with these dimensions stores.
+fn cfg(
+    agg_type: AggregationType,
+    params: HashMap<String, Value>,
+) -> planner_types::post_asap::SummaryFamilyType {
+    crate::tests::test_utilities::outputs::family(agg_type, &serde_json::to_value(params).unwrap())
 }
 
 // -------- published-constant parity ----------

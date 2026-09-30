@@ -66,10 +66,17 @@ async fn run_maintenance_process(multi_source: bool, distinct_groups: bool) {
     );
     // The production cost model may choose DDSketch or KLL. Preserve that
     // choice and use its actual value contract for this singleton oracle.
-    let max_relative_error = match derived.aggregation_type {
-        asap_types::AggregationType::DDSketch => derived.parameters["alpha"].as_f64().unwrap(),
-        asap_types::AggregationType::DatasketchesKLL => 0.0,
-        ref other => panic!("singleton quantile oracle missing for {other:?}"),
+    let family = plan
+        .precompute_plan
+        .state_family(derived.stored_output_id)
+        .unwrap();
+    let max_relative_error = match family {
+        planner_types::post_asap::SummaryFamilyType::Sketch(kind, _) => match kind.params() {
+            planner_types::post_asap::SketchParams::DDSketch { alpha } => *alpha,
+            planner_types::post_asap::SketchParams::Kll { .. } => 0.0,
+            other => panic!("singleton oracle missing for {other:?}"),
+        },
+        other => panic!("singleton quantile oracle missing for {other:?}"),
     };
     eprintln!(
         "IMMUTABLE_SELECTED {}",

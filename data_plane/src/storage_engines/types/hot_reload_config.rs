@@ -702,7 +702,7 @@ mod tests {
             generated_at_unix_ms: activation_unix_ms,
             activation_unix_ms,
             expiry_unix_ms,
-            backend_compat: "asap-query-backend.v1".into(),
+            backend_compat: "asap-query-backend.v2".into(),
             planner_revision: control_plane::physical::compiler::PLANNER_REVISION.into(),
             capability_snapshot_id: "test".into(),
         };
@@ -735,7 +735,7 @@ mod tests {
                     generated_at_unix_ms: activation_unix_ms,
                     activation_unix_ms,
                     expiry_unix_ms,
-                    backend_compat: "asap-query-backend.v1".into(),
+                    backend_compat: "asap-query-backend.v2".into(),
                     planner_revision: control_plane::physical::compiler::PLANNER_REVISION.into(),
                     capability_snapshot_id: "test".into(),
                 },
@@ -830,23 +830,17 @@ mod tests {
         );
     }
 
-    fn dummy_agg(id: u64) -> PrecomputeMaterialization {
-        PrecomputeMaterialization::new(
-            AggregationType::Sum,
-            String::new(),
-            HashMap::new(),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            String::new(),
+    fn dummy_agg(
+        id: u64,
+    ) -> (
+        PrecomputeMaterialization,
+        planner_types::post_asap::SummaryFamilyType,
+    ) {
+        crate::tests::test_utilities::outputs::output(
+            &format!("metric_{id}"),
+            AggregationType::Sum.planner_exact_family().unwrap(),
+            vec![],
             60,
-            60,
-            WindowKind::Tumbling,
-            String::new(),
-            format!("metric_{id}"),
-            None,
-            None,
-            None,
         )
     }
 
@@ -856,15 +850,14 @@ mod tests {
     /// dummy-id→fingerprint mapping so the assertions below can look
     /// up entries.
     fn cfg_with_ids(ids: &[u64]) -> (InstalledPrecomputePlan, std::collections::HashMap<u64, u64>) {
-        let mut map = HashMap::new();
+        let mut outputs = Vec::new();
         let mut id_to_fp = std::collections::HashMap::new();
         for &id in ids {
             let cfg = dummy_agg(id);
-            let fp = cfg.policy_fp_u64();
-            id_to_fp.insert(id, fp);
-            map.insert(fp, cfg);
+            id_to_fp.insert(id, cfg.0.policy_fp_u64());
+            outputs.push(cfg);
         }
-        (InstalledPrecomputePlan::from_raw_ids(map), id_to_fp)
+        (InstalledPrecomputePlan::new(outputs), id_to_fp)
     }
 
     #[test]

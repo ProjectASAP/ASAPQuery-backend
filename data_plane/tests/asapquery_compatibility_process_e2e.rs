@@ -379,9 +379,16 @@ async fn certified_kll_state_to_query_oracle() {
         .compile_promql(request, environment)
         .unwrap();
     assert_eq!(plan.precompute_plan.materializations.len(), 1);
-    let k = plan.precompute_plan.materializations[0].parameters["k"]
-        .as_u64()
-        .unwrap() as u32;
+    let family = plan
+        .precompute_plan
+        .state_family(plan.precompute_plan.materializations[0].stored_output_id)
+        .unwrap();
+    let planner_types::post_asap::SummaryFamilyType::Sketch(kind, _) = family else {
+        panic!("quantile output stores a sketch")
+    };
+    let planner_types::post_asap::SketchParams::Kll { k } = *kind.params() else {
+        panic!("quantile output stores a KLL")
+    };
     let guarantee = asap_aware_mapping::DefaultAccuracyModel::sketch_guarantee(
         &planner_types::post_asap::SketchAlgorithm::Kll,
         &planner_types::post_asap::SketchParams::Kll { k },
@@ -769,14 +776,24 @@ async fn registered_temporal_topk(
         }
         _ => panic!("fixture requires a heap implementation"),
     };
+    let output = plan.precompute_plan.materializations[0].stored_output_id;
     assert_eq!(
-        plan.precompute_plan.materializations[0].aggregation_type,
-        expected_type
+        plan.precompute_plan
+            .state_family(output)
+            .and_then(asap_types::aggregation_type_for_family),
+        Some(expected_type)
     );
-    assert_eq!(
-        plan.precompute_plan.materializations[0].parameters["weight_mode"],
-        "count"
-    );
+    // The Planner update counts occurrences.
+    let (producer, _) = plan
+        .precompute_plan
+        .summary_producer(output)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        producer.payload,
+        planner_types::post_asap::PostAsapOperatorPayload::SummaryAgg { ref input, .. }
+            if input.weight == planner_types::post_asap::SummaryInputExpr::Constant(1.0)
+    ));
     let artifact = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
         summary_catalog: plan.summary_catalog,
         collector_plans: plan.collector_plans,
@@ -1072,7 +1089,15 @@ async fn run_shared_dashboard(multi_pane: bool) {
         .precompute_plan
         .materializations
         .iter()
-        .map(|m| m.aggregation_type.as_str())
+        .map(|m| {
+            asap_types::aggregation_type_for_family(
+                plan.precompute_plan
+                    .state_family(m.stored_output_id)
+                    .unwrap(),
+            )
+            .unwrap()
+            .as_str()
+        })
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(families, std::collections::BTreeSet::from(["Sum", "Count"]));
     assert_eq!(plan.query_plan.entries.len(), 3);

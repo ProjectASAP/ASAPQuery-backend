@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::storage_engines::types::InstalledPrecomputePlan;
 use asap_types::aggregation_config::PrecomputeMaterialization;
 
-use crate::storage_engines::sketch_db::data::{canonical_parameters, AggKind};
+use crate::storage_engines::sketch_db::data::AggKind;
 use crate::storage_engines::sketch_db::index::SketchStore;
 use crate::storage_engines::sketch_db::lifecycle::AggStatus;
 
@@ -166,21 +166,19 @@ fn signature_into(
     }
 }
 
-fn signature_from_agg_config(cfg: &PrecomputeMaterialization) -> Vec<u8> {
-    let agg_kind = AggKind::ExactAgg {
-        agg_type: cfg.aggregation_type,
-        parameters_canonical: canonical_parameters(&cfg.parameters),
-        spatial_filter_canonical: cfg.spatial_filter_normalized.clone(),
-    };
+fn signature_from_agg_config(cfg: &PrecomputeMaterialization, agg_kind: &AggKind) -> Vec<u8> {
     let group_by_keys: BTreeSet<String> = cfg.grouping_labels.iter().cloned().collect();
-    signature_bytes(&cfg.metric, &agg_kind, &group_by_keys)
+    signature_bytes(&cfg.metric, agg_kind, &group_by_keys)
 }
 
 fn build_live_signature_set(config: &InstalledPrecomputePlan) -> HashSet<Vec<u8>> {
     config
         .materializations()
         .values()
-        .map(signature_from_agg_config)
+        .filter_map(|cfg| {
+            let kind = config.agg_kind(cfg.stored_output_id)?;
+            Some(signature_from_agg_config(cfg, &kind))
+        })
         .collect()
 }
 
@@ -276,23 +274,15 @@ mod tests {
         metric: &str,
         agg_type: AggregationType,
         group_by: Vec<&str>,
-    ) -> PrecomputeMaterialization {
-        PrecomputeMaterialization::new(
-            agg_type,
-            String::new(),
-            HashMap::new(),
-            KeyByLabelNames::new(group_by.into_iter().map(|s| s.to_string()).collect()),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            String::new(),
+    ) -> (
+        PrecomputeMaterialization,
+        planner_types::post_asap::SummaryFamilyType,
+    ) {
+        crate::tests::test_utilities::outputs::output(
+            metric,
+            agg_type.planner_exact_family().unwrap(),
+            group_by,
             1,
-            1,
-            WindowKind::Tumbling,
-            String::new(),
-            metric.to_string(),
-            None,
-            None,
-            None,
         )
     }
 
@@ -321,12 +311,13 @@ mod tests {
         }
     }
 
-    fn streaming(configs: Vec<PrecomputeMaterialization>) -> InstalledPrecomputePlan {
-        let mut map = HashMap::new();
-        for (i, c) in configs.into_iter().enumerate() {
-            map.insert(i as u64 + 1, c);
-        }
-        InstalledPrecomputePlan::from_raw_ids(map)
+    fn streaming(
+        configs: Vec<(
+            PrecomputeMaterialization,
+            planner_types::post_asap::SummaryFamilyType,
+        )>,
+    ) -> InstalledPrecomputePlan {
+        InstalledPrecomputePlan::new(configs)
     }
 
     #[test]

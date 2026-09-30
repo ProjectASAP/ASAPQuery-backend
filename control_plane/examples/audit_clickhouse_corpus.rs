@@ -25,24 +25,20 @@ struct Row {
 }
 
 fn publication_inputs(schema: &Schema, sql: String) -> ClickHouseSqlWorkload {
+    let family = AggregationType::Max.planner_exact_family().unwrap();
     let mut materialization = PrecomputeMaterialization::new(
-        AggregationType::Max,
-        String::new(),
-        std::collections::HashMap::from([("variant".into(), json!(2))]),
+        "raw_samples.value",
         KeyByLabelNames::new(vec!["labels".into()]),
-        KeyByLabelNames::empty(),
-        KeyByLabelNames::empty(),
-        String::new(),
         60,
         60,
         WindowKind::Tumbling,
-        String::new(),
-        "raw_samples.value".into(),
-        None,
-        Some("raw_samples".into()),
-        Some("value".into()),
     );
+    materialization.table_name = Some("raw_samples".into());
+    materialization.value_projection = Some(asap_types::sds::ValueProjectionIdentity::Column {
+        name: "value".into(),
+    });
     materialization.pane_origin_ms = Some(0);
+    materialization.allocate_stored_output_id(&family);
     let envelope = PlanEnvelope {
         plan_id: 27,
         plan_version: 1,
@@ -54,7 +50,7 @@ fn publication_inputs(schema: &Schema, sql: String) -> ClickHouseSqlWorkload {
         capability_snapshot_id: "sql27-main-eval".into(),
     };
     let mut precompute_plan =
-        PrecomputePlan::build_backend_local(envelope.clone(), vec![materialization.clone()])
+        PrecomputePlan::build_backend_local(envelope.clone(), vec![(materialization, family)])
             .unwrap();
     let mut transmission_plan = control_plane::physical::compiler::build_transmission_plan(
         envelope,
@@ -62,12 +58,7 @@ fn publication_inputs(schema: &Schema, sql: String) -> ClickHouseSqlWorkload {
         &Default::default(),
     )
     .unwrap();
-    let sds = asap_types::summary_catalog::SummaryCatalog::from_materializations(
-        27,
-        1,
-        &[materialization],
-    )
-    .unwrap();
+    let sds = asap_types::summary_catalog::SummaryCatalog::from_plan(&precompute_plan).unwrap();
     let reference = sds.reference().unwrap();
     precompute_plan.bind_catalog(&sds).unwrap();
     transmission_plan.summary_catalog = Some(reference);

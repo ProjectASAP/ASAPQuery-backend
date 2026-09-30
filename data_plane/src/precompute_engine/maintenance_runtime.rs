@@ -501,10 +501,18 @@ pub(crate) fn execute_completed_maintenance_cohort(
         target.fingerprint(),
     );
     output.catalog_generation = Some(Arc::clone(generation));
+    let planner_types::post_asap::PostAsapOperatorPayload::SummaryAgg { family, .. } =
+        &target_node.payload
+    else {
+        return Err("maintenance target node is not a Planner SummaryAgg".into());
+    };
+    // Derived outputs read stored states, so their input has no predicate.
+    let kind = crate::storage_engines::sketch_db::data::agg_kind_for_family(family, "");
     store
         .publish_frozen_maintenance_output(
             target_sid,
             target_config,
+            &kind,
             &output,
             state.as_ref(),
             &cohort,
@@ -784,7 +792,12 @@ fn execute_finite_complete_populations(
                 batch.schema(),
             ) {
                 output.population_labels = Some(Population::new());
-                store.publish_native_summary_output(resolver, config, &output, batch, max_bytes)?;
+                let family = plan
+                    .state_family(config.stored_output_id)
+                    .ok_or("physical output has no state schema")?;
+                store.publish_native_summary_output(
+                    resolver, config, family, &output, batch, max_bytes,
+                )?;
                 continue;
             }
             let derived = config
@@ -821,9 +834,13 @@ fn execute_finite_complete_populations(
                     continue;
                 }
                 output.population_labels = Some(group);
+                let family = plan
+                    .state_family(config.stored_output_id)
+                    .ok_or("complete maintenance target has no state schema")?;
                 store.publish_complete_raw_maintenance_output(
                     target_sid,
                     config,
+                    &crate::storage_engines::sketch_db::data::agg_kind_for_family(family, ""),
                     &output,
                     state.as_ref(),
                     &cohort,
@@ -1720,6 +1737,45 @@ mod tests {
         }
     }
 
+    /// Raw sources of these fixtures store exact sums.
+    fn sum_family() -> planner_types::post_asap::SummaryFamilyType {
+        asap_types::AggregationType::Sum
+            .planner_exact_family()
+            .unwrap()
+    }
+
+    /// The maintained output of these fixtures stores a KLL.
+    fn kll_family() -> planner_types::post_asap::SummaryFamilyType {
+        crate::tests::test_utilities::outputs::family(
+            asap_types::AggregationType::DatasketchesKLL,
+            &serde_json::json!({"k": 200}),
+        )
+    }
+
+    fn sum_kind() -> crate::storage_engines::sketch_db::index::AggKind {
+        crate::storage_engines::sketch_db::data::agg_kind_for_family(&sum_family(), "")
+    }
+
+    /// The catalog of raw sum sources followed by the maintained KLL output.
+    fn fixture_catalog(
+        plan_id: u64,
+        plan_version: u64,
+        configs: &[asap_types::PrecomputeMaterialization],
+    ) -> asap_types::summary_catalog::SummaryCatalog {
+        let (sum, kll) = (sum_family(), kll_family());
+        let (sources, target) = configs.split_at(configs.len() - 1);
+        asap_types::summary_catalog::SummaryCatalog::from_outputs(
+            plan_id,
+            plan_version,
+            sources
+                .iter()
+                .map(|config| (config, &sum, String::new()))
+                .chain(target.iter().map(|config| (config, &kll, String::new())))
+                .collect(),
+        )
+        .unwrap()
+    }
+
     fn sum(value: f64) -> SummaryState {
         let mut accumulator = crate::tests::accumulator_fixture::sum_state(0.0);
         accumulator.update(None, value, 0);
@@ -1754,17 +1810,14 @@ mod tests {
         source_config.window_type = asap_types::WindowKind::Tumbling;
         source_config.window_layout =
             asap_types::aggregation_config::WindowMaterializationLayout::Pane { pane_secs: 1 };
+        source_config.allocate_stored_output_id(&sum_family());
         let source_definition = source_config.policy_fingerprint().into();
         let mut target_config = source_config.clone();
         target_config.window_layout =
             asap_types::aggregation_config::WindowMaterializationLayout::FullWindow;
-        target_config.aggregation_type = asap_types::AggregationType::DatasketchesKLL;
-        target_config.aggregation_sub_type = "quantile".into();
-        target_config
-            .parameters
-            .insert("k".into(), serde_json::json!(200));
+        target_config.allocate_stored_output_id(&kll_family());
         let target = target_config.policy_fingerprint().into();
-        let target_family = target_config.accumulator_spec().unwrap().family;
+        let target_family = kll_family();
         let configs = [source_config, target_config];
         let binding = BackendExecutableBinding {
             nodes: BTreeMap::from([
@@ -1815,7 +1868,7 @@ mod tests {
         read.output_state = planner_types::post_asap::ExecutionDataState::INGESTION_ROWS;
         aggregate.output_schema.fields = vec![SummaryField {
             name: "state".into(),
-            dtype: configs[1].accumulator_spec().unwrap().family,
+            dtype: kll_family(),
             nullable: false,
         }];
         let mut query = node(4);
@@ -1868,6 +1921,7 @@ mod tests {
             )
             .unwrap(),
         );
+        durable_configs[1].allocate_stored_output_id(&kll_family());
         document.schema_version = asap_types::executable_plan::PRECOMPUTE_DAG_SCHEMA_VERSION;
         let mut durable_binding = scheduled_binding.clone();
         durable_binding.nodes.insert(
@@ -1887,14 +1941,7 @@ mod tests {
             document,
             binding: durable_binding,
         };
-        let catalog = Arc::new(
-            asap_types::summary_catalog::SummaryCatalog::from_materializations(
-                1,
-                1,
-                &durable_configs,
-            )
-            .unwrap(),
-        );
+        let catalog = Arc::new(fixture_catalog(1, 1, &durable_configs));
         let directory = tempfile::tempdir().unwrap();
         let persistence_config = || {
             let mut config = SketchStorePersistenceConfig::with_memory_limit(
@@ -1941,6 +1988,7 @@ mod tests {
                         writer.ingest_precompute_with_series_id(
                             600,
                             &durable_configs[0],
+                            &sum_kind(),
                             &output,
                             sum(value).as_ref(),
                         )
@@ -1977,6 +2025,7 @@ mod tests {
             .ingest_precompute_with_series_id(
                 600,
                 &durable_configs[0],
+                &sum_kind(),
                 &rejected_output,
                 sum(99.0).as_ref()
             )
@@ -2066,6 +2115,7 @@ mod tests {
             .ingest_precompute_with_series_id(
                 600,
                 &durable_configs[0],
+                &sum_kind(),
                 &correction,
                 sum(100.0).as_ref()
             )
@@ -2108,6 +2158,7 @@ mod tests {
             .ingest_precompute_with_series_id(
                 600,
                 &durable_configs[0],
+                &sum_kind(),
                 &correction,
                 sum(100.0).as_ref()
             )
@@ -2130,14 +2181,7 @@ mod tests {
             })
             .sum::<usize>();
         assert_eq!(target_entries, 1);
-        let next_catalog = Arc::new(
-            asap_types::summary_catalog::SummaryCatalog::from_materializations(
-                1,
-                2,
-                &durable_configs,
-            )
-            .unwrap(),
-        );
+        let next_catalog = Arc::new(fixture_catalog(1, 2, &durable_configs));
         restored.install_summary_catalog(next_catalog).unwrap();
         let next_generation = restored.active_catalog_generation().unwrap();
         assert!(restored
@@ -2154,6 +2198,7 @@ mod tests {
             restored.ingest_precompute_with_series_id(
                 602,
                 &durable_configs[0],
+                &sum_kind(),
                 &new_population,
                 sum(20.0).as_ref()
             ),
@@ -2188,8 +2233,10 @@ mod tests {
             first.population_key_encoding = asap_types::PopulationKeyEncoding::CanonicalLabelsV1;
             first.partitioning = Some(asap_types::sds::PopulationPartitioning::PerEntity);
         }
+        first.allocate_stored_output_id(&sum_family());
         let mut second = first.clone();
         second.metric = "second_maintenance_source".into();
+        second.allocate_stored_output_id(&sum_family());
         let first_id = first.policy_fingerprint().into();
         let second_id = second.policy_fingerprint().into();
         let mut dag = template.clone();
@@ -2277,10 +2324,7 @@ mod tests {
             binding,
         };
         let configs = [first, second, target];
-        let catalog = Arc::new(
-            asap_types::summary_catalog::SummaryCatalog::from_materializations(2, 1, &configs)
-                .unwrap(),
-        );
+        let catalog = Arc::new(fixture_catalog(2, 1, &configs));
         let directory = tempfile::tempdir().unwrap();
         let persistence_config = || {
             let mut config =
@@ -2316,12 +2360,22 @@ mod tests {
                     // is tested with the real compiler/process integration separately.
                     config.population_key_encoding =
                         asap_types::PopulationKeyEncoding::LegacyDelimited;
-                    config
+                    (config, sum_family())
                 })
                 .collect(),
         )
         .unwrap();
         plan.materializations = configs.to_vec();
+        // The unvalidated fixture target still names its stored state schema.
+        plan.schemas
+            .push(asap_types::precompute_plan::StateSchemaContract {
+                materialization: configs[2].stored_output_id,
+                stored_output_reference: asap_types::sds::StoredOutputReference::for_output(
+                    configs[2].stored_output_id,
+                ),
+                family: kll_family(),
+                ..plan.schemas[0].clone()
+            });
         plan.summary_catalog = Some(generation.as_ref().clone());
         plan.executable_dags = BTreeMap::from([("cohort-fixture".into(), installed.clone())]);
         let resolver_path = directory.path().join("resolver.wal");
@@ -2380,6 +2434,7 @@ mod tests {
                             writer.ingest_precompute_with_series_id(
                                 sid,
                                 config,
+                                &sum_kind(),
                                 &output,
                                 sum(value + population_index as f64 * 10.0).as_ref(),
                             )
@@ -2569,10 +2624,7 @@ mod tests {
         )
         .unwrap());
         assert_eq!(persistence.manifest.live_parts().len(), parts);
-        let next_catalog = Arc::new(
-            asap_types::summary_catalog::SummaryCatalog::from_materializations(2, 2, &configs)
-                .unwrap(),
-        );
+        let next_catalog = Arc::new(fixture_catalog(2, 2, &configs));
         restored.install_summary_catalog(next_catalog).unwrap();
         assert_ne!(generation, restored.active_catalog_generation().unwrap());
         // Stale scheduling fails at the captured catalog boundary, before any
@@ -2790,7 +2842,7 @@ mod tests {
             summary_catalog: Some(Arc::new(bundle.summary_catalog)),
             precompute_plan: bundle.precompute_plan,
             transmission_plan: bundle.transmission_plan,
-            installed_precompute_plan: Arc::new(InstalledPrecomputePlan::new(Default::default())),
+            installed_precompute_plan: Arc::new(InstalledPrecomputePlan::new(Vec::new())),
             query_plan: Arc::new(bundle.query_plan),
             storage_routing: Arc::new(Default::default()),
         };
@@ -3018,7 +3070,11 @@ pub(crate) fn execute_revision_outputs(
                         for (group, state) in
                             super::native_precompute::population_states(&batch, window.1)?
                         {
-                            let payload = encode_state(state, config.accumulator_spec()?.family)?;
+                            let family = plan
+                                .precompute_plan
+                                .state_family(config.stored_output_id)
+                                .ok_or("physical output has no state schema")?;
+                            let payload = encode_state(state, family.clone())?;
                             if payload.len() > limit {
                                 return Err(asap_physical_operators::Error::MemoryLimit.into());
                             }

@@ -179,24 +179,16 @@ mod tests {
     }
 
     fn catalog_fixture() -> SummaryCatalog {
-        let config = PrecomputeMaterialization::new(
-            AggregationType::Sum,
-            String::new(),
-            Default::default(),
+        let family = AggregationType::Sum.planner_exact_family().unwrap();
+        let mut config = PrecomputeMaterialization::new(
+            "m",
             KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            String::new(),
             60,
             60,
             WindowKind::Tumbling,
-            String::new(),
-            "m".into(),
-            None,
-            None,
-            None,
         );
-        SummaryCatalog::from_materializations(1, 1, &[config]).unwrap()
+        config.allocate_stored_output_id(&family);
+        SummaryCatalog::from_outputs(1, 1, vec![(&config, &family, String::new())]).unwrap()
     }
 
     // A readout cannot relabel a valid sum materialization as a rate capability.

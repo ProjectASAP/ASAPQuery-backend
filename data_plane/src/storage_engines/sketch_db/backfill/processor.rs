@@ -216,6 +216,9 @@ impl WindowProcessor for BackfillWindowProcessor {
             .cloned()
             .ok_or_else(|| format!("agg_id {agg_id} not in current InstalledPrecomputePlan"))?;
         let program = snapshot.raw_programs.get(&agg_id).cloned();
+        let kind = snapshot
+            .agg_kind(asap_types::sds::StoredOutputId(agg_id))
+            .ok_or_else(|| format!("agg_id {agg_id} has no installed state schema"))?;
         #[cfg(not(test))]
         if program.is_none() {
             return Err("backfill requires a post-ASAP DAG installation".into());
@@ -299,7 +302,15 @@ impl WindowProcessor for BackfillWindowProcessor {
             } else {
                 #[cfg(test)]
                 {
-                    build_backfilled_accumulator(&config, &samples)
+                    build_backfilled_accumulator(
+                        snapshot
+                            .state_family(config.stored_output_id)
+                            .ok_or("backfill fixture has no state family")?,
+                        &planner_types::post_asap::SummaryUpdate::column(
+                            planner_types::pre_asap::ColumnRef::SampleValue,
+                        ),
+                        &samples,
+                    )
                 }
                 #[cfg(not(test))]
                 {
@@ -372,6 +383,7 @@ impl WindowProcessor for BackfillWindowProcessor {
                                 &address,
                                 _resolver,
                                 &config,
+                                &kind,
                                 output,
                                 accumulator.as_ref(),
                             )
@@ -428,29 +440,18 @@ mod tests {
         } else {
             KeyByLabelNames::from_names(grouping.into_iter().map(String::from).collect())
         };
-        PrecomputeMaterialization::new(
-            AggregationType::Sum,
-            String::new(),
-            std::collections::HashMap::new(),
-            grouping_labels,
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            String::new(),
-            60,
-            60,
-            WindowKind::Tumbling,
-            String::new(),
-            metric.to_string(),
-            None,
-            None,
-            None,
-        )
+        let mut config =
+            PrecomputeMaterialization::new(metric, grouping_labels, 60, 60, WindowKind::Tumbling);
+        config.allocate_stored_output_id(&sum_family());
+        config
+    }
+
+    fn sum_family() -> planner_types::post_asap::SummaryFamilyType {
+        AggregationType::Sum.planner_exact_family().unwrap()
     }
 
     fn streaming_config_with(config: PrecomputeMaterialization) -> Arc<InstalledPrecomputePlan> {
-        let mut map = std::collections::HashMap::new();
-        map.insert(config.policy_fp_u64(), config);
-        Arc::new(InstalledPrecomputePlan::from_raw_ids(map))
+        Arc::new(InstalledPrecomputePlan::new([(config, sum_family())]))
     }
 
     #[tokio::test]
@@ -640,7 +641,12 @@ mod tests {
 
         // Live path: factory + update_single per sample in order.
         let live_bytes = {
-            let mut updater = create_fixture_accumulator(&cfg);
+            let mut updater = create_fixture_accumulator(
+                &sum_family(),
+                &planner_types::post_asap::SummaryUpdate::column(
+                    planner_types::pre_asap::ColumnRef::SampleValue,
+                ),
+            );
             for s in &samples {
                 updater.update_single(s.value, s.timestamp_ms);
             }
@@ -650,7 +656,13 @@ mod tests {
 
         // Backfill path: build_backfilled_accumulator.
         let backfill_bytes = {
-            let acc = build_backfilled_accumulator(&cfg, &samples);
+            let acc = build_backfilled_accumulator(
+                &sum_family(),
+                &planner_types::post_asap::SummaryUpdate::column(
+                    planner_types::pre_asap::ColumnRef::SampleValue,
+                ),
+                &samples,
+            );
             acc.serialize_to_bytes()
         };
 
@@ -843,10 +855,10 @@ mod tests {
         let hot = InstalledPrecomputePlanHandle::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let summary_store = Arc::new(SketchStore::new());
-        let catalog = asap_types::summary_catalog::SummaryCatalog::from_materializations(
+        let catalog = asap_types::summary_catalog::SummaryCatalog::from_outputs(
             1,
             1,
-            &[cfg.clone()],
+            vec![(&cfg, &sum_family(), String::new())],
         )
         .unwrap();
         summary_store
@@ -1000,6 +1012,7 @@ mod tests {
                         .ok()
                 },
                 &cfg,
+                &crate::storage_engines::sketch_db::data::agg_kind_for_family(&sum_family(), ""),
                 &output,
                 &acc,
             )

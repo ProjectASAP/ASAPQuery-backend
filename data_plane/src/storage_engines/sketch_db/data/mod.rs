@@ -33,9 +33,6 @@
 //!   (in `drivers::ingest::series_resolver`) is the single mint
 //!   authority for every sid in the system. `AggKind::canonical_string()`
 //!   here produces the third element of the resolver's cache key.
-//! - [`canonical_parameters`] — helper that renders a parameters
-//!   `HashMap` into the canonical string form
-//!   `AggKind::ExactAgg::parameters_canonical` expects.
 //!
 //! ## Re-exports for callers
 //!
@@ -122,11 +119,9 @@ pub enum AggKind {
     /// accumulator serializer.
     ExactAgg {
         agg_type: AggregationType,
-        /// Stable canonical encoding of the agg's
-        /// `parameters: HashMap<String, Value>` — sorted keys, each
-        /// value rendered via serde_json. Held as a single owned
-        /// string so equality / hashing stay cheap and independent of
-        /// the original HashMap's iteration order.
+        /// Canonical tuning parameters of the exact state. Planner exact
+        /// families have none, so installed outputs register it empty;
+        /// recovered legacy records may carry a non-empty encoding.
         parameters_canonical: String,
         /// Canonical form of the policy's spatial-filter predicate;
         /// see the `Sketch` variant's field doc.
@@ -135,103 +130,84 @@ pub enum AggKind {
 }
 
 /// Complete resolver identity for a configured materialization. All live and
-/// replay paths must include policy semantics, not just the sketch family.
-pub(crate) fn materialization_kind_for_config(
+/// replay paths must include the stored output, not just the sketch family.
+pub(crate) fn materialization_kind(
     config: &asap_types::aggregation_config::PrecomputeMaterialization,
+    kind: &AggKind,
 ) -> String {
     format!(
         "{}|{}",
-        agg_kind_for_config(config).canonical_string(),
+        kind.canonical_string(),
         config.policy_fingerprint()
     )
 }
 
-/// Resolve the physical state family produced by a precompute policy. This is
-/// shared by SID minting and store registration so a sketch policy can never
-/// be minted as `ExactAgg` and later registered as `Sketch` (or vice versa).
-pub fn agg_kind_for_config(
-    config: &asap_types::aggregation_config::PrecomputeMaterialization,
+/// The physical state kind of a stored output of the Planner `family` whose
+/// input has the canonical predicate `filter`. This is shared by SID minting
+/// and store registration so a sketch output can never be minted as `ExactAgg`
+/// and later registered as `Sketch` (or vice versa).
+pub fn agg_kind_for_family(
+    family: &planner_types::post_asap::SummaryFamilyType,
+    filter: &str,
 ) -> AggKind {
     use planner_types::post_asap::{SketchAlgorithm as Algorithm, SketchParams, SummaryFamilyType};
-
-    // HLL is intentionally absent from raw-value accumulator dispatch because
-    // it arrives through SketchEnvelope ingest. It is still a sketch for SID
-    // identity and store registration, so classify it before consulting the
-    // accumulator factory contract.
-    let sketch = (config.aggregation_type == AggregationType::HLL)
-        .then(|| {
-            let precision = config
-                .parameters
-                .get("precision")
-                .or_else(|| config.parameters.get("p"))
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok())
-                .unwrap_or(14);
-            AggKind::Sketch {
-                algorithm: SketchAlgorithm::Hll,
-                config: SketchConfig::Hll { precision },
-                spatial_filter_canonical: config.spatial_filter_normalized.clone(),
-            }
-        })
-        .or_else(|| {
-            config.accumulator_spec().ok().and_then(|spec| {
-                let SummaryFamilyType::Sketch(kind, _) = spec.family else {
-                    return None;
-                };
-                let algorithm = kind.algorithm().clone();
-                let physical = match (kind.algorithm(), kind.params()) {
-                    (
-                        Algorithm::UnivMon,
-                        SketchParams::UnivMon {
-                            heap_size,
-                            sketch_rows,
-                            sketch_cols,
-                            layers,
-                        },
-                    ) => SketchConfig::UnivMon {
-                        heap_size: *heap_size,
-                        sketch_rows: *sketch_rows,
-                        sketch_cols: *sketch_cols,
-                        layers: *layers,
+    let sketch = match family {
+        SummaryFamilyType::Sketch(kind, _) => {
+            let physical = match (kind.algorithm(), kind.params()) {
+                (
+                    Algorithm::UnivMon,
+                    SketchParams::UnivMon {
+                        heap_size,
+                        sketch_rows,
+                        sketch_cols,
+                        layers,
                     },
-                    (Algorithm::DDSketch, SketchParams::DDSketch { alpha }) => {
-                        SketchConfig::DDSketch {
-                            relative_accuracy: *alpha,
-                        }
-                    }
-                    (Algorithm::Kll, SketchParams::Kll { k }) => SketchConfig::Kll { k: *k },
-                    (Algorithm::Hll, SketchParams::Hll { precision }) => SketchConfig::Hll {
-                        precision: (*precision).into(),
-                    },
-                    (Algorithm::Cms, SketchParams::Cms { width, depth })
-                    | (Algorithm::CmsWithHeap, SketchParams::CmsWithHeap { width, depth, .. }) => {
-                        SketchConfig::CountMin {
-                            rows: *depth as i32,
-                            cols: *width as i32,
-                        }
-                    }
-                    (Algorithm::CountSketch, SketchParams::CountSketch { width, depth })
-                    | (
-                        Algorithm::CountSketchWithHeap,
-                        SketchParams::CountSketchWithHeap { width, depth, .. },
-                    ) => SketchConfig::CountSketch {
+                ) => Some(SketchConfig::UnivMon {
+                    heap_size: *heap_size,
+                    sketch_rows: *sketch_rows,
+                    sketch_cols: *sketch_cols,
+                    layers: *layers,
+                }),
+                (Algorithm::DDSketch, SketchParams::DDSketch { alpha }) => {
+                    Some(SketchConfig::DDSketch {
+                        relative_accuracy: *alpha,
+                    })
+                }
+                (Algorithm::Kll, SketchParams::Kll { k }) => Some(SketchConfig::Kll { k: *k }),
+                (Algorithm::Hll, SketchParams::Hll { precision }) => Some(SketchConfig::Hll {
+                    precision: (*precision).into(),
+                }),
+                (Algorithm::Cms, SketchParams::Cms { width, depth })
+                | (Algorithm::CmsWithHeap, SketchParams::CmsWithHeap { width, depth, .. }) => {
+                    Some(SketchConfig::CountMin {
                         rows: *depth as i32,
                         cols: *width as i32,
-                    },
-                    _ => return None,
-                };
-                Some(AggKind::Sketch {
-                    algorithm,
-                    config: physical,
-                    spatial_filter_canonical: config.spatial_filter_normalized.clone(),
-                })
+                    })
+                }
+                (Algorithm::CountSketch, SketchParams::CountSketch { width, depth })
+                | (
+                    Algorithm::CountSketchWithHeap,
+                    SketchParams::CountSketchWithHeap { width, depth, .. },
+                ) => Some(SketchConfig::CountSketch {
+                    rows: *depth as i32,
+                    cols: *width as i32,
+                }),
+                _ => None,
+            };
+            physical.map(|config| AggKind::Sketch {
+                algorithm: kind.algorithm().clone(),
+                config,
+                spatial_filter_canonical: filter.to_owned(),
             })
-        });
-
+        }
+        _ => None,
+    };
     sketch.unwrap_or_else(|| AggKind::ExactAgg {
-        agg_type: config.aggregation_type,
-        parameters_canonical: canonical_parameters(&config.parameters),
-        spatial_filter_canonical: config.spatial_filter_normalized.clone(),
+        agg_type: asap_types::aggregation_type_for_family(family)
+            .expect("installed plans only carry families with a stored-state kernel"),
+        // Exact families have no tuning parameters.
+        parameters_canonical: String::new(),
+        spatial_filter_canonical: filter.to_owned(),
     })
 }
 
@@ -296,24 +272,6 @@ impl AggKind {
     }
 }
 
-/// Render a `HashMap<String, Value>` of parameters into the canonical
-/// string form `AggKind::ExactAgg::parameters_canonical` expects.
-/// Keys sorted lexicographically; each value via `serde_json`.
-pub fn canonical_parameters(
-    parameters: &std::collections::HashMap<String, serde_json::Value>,
-) -> String {
-    let sorted: std::collections::BTreeMap<&String, &serde_json::Value> =
-        parameters.iter().collect();
-    let mut buf = String::new();
-    for (k, v) in sorted {
-        buf.push_str(k);
-        buf.push('=');
-        buf.push_str(&serde_json::to_string(v).unwrap_or_default());
-        buf.push(';');
-    }
-    buf
-}
-
 impl AggKind {
     /// Stable string form of this `AggKind`, used as the third element
     /// of the `SeriesIdResolver` cache key and as the `agg_kind_canonical`
@@ -355,9 +313,7 @@ impl AggKind {
                 spatial_filter_canonical,
             } => {
                 // `AggregationType`'s `Display` impl is stable
-                // (matches the snake-case form on the wire) and
-                // `parameters_canonical` is already canonicalized
-                // upstream (see [`canonical_parameters`]).
+                // (matches the snake-case form on the wire).
                 format!(
                     "exact_agg:{}:{}:filter={}",
                     agg_type, parameters_canonical, spatial_filter_canonical,
@@ -579,31 +535,19 @@ impl AggPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asap_types::{enums::WindowKind, KeyByLabelNames};
-    use std::collections::HashMap;
 
+    // HLL state registers as a sketch kind with its precision.
     #[test]
-    fn hll_envelope_config_is_registered_as_a_sketch() {
-        let config = asap_types::aggregation_config::PrecomputeMaterialization::new(
-            AggregationType::HLL,
-            String::new(),
-            HashMap::from([("precision".to_string(), serde_json::json!(12))]),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            String::new(),
-            60,
-            60,
-            WindowKind::Tumbling,
-            String::new(),
-            "unique_users".to_string(),
-            None,
-            None,
-            None,
+    fn hll_family_is_registered_as_a_sketch() {
+        let family = planner_types::post_asap::SummaryFamilyType::Sketch(
+            planner_types::post_asap::SketchKind::new(
+                SketchAlgorithm::Hll,
+                planner_types::post_asap::SketchParams::Hll { precision: 12 },
+            ),
+            planner_types::post_asap::GroupingStrategy::PerSubpopulationInstance,
         );
-
         assert!(matches!(
-            agg_kind_for_config(&config),
+            agg_kind_for_family(&family, ""),
             AggKind::Sketch {
                 algorithm: SketchAlgorithm::Hll,
                 config: SketchConfig::Hll { precision: 12 },

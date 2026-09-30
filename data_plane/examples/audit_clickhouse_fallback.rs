@@ -69,7 +69,7 @@ async fn main() {
         capability_snapshot_id: "sql27-main-eval".into(),
     };
     let catalog =
-        asap_types::summary_catalog::SummaryCatalog::from_materializations(27, 1, &[]).unwrap();
+        asap_types::summary_catalog::SummaryCatalog::from_outputs(27, 1, Vec::new()).unwrap();
     let reference = catalog.reference().unwrap();
     let mut precompute_plan =
         PrecomputePlan::build_backend_local(envelope.clone(), vec![]).unwrap();

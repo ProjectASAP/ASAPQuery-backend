@@ -386,7 +386,9 @@ impl TransmissionPlan {
             if !schema.encodings.contains(&rule.encoding) {
                 return Err(TransmissionPlanError::InvalidRule(rule.producer_id.clone()));
             }
-            validate_runtime_rule_policy(rule, &schema.family)?;
+            let family = StateFamilyContract::try_from(&schema.family)
+                .map_err(|()| TransmissionPlanError::InvalidRule(rule.producer_id.clone()))?;
+            validate_runtime_rule_policy(rule, &family)?;
         }
         Ok(())
     }
