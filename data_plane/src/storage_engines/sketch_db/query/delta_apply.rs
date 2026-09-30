@@ -1,10 +1,10 @@
 //! Storage uses the Planner-owned state implementation.
-pub use asap_physical_operators::stored_state::delta_apply::*;
+pub use asap_summary_state::stored_state::delta_apply::*;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asap_physical_operators::stored_state::{SketchEncoding, SketchSampleState};
+    use asap_summary_state::stored_state::{SketchEncoding, SketchSampleState};
 
     #[test]
     fn native_batches_are_not_legacy_sketch_frames() {

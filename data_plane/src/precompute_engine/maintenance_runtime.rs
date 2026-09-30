@@ -1,4 +1,7 @@
 //! Bind immutable inputs to retained physical graphs and publish their stored outputs.
+use asap_summary_state::codec::KeyCodec;
+#[cfg(test)]
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 
 use super::output_sink::OutputSink;
 use crate::storage_engines::types::{
@@ -1560,7 +1563,7 @@ pub(crate) fn affected_materializations(
 mod tests {
 
     use super::*;
-    use asap_physical_operators::summary_kernels::SumAccumulator;
+    use asap_summary_state::summary_kernels::SumAccumulator;
     use planner_types::post_asap::{
         EdgeRole, GroupingEdgeCompatibility, PostAsapDag, PostAsapDagEdge, SummarySchema,
         WindowEdgeCompatibility,
@@ -1616,7 +1619,7 @@ mod tests {
     fn cohort_lineage_is_order_independent_and_binds_every_input() {
         use crate::storage_engines::sketch_db::index::FrozenExactWindows;
         let make = |sid, id, value| {
-            let mut state = asap_physical_operators::summary_kernels::SumAccumulator::new();
+            let mut state = asap_summary_state::summary_kernels::SumAccumulator::new();
             state.update(value);
             FrozenExactWindows {
                 stored_output_reference: asap_types::sds::StoredOutputReference::for_output(
@@ -3041,8 +3044,7 @@ pub(crate) fn execute_revision_outputs(
                         }
                         continue;
                     }
-                    let payload =
-                        asap_physical_operators::stored_state::native::encode_batch(&batch)?;
+                    let payload = asap_summary_state::stored_state::native::encode_batch(&batch)?;
                     if payload.len() > limit {
                         return Err(asap_physical_operators::Error::MemoryLimit.into());
                     }

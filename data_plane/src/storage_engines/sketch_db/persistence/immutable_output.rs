@@ -1,5 +1,6 @@
 //! Crash-resumable publication of one immutable output window. The SID sidecar
 //! reserves the existing part ID before writing; no second payload store is used.
+use asap_summary_state::codec::KeyCodec;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 

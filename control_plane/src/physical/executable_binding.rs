@@ -1,4 +1,5 @@
 //! Compiler checks relating the shared executable contract to QueryPlan.
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 
 pub use asap_types::executable_plan::*;
 

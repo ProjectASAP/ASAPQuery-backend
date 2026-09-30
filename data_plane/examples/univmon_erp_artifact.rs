@@ -1,7 +1,7 @@
 //! Measure readout-specific ERP evidence from finite JSONL evaluation data.
 //! This offline tool retains samples; the production backend does not.
-use asap_physical_operators::summary_kernels::hll_sketch::HllSketchAccumulator;
-use asap_physical_operators::summary_kernels::univmon::UnivMonAccumulator;
+use asap_summary_state::summary_kernels::hll_sketch::HllSketchAccumulator;
+use asap_summary_state::summary_kernels::univmon::UnivMonAccumulator;
 use data_plane::storage_engines::types::{AggregateCore, SerializableToSink};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};

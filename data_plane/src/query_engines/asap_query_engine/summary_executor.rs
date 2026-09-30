@@ -1,5 +1,5 @@
 //! Deployment adapters for resolving, decoding, and reading installed materializations.
-use asap_physical_operators::summary_kernels::{MaxAccumulator, MinAccumulator};
+use asap_summary_state::summary_kernels::{MaxAccumulator, MinAccumulator};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -88,7 +88,7 @@ impl GroupState {
             SummaryFamilyType::ExactAggregate(ExactKind::Rate, _) => asap_types::Statistic::Rate,
             _ => return None,
         };
-        asap_physical_operators::stored_state::readout::exact_readout(
+        asap_summary_state::stored_state::readout::exact_readout(
             entries.iter().flat_map(|windows| windows.values().cloned()),
             stat,
             key,
@@ -133,7 +133,7 @@ impl GroupState {
             asap_types::query_plan::ExactReadout::Max => asap_types::Statistic::Max,
         };
 
-        asap_physical_operators::stored_state::readout::exact_readout_optional(
+        asap_summary_state::stored_state::readout::exact_readout_optional(
             entries.iter().flat_map(|windows| windows.values().cloned()),
             stat,
             key,
@@ -757,15 +757,15 @@ fn sketch_query_value(
     state: &SummaryState,
     query: &SketchQuery,
 ) -> Result<f64, SummaryExecutorError> {
-    asap_physical_operators::stored_state::readout::sketch_query_value(state, query).map_err(
-        |asap_physical_operators::stored_state::readout::Error::Unsupported(reason)| {
+    asap_summary_state::stored_state::readout::sketch_query_value(state, query).map_err(
+        |asap_summary_state::stored_state::readout::Error::Unsupported(reason)| {
             SummaryExecutorError::Unsupported(reason)
         },
     )
 }
 fn topk_ranked(state: &SummaryState, k: usize) -> Result<Vec<(String, f64)>, SummaryExecutorError> {
-    asap_physical_operators::stored_state::readout::topk_ranked(state, k).map_err(
-        |asap_physical_operators::stored_state::readout::Error::Unsupported(reason)| {
+    asap_summary_state::stored_state::readout::topk_ranked(state, k).map_err(
+        |asap_summary_state::stored_state::readout::Error::Unsupported(reason)| {
             SummaryExecutorError::Unsupported(reason)
         },
     )
@@ -1007,7 +1007,7 @@ mod tests {
 
     #[test]
     fn keyed_count_state_follows_planner_family_and_query_readout() {
-        use asap_physical_operators::summary_kernels::KeyedSumCountAccumulator;
+        use asap_summary_state::summary_kernels::KeyedSumCountAccumulator;
         use asap_types::query_plan::ExactReadout;
 
         let key = KeyByLabelValues::new_with_labels(vec!["web".to_string()]);
@@ -1201,7 +1201,7 @@ mod tests {
     fn bound_univmon_merges_panes_for_four_readouts() {
         use crate::storage_engines::sketch_db::index::SketchEncoding;
         use crate::storage_engines::types::SerializableToSink;
-        use asap_physical_operators::summary_kernels::univmon::UnivMonAccumulator;
+        use asap_summary_state::summary_kernels::univmon::UnivMonAccumulator;
         use asap_types::query_plan::{MaterializationBinding, PhysicalGrouping};
         let index = SketchStore::new();
         let fp = asap_types::PolicyFingerprint(701);

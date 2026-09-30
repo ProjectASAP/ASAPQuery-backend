@@ -325,7 +325,7 @@ mod tests {
     use super::*;
     use crate::storage_engines::sketch_db::index::{AggKind, SeriesLookup};
     use crate::storage_engines::types::{InstalledPrecomputePlan, KeyByLabelValues};
-    use asap_physical_operators::summary_kernels::{DDSketchAccumulator, SumAccumulator};
+    use asap_summary_state::summary_kernels::{DDSketchAccumulator, SumAccumulator};
     use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;

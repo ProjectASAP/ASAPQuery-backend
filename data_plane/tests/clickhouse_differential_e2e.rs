@@ -1,6 +1,7 @@
 //! Optional real-ClickHouse protocol and Grafana smoke coverage.
 //!
 //! Set `CLICKHOUSE_URL` (for example `http://127.0.0.1:8123`) to run it.
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 
 #[path = "support/empty_physical_plan.rs"]
 mod empty_physical_plan;

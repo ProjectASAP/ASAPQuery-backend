@@ -3,6 +3,7 @@
 //! Planner owns semantic candidates and guarantees. This module owns the
 //! deployment decision: evidence freshness, target capabilities, windows, the
 //! Collector execution projection, SummaryCatalog, and executable plans.
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
@@ -39,6 +40,7 @@ use crate::query_plan::{
 use crate::types::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
+mod rate_placement;
 mod windows;
 pub(super) use windows::gcd;
 pub use windows::{prepare_window_implementations, WindowCostModel};
@@ -96,7 +98,7 @@ impl QueryCompilationInput {
     pub(crate) fn retain_physical_candidate(&mut self) -> Result<(), CompileError> {
         use asap_physical_operators::physical_planner::{promql_rows, PhysicalCandidate};
         let candidate =
-            promql_rows::compile_fixed_window_rate_aggregation(&self.selected_plan_root)
+            rate_placement::compile_fixed_window_rate_aggregation(&self.selected_plan_root)
                 .or_else(|_| {
                     promql_rows::compile_current_series_readout(&self.selected_plan_root)
                         .or_else(|_| {
@@ -377,7 +379,7 @@ impl ScopedAccuracyEvidence {
 #[serde(deny_unknown_fields)]
 pub struct PhysicalDeploymentContext {
     /// Semantic dataset served by this deployment's input channel; never an endpoint.
-    pub dataset_identity: planner_types::post_asap::LogicalDatasetIdentity,
+    pub dataset_identity: asap_types::semantic_fragment::LogicalDatasetIdentity,
     pub target: PhysicalDeploymentTarget,
     #[serde(rename = "collector_ids")]
     pub target_collector_ids: Vec<String>,
@@ -1043,12 +1045,16 @@ impl BackendLocalPlanningInput {
             );
             proposed
                 .candidates
-                .extend(strategy.fixed_window_rate_candidates(&typed).candidates);
-            proposed.candidates.extend(
-                strategy
-                    .query_time_rate_aggregation_candidates(&typed)
-                    .candidates,
-            );
+                .extend(rate_placement::fixed_window_rate_candidates(
+                    &direct.candidates,
+                    &typed,
+                ));
+            proposed
+                .candidates
+                .extend(rate_placement::query_time_rate_aggregation_candidates(
+                    &direct.candidates,
+                    &typed,
+                ));
             proposed.candidates.extend(direct.candidates);
             proposed.rejected.extend(direct.rejected);
             for candidate in proposed.candidates {
@@ -1059,7 +1065,7 @@ impl BackendLocalPlanningInput {
                     .map_err(|error| CompileError::Snapshot(error.to_string()))?;
                 let compiled = asap_physical_operators::physical_planner::promql_rows::compile_current_series_readout(&root)
                     .or_else(|_| asap_physical_operators::physical_planner::promql_rows::compile_rate_ranking(&root).map(|(_, program)| program));
-                if let Ok(physical) = asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_aggregation(&root) {
+                if let Ok(physical) = rate_placement::compile_fixed_window_rate_aggregation(&root) {
                     planner_selection_trace.push(serde_json::json!({
                         "stage":"planner.physical_candidate", "query_id":query.query_id,
                         "logical_root_id":crate::planner_selection::explained_root_id(&root, &query.accuracy_target),
@@ -4653,7 +4659,7 @@ fn collect_selected_materializations(
         physical_source.as_ref().unwrap_or(node),
         None,
         composable,
-        asap_physical_operators::physical_planner::promql_rows::compile_fixed_window_rate_aggregation(node).is_ok(),
+        rate_placement::compile_fixed_window_rate_aggregation(node).is_ok(),
         None,
         &mut selected,
     )?;
@@ -5599,7 +5605,7 @@ pub(crate) mod tests {
 
     fn environment(now: u64) -> PhysicalDeploymentContext {
         PhysicalDeploymentContext {
-            dataset_identity: planner_types::post_asap::LogicalDatasetIdentity {
+            dataset_identity: asap_types::semantic_fragment::LogicalDatasetIdentity {
                 namespace: "test".into(),
                 dataset: "metrics".into(),
             },

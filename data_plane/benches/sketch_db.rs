@@ -33,7 +33,7 @@ use asap_sketchlib::DdSketch;
 use asap_sketchlib::{HllSketch, HllVariant};
 use prost::Message;
 
-use asap_physical_operators::summary_kernels::SumAccumulator;
+use asap_summary_state::summary_kernels::SumAccumulator;
 use data_plane::storage_engines::sketch_db::data::{
     AccuracyBound, AggKind, AggregationType, Capability, SketchAlgorithm, SketchConfig,
     SketchEncoding,

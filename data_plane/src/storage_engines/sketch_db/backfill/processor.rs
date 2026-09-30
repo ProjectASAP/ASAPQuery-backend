@@ -980,7 +980,7 @@ mod tests {
             ),
             cfg.policy_fingerprint(),
         );
-        let acc = asap_physical_operators::summary_kernels::sum::SumAccumulator::with_sum(1.0);
+        let acc = asap_summary_state::summary_kernels::sum::SumAccumulator::with_sum(1.0);
         let live_sid = store
             .ingest_precompute_for_agg_config(
                 |_metric, attrs, _kind| {

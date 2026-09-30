@@ -1,4 +1,6 @@
 //! Bind a complete durable counter cohort to a Planner-owned precompute graph.
+#[cfg(test)]
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 use std::{collections::BTreeMap, sync::Arc};
 
 use asap_physical_operators::{
@@ -71,7 +73,7 @@ pub(super) fn execute(
                         ),
                         Value::Summary {
                             family: family.clone(),
-                            state: Arc::clone(state),
+                            state: asap_summary_state::physical::to_physical(state.as_ref())?,
                         },
                     ]);
                 }
@@ -91,7 +93,8 @@ pub(super) fn execute(
                         _,
                     ) => Ok(Value::Summary {
                         family: field.dtype.clone(),
-                        state: Arc::clone(state),
+                        state: asap_summary_state::physical::to_physical(state.as_ref())
+                            .map_err(|e| e.to_string())?,
                     }),
                     SummaryFamilyType::Plain(DataType::Timestamp) => Ok(Value::Timestamp(
                         i64::try_from(window.1).map_err(|_| "native window overflow")?,
@@ -213,7 +216,8 @@ pub(super) fn population_states(
                 return Err("duplicate population label".into());
             }
         }
-        if result.insert(group, Arc::clone(state)).is_some() {
+        let state = asap_summary_state::physical::from_physical(state.as_ref())?;
+        if result.insert(group, Arc::from(state)).is_some() {
             return Err("repeated precompute output population".into());
         }
     }
@@ -293,7 +297,7 @@ mod tests {
             snapshot_sha256: "0".repeat(64),
         });
         let state = |value| {
-            let mut sum = asap_physical_operators::summary_kernels::SumAccumulator::new();
+            let mut sum = asap_summary_state::summary_kernels::SumAccumulator::new();
             sum.update(value);
             Arc::new(sum) as Arc<dyn crate::storage_engines::types::AggregateCore>
         };
@@ -331,7 +335,8 @@ mod tests {
                 "shared merge must execute once, not once per output"
             );
             assert_eq!(
-                state_at(3)
+                asap_summary_state::physical::from_physical(state_at(3).as_ref())
+                    .unwrap()
                     .query_statistic(asap_types::Statistic::Sum, &None, &Default::default(),)
                     .unwrap(),
                 value + 3.0

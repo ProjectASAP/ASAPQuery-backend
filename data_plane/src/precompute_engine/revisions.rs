@@ -431,10 +431,8 @@ fn validate_records(output: u64, records: &[RevisionRecord]) -> Result<(), Revis
 use crate::storage_engines::types::{
     AggregateCore, InstalledPrecomputePlanHandle, RuntimePhysicalPlan,
 };
-use asap_physical_operators::{
-    stored_state::native,
-    values::{Batch, Schema, Value},
-};
+use asap_physical_operators::values::{Batch, Schema, Value};
+use asap_summary_state::stored_state::native;
 use planner_types::post_asap::{SummaryFamilyType, SummaryField, SummarySchema};
 
 fn state_schema(family: SummaryFamilyType) -> Schema {
@@ -454,7 +452,10 @@ pub(crate) fn encode_state(
 ) -> Result<Vec<u8>, RevisionError> {
     Ok(native::encode_batch(&Batch::try_new(
         state_schema(family.clone()),
-        vec![vec![Value::Summary { family, state }]],
+        vec![vec![Value::Summary {
+            family,
+            state: asap_summary_state::physical::to_physical(state.as_ref())?,
+        }]],
     )?)?)
 }
 
@@ -466,7 +467,9 @@ pub(crate) fn decode_state(
     let batch = native::decode_batch(&record.payload, state_schema(family), record.payload.len())?;
     match batch.rows() {
         [row] => match row.as_slice() {
-            [Value::Summary { state, .. }] => Ok(Arc::clone(state)),
+            [Value::Summary { state, .. }] => Ok(Arc::from(
+                asap_summary_state::physical::from_physical(state.as_ref())?,
+            )),
             _ => Err("revision record must contain exactly one typed summary".into()),
         },
         _ => Err("revision record must contain exactly one row".into()),

@@ -2,7 +2,7 @@
 use crate::storage_engines::types::{
     KeyByLabelValues, MultipleSubpopulationAggregate, SingleSubpopulationAggregate,
 };
-use asap_physical_operators::summary_kernels::{KeyedSumCountAccumulator, SumAccumulator};
+use asap_summary_state::summary_kernels::{KeyedSumCountAccumulator, SumAccumulator};
 use asap_types::Statistic;
 
 #[test]

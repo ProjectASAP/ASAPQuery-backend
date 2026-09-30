@@ -11,7 +11,7 @@ use crate::storage_engines::types::AggregateCore;
 #[cfg(test)]
 use crate::tests::accumulator_fixture::create_fixture_accumulator;
 #[cfg(test)]
-use asap_physical_operators::factory::AccumulatorUpdater;
+use asap_summary_state::factory::AccumulatorUpdater;
 #[cfg(test)]
 use asap_types::aggregation_config::PrecomputeMaterialization;
 
@@ -86,7 +86,7 @@ mod tests {
     // Replay must preserve each series and rank by the selected update mode.
     #[test]
     fn backfilled_topk_preserves_series_and_weight_mode() {
-        use asap_physical_operators::summary_kernels::{
+        use asap_summary_state::summary_kernels::{
             CountMinSketchWithHeapAccumulator, CountSketchWithHeapAccumulator,
         };
         for kind in [

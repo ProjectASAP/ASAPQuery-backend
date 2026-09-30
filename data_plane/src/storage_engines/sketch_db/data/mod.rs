@@ -472,7 +472,7 @@ impl AccuracyBound {
 
 /// Per-sample sketch state. Stored as the payload column inside the
 /// per-sid `SidStoreData` columnar storage.
-pub use asap_physical_operators::stored_state::{SketchEncoding, SketchSampleState};
+pub use asap_summary_state::stored_state::{SketchEncoding, SketchSampleState};
 
 /// One materialized series row returned by the query path. Resolved
 /// from the per-sid intern table at read time.

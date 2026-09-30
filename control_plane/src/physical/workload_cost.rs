@@ -41,7 +41,7 @@ pub struct CostComponentDemand {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkloadCostManifest {
-    pub dataset_identity: planner_types::post_asap::LogicalDatasetIdentity,
+    pub dataset_identity: asap_types::semantic_fragment::LogicalDatasetIdentity,
     pub plan_id: u64,
     pub plan_version: u64,
     pub planner_revision: String,

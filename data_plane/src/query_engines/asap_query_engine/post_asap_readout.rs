@@ -1,4 +1,6 @@
 //! Execute installed query DAGs and project their values and coverage.
+#[cfg(test)]
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 
 use std::collections::BTreeMap;
 
@@ -1091,7 +1093,7 @@ mod tests {
         let groups = [1, 2]
             .into_iter()
             .map(|samples| {
-                let mut state = asap_physical_operators::summary_kernels::IncreaseAccumulator::new(
+                let mut state = asap_summary_state::summary_kernels::IncreaseAccumulator::new(
                     Measurement::new(10.0),
                     10_000,
                     Measurement::new(10.0),
@@ -1165,7 +1167,7 @@ mod tests {
             policy_fp: policy,
         });
         for (start, time, value) in [(20_000, 25_000, 10.), (40_000, 45_000, 20.)] {
-            let state = asap_physical_operators::summary_kernels::IncreaseAccumulator::new(
+            let state = asap_summary_state::summary_kernels::IncreaseAccumulator::new(
                 Measurement::new(value),
                 time,
                 Measurement::new(value),
@@ -1236,7 +1238,7 @@ mod tests {
                 sid,
                 BTreeMap::from([("instance".into(), instance.into())]),
                 (0, 1_000),
-                Box::new(asap_physical_operators::summary_kernels::SumAccumulator::with_sum(1.)),
+                Box::new(asap_summary_state::summary_kernels::SumAccumulator::with_sum(1.)),
             );
         }
         let binding = asap_types::query_plan::MaterializationBinding {
@@ -1808,7 +1810,7 @@ mod tests {
             1,
             BTreeMap::new(),
             (1_000, 2_000),
-            Box::new(asap_physical_operators::summary_kernels::SumAccumulator::with_sum(42.0)),
+            Box::new(asap_summary_state::summary_kernels::SumAccumulator::with_sum(42.0)),
         );
         let config =
             test_plan::materialization("bytes_total", "Sum", serde_json::json!({}), &[], 1000);
@@ -1906,9 +1908,7 @@ mod tests {
                             BTreeMap::new(),
                             bounds,
                             Box::new(
-                                asap_physical_operators::summary_kernels::SumAccumulator::with_sum(
-                                    sum,
-                                ),
+                                asap_summary_state::summary_kernels::SumAccumulator::with_sum(sum),
                             ),
                         );
                     }
@@ -1976,7 +1976,7 @@ mod tests {
                 BTreeMap::new(),
                 (pane * 60_000, (pane + 1) * 60_000),
                 Box::new(
-                    asap_physical_operators::summary_kernels::SumAccumulator::with_sum(
+                    asap_summary_state::summary_kernels::SumAccumulator::with_sum(
                         (pane + 1) as f64,
                     ),
                 ),
@@ -2051,7 +2051,7 @@ mod tests {
                 BTreeMap::new(),
                 (pane * 10_000, (pane + 1) * 10_000),
                 Box::new(
-                    asap_physical_operators::summary_kernels::SumAccumulator::with_sum(
+                    asap_summary_state::summary_kernels::SumAccumulator::with_sum(
                         (pane + 1) as f64,
                     ),
                 ),
@@ -2119,7 +2119,7 @@ mod tests {
                 7,
                 BTreeMap::new(),
                 (pane * 10_000, (pane + 1) * 10_000),
-                Box::new(asap_physical_operators::summary_kernels::SumAccumulator::with_sum(1.0)),
+                Box::new(asap_summary_state::summary_kernels::SumAccumulator::with_sum(1.0)),
             );
         }
         assert!(
@@ -2149,7 +2149,7 @@ mod tests {
             policy_fp: policy,
         });
         use crate::storage_engines::types::Measurement;
-        let mut accumulator = asap_physical_operators::summary_kernels::IncreaseAccumulator::new(
+        let mut accumulator = asap_summary_state::summary_kernels::IncreaseAccumulator::new(
             Measurement::new(10.0),
             10_000,
             Measurement::new(10.0),

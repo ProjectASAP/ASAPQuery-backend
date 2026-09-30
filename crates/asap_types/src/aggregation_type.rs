@@ -1,2 +1,2 @@
-//! Kernel identity is owned by the shared physical operator library.
-pub use asap_physical_operators::AggregationType;
+//! Kernel identity of backend-stored summary state.
+pub use asap_summary_state::AggregationType;
