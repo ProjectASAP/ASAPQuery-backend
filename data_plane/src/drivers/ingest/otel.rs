@@ -1512,7 +1512,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                     // starts fresh, so the reconstructed `state(N)` is
                     // window N only. Sketch-agnostic: the reset is the
                     // additive families' (DDSketch / CMS / CountSketch /
-                    // HLL) `AggregateCore::reset_to_empty`; KLL never
+                    // HLL) `codec::empty_like`; KLL never
                     // deltas. Full frames keep REPLACE semantics and set
                     // the stored `window_start`.
                     let accumulator: Box<dyn AggregateCore> = if dp.encoding == ENCODING_PROTO_DELTA

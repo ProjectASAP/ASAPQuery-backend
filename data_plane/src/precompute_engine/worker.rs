@@ -2026,7 +2026,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test: raw mode — each sample forwarded as SumAccumulator with sum==value
+    // Test: raw mode — each sample forwarded as an exact Sum with sum==value
     // -----------------------------------------------------------------------
 
     #[test]

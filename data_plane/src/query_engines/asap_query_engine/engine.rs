@@ -1575,8 +1575,8 @@ mod sketch_query_tests {
 //
 // Pins that the warm engine answers `count(metric)` from an HLL-backed
 // aggregation: capability matching picks HLL (per
-// `compatible_agg_types(Statistic::Count)`), and the HLL accumulator's
-// `query_statistic` returns the cardinality estimate. This is the
+// `compatible_agg_types(Statistic::Count)`), and the HLL state's readout
+// returns the cardinality estimate. This is the
 // runtime contract the wire-side _hll alias resolver above relies on.
 // ===========================================================================
 // ===========================================================================
@@ -1615,7 +1615,7 @@ mod asap_tier_classify_tests {
         let idx = Arc::new(SketchStore::new());
         // Mirror the acceptance-test setup: four ExactAgg(Sum) sids, one
         // per zone (z0..z3), registered with `group_by_keys=["zone"]`
-        // and carrying a `SumAccumulator` per window.
+        // and carrying an exact Sum state per window.
         let zones = ["z0", "z1", "z2", "z3"];
         // Anchor windows so the engine's instant-query default
         // lookback (5 min) reaches them.
@@ -1684,7 +1684,7 @@ mod asap_tier_classify_tests {
             other => panic!("expected Vector, got {other:?}"),
         };
         assert_eq!(vector.values.len(), 4, "one entry per zone");
-        // Per-zone values match what each SumAccumulator carries.
+        // Per-zone values match what each exact Sum state carries.
         // KeyByLabelValues stores values only; the override carries
         // the corresponding keys.
         let mut by_zone: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
