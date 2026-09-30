@@ -116,6 +116,32 @@ impl QueryPlanEntry {
         }
     }
 
+    /// A query-time raw input: a named range selector read from the raw-series
+    /// endpoint at the evaluation time.
+    fn is_query_time_raw(&self, input: &QueryNodeId) -> bool {
+        matches!(
+            self.nodes.get(input),
+            Some(QueryPlanNode::Logical {
+                operator: query_time::QueryTimeOperator::Scan {
+                    metric: Some(_),
+                    range_ms: Some(_),
+                    ..
+                },
+                ..
+            })
+        )
+    }
+
+    /// True when the physical inputs include both query-time raw inputs and
+    /// stored inputs.
+    pub fn mixes_raw_and_stored_inputs(&self) -> bool {
+        self.physical_vector_binding()
+            .is_some_and(|(inputs, _, _)| {
+                inputs.iter().any(|input| self.is_query_time_raw(input))
+                    && !inputs.iter().all(|input| self.is_query_time_raw(input))
+            })
+    }
+
     /// Whether the root physical result drops `__name__` from series identities.
     pub fn drops_metric_name(&self) -> bool {
         matches!(
@@ -142,24 +168,22 @@ impl QueryPlanEntry {
         {
             return Err(invalid("invalid physical vector source mapping or budget"));
         }
-        let raw = |input: &QueryNodeId| {
-            matches!(
-                self.nodes.get(input),
-                Some(QueryPlanNode::Logical {
-                    operator: query_time::QueryTimeOperator::Scan {
-                        metric: Some(_),
-                        range_ms: Some(_),
-                        ..
-                    },
-                    ..
-                })
-            )
-        };
-        // Raw samples are read from the external endpoint at query time; like
-        // exact cuts, they share no snapshot with installed summary state.
-        if inputs.iter().any(raw) && !inputs.iter().all(raw) {
+        let raw = |input: &QueryNodeId| self.is_query_time_raw(input);
+        // Only a stored native batch has a lag the executor can check against
+        // the evaluation time of the raw inputs. Its admitted families (Sum and
+        // heap sketches, checked below) read out independently of the
+        // evaluation time, so a lagged batch is read as of its own window.
+        if inputs.iter().any(raw)
+            && inputs.iter().any(|input| {
+                !raw(input)
+                    && !matches!(
+                        self.nodes.get(input),
+                        Some(QueryPlanNode::ReadMaterialization { .. })
+                    )
+            })
+        {
             return Err(invalid(
-                "query-time raw inputs cannot be mixed with installed state",
+                "query-time raw inputs mix only with stored native batches",
             ));
         }
         for input in inputs {

@@ -756,6 +756,25 @@ impl MaterializationBinding {
             }
         }
     }
+
+    /// Interval between the ends of successive complete stored windows.
+    pub fn slide_ms(&self) -> u64 {
+        self.full_window_slide_ms.unwrap_or(self.window_ms)
+    }
+
+    /// End of the newest window on this output's grid that ends at or before
+    /// `at_ms`; None when the grid is unknown or that window starts before 0.
+    pub fn latest_window_end_at_or_before(&self, at_ms: u64) -> Option<u64> {
+        let origin = i128::from(self.pane_origin_ms?);
+        let (window, slide) = (i128::from(self.window_ms), i128::from(self.slide_ms()));
+        if window == 0 || slide == 0 {
+            return None;
+        }
+        // Pane and full-window ends both lie on origin + window + n * slide.
+        let at = i128::from(at_ms);
+        let end = at - (at - origin - window).rem_euclid(slide);
+        u64::try_from(end).ok().filter(|end| *end >= self.window_ms)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1094,5 +1113,56 @@ mod retired_plan_tests {
                     .unwrap_err();
             assert!(error.to_string().contains("unknown variant"), "{error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod window_grid_tests {
+    use super::*;
+
+    fn binding(window_ms: u64, slide: Option<u64>, origin: Option<i64>) -> MaterializationBinding {
+        MaterializationBinding {
+            stored_output_reference: serde_json::from_value(serde_json::json!({
+                "stored_output_id": 1,
+                "definition_id": format!("sds-v1:{}", "a".repeat(64)),
+            }))
+            .unwrap(),
+            full_window_slide_ms: slide,
+            materialization: StoredOutputId(1),
+            output_grouping: PhysicalGrouping::Reduce(vec![]),
+            item_labels: vec![],
+            window_ms,
+            pane_origin_ms: origin,
+            readout_lookback_ms: Some(window_ms),
+        }
+    }
+
+    // The newest complete window end follows the pane or full-window grid at any
+    // origin, and every returned window is one the grid can store.
+    #[test]
+    fn latest_window_end_follows_the_stored_grid() {
+        let panes = binding(60_000, None, Some(0));
+        assert_eq!(panes.slide_ms(), 60_000);
+        assert_eq!(panes.latest_window_end_at_or_before(120_000), Some(120_000));
+        assert_eq!(panes.latest_window_end_at_or_before(179_999), Some(120_000));
+        assert_eq!(panes.latest_window_end_at_or_before(59_999), None);
+        let sliding = binding(300_000, Some(60_000), Some(5_000));
+        assert_eq!(sliding.slide_ms(), 60_000);
+        let end = sliding.latest_window_end_at_or_before(1_000_000).unwrap();
+        assert_eq!(end, 965_000);
+        assert!(sliding.covers_range(end - 300_000, end));
+        assert_eq!(
+            binding(60_000, None, None).latest_window_end_at_or_before(120_000),
+            None
+        );
+        let shifted = binding(60_000, None, Some(-30_000));
+        assert_eq!(
+            shifted.latest_window_end_at_or_before(100_000),
+            Some(90_000)
+        );
+        assert_eq!(
+            binding(60_000, None, Some(500_000)).latest_window_end_at_or_before(100_000),
+            Some(80_000)
+        );
     }
 }
