@@ -202,6 +202,20 @@ impl InstalledPostAsapDag {
         Ok(())
     }
 
+    /// Whether `sink`'s Planner program reads raw ingested samples rather
+    /// than stored states (a raw-ingest output, not a derived maintenance one).
+    pub fn reads_raw_samples(&self, sink: PostAsapNodeId) -> bool {
+        let raw = asap_physical_operators::physical_planner::precompute::raw_sample_schema();
+        self.native_program(sink)
+            .ok()
+            .flatten()
+            .is_some_and(|program| {
+                program
+                    .input_contracts()
+                    .all(|(_, contract)| contract.schema == raw)
+            })
+    }
+
     /// Recovery validates the physical producer's typed storage boundaries;
     /// it never lowers the semantic provenance document again.
     pub fn native_program(
@@ -235,14 +249,39 @@ impl InstalledPostAsapDag {
             }
         }
         let dag = self.document.decode()?;
+        let mut raw_inputs = 0;
         for (id, contract) in program.input_contracts() {
             let id = PostAsapNodeId(u32::try_from(id).map_err(|_| "physical source id overflow")?);
+            let node = dag.nodes.iter().find(|n| n.id == id);
+            // A raw sample boundary is fed by ingestion, not a stored state.
+            let raw = node.is_some_and(|n| {
+                asap_physical_operators::physical_planner::precompute::boundary_schema(n)
+                    .is_ok_and(|schema| {
+                        schema == contract.schema
+                            && schema
+                                == asap_physical_operators::physical_planner::precompute::raw_sample_schema()
+                    })
+            });
+            if raw {
+                if program.roots().contains(&u64::from(id.0))
+                    || !matches!(
+                        self.binding.node(id),
+                        Some(BackendNodeBinding::MaintenanceInput)
+                    )
+                {
+                    return Err(
+                        "native raw sample source differs from its ingestion binding".into(),
+                    );
+                }
+                raw_inputs += 1;
+                continue;
+            }
             if program.roots().contains(&u64::from(id.0))
                 || !matches!(
                     self.binding.node(id),
                     Some(BackendNodeBinding::Materialization { .. })
                 )
-                || dag.nodes.iter().find(|n| n.id == id).is_none_or(|n| {
+                || node.is_none_or(|n| {
                     n.output_schema != *contract.schema
                         && asap_physical_operators::physical_planner::precompute::source_schema(
                             &n.output_schema,
@@ -258,6 +297,9 @@ impl InstalledPostAsapDag {
         if program.input_contracts().count() == 0 {
             return Err("native precompute program has no bound inputs".into());
         }
+        // Raw summaries are stored as their family's population state; their
+        // semantic schema may also carry source columns that ingestion drops.
+        let raw_program = raw_inputs == program.input_contracts().count();
         for root in program.roots() {
             let output = program.output_contract(*root).map_err(|e| e.to_string())?;
             if dag
@@ -265,7 +307,11 @@ impl InstalledPostAsapDag {
                 .iter()
                 .find(|n| u64::from(n.id.0) == *root)
                 .is_none_or(|n| {
-                    n.output_schema != *output.schema
+                    let raw_summary = raw_program
+                        && matches!(&n.payload, planner_types::post_asap::PostAsapOperatorPayload::SummaryAgg { family, .. }
+                            if output.schema == asap_physical_operators::physical_planner::precompute::population_schema(family.clone()));
+                    !raw_summary
+                        && n.output_schema != *output.schema
                         && asap_physical_operators::physical_planner::precompute::source_schema(
                             &n.output_schema,
                         )

@@ -100,6 +100,7 @@ pub(super) fn compile_precompute_programs(
     use asap_types::executable_plan::BackendNodeBinding;
     let dag = installed.document.decode()?;
     let mut groups = std::collections::BTreeMap::<_, Vec<u64>>::new();
+    let mut raw = Vec::new();
     for sink in &installed.binding.precompute_sinks {
         if installed.native_programs.contains_key(sink) {
             continue;
@@ -114,6 +115,24 @@ pub(super) fn compile_precompute_programs(
             .find(|c| c.policy_fingerprint() == stored_output.fingerprint())
             .ok_or("precompute output configuration missing")?;
         let Some(derived) = &config.derived_input else {
+            // Raw ingest: Planner compiles the summary over its raw sample boundary.
+            let raw_inputs = dag
+                .edges
+                .iter()
+                .filter(|edge| edge.consumer == *sink)
+                .map(|edge| u64::from(edge.producer.0))
+                .collect::<Vec<_>>();
+            let program = asap_physical_operators::physical_planner::precompute::compile(
+                &dag,
+                &raw_inputs,
+                &[u64::from(sink.0)],
+            )
+            .map_err(|e| format!("raw precompute output {}: {e}", sink.0))?;
+            raw.push((
+                *sink,
+                serde_json::from_slice(&program.encode().map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?,
+            ));
             continue;
         };
         let frontiers = installed.binding.nodes.iter().filter_map(|(id, binding)| {
@@ -133,6 +152,7 @@ pub(super) fn compile_precompute_programs(
             .or_default()
             .push(u64::from(sink.0));
     }
+    installed.native_programs.extend(raw);
     for ((frontiers, _, _, _, _), roots) in groups {
         let program = asap_physical_operators::physical_planner::precompute::compile(
             &dag, &frontiers, &roots,

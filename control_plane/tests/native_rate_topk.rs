@@ -55,12 +55,11 @@ fn rate_heap_candidates_bind_durable_counter_windows() {
         let Ok(plan) = DeploymentPlanCompiler.compile_promql(candidate, environment.clone()) else {
             continue;
         };
-        if plan
-            .precompute_plan
-            .executable_dags
-            .values()
-            .any(|dag| !dag.native_programs.is_empty())
-        {
+        if plan.precompute_plan.executable_dags.values().any(|dag| {
+            dag.native_programs
+                .keys()
+                .any(|sink| !dag.reads_raw_samples(*sink))
+        }) {
             continue;
         }
         let entry = plan.query_plan.entries.values().next().unwrap();
@@ -151,11 +150,11 @@ fn rate_heap_costs_can_select_each_compiled_candidate() {
                     .map(ToString::to_string)
                     .unwrap_or_default();
                 let preferred_plan = entry.physical_vector_binding().is_some()
-                    && !plan
-                        .precompute_plan
-                        .executable_dags
-                        .values()
-                        .any(|dag| !dag.native_programs.is_empty())
+                    && !plan.precompute_plan.executable_dags.values().any(|dag| {
+                        dag.native_programs
+                            .keys()
+                            .any(|sink| !dag.reads_raw_samples(*sink))
+                    })
                     && if preferred == "exact" {
                         !program.contains("WithHeap")
                     } else {
@@ -218,6 +217,9 @@ fn fixed_window_rate_heap_candidates_install_both_physical_graphs() {
         };
         for installed in plan.precompute_plan.executable_dags.values() {
             for sink in installed.native_programs.keys() {
+                if installed.reads_raw_samples(*sink) {
+                    continue;
+                }
                 let program = installed.native_program(*sink).unwrap().unwrap();
                 let encoded = String::from_utf8(program.encode().unwrap()).unwrap();
                 for family in ["CmsWithHeap", "CountSketchWithHeap"] {
@@ -278,11 +280,11 @@ fn grouped_rate_placement_follows_summary_store_cost() {
                 continue;
             }
             entry.recover_vector_physical_dag().unwrap();
-            let stored = plan
-                .precompute_plan
-                .executable_dags
-                .values()
-                .any(|dag| !dag.native_programs.is_empty());
+            let stored = plan.precompute_plan.executable_dags.values().any(|dag| {
+                dag.native_programs
+                    .keys()
+                    .any(|sink| !dag.reads_raw_samples(*sink))
+            });
             let rebuilt = program.to_string().contains("SummaryBuild");
             assert!(!(stored && rebuilt));
             // Planner also offers a relational Sum over the readouts, which has
