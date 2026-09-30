@@ -1,14 +1,14 @@
 //! Bind raw ingestion to a selected Planner producer and its raw dependency edge.
 //! The backend supplies one typed sample batch per pane; the Planner-compiled
 //! precompute graph owns every update, grouping and item computation.
-use crate::storage_engines::types::{AggregateCore, KeyByLabelValues};
+use crate::storage_engines::types::AggregateCore;
 use asap_physical_operators::{
     operators::Operator,
     physical_planner::{precompute, CompiledPhysicalDag, Source as PhysicalSource},
     runtime::{Limits, RunContext, Scope},
     values::{Batch, Value},
 };
-use asap_summary_state::factory::{create_planner_accumulator, AccumulatorUpdater};
+use asap_summary_state::factory::create_planner_accumulator;
 use asap_types::physical_plan_codec::PhysicalPlanCodec;
 use asap_types::{executable_plan::BackendNodeBinding, PrecomputeMaterialization};
 use planner_types::post_asap::{
@@ -32,7 +32,7 @@ pub struct RawDagProgram {
     pub grouping: GroupingStrategy,
     pub reduction: planner_types::pre_asap::Reduction,
     /// Planner's encoded precompute graph from the raw sample boundary to this
-    /// output. Decoded graphs are not `Send`, so each execution decodes it.
+    /// output; decoded graphs are not `Send` (see `decoded`).
     program: std::sync::Arc<[u8]>,
     source: u64,
 }
@@ -201,9 +201,6 @@ impl RawDagProgram {
                     grouping: grouping.clone(),
                     reduction: reduction.clone(),
                 };
-                if program.heap() {
-                    program.validate_heap_update()?;
-                }
                 if let Some(old) = &selected {
                     if old.family != program.family
                         || old.input != program.input
@@ -223,16 +220,6 @@ impl RawDagProgram {
         selected.ok_or_else(|| "raw materialization has no selected post-ASAP DAG producer".into())
     }
 
-    /// Heap readout decodes only the backend heap kernel, not Planner's weighted
-    /// frequency state, so heaps stay on that kernel until it does.
-    fn heap(&self) -> bool {
-        matches!(&self.family, SummaryFamilyType::Sketch(kind, _) if matches!(
-            kind.algorithm(),
-            planner_types::post_asap::SketchAlgorithm::CmsWithHeap
-                | planner_types::post_asap::SketchAlgorithm::CountSketchWithHeap
-        ))
-    }
-
     /// Execute the Planner graph over one pane's samples as one typed batch.
     /// Returns `None` when the graph admits no population from them.
     pub fn build<'a>(
@@ -242,13 +229,6 @@ impl RawDagProgram {
         max_bytes: usize,
     ) -> Result<Option<Box<dyn AggregateCore>>, BuildError> {
         let samples = pane_batch(samples);
-        if self.heap() {
-            let mut updater = self.heap_updater()?;
-            for (series, time, value) in samples {
-                self.apply(&mut *updater, series, value, time)?;
-            }
-            return Ok(Some(updater.take_accumulator()));
-        }
         // The router assigns one population per group, so one pane yields
         // at most one state.
         match self.execute(samples, pane, max_bytes)?.as_slice() {
@@ -270,13 +250,6 @@ impl RawDagProgram {
         max_bytes: usize,
     ) -> Result<(), BuildError> {
         let samples = pane_batch(samples);
-        if self.heap() {
-            let updater = self.heap_updater()?;
-            for (_, _, value) in samples {
-                self.validate_sample(updater.as_ref(), value)?;
-            }
-            return Ok(());
-        }
         if samples.is_empty() {
             return Ok(());
         }
@@ -290,7 +263,10 @@ impl RawDagProgram {
 
     /// The family's empty state, for a pane known to have no samples.
     pub fn empty_state(&self) -> Result<Box<dyn AggregateCore>, String> {
-        Ok(self.heap_updater()?.take_accumulator())
+        Ok(
+            create_planner_accumulator(&self.family, &self.input, &self.grouping)?
+                .take_accumulator(),
+        )
     }
 
     fn execute<'a>(
@@ -337,94 +313,6 @@ impl RawDagProgram {
             }
             Ok::<_, asap_physical_operators::Error>(rows)
         })?)
-    }
-
-    /// Heaps still use the kernel interpreter, so install only updates it evaluates.
-    fn validate_heap_update(&self) -> Result<(), String> {
-        if !matches!(
-            &self.input.weight,
-            SummaryInputExpr::Column(ColumnRef::SampleValue) | SummaryInputExpr::Constant(_)
-        ) {
-            return Err("raw heap weight expression is unsupported".into());
-        }
-        fn item(expr: &SummaryInputExpr) -> bool {
-            match expr {
-                SummaryInputExpr::Column(ColumnRef::Named(_) | ColumnRef::SampleValue) => true,
-                SummaryInputExpr::Tuple(items) => items.iter().all(item),
-                SummaryInputExpr::EntityIdentity(
-                    planner_types::post_asap::EntityIdentity::PromqlLabelSet { excluding },
-                ) => excluding.is_empty(),
-                _ => false,
-            }
-        }
-        if !self.input.item.as_ref().is_some_and(item) {
-            return Err("raw heap item expression is unsupported".into());
-        }
-        self.heap_updater().map(|_| ())
-    }
-
-    fn heap_updater(&self) -> Result<Box<dyn AccumulatorUpdater>, String> {
-        create_planner_accumulator(&self.family, &self.input, &self.grouping)
-    }
-
-    fn validate_sample(&self, updater: &dyn AccumulatorUpdater, value: f64) -> Result<f64, String> {
-        let weight = match &self.input.weight {
-            SummaryInputExpr::Constant(c) => *c,
-            // The worker retains one previous value per series across pane rotation.
-            SummaryInputExpr::Column(_) => value,
-            _ => return Err("unsupported raw weight expression".into()),
-        };
-        let scalar_frequency = asap_types::accumulator_spec::is_unit_sample_frequency(&self.input)
-            && !updater.is_keyed();
-        let weight = if scalar_frequency { value } else { weight };
-        updater.validate_single_input(weight)?;
-        Ok(weight)
-    }
-
-    fn apply(
-        &self,
-        updater: &mut dyn AccumulatorUpdater,
-        series: &str,
-        value: f64,
-        timestamp: i64,
-    ) -> Result<(), String> {
-        let weight = self.validate_sample(updater, value)?;
-        if updater.is_keyed() {
-            let labels = super::worker::parse_labels_from_series_key(series);
-            fn eval(
-                expr: &SummaryInputExpr,
-                series: &str,
-                value: f64,
-                labels: &HashMap<&str, &str>,
-            ) -> Result<Vec<String>, String> {
-                Ok(match expr {
-                    SummaryInputExpr::EntityIdentity(_) => vec![series.to_owned()],
-                    SummaryInputExpr::Column(ColumnRef::SampleValue) => vec![value.to_string()],
-                    SummaryInputExpr::Column(ColumnRef::Named(name)) => vec![labels
-                        .get(name.as_str())
-                        .map(|s| super::worker::decode_label_value(s).into_owned())
-                        .ok_or_else(|| format!("missing DAG item column {name}"))?],
-                    SummaryInputExpr::Tuple(items) => items
-                        .iter()
-                        .map(|i| eval(i, series, value, labels))
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_iter()
-                        .flatten()
-                        .collect(),
-                    _ => return Err("unsupported raw item expression".into()),
-                })
-            }
-            let item = self
-                .input
-                .item
-                .as_ref()
-                .ok_or("keyed DAG kernel requires an explicit item")?;
-            let key = KeyByLabelValues::new_with_labels(eval(item, series, value, &labels)?);
-            updater.update_keyed(&key, weight, timestamp);
-        } else {
-            updater.update_single(weight, timestamp);
-        }
-        Ok(())
     }
 }
 
