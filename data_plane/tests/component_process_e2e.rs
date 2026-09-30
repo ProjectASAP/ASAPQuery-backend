@@ -127,8 +127,10 @@ async fn production_binary_ingests_ddsketch_and_answers_promql() {
     let install =
         physical_fixture::artifact_from_materializations(vec![physical_fixture::materialization(
             "component_process_e2e_latency_ms",
-            asap_types::AggregationType::DDSketch,
-            [("relative_accuracy".into(), serde_json::json!(0.01))].into(),
+            physical_fixture::sketch_family(
+                asap_types::AggregationType::DDSketch,
+                &serde_json::json!({"relative_accuracy": 0.01}),
+            ),
         )]);
     let mut physical = tempfile::NamedTempFile::new().unwrap();
     serde_json::to_writer(&mut physical, &install).unwrap();

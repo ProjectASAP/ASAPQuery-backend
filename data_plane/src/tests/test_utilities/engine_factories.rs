@@ -1,538 +1,158 @@
 //! Engine factory helpers for integration tests
 //!
 //! Provides reusable construction helpers for ASAPQueryEngine + SketchStore
-//! populated with various accumulator types. Unlike TestConfigBuilder which
-//! hardcodes "SumAccumulator", these helpers build PrecomputeMaterialization with
-//! the correct aggregation_type string.
+//! populated with stored states of a given kernel family.
 
 use crate::drivers::ingest::series_resolver::SeriesIdResolver;
 use crate::query_engines::asap_query_engine::engine::ASAPQueryEngine;
-use crate::query_engines::query_result::InstantVectorElement;
+use crate::storage_engines::sketch_db::index::SketchStore;
 use crate::storage_engines::types::{
-    AggregationType, InstalledPrecomputePlan, KeyByLabelValues, PrecomputeMaterialization,
-    PrecomputedOutput, QueryLanguage, WindowKind,
+    AggregationType, KeyByLabelValues, PrecomputeMaterialization, PrecomputedOutput, WindowKind,
 };
 use crate::AggregateCore;
-use asap_types::KeyByLabelNames;
-use std::collections::HashMap;
-
-/// Helper for test factories — wraps the closure-mint call with a
-/// fresh resolver and forwards to `SketchStore::ingest_precompute_for_agg_config`.
-/// Each factory gets its own resolver instance; tests are isolated so
-/// the `next_sid = 1, 2, ...` counter doesn't bleed between fixtures.
-fn ingest_with_fresh_resolver(
-    summary_store: &crate::storage_engines::sketch_db::index::SketchStore,
-    resolver: &std::sync::Arc<SeriesIdResolver>,
-    agg_cfg: &PrecomputeMaterialization,
-    output: &PrecomputedOutput,
-    accumulator: &dyn AggregateCore,
-) -> Option<u64> {
-    let resolver = resolver.clone();
-    summary_store.ingest_precompute_for_agg_config(
-        |m, fp, ak| resolver.resolve(m, fp, ak),
-        agg_cfg,
-        output,
-        accumulator,
-    )
-}
 use std::sync::Arc;
 
 /// Data to insert into a store: (label_values, accumulator)
 pub type AccumulatorData = Vec<(Option<Vec<String>>, Box<dyn AggregateCore>)>;
 
+/// One stored output of `kind` state over `metric`, with its storage kind.
+fn stored_output(
+    metric: &str,
+    kind: AggregationType,
+    grouping_labels: Vec<&str>,
+    window_size: u64,
+    window_type: WindowKind,
+) -> (
+    PrecomputeMaterialization,
+    crate::storage_engines::sketch_db::index::AggKind,
+) {
+    let family = super::outputs::family(kind, &serde_json::json!({}));
+    let mut config = PrecomputeMaterialization::new(
+        metric,
+        asap_types::KeyByLabelNames::new(grouping_labels.into_iter().map(str::to_owned).collect()),
+        window_size,
+        1,
+        window_type,
+    );
+    config.window_layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 };
+    config.allocate_stored_output_id(&family);
+    let agg_kind = crate::storage_engines::sketch_db::data::agg_kind_for_family(&family, "");
+    (config, agg_kind)
+}
+
+/// Ingest `(end_timestamp, labels, state)` rows of one output, each covering
+/// `[end - span, end]`, through a fresh resolver.
+fn ingest(
+    store: &SketchStore,
+    output: &(
+        PrecomputeMaterialization,
+        crate::storage_engines::sketch_db::index::AggKind,
+    ),
+    span: u64,
+    rows: impl IntoIterator<Item = (u64, Option<Vec<String>>, Box<dyn AggregateCore>)>,
+) {
+    let resolver = Arc::new(SeriesIdResolver::new());
+    let (config, kind) = output;
+    for (timestamp, labels, state) in rows {
+        let key = labels.map(|labels| KeyByLabelValues { labels });
+        let output = PrecomputedOutput::new(
+            timestamp - span,
+            timestamp,
+            key,
+            config.policy_fingerprint(),
+        );
+        store.ingest_precompute_for_agg_config(
+            |m, fp, ak| resolver.resolve(m, fp, ak),
+            config,
+            kind,
+            &output,
+            state.as_ref(),
+        );
+    }
+}
+
+fn at_one_second(data: AccumulatorData) -> Vec<(u64, Option<Vec<String>>, Box<dyn AggregateCore>)> {
+    data.into_iter()
+        .map(|(labels, state)| (1_000_000, labels, state))
+        .collect()
+}
+
 /// Creates a ASAPQueryEngine with a single aggregation populated with given data.
-///
-/// # Arguments
-/// * `metric` - Metric name
-/// * `aggregation_type` - Accumulator type string (e.g. "SumAccumulator", "DatasketchesKLLAccumulator")
-/// * `grouping_labels` - Label names for GROUP BY
-/// * `data` - Vec of (label_values, accumulator) pairs to insert
-/// * `promql_query` - The PromQL query string
 pub fn create_engine_single_pop(
     metric: &str,
     aggregation_type: AggregationType,
     grouping_labels: Vec<&str>,
     data: AccumulatorData,
-    promql_query: &str,
+    _promql_query: &str,
 ) -> ASAPQueryEngine {
-    create_engine_single_pop_with_aggregated(
+    let store = Arc::new(SketchStore::new());
+    let output = stored_output(
         metric,
         aggregation_type,
         grouping_labels,
-        vec![],
-        data,
-        promql_query,
-    )
-}
-
-/// Creates a ASAPQueryEngine with aggregated labels (sub-key labels within the accumulator).
-///
-/// Use for self-keyed multi-population accumulators (Multiple* types) where
-/// `aggregated_labels` are the labels that key the accumulator internally
-/// (e.g. "endpoint" within a MultipleIncrease accumulator).
-pub fn create_engine_single_pop_with_aggregated(
-    metric: &str,
-    aggregation_type: AggregationType,
-    grouping_labels: Vec<&str>,
-    aggregated_labels: Vec<&str>,
-    data: AccumulatorData,
-    promql_query: &str,
-) -> ASAPQueryEngine {
-    let grouping_label_strings: Vec<String> =
-        grouping_labels.iter().map(|s| s.to_string()).collect();
-    let aggregated_label_strings: Vec<String> =
-        aggregated_labels.iter().map(|s| s.to_string()).collect();
-    let all_schema_labels: Vec<String> = grouping_label_strings
-        .iter()
-        .chain(aggregated_label_strings.iter())
-        .cloned()
-        .collect();
-
-    let mut materializations_by_output = HashMap::new();
-    let agg_config = PrecomputeMaterialization {
-        stored_output_id: None,
-        semantic_fragment: None,
-        population_key_encoding: Default::default(),
-        aggregation_type,
-        aggregation_sub_type: String::new(),
-        parameters: HashMap::new(),
-        grouping_labels: KeyByLabelNames::new(grouping_label_strings.clone()).into(),
-        aggregated_labels: KeyByLabelNames::new(aggregated_label_strings),
-        rollup_labels: KeyByLabelNames::empty(),
-        original_yaml: String::new(),
-        window_size: 1,
-        slide_interval: 1,
-        window_type: WindowKind::Tumbling,
-        window_layout: asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 },
-        pane_origin_ms: None,
-        spatial_filter: String::new(),
-        spatial_filter_normalized: String::new(),
-        metric: metric.to_string(),
-        num_aggregates_to_retain: None,
-        table_name: None,
-        value_projection: None,
-        table_population: None,
-        derived_input: None,
-        table_timestamp_column: None,
-        partitioning: None,
-        value_source_column: None,
-    };
-    let agg_id = agg_config.policy_fp_u64();
-    materializations_by_output.insert(agg_id, agg_config);
-
-    let installed_precompute_plan = Arc::new(InstalledPrecomputePlan {
-        partitioning: Default::default(),
-        raw_programs: Default::default(),
-        precompute_plan: None,
-        materializations_by_output: materializations_by_output
-            .into_iter()
-            .map(|(id, cfg)| (asap_types::sds::StoredOutputId(id), cfg))
-            .collect(),
-        storage_backend: Default::default(),
-    });
-
-    let summary_store =
-        std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
-    let resolver = std::sync::Arc::new(SeriesIdResolver::new());
-
-    // Insert data into SketchStore via the canonical helper (M2.3.6e).
-    let agg_cfg = installed_precompute_plan
-        .get_aggregation_config(asap_types::sds::StoredOutputId(agg_id))
-        .cloned()
-        .expect("agg config must be in installed_precompute_plan");
-    let timestamp = 1_000_000_u64;
-    for (label_values_opt, acc) in data {
-        let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
-        let output = PrecomputedOutput::new(
-            timestamp,
-            timestamp,
-            key,
-            asap_types::PolicyFingerprint(agg_id),
-        );
-        ingest_with_fresh_resolver(&summary_store, &resolver, &agg_cfg, &output, acc.as_ref());
-    }
-
-    ASAPQueryEngine::new(1).with_sketch_index(summary_store)
-}
-
-/// Build a test engine with separate value and key aggregations. Each input
-/// carries its own accumulator type, labels, and samples.
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub fn create_engine_dual_input(
-    metric: &str,
-    value_agg_type: AggregationType,
-    key_agg_type: AggregationType,
-    grouping_labels: Vec<&str>,
-    aggregated_labels: Vec<&str>,
-    value_data: AccumulatorData,
-    keys_data: AccumulatorData,
-    promql_query: &str,
-) -> ASAPQueryEngine {
-    let grouping_label_strings: Vec<String> =
-        grouping_labels.iter().map(|s| s.to_string()).collect();
-    let aggregated_label_strings: Vec<String> =
-        aggregated_labels.iter().map(|s| s.to_string()).collect();
-    let all_labels: Vec<String> = grouping_label_strings
-        .iter()
-        .chain(aggregated_label_strings.iter())
-        .cloned()
-        .collect();
-
-    let mut materializations_by_output = HashMap::new();
-
-    // Value aggregation
-    let value_agg_config = PrecomputeMaterialization {
-        stored_output_id: None,
-        semantic_fragment: None,
-        population_key_encoding: Default::default(),
-        aggregation_type: value_agg_type,
-        aggregation_sub_type: String::new(),
-        parameters: HashMap::new(),
-        grouping_labels: KeyByLabelNames::new(grouping_label_strings.clone()).into(),
-        aggregated_labels: KeyByLabelNames::empty(),
-        rollup_labels: KeyByLabelNames::empty(),
-        original_yaml: String::new(),
-        window_size: 1,
-        slide_interval: 1,
-        window_type: WindowKind::Tumbling,
-        window_layout: asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 },
-        pane_origin_ms: None,
-        spatial_filter: String::new(),
-        spatial_filter_normalized: String::new(),
-        metric: metric.to_string(),
-        num_aggregates_to_retain: None,
-        table_name: None,
-        value_projection: None,
-        table_population: None,
-        derived_input: None,
-        table_timestamp_column: None,
-        partitioning: None,
-        value_source_column: None,
-    };
-    let value_id = value_agg_config.policy_fp_u64();
-    materializations_by_output.insert(value_id, value_agg_config);
-
-    // Keys aggregation
-    let keys_agg_config = PrecomputeMaterialization {
-        stored_output_id: None,
-        semantic_fragment: None,
-        population_key_encoding: Default::default(),
-        aggregation_type: key_agg_type,
-        aggregation_sub_type: String::new(),
-        parameters: HashMap::new(),
-        grouping_labels: KeyByLabelNames::new(grouping_label_strings.clone()).into(),
-        aggregated_labels: KeyByLabelNames::new(aggregated_label_strings),
-        rollup_labels: KeyByLabelNames::empty(),
-        original_yaml: String::new(),
-        window_size: 1,
-        slide_interval: 1,
-        window_type: WindowKind::Tumbling,
-        window_layout: asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 },
-        pane_origin_ms: None,
-        spatial_filter: String::new(),
-        spatial_filter_normalized: String::new(),
-        metric: metric.to_string(),
-        num_aggregates_to_retain: None,
-        table_name: None,
-        value_projection: None,
-        table_population: None,
-        derived_input: None,
-        table_timestamp_column: None,
-        partitioning: None,
-        value_source_column: None,
-    };
-    let keys_id = keys_agg_config.policy_fp_u64();
-    materializations_by_output.insert(keys_id, keys_agg_config);
-
-    let installed_precompute_plan = Arc::new(InstalledPrecomputePlan {
-        partitioning: Default::default(),
-        raw_programs: Default::default(),
-        precompute_plan: None,
-        materializations_by_output: materializations_by_output
-            .into_iter()
-            .map(|(id, cfg)| (asap_types::sds::StoredOutputId(id), cfg))
-            .collect(),
-        storage_backend: Default::default(),
-    });
-
-    let summary_store =
-        std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
-    let resolver = std::sync::Arc::new(SeriesIdResolver::new());
-
-    let agg_cfg_1 = installed_precompute_plan
-        .get_aggregation_config(asap_types::sds::StoredOutputId(value_id))
-        .cloned()
-        .expect("value agg config");
-    let agg_cfg_2 = installed_precompute_plan
-        .get_aggregation_config(asap_types::sds::StoredOutputId(keys_id))
-        .cloned()
-        .expect("keys agg config");
-    let timestamp = 1_000_000_u64;
-    for (label_values_opt, acc) in value_data {
-        let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
-        let output = PrecomputedOutput::new(
-            timestamp,
-            timestamp,
-            key,
-            asap_types::PolicyFingerprint(value_id),
-        );
-        ingest_with_fresh_resolver(&summary_store, &resolver, &agg_cfg_1, &output, acc.as_ref());
-    }
-    for (label_values_opt, acc) in keys_data {
-        let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
-        let output = PrecomputedOutput::new(
-            timestamp,
-            timestamp,
-            key,
-            asap_types::PolicyFingerprint(keys_id),
-        );
-        ingest_with_fresh_resolver(&summary_store, &resolver, &agg_cfg_2, &output, acc.as_ref());
-    }
-
-    ASAPQueryEngine::new(1).with_sketch_index(summary_store)
+        1,
+        WindowKind::Tumbling,
+    );
+    ingest(&store, &output, 0, at_one_second(data));
+    ASAPQueryEngine::new(1).with_sketch_index(store)
 }
 
 /// Creates a ASAPQueryEngine with two independent metrics, each with their own
-/// aggregation config and query_config.
-///
-/// agg_id=1 → metric_a, agg_id=2 → metric_b.
-/// Both are registered as separate query_configs in the inference config.
+/// stored output.
 #[allow(clippy::too_many_arguments)]
 pub fn create_engine_two_metrics(
     metric_a: &str,
     aggregation_type_a: AggregationType,
     grouping_labels_a: Vec<&str>,
     data_a: AccumulatorData,
-    query_a: &str,
+    _query_a: &str,
     metric_b: &str,
     aggregation_type_b: AggregationType,
     grouping_labels_b: Vec<&str>,
     data_b: AccumulatorData,
-    query_b: &str,
+    _query_b: &str,
 ) -> ASAPQueryEngine {
-    let labels_a: Vec<String> = grouping_labels_a.iter().map(|s| s.to_string()).collect();
-    let labels_b: Vec<String> = grouping_labels_b.iter().map(|s| s.to_string()).collect();
-
-    let mut materializations_by_output = HashMap::new();
-
-    let agg_config_a = PrecomputeMaterialization {
-        stored_output_id: None,
-        semantic_fragment: None,
-        population_key_encoding: Default::default(),
-        aggregation_type: aggregation_type_a,
-        aggregation_sub_type: String::new(),
-        parameters: HashMap::new(),
-        grouping_labels: KeyByLabelNames::new(labels_a.clone()).into(),
-        aggregated_labels: KeyByLabelNames::empty(),
-        rollup_labels: KeyByLabelNames::empty(),
-        original_yaml: String::new(),
-        window_size: 1,
-        slide_interval: 1,
-        window_type: WindowKind::Tumbling,
-        window_layout: asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 },
-        pane_origin_ms: None,
-        spatial_filter: String::new(),
-        spatial_filter_normalized: String::new(),
-        metric: metric_a.to_string(),
-        num_aggregates_to_retain: None,
-        table_name: None,
-        value_projection: None,
-        table_population: None,
-        derived_input: None,
-        table_timestamp_column: None,
-        partitioning: None,
-        value_source_column: None,
-    };
-    let id_a = agg_config_a.policy_fp_u64();
-    materializations_by_output.insert(id_a, agg_config_a);
-
-    let agg_config_b = PrecomputeMaterialization {
-        stored_output_id: None,
-        semantic_fragment: None,
-        population_key_encoding: Default::default(),
-        aggregation_type: aggregation_type_b,
-        aggregation_sub_type: String::new(),
-        parameters: HashMap::new(),
-        grouping_labels: KeyByLabelNames::new(labels_b.clone()).into(),
-        aggregated_labels: KeyByLabelNames::empty(),
-        rollup_labels: KeyByLabelNames::empty(),
-        original_yaml: String::new(),
-        window_size: 1,
-        slide_interval: 1,
-        window_type: WindowKind::Tumbling,
-        window_layout: asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 },
-        pane_origin_ms: None,
-        spatial_filter: String::new(),
-        spatial_filter_normalized: String::new(),
-        metric: metric_b.to_string(),
-        num_aggregates_to_retain: None,
-        table_name: None,
-        value_projection: None,
-        table_population: None,
-        derived_input: None,
-        table_timestamp_column: None,
-        partitioning: None,
-        value_source_column: None,
-    };
-    let id_b = agg_config_b.policy_fp_u64();
-    materializations_by_output.insert(id_b, agg_config_b);
-
-    let installed_precompute_plan = Arc::new(InstalledPrecomputePlan {
-        partitioning: Default::default(),
-        raw_programs: Default::default(),
-        precompute_plan: None,
-        materializations_by_output: materializations_by_output
-            .into_iter()
-            .map(|(id, cfg)| (asap_types::sds::StoredOutputId(id), cfg))
-            .collect(),
-        storage_backend: Default::default(),
-    });
-
-    let summary_store =
-        std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
-    let resolver = std::sync::Arc::new(SeriesIdResolver::new());
-    let agg_cfg_1 = installed_precompute_plan
-        .get_aggregation_config(asap_types::sds::StoredOutputId(id_a))
-        .cloned()
-        .expect("agg a");
-    let agg_cfg_2 = installed_precompute_plan
-        .get_aggregation_config(asap_types::sds::StoredOutputId(id_b))
-        .cloned()
-        .expect("agg b");
-    let timestamp = 1_000_000_u64;
-    for (label_values_opt, acc) in data_a {
-        let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
-        let output = PrecomputedOutput::new(
-            timestamp,
-            timestamp,
-            key,
-            asap_types::PolicyFingerprint(id_a),
-        );
-        ingest_with_fresh_resolver(&summary_store, &resolver, &agg_cfg_1, &output, acc.as_ref());
+    let store = Arc::new(SketchStore::new());
+    for (metric, kind, labels, data) in [
+        (metric_a, aggregation_type_a, grouping_labels_a, data_a),
+        (metric_b, aggregation_type_b, grouping_labels_b, data_b),
+    ] {
+        let output = stored_output(metric, kind, labels, 1, WindowKind::Tumbling);
+        ingest(&store, &output, 0, at_one_second(data));
     }
-    for (label_values_opt, acc) in data_b {
-        let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
-        let output = PrecomputedOutput::new(
-            timestamp,
-            timestamp,
-            key,
-            asap_types::PolicyFingerprint(id_b),
-        );
-        ingest_with_fresh_resolver(&summary_store, &resolver, &agg_cfg_2, &output, acc.as_ref());
-    }
-    let _ = (query_a, query_b);
-    ASAPQueryEngine::new(1).with_sketch_index(summary_store)
+    ASAPQueryEngine::new(1).with_sketch_index(store)
 }
 
 /// Creates a ASAPQueryEngine with three independent metrics, each with their own
-/// aggregation config and query_config.
-///
-/// agg_id=1 → metric_a, agg_id=2 → metric_b, agg_id=3 → metric_c.
+/// stored output.
 #[allow(clippy::too_many_arguments)]
 pub fn create_engine_three_metrics(
     metric_a: &str,
     aggregation_type_a: AggregationType,
     grouping_labels_a: Vec<&str>,
     data_a: AccumulatorData,
-    query_a: &str,
+    _query_a: &str,
     metric_b: &str,
     aggregation_type_b: AggregationType,
     grouping_labels_b: Vec<&str>,
     data_b: AccumulatorData,
-    query_b: &str,
+    _query_b: &str,
     metric_c: &str,
     aggregation_type_c: AggregationType,
     grouping_labels_c: Vec<&str>,
     data_c: AccumulatorData,
-    query_c: &str,
+    _query_c: &str,
 ) -> ASAPQueryEngine {
-    let labels_a: Vec<String> = grouping_labels_a.iter().map(|s| s.to_string()).collect();
-    let labels_b: Vec<String> = grouping_labels_b.iter().map(|s| s.to_string()).collect();
-    let labels_c: Vec<String> = grouping_labels_c.iter().map(|s| s.to_string()).collect();
-
-    let mut materializations_by_output = HashMap::new();
-    let mut ids: Vec<u64> = Vec::new();
-
-    for (agg_type, labels, metric) in [
-        (aggregation_type_a, &labels_a, metric_a),
-        (aggregation_type_b, &labels_b, metric_b),
-        (aggregation_type_c, &labels_c, metric_c),
+    let store = Arc::new(SketchStore::new());
+    for (metric, kind, labels, data) in [
+        (metric_a, aggregation_type_a, grouping_labels_a, data_a),
+        (metric_b, aggregation_type_b, grouping_labels_b, data_b),
+        (metric_c, aggregation_type_c, grouping_labels_c, data_c),
     ] {
-        let cfg = PrecomputeMaterialization {
-            stored_output_id: None,
-            semantic_fragment: None,
-            population_key_encoding: Default::default(),
-            aggregation_type: agg_type,
-            aggregation_sub_type: String::new(),
-            parameters: HashMap::new(),
-            grouping_labels: KeyByLabelNames::new(labels.clone()).into(),
-            aggregated_labels: KeyByLabelNames::empty(),
-            rollup_labels: KeyByLabelNames::empty(),
-            original_yaml: String::new(),
-            window_size: 1,
-            slide_interval: 1,
-            window_type: WindowKind::Tumbling,
-            window_layout: asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 },
-            pane_origin_ms: None,
-            spatial_filter: String::new(),
-            spatial_filter_normalized: String::new(),
-            metric: metric.to_string(),
-            num_aggregates_to_retain: None,
-            table_name: None,
-            value_projection: None,
-            table_population: None,
-            derived_input: None,
-            table_timestamp_column: None,
-            partitioning: None,
-            value_source_column: None,
-        };
-        let id = cfg.policy_fp_u64();
-        ids.push(id);
-        materializations_by_output.insert(id, cfg);
+        let output = stored_output(metric, kind, labels, 1, WindowKind::Tumbling);
+        ingest(&store, &output, 0, at_one_second(data));
     }
-
-    let installed_precompute_plan = Arc::new(InstalledPrecomputePlan {
-        partitioning: Default::default(),
-        raw_programs: Default::default(),
-        precompute_plan: None,
-        materializations_by_output: materializations_by_output
-            .into_iter()
-            .map(|(id, cfg)| (asap_types::sds::StoredOutputId(id), cfg))
-            .collect(),
-        storage_backend: Default::default(),
-    });
-
-    let summary_store =
-        std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
-    let resolver = std::sync::Arc::new(SeriesIdResolver::new());
-    let agg_cfgs: Vec<_> = ids
-        .iter()
-        .map(|id| {
-            installed_precompute_plan
-                .get_aggregation_config(asap_types::sds::StoredOutputId(*id))
-                .cloned()
-                .expect("agg present")
-        })
-        .collect();
-    let timestamp = 1_000_000_u64;
-    for (idx, data) in [(0, data_a), (1, data_b), (2, data_c)] {
-        let agg_cfg = &agg_cfgs[idx];
-        let agg_id = ids[idx];
-        for (label_values_opt, acc) in data {
-            let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
-            let output = PrecomputedOutput::new(
-                timestamp,
-                timestamp,
-                key,
-                asap_types::PolicyFingerprint(agg_id),
-            );
-            ingest_with_fresh_resolver(&summary_store, &resolver, agg_cfg, &output, acc.as_ref());
-        }
-    }
-
-    let _ = (labels_a, labels_b, labels_c, query_a, query_b, query_c);
-    ASAPQueryEngine::new(1).with_sketch_index(summary_store)
+    ASAPQueryEngine::new(1).with_sketch_index(store)
 }
 
 /// Creates a single-pop engine with data at multiple timestamps for testing merge.
@@ -544,76 +164,21 @@ pub fn create_engine_multi_timestamp(
     data: Vec<(u64, Option<Vec<String>>, Box<dyn AggregateCore>)>,
     promql_query: &str,
 ) -> ASAPQueryEngine {
-    let grouping_label_strings: Vec<String> =
-        grouping_labels.iter().map(|s| s.to_string()).collect();
-
-    let mut materializations_by_output = HashMap::new();
-    let agg_config = PrecomputeMaterialization {
-        stored_output_id: None,
-        semantic_fragment: None,
-        population_key_encoding: Default::default(),
+    create_engine_multi_timestamp_with_window(
+        metric,
         aggregation_type,
-        aggregation_sub_type: String::new(),
-        parameters: HashMap::new(),
-        grouping_labels: KeyByLabelNames::new(grouping_label_strings.clone()).into(),
-        aggregated_labels: KeyByLabelNames::empty(),
-        rollup_labels: KeyByLabelNames::empty(),
-        original_yaml: String::new(),
-        window_size: 1,
-        slide_interval: 1,
-        window_type: WindowKind::Tumbling,
-        window_layout: asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 },
-        pane_origin_ms: None,
-        spatial_filter: String::new(),
-        spatial_filter_normalized: String::new(),
-        metric: metric.to_string(),
-        num_aggregates_to_retain: None,
-        table_name: None,
-        value_projection: None,
-        table_population: None,
-        derived_input: None,
-        table_timestamp_column: None,
-        partitioning: None,
-        value_source_column: None,
-    };
-    let agg_id = agg_config.policy_fp_u64();
-    materializations_by_output.insert(agg_id, agg_config);
-
-    let installed_precompute_plan = Arc::new(InstalledPrecomputePlan {
-        partitioning: Default::default(),
-        raw_programs: Default::default(),
-        precompute_plan: None,
-        materializations_by_output: materializations_by_output
-            .into_iter()
-            .map(|(id, cfg)| (asap_types::sds::StoredOutputId(id), cfg))
-            .collect(),
-        storage_backend: Default::default(),
-    });
-
-    let summary_store =
-        std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
-    let resolver = std::sync::Arc::new(SeriesIdResolver::new());
-    let agg_cfg = installed_precompute_plan
-        .get_aggregation_config(asap_types::sds::StoredOutputId(agg_id))
-        .cloned()
-        .expect("agg");
-    for (timestamp, label_values_opt, acc) in data {
-        let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
-        let output = PrecomputedOutput::new(
-            timestamp - 1000,
-            timestamp,
-            key,
-            asap_types::PolicyFingerprint(agg_id),
-        );
-        ingest_with_fresh_resolver(&summary_store, &resolver, &agg_cfg, &output, acc.as_ref());
-    }
-    ASAPQueryEngine::new(1).with_sketch_index(summary_store)
+        grouping_labels,
+        data,
+        promql_query,
+        1,
+        WindowKind::Tumbling,
+    )
 }
 
 /// Creates a single-pop engine with data at multiple timestamps and configurable window.
 ///
 /// Like `create_engine_multi_timestamp` but allows setting `window_size` and `window_type`
-/// on the PrecomputeMaterialization (needed for temporal queries like `sum_over_time(metric[5s])`).
+/// on the stored output (needed for temporal queries like `sum_over_time(metric[5s])`).
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 pub fn create_engine_multi_timestamp_with_window(
@@ -621,72 +186,18 @@ pub fn create_engine_multi_timestamp_with_window(
     aggregation_type: AggregationType,
     grouping_labels: Vec<&str>,
     data: Vec<(u64, Option<Vec<String>>, Box<dyn AggregateCore>)>,
-    promql_query: &str,
+    _promql_query: &str,
     window_size: u64,
     window_type: WindowKind,
 ) -> ASAPQueryEngine {
-    let grouping_label_strings: Vec<String> =
-        grouping_labels.iter().map(|s| s.to_string()).collect();
-
-    let mut materializations_by_output = HashMap::new();
-    let agg_config = PrecomputeMaterialization {
-        stored_output_id: None,
-        semantic_fragment: None,
-        population_key_encoding: Default::default(),
+    let store = Arc::new(SketchStore::new());
+    let output = stored_output(
+        metric,
         aggregation_type,
-        aggregation_sub_type: String::new(),
-        parameters: HashMap::new(),
-        grouping_labels: KeyByLabelNames::new(grouping_label_strings.clone()).into(),
-        aggregated_labels: KeyByLabelNames::empty(),
-        rollup_labels: KeyByLabelNames::empty(),
-        original_yaml: String::new(),
+        grouping_labels,
         window_size,
-        slide_interval: 1,
         window_type,
-        window_layout: asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 },
-        pane_origin_ms: None,
-        spatial_filter: String::new(),
-        spatial_filter_normalized: String::new(),
-        metric: metric.to_string(),
-        num_aggregates_to_retain: None,
-        table_name: None,
-        value_projection: None,
-        table_population: None,
-        derived_input: None,
-        table_timestamp_column: None,
-        partitioning: None,
-        value_source_column: None,
-    };
-    let agg_id = agg_config.policy_fp_u64();
-    materializations_by_output.insert(agg_id, agg_config);
-
-    let installed_precompute_plan = Arc::new(InstalledPrecomputePlan {
-        partitioning: Default::default(),
-        raw_programs: Default::default(),
-        precompute_plan: None,
-        materializations_by_output: materializations_by_output
-            .into_iter()
-            .map(|(id, cfg)| (asap_types::sds::StoredOutputId(id), cfg))
-            .collect(),
-        storage_backend: Default::default(),
-    });
-
-    let summary_store =
-        std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
-    let resolver = std::sync::Arc::new(SeriesIdResolver::new());
-    let agg_cfg = installed_precompute_plan
-        .get_aggregation_config(asap_types::sds::StoredOutputId(agg_id))
-        .cloned()
-        .expect("agg");
-    for (timestamp, label_values_opt, acc) in data {
-        let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
-        let output = PrecomputedOutput::new(
-            timestamp - 1000,
-            timestamp,
-            key,
-            asap_types::PolicyFingerprint(agg_id),
-        );
-        ingest_with_fresh_resolver(&summary_store, &resolver, &agg_cfg, &output, acc.as_ref());
-    }
-    ASAPQueryEngine::new(1).with_sketch_index(summary_store)
+    );
+    ingest(&store, &output, 1000, data);
+    ASAPQueryEngine::new(1).with_sketch_index(store)
 }

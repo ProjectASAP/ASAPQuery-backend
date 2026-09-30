@@ -3,7 +3,7 @@
 //! belong to the stored summary identified by this metadata.
 pub const TIMESTAMPED_OBSERVATION_SEMANTICS: &str = "asap.timestamped-observations.v2";
 
-use crate::{AggregationType, PrecomputeMaterialization};
+use crate::AggregationType;
 use planner_types::post_asap::{SketchAlgorithm, SketchParams, SummaryFamilyType};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -492,15 +492,11 @@ pub enum SummaryOperator {
         agg_type: AggregationType,
         parameters_canonical: String,
     },
-    /// Complete planner materialization configuration, including heap/Hydra
-    /// dimensions and readout/update subtype. Never equal to a legacy projection.
+    /// The Planner-selected state family of a stored output, including
+    /// heap/Hydra dimensions. Never equal to a legacy projection. Grouping and
+    /// pane layout live in the data descriptor and summary definition.
     Configured {
-        /// Planner-selected semantic family; grouping and pane layout live in
-        /// the data descriptor and summary definition, respectively.
         family: planner_types::post_asap::SummaryFamilyType,
-        aggregation_type: AggregationType,
-        aggregation_sub_type: String,
-        parameters: BTreeMap<String, Value>,
     },
 }
 
@@ -553,32 +549,19 @@ impl FidelityGuarantee {
     /// Model IDs name parameterized error families/scopes, not certified numeric
     /// epsilon/confidence values. Heap membership and Hydra cross-cell readouts
     /// need separate models; point-frequency/per-cell rank does not attest them.
-    pub fn from_config(config: &PrecomputeMaterialization) -> Self {
-        if config.aggregation_type == AggregationType::HLL {
-            let precision = config
-                .parameters
-                .get("precision")
-                .or_else(|| config.parameters.get("p"))
-                .and_then(Value::as_u64)
-                .and_then(|v| u32::try_from(v).ok())
-                .unwrap_or(14);
-            return Self::HllCardinalityError {
-                precision,
-                model: "asap.hll.relative-cardinality.v1".into(),
-            };
-        }
-        match config.accumulator_spec().map(|s| s.family) {
-            Ok(SummaryFamilyType::ExactAggregate(
+    pub fn from_family(family: &SummaryFamilyType) -> Self {
+        match family {
+            SummaryFamilyType::ExactAggregate(
                 planner_types::post_asap::ExactKind::Increase
                 | planner_types::post_asap::ExactKind::Rate
                 | planner_types::post_asap::ExactKind::IRate,
                 _,
-            )) => Self::ExactCounter {
+            ) => Self::ExactCounter {
                 model: "prometheus.extrapolated-rate.v1".into(),
                 full_pane_coverage_required: true,
             },
-            Ok(SummaryFamilyType::ExactAggregate(..)) => Self::Exact,
-            Ok(SummaryFamilyType::Sketch(kind, _)) => match kind.params() {
+            SummaryFamilyType::ExactAggregate(..) => Self::Exact,
+            SummaryFamilyType::Sketch(kind, grouping) => match kind.params() {
                 SketchParams::UnivMon {
                     heap_size,
                     sketch_rows,
@@ -592,7 +575,10 @@ impl FidelityGuarantee {
                 },
                 SketchParams::Kll { k } => Self::KllRankError {
                     k: *k,
-                    model: if config.aggregation_type == AggregationType::HydraKLL {
+                    model: if matches!(
+                        grouping,
+                        planner_types::post_asap::GroupingStrategy::SharedMultiSubpopulation { .. }
+                    ) {
                         "asap.hydra-kll.per-cell-rank.v1"
                     } else {
                         "asap.kll.normalized-rank.v1"
@@ -713,41 +699,6 @@ impl SummaryDescriptor {
             return Err(SdsError("state schema version must be positive".into()));
         }
         fidelity.validate()?;
-        if let SummaryOperator::Configured {
-            family,
-            aggregation_type,
-            ..
-        } = &operator
-        {
-            if let Some(expected) = aggregation_type.planner_exact_family() {
-                if family != &expected {
-                    return Err(SdsError(
-                        "configured storage type disagrees with Planner family".into(),
-                    ));
-                }
-            } else {
-                use AggregationType as A;
-                let expected = match aggregation_type {
-                    A::DatasketchesKLL | A::HydraKLL => Some(SketchAlgorithm::Kll),
-                    A::CountMinSketch => Some(SketchAlgorithm::Cms),
-                    A::CountMinSketchWithHeap => Some(SketchAlgorithm::CmsWithHeap),
-                    A::CountSketch => Some(SketchAlgorithm::CountSketch),
-                    A::CountSketchWithHeap => Some(SketchAlgorithm::CountSketchWithHeap),
-                    A::DDSketch => Some(SketchAlgorithm::DDSketch),
-                    A::HLL => Some(SketchAlgorithm::Hll),
-                    A::UnivMon => Some(SketchAlgorithm::UnivMon),
-                    _ => None,
-                };
-                if let Some(expected) = expected {
-                    if !matches!(family, planner_types::post_asap::SummaryFamilyType::Sketch(kind, _) if kind.algorithm() == &expected)
-                    {
-                        return Err(SdsError(
-                            "configured sketch storage disagrees with Planner family".into(),
-                        ));
-                    }
-                }
-            }
-        }
         if !fidelity.is_compatible_with(&operator) {
             return Err(SdsError(
                 "summary operator and fidelity guarantee are incompatible".into(),
@@ -777,12 +728,9 @@ impl SummaryDescriptor {
         Ok(())
     }
 
-    /// Preserve every configured state/update parameter. Omitted defaults remain
-    /// distinct from explicit defaults (conservative identity, never false sharing).
-    /// Legacy AggKind projections intentionally have different operator variants:
-    /// they cannot attest heap, Hydra, or aggregation-subtype semantics they lost.
-    pub fn from_config(config: &PrecomputeMaterialization) -> Result<Self, SdsError> {
-        let fidelity = FidelityGuarantee::from_config(config);
+    /// The descriptor of a stored output whose state has the Planner `family`.
+    pub fn from_family(family: &SummaryFamilyType) -> Result<Self, SdsError> {
+        let fidelity = FidelityGuarantee::from_family(family);
         let state_schema_version = if matches!(fidelity, FidelityGuarantee::ExactCounter { .. }) {
             2
         } else {
@@ -790,17 +738,7 @@ impl SummaryDescriptor {
         };
         Self::new(
             SummaryOperator::Configured {
-                family: config
-                    .accumulator_spec()
-                    .map_err(|error| SdsError(error.to_string()))?
-                    .family,
-                aggregation_type: config.aggregation_type,
-                aggregation_sub_type: config.aggregation_sub_type.clone(),
-                parameters: config
-                    .parameters
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
+                family: family.clone(),
             },
             fidelity,
             state_schema_version,
@@ -844,11 +782,7 @@ impl FidelityGuarantee {
         match operator {
             SummaryOperator::LegacyPartial { .. } => matches!(self, Unknown { .. }),
             SummaryOperator::ExactAgg { agg_type, .. } => configured(*agg_type),
-            SummaryOperator::Configured {
-                aggregation_type,
-                parameters,
-                ..
-            } => configured(*aggregation_type) && self.matches_parameters(parameters),
+            SummaryOperator::Configured { family } => self == &Self::from_family(family),
             SummaryOperator::Sketch {
                 algorithm,
                 parameters,
@@ -1653,9 +1587,6 @@ mod tests {
         assert!(SummaryDescriptor::new(
             SummaryOperator::Configured {
                 family: AggregationType::Sum.planner_exact_family().unwrap(),
-                aggregation_type: AggregationType::Sum,
-                aggregation_sub_type: String::new(),
-                parameters: BTreeMap::new(),
             },
             FidelityGuarantee::KllRankError {
                 k: 200,
@@ -1678,70 +1609,67 @@ mod tests {
         .is_err());
     }
 
+    // A configured descriptor's fidelity must be the one its family declares.
     #[test]
-    fn configured_descriptor_rejects_family_storage_disagreement() {
+    fn configured_descriptor_rejects_fidelity_family_disagreement() {
         assert!(SummaryDescriptor::new(
             SummaryOperator::Configured {
                 family: AggregationType::Rate.planner_exact_family().unwrap(),
-                aggregation_type: AggregationType::Increase,
-                aggregation_sub_type: String::new(),
-                parameters: BTreeMap::new(),
             },
-            FidelityGuarantee::ExactCounter {
-                model: "prometheus.extrapolated-rate.v1".into(),
-                full_pane_coverage_required: true,
-            },
+            FidelityGuarantee::Exact,
             2,
         )
         .is_err());
     }
+    // Configured identity preserves every heap/Hydra/state parameter of the
+    // family and names no population.
     #[test]
-    fn configured_identity_preserves_heap_hydra_and_subtype_and_excludes_population() {
-        let yaml:serde_yaml::Value=serde_yaml::from_str("aggregationType: DDSketch\naggregationSubType: ''\nmetric: m\nlabels:\n  grouping: []\n  rollup: []\n  aggregated: []\nparameters:\n  relative_accuracy: 0.01\nwindowSize: 30\nwindowType: tumbling\nspatialFilter: ''\n").unwrap();
-        let mut config =
-            PrecomputeMaterialization::from_yaml_data(&yaml, None, crate::QueryLanguage::PromQl)
-                .unwrap();
-        assert!(matches!(
-            SummaryDescriptor::from_config(&config).unwrap().fidelity,
-            FidelityGuarantee::DdSketchRelativeError { .. }
-        ));
-        for (kind, key) in [
-            (AggregationType::CountMinSketchWithHeap, "heap_size"),
-            (AggregationType::HydraKLL, "row"),
-            (AggregationType::HydraKLL, "col"),
-            (AggregationType::HydraKLL, "k"),
-        ] {
-            config.aggregation_type = kind;
-            config.parameters.insert(key.into(), json!(10));
-            let before = SummaryDescriptor::from_config(&config).unwrap();
-            config.parameters.insert(key.into(), json!(11));
-            let after = SummaryDescriptor::from_config(&config).unwrap();
-            assert_ne!(before.id, after.id, "{key}");
-            config.metric = "other".into();
-            config.spatial_filter_normalized = "job=a".into();
-            assert_eq!(
-                after.id,
-                SummaryDescriptor::from_config(&config).unwrap().id
-            );
-        }
-        let before = SummaryDescriptor::from_config(&config).unwrap();
-        config.aggregation_sub_type = "max".into();
+    fn configured_identity_preserves_state_parameters() {
+        use planner_types::post_asap::{GroupingStrategy, HydraKind, HydraParams, SketchKind};
+        let heap = |heap_size| {
+            SummaryFamilyType::Sketch(
+                SketchKind::new(
+                    SketchAlgorithm::CmsWithHeap,
+                    SketchParams::CmsWithHeap {
+                        width: 64,
+                        depth: 4,
+                        heap_size,
+                    },
+                ),
+                GroupingStrategy::PerSubpopulationInstance,
+            )
+        };
+        let hydra = |k, shared_buckets| {
+            SummaryFamilyType::Sketch(
+                SketchKind::new(SketchAlgorithm::Kll, SketchParams::Kll { k }),
+                GroupingStrategy::SharedMultiSubpopulation {
+                    kind: HydraKind::HydraKll,
+                    params: HydraParams::HydraKll { k, shared_buckets },
+                },
+            )
+        };
+        let id = |family: &SummaryFamilyType| SummaryDescriptor::from_family(family).unwrap().id;
+        assert_ne!(id(&heap(10)), id(&heap(11)));
+        assert_ne!(id(&hydra(10, 10)), id(&hydra(10, 11)));
         assert_ne!(
-            before.id,
-            SummaryDescriptor::from_config(&config).unwrap().id
+            id(&hydra(10, 10)),
+            id(&SummaryFamilyType::Sketch(
+                SketchKind::new(SketchAlgorithm::Kll, SketchParams::Kll { k: 10 }),
+                GroupingStrategy::PerSubpopulationInstance,
+            ))
         );
-    }
-    #[test]
-    fn increase_config_declares_prometheus_counter_fidelity() {
-        let yaml: serde_yaml::Value = serde_yaml::from_str(
-            "aggregationType: Increase\naggregationSubType: ''\nmetric: requests_total\nlabels:\n  grouping: []\n  rollup: []\n  aggregated: []\nparameters: {}\nwindowSize: 60\nwindowType: tumbling\nspatialFilter: ''\n",
-        )
-        .unwrap();
-        let config =
-            PrecomputeMaterialization::from_yaml_data(&yaml, None, crate::QueryLanguage::PromQl)
-                .unwrap();
         assert!(matches!(
-            SummaryDescriptor::from_config(&config).unwrap().fidelity,
+            SummaryDescriptor::from_family(&hydra(10, 10)).unwrap().fidelity,
+            FidelityGuarantee::KllRankError { ref model, .. } if model == "asap.hydra-kll.per-cell-rank.v1"
+        ));
+    }
+    // Increase state declares the Prometheus counter fidelity model.
+    #[test]
+    fn increase_declares_prometheus_counter_fidelity() {
+        assert!(matches!(
+            SummaryDescriptor::from_family(&AggregationType::Increase.planner_exact_family().unwrap())
+                .unwrap()
+                .fidelity,
             FidelityGuarantee::ExactCounter {
                 ref model,
                 full_pane_coverage_required: true
@@ -1750,25 +1678,27 @@ mod tests {
     }
     #[test]
     fn canonical_nested_parameters_and_model_versions_are_identity() {
-        let a = SummaryOperator::Configured {
-            family: AggregationType::Sum.planner_exact_family().unwrap(),
-            aggregation_type: AggregationType::Sum,
-            aggregation_sub_type: String::new(),
-            parameters: BTreeMap::from([("nested".into(), json!({"z":1,"a":2}))]),
+        let a = SummaryOperator::Sketch {
+            algorithm: SketchAlgorithm::Kll,
+            parameters: BTreeMap::from([
+                ("k".into(), json!(200)),
+                ("nested".into(), json!({"z":1,"a":2})),
+            ]),
         };
-        let b = SummaryOperator::Configured {
-            family: AggregationType::Sum.planner_exact_family().unwrap(),
-            aggregation_type: AggregationType::Sum,
-            aggregation_sub_type: String::new(),
-            parameters: BTreeMap::from([("nested".into(), json!({"a":2,"z":1}))]),
+        let b = SummaryOperator::Sketch {
+            algorithm: SketchAlgorithm::Kll,
+            parameters: BTreeMap::from([
+                ("nested".into(), json!({"a":2,"z":1})),
+                ("k".into(), json!(200)),
+            ]),
+        };
+        let fidelity = FidelityGuarantee::KllRankError {
+            k: 200,
+            model: "rank.v1".into(),
         };
         assert_eq!(
-            SummaryDescriptor::new(a.clone(), FidelityGuarantee::Exact, 1)
-                .unwrap()
-                .id,
-            SummaryDescriptor::new(b, FidelityGuarantee::Exact, 1)
-                .unwrap()
-                .id
+            SummaryDescriptor::new(a, fidelity.clone(), 1).unwrap().id,
+            SummaryDescriptor::new(b, fidelity, 1).unwrap().id
         );
         let kll = SummaryOperator::Sketch {
             algorithm: SketchAlgorithm::Kll,

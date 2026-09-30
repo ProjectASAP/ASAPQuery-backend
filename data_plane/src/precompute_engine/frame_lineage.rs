@@ -198,7 +198,7 @@ mod tests {
             identity_version: 1,
             plan_id: 7,
             plan_version: 3,
-            backend_compat: "asap-query-backend.v1".into(),
+            backend_compat: "asap-query-backend.v2".into(),
             materialization: asap_types::PolicyFingerprint(41).into(),
             series_identity: "service=checkout,zone=a".into(),
             schema_id: "schema-41".into(),

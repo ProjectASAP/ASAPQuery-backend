@@ -56,18 +56,22 @@ impl RuntimeErpObserver {
         &self,
         generation: &CatalogGeneration,
         coordinates: SummaryInstanceCoordinates,
-        config: &asap_types::PrecomputeMaterialization,
+        program: &crate::precompute_engine::raw_dag::RawDagProgram,
         timestamp_ms: i64,
         value: f64,
     ) {
-        use asap_types::{AggregationType, SampleUpdateRule};
-        let (semantics, sketch, implementation) = match config.aggregation_type {
-            AggregationType::HLL => (
+        use planner_types::post_asap::{SketchAlgorithm, SummaryFamilyType};
+        let algorithm = match &program.family {
+            SummaryFamilyType::Sketch(kind, _) => kind.algorithm(),
+            _ => return,
+        };
+        let (semantics, sketch, implementation) = match algorithm {
+            SketchAlgorithm::Hll => (
                 ErpObservationInputSemantics::ScalarSampleValue,
                 "hll",
                 "asap-sketchlib-hll-regular-v1",
             ),
-            AggregationType::UnivMon => (
+            SketchAlgorithm::UnivMon => (
                 ErpObservationInputSemantics::UnitSampleFrequency,
                 "univmon",
                 "asap-sketchlib-univmon-standard-v1",
@@ -83,12 +87,10 @@ impl RuntimeErpObserver {
         if state.invalid.is_some() {
             return;
         }
-        if !value.is_finite()
-            || !matches!(
-                config.sample_update_rule(),
-                SampleUpdateRule::Value { scale: 1.0 }
-            )
-        {
+        // Both implemented raw update domains observe the raw sample value.
+        let untransformed = asap_types::accumulator_spec::is_scalar_sample_value(&program.input)
+            || asap_types::accumulator_spec::is_unit_sample_frequency(&program.input);
+        if !value.is_finite() || !untransformed {
             state.invalid = Some("unsupported non-finite or transformed summary input".into());
             for population in state.populations.values_mut() {
                 population.observer = BoundedFrequencyObserver::new(1, 64).unwrap();
@@ -264,23 +266,20 @@ impl RuntimeErpObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn fixture() -> (CatalogGeneration, asap_types::PrecomputeMaterialization) {
-        let config = asap_types::PrecomputeMaterialization::new(
-            asap_types::AggregationType::HLL,
-            String::new(),
-            Default::default(),
-            asap_types::KeyByLabelNames::new(vec![]),
-            asap_types::KeyByLabelNames::new(vec![]),
-            asap_types::KeyByLabelNames::new(vec![]),
-            String::new(),
-            60,
-            60,
-            asap_types::enums::WindowKind::Tumbling,
-            String::new(),
-            "m".into(),
-            None,
-            None,
-            None,
+    fn fixture() -> (
+        CatalogGeneration,
+        crate::precompute_engine::raw_dag::RawDagProgram,
+    ) {
+        use planner_types::post_asap::{
+            GroupingStrategy, SketchAlgorithm, SketchKind, SketchParams, SummaryFamilyType,
+            SummaryUpdate,
+        };
+        let config = crate::precompute_engine::raw_dag::RawDagProgram::fixture(
+            SummaryFamilyType::Sketch(
+                SketchKind::new(SketchAlgorithm::Hll, SketchParams::Hll { precision: 14 }),
+                GroupingStrategy::PerSubpopulationInstance,
+            ),
+            SummaryUpdate::column(planner_types::pre_asap::ColumnRef::SampleValue),
         );
         (
             CatalogGeneration {

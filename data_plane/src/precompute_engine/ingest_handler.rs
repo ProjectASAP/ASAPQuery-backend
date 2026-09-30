@@ -301,27 +301,26 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    fn make_config(_agg_id: u64, metric: &str) -> PrecomputeMaterialization {
-        // `_agg_id` is unused after PR 5 — identity is content-addressed
-        // via `PolicyFingerprint::from_config`. Kept as a parameter to
-        // avoid churning the call sites below.
-        PrecomputeMaterialization::new(
-            AggregationType::CountMinSketch,
-            String::new(),
-            std::collections::HashMap::new(),
+    fn make_config(
+        agg_id: u64,
+        metric: &str,
+    ) -> (
+        PrecomputeMaterialization,
+        planner_types::post_asap::SummaryFamilyType,
+    ) {
+        let mut config = PrecomputeMaterialization::new(
+            metric,
             KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            String::new(),
             60,
             60,
             WindowKind::Tumbling,
-            String::new(),
-            metric.to_string(),
-            None,
-            None,
-            None,
-        )
+        );
+        config.stored_output_id = asap_types::sds::StoredOutputId(agg_id);
+        let family = crate::tests::test_utilities::outputs::family(
+            AggregationType::CountMinSketch,
+            &serde_json::json!({}),
+        );
+        (config, family)
     }
 
     /// Set up an `IngestState` with one Active agg for `metric` and a
@@ -334,9 +333,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1024);
         let router = SeriesRouter::new(vec![tx]);
 
-        let mut map = std::collections::HashMap::new();
-        map.insert(agg_id, make_config(agg_id, metric));
-        let streaming = InstalledPrecomputePlan::from_raw_ids(map);
+        let streaming = InstalledPrecomputePlan::new([make_config(agg_id, metric)]);
         let hot_reload =
             crate::storage_engines::types::InstalledPrecomputePlanHandle::new(streaming.clone());
 

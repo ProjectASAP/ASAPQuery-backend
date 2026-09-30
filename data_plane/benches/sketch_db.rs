@@ -401,30 +401,20 @@ fn matching_streaming_config(
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType as AT;
     use asap_types::KeyByLabelNames;
-    use std::collections::HashMap;
 
-    let cfg = PrecomputeMaterialization::new(
-        AT::Sum,
-        String::new(),
-        HashMap::new(),
+    let family = AT::Sum.planner_exact_family().unwrap();
+    let mut cfg = PrecomputeMaterialization::new(
+        metric,
         KeyByLabelNames::empty(),
-        KeyByLabelNames::empty(),
-        KeyByLabelNames::empty(),
-        String::new(),
         60,
         60,
         WindowKind::Tumbling,
-        String::new(),
-        metric.to_string(),
-        None,
-        None,
-        None,
     );
+    cfg.allocate_stored_output_id(&family);
     let runtime = data_plane::storage_engines::types::InstalledPrecomputePlan::default();
-    let plan = control_plane::physical::compiler::PrecomputePlan::build(
+    let plan = control_plane::physical::compiler::PrecomputePlan::build_backend_local(
         runtime.plan().envelope.clone(),
-        vec![cfg],
-        &[],
+        vec![(cfg, family)],
     )
     .unwrap();
     data_plane::storage_engines::types::InstalledPrecomputePlan::from_precompute_plan(plan).unwrap()

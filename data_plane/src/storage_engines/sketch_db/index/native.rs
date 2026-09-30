@@ -39,6 +39,7 @@ impl SketchStore {
         &self,
         resolver: &SeriesIdResolver,
         config: &asap_types::PrecomputeMaterialization,
+        family: &planner_types::post_asap::SummaryFamilyType,
         output: &crate::storage_engines::types::PrecomputedOutput,
         batch: Batch,
         max_bytes: usize,
@@ -57,7 +58,6 @@ impl SketchStore {
             self.read_complete_raw_maintenance_cohort(generation, &program.inputs, window)?;
         let (population_key, group) = build_attrs_fp_and_label_map(config, output)?;
         let state = NativeSummaryOutput::new(batch, max_bytes)?;
-        let family = config.accumulator_spec().map_err(|e| e.to_string())?.family;
         if state
             .batch()
             .schema()
@@ -69,13 +69,13 @@ impl SketchStore {
                     planner_types::post_asap::SummaryFamilyType::Plain(_)
                 )
             })
-            .any(|field| field.dtype != family)
+            .any(|field| &field.dtype != family)
         {
             return Err("native output schema differs from installed definition".into());
         }
         for value in state.batch().rows().iter().flatten() {
             if let Value::Summary { family: actual, .. } = value {
-                if actual != &family {
+                if actual != family {
                     return Err("native output family differs from installed definition".into());
                 }
             }
@@ -104,6 +104,8 @@ impl SketchStore {
         self.publish_complete_raw_maintenance_output(
             sid,
             config,
+            // Derived outputs read stored states, so their input has no predicate.
+            &crate::storage_engines::sketch_db::data::agg_kind_for_family(family, ""),
             output,
             &state,
             &cohort,
@@ -378,6 +380,14 @@ mod tests {
             .iter()
             .find(|c| c.derived_input.is_some())
             .unwrap();
+        let source_family = plan
+            .precompute_plan
+            .state_family(source.stored_output_id)
+            .unwrap();
+        let target_family = plan
+            .precompute_plan
+            .state_family(target.stored_output_id)
+            .unwrap();
         let directory = tempfile::tempdir().unwrap();
         let resolver_path = directory.path().join("resolver.jsonl");
         let resolver = SeriesIdResolver::open(resolver_path.clone()).unwrap();
@@ -421,7 +431,18 @@ mod tests {
                     revision,
                     revision,
                     120_000,
-                    |writer| writer.ingest_precompute_with_series_id(700, source, &output, &state),
+                    |writer| {
+                        writer.ingest_precompute_with_series_id(
+                            700,
+                            source,
+                            &crate::storage_engines::sketch_db::data::agg_kind_for_family(
+                                source_family,
+                                "",
+                            ),
+                            &output,
+                            &state,
+                        )
+                    },
                 )
                 .unwrap();
         }
@@ -456,14 +477,8 @@ mod tests {
             time_index: None,
         });
         let input = Batch::try_new(raw_schema.clone(), values).unwrap();
-        let build = Operator::summary_build(
-            raw_schema,
-            target.accumulator_spec().unwrap().family,
-            0,
-            None,
-            vec![],
-        )
-        .unwrap();
+        let build =
+            Operator::summary_build(raw_schema, target_family.clone(), 0, None, vec![]).unwrap();
         let output_batch = run(input, build);
         let expected_schema = output_batch.schema().clone();
         let mut output = PrecomputedOutput::new(0, 60_000, None, target.policy_fingerprint());
@@ -473,13 +488,21 @@ mod tests {
             .publish_native_summary_output(
                 &resolver,
                 target,
+                target_family,
                 &output,
                 output_batch.clone(),
                 1 << 20
             )
             .unwrap());
         store
-            .publish_native_summary_output(&resolver, target, &output, output_batch, 1 << 20)
+            .publish_native_summary_output(
+                &resolver,
+                target,
+                target_family,
+                &output,
+                output_batch,
+                1 << 20,
+            )
             .unwrap();
         assert_eq!(persistence.manifest.live_parts().len(), before + 1);
         let reference = plan

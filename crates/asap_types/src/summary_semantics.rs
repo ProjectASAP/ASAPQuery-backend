@@ -24,8 +24,6 @@ pub enum SummarySemantics {
     Configured {
         computation: Box<SummaryComputation>,
         value_source_column: Option<planner_types::pre_asap::Column>,
-        aggregated_labels: crate::KeyByLabelNames,
-        rollup_labels: crate::KeyByLabelNames,
     },
 }
 
@@ -57,8 +55,6 @@ impl SummaryDefinition {
             semantic_format_version: 1,
             semantics: SummarySemantics::Configured {
                 value_source_column: None,
-                aggregated_labels: crate::KeyByLabelNames::empty(),
-                rollup_labels: crate::KeyByLabelNames::empty(),
                 computation: Box::new(SummaryComputation {
                     operator: summary.operator.clone(),
                     source: data.source.clone(),
@@ -80,14 +76,10 @@ impl SummaryDefinition {
             };
         } else if let SummarySemantics::Configured {
             value_source_column,
-            aggregated_labels,
-            rollup_labels,
             ..
         } = &mut self.semantics
         {
             *value_source_column = config.value_source_column.clone();
-            *aggregated_labels = config.aggregated_labels.clone();
-            *rollup_labels = config.rollup_labels.clone();
         }
         self
     }

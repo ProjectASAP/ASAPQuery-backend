@@ -138,25 +138,40 @@ impl DerivedInputIdentity {
 mod tests {
     use super::*;
     use crate::summary_catalog::SummaryCatalog;
-    use crate::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
+    use crate::{KeyByLabelNames, PrecomputeMaterialization, WindowKind};
+    use planner_types::post_asap::{ExactKind, ExactParams, SummaryFamilyType};
+
+    fn sum() -> SummaryFamilyType {
+        SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum)
+    }
+
+    fn allocated(mut config: PrecomputeMaterialization) -> PrecomputeMaterialization {
+        config.allocate_stored_output_id(&"sum");
+        config
+    }
 
     fn config() -> PrecomputeMaterialization {
-        PrecomputeMaterialization::new(
-            AggregationType::Sum,
-            String::new(),
-            Default::default(),
+        allocated(PrecomputeMaterialization::new(
+            "m",
             KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            String::new(),
             10,
             10,
             WindowKind::Tumbling,
-            String::new(),
-            "m".into(),
-            None,
-            None,
-            None,
+        ))
+    }
+
+    fn catalog(
+        plan_version: u64,
+        outputs: &[PrecomputeMaterialization],
+    ) -> Result<SummaryCatalog, crate::summary_catalog::SummaryCatalogError> {
+        let family = sum();
+        SummaryCatalog::from_outputs(
+            1,
+            plan_version,
+            outputs
+                .iter()
+                .map(|c| (c, &family, String::new()))
+                .collect(),
         )
     }
 
@@ -169,15 +184,18 @@ mod tests {
             inputs: BTreeSet::from([raw_id]),
             program_sha256: "a".repeat(64),
         });
+        let derived = allocated(derived);
         assert_ne!(raw.policy_fingerprint(), derived.policy_fingerprint());
-        let a =
-            SummaryCatalog::from_materializations(1, 1, &[raw.clone(), derived.clone()]).unwrap();
-        let b = SummaryCatalog::from_materializations(2, 9, &[raw, derived.clone()]).unwrap();
+        let a = catalog(1, &[raw.clone(), derived.clone()]).unwrap();
+        let b = catalog(9, &[raw, derived.clone()]).unwrap();
         assert_eq!(a.outputs, b.outputs);
         assert_eq!(a.data_descriptors, b.data_descriptors);
         let mut renamed = derived.clone();
         renamed.metric = "output_alias".into();
-        assert_eq!(renamed.policy_fingerprint(), derived.policy_fingerprint());
+        assert_eq!(
+            allocated(renamed).policy_fingerprint(),
+            derived.policy_fingerprint()
+        );
         let json = serde_json::to_value(&derived).unwrap();
         let decoded: PrecomputeMaterialization = serde_json::from_value(json).unwrap();
         assert_eq!(decoded.policy_fingerprint(), derived.policy_fingerprint());
@@ -190,13 +208,17 @@ mod tests {
             inputs: BTreeSet::from([StoredOutputId::from(derived.policy_fingerprint())]),
             program_sha256: "d".repeat(64),
         });
+        let derived = allocated(derived);
         let mut raw = derived.clone();
         raw.metric = format!(
             "derived-input-v1:{}",
             serde_json::to_string(&derived.source_identity()).unwrap()
         );
         raw.derived_input = None;
-        assert_ne!(raw.policy_fingerprint(), derived.policy_fingerprint());
+        assert_ne!(
+            allocated(raw).policy_fingerprint(),
+            derived.policy_fingerprint()
+        );
     }
 
     #[test]
@@ -206,9 +228,11 @@ mod tests {
             inputs: BTreeSet::from([StoredOutputId::from(derived.policy_fingerprint())]),
             program_sha256: "b".repeat(64),
         });
-        assert!(SummaryCatalog::from_materializations(1, 1, &[derived.clone()]).is_err());
+        let derived = allocated(derived);
+        assert!(catalog(1, std::slice::from_ref(&derived)).is_err());
+        let mut derived = derived;
         derived.table_name = Some("table".into());
-        assert!(derived.population_filter_canonical().is_err());
+        assert!(derived.table_population_canonical().is_err());
     }
     fn program(source: u32, root: u32) -> OwnedPostAsapDag {
         use crate::executable_plan::{OwnedPostAsapEdge, OwnedPostAsapNode};
@@ -322,7 +346,7 @@ mod tests {
             1,
             [(
                 config.policy_fingerprint(),
-                SummaryDescriptor::from_config(&config).unwrap(),
+                SummaryDescriptor::from_family(&sum()).unwrap(),
                 data,
             )]
         )
@@ -342,12 +366,16 @@ mod tests {
             generated_at_unix_ms: 0,
             activation_unix_ms: 0,
             expiry_unix_ms: None,
-            backend_compat: "asap-query-backend.v1".into(),
+            backend_compat: crate::precompute_plan::BACKEND_COMPAT.into(),
             planner_revision: "test".into(),
             capability_snapshot_id: "test".into(),
         };
-        let error =
-            PrecomputePlan::build(envelope, vec![config], &["producer".into()]).unwrap_err();
+        let error = PrecomputePlan::build(
+            envelope,
+            vec![(allocated(config), sum())],
+            &["producer".into()],
+        )
+        .unwrap_err();
         assert!(error
             .to_string()
             .contains("installed aligned immutable maintenance DAG"));

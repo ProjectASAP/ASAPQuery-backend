@@ -14,7 +14,6 @@ use asap_summary_state::codec::KeyCodec;
 use asap_summary_state::StoredState;
 use asap_types::aggregation_config::PrecomputeMaterialization;
 use asap_types::PolicyFingerprint;
-use asap_types::SampleUpdateRule;
 use std::collections::{BTreeMap, HashMap};
 // (PolicyFingerprint is used for both `PolicyFingerprint::from_config(...)`
 //  on the emit path and the `policy_fp` field of GroupState below.)
@@ -39,6 +38,9 @@ use tracing::{debug, debug_span, info, warn};
 /// `GROUP BY window, key`.
 struct GroupState {
     program: Option<Arc<super::raw_dag::RawDagProgram>>,
+    /// Stored state family for isolated kernel tests without a Planner program.
+    #[cfg(test)]
+    fixture_family: Option<planner_types::post_asap::SummaryFamilyType>,
     series_id: u64,
     stored_output_reference: Option<asap_types::sds::StoredOutputReference>,
     catalog_generation: Option<Arc<asap_types::sds::CatalogGeneration>>,
@@ -60,10 +62,6 @@ struct GroupState {
     /// Samples admitted to each open pane, keyed by pane_start_ms, in arrival
     /// order. The installed Planner graph builds the pane's state at close.
     active_panes: BTreeMap<i64, Vec<(Arc<str>, i64, f64)>>,
-    /// Last cumulative counter sample per source series for heap membership
-    /// materializations. This is bounded O(series) derivative state, not a
-    /// raw-sample history, and deliberately survives pane rotation.
-    counter_previous: HashMap<String, (i64, f64)>,
     /// Active panes for pre-built accumulator inputs (e.g. OTLP-delivered
     /// sketches), keyed by pane_start_ms. Each entry is the running merge
     /// of every accumulator that landed in that pane's time range. Kept
@@ -90,6 +88,16 @@ struct PaneWallClock {
 }
 
 impl GroupState {
+    #[cfg(test)]
+    fn fixture_family(&self) -> Option<&planner_types::post_asap::SummaryFamilyType> {
+        self.fixture_family.as_ref()
+    }
+
+    #[cfg(not(test))]
+    fn fixture_family(&self) -> Option<&planner_types::post_asap::SummaryFamilyType> {
+        None
+    }
+
     fn stores_full_windows(&self) -> bool {
         matches!(
             self.config.window_layout,
@@ -522,6 +530,8 @@ impl Worker {
             let config = Arc::new(cfg.clone());
             let gs = GroupState {
                 program,
+                #[cfg(test)]
+                fixture_family: snap.state_family(policy_fp.into()).cloned(),
                 series_id: sid,
                 stored_output_reference: snap.stored_output_reference(policy_fp.into()),
                 catalog_generation: self.current_catalog_generation.clone(),
@@ -536,7 +546,6 @@ impl Worker {
                 policy_fp,
                 group_key: Arc::clone(group_key),
                 active_panes: BTreeMap::new(),
-                counter_previous: HashMap::new(),
                 sketch_panes: BTreeMap::new(),
                 max_event_time_ms: i64::MIN,
                 closure_watermark_ms: i64::MIN,
@@ -588,12 +597,7 @@ impl Worker {
 
         // Keep original timestamps inside accumulators (notably rate/increase),
         // shifting only pane membership and closure watermark for PromQL (a,b].
-        let right_closed = state
-            .config
-            .parameters
-            .get("promql_right_closed")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let right_closed = state.program.is_some();
         let pane_timestamp = |ts: i64| {
             if right_closed {
                 ts.saturating_sub(1)
@@ -635,11 +639,7 @@ impl Worker {
             let too_late = previous_event_time != i64::MIN
                 && pane_timestamp(*ts)
                     < watermark_for_event_time(previous_event_time, allowed_lateness_ms);
-            let value = if legacy_counter_delta(state) {
-                reset_aware_counter_delta(&mut state.counter_previous, series_key, *val, *ts)
-            } else {
-                Some(*val)
-            };
+            let value = Some(*val);
             for bucket_start in state.bucket_starts_for(pane_timestamp(*ts)) {
                 if let Some(revision) = &input_revision {
                     state
@@ -686,25 +686,18 @@ impl Worker {
                             // Never feed the raw counter value into a membership
                             // heap; the authoritative ExactCounter branch remains
                             // responsible for the visible result.
-                            if legacy_counter_delta(state) {
-                                if let Some(input) = state.input_revisions.get_mut(&bucket_start) {
-                                    Arc::make_mut(input).first_revision = 0;
-                                }
-                                record_late_input("drop", "counter_delta_membership");
-                                continue;
-                            }
                             record_late_input("append_correction", "raw_sample");
                             let Some(correction) = build_pane(
                                 state.program.as_deref(),
-                                &state.config,
+                                state.fixture_family(),
                                 &[(Arc::from(series_key.as_str()), *ts, *val)],
                                 (bucket_start, bucket_end),
                             )?
                             else {
                                 continue;
                             };
-                            if let (Some(observer), Some(revision)) =
-                                (&self.erp_observer, &input_revision)
+                            if let (Some(observer), Some(revision), Some(program)) =
+                                (&self.erp_observer, &input_revision, &state.program)
                             {
                                 observer.observe(
                                     &revision.generation,
@@ -716,7 +709,7 @@ impl Worker {
                                         },
                                         group_values: group_key.as_population_labels(),
                                     },
-                                    &state.config,
+                                    program,
                                     *ts,
                                     *val,
                                 );
@@ -751,7 +744,8 @@ impl Worker {
                 let pane = state.active_panes.entry(bucket_start).or_default();
                 if let Some(value) = value {
                     pane.push((Arc::clone(&series), *ts, value));
-                    if let (Some(observer), Some(revision)) = (&self.erp_observer, &input_revision)
+                    if let (Some(observer), Some(revision), Some(program)) =
+                        (&self.erp_observer, &input_revision, &state.program)
                     {
                         observer.observe(
                             &revision.generation,
@@ -763,7 +757,7 @@ impl Worker {
                                 },
                                 group_values: group_key.as_population_labels(),
                             },
-                            &state.config,
+                            program,
                             *ts,
                             value,
                         );
@@ -1594,7 +1588,7 @@ pub fn decode_label_value(s: &str) -> std::borrow::Cow<'_, str> {
 /// Build a pane's state from its samples with the installed Planner graph.
 fn build_pane(
     program: Option<&super::raw_dag::RawDagProgram>,
-    config: &PrecomputeMaterialization,
+    fixture_family: Option<&planner_types::post_asap::SummaryFamilyType>,
     samples: &[(Arc<str>, i64, f64)],
     pane: (i64, i64),
 ) -> Result<Option<Box<dyn AggregateCore>>, String> {
@@ -1612,15 +1606,21 @@ fn build_pane(
     #[cfg(test)]
     {
         let _ = pane;
-        let mut updater = create_fixture_accumulator(config);
+        let family = fixture_family.ok_or("fixture output has no state family")?;
+        let mut updater = create_fixture_accumulator(
+            family,
+            &planner_types::post_asap::SummaryUpdate::column(
+                planner_types::pre_asap::ColumnRef::SampleValue,
+            ),
+        );
         for (series, time, value) in samples {
-            apply_sample(&mut *updater, series, *value, *time, config);
+            apply_sample(&mut *updater, series, *value, *time, family);
         }
         Ok(Some(updater.take_accumulator()))
     }
     #[cfg(not(test))]
     {
-        let _ = (config, samples, pane);
+        let _ = (fixture_family, samples, pane);
         Err("missing installed Planner producer".into())
     }
 }
@@ -1635,7 +1635,7 @@ fn close_pane(
     };
     let built = build_pane(
         state.program.as_deref(),
-        &state.config,
+        state.fixture_family(),
         samples,
         state.bucket_bounds(start),
     )?;
@@ -1643,104 +1643,29 @@ fn close_pane(
     Ok(built)
 }
 
-/// Route a single sample to `updater`, dispatching keyed vs. non-keyed based on config.
-///
-/// For keyed accumulators (MultipleSum, CMS, HydraKLL), the key is extracted
-/// from the series' **aggregated_labels** — these are the labels that become
-/// the key dimension *inside* the sketch (e.g., which bucket in a CMS, which
-/// entry in a KeyedSumCountAccumulator's HashMap). This matches the Arroyo SQL
-/// pattern: `udf(concat_ws(';', aggregated_labels), value)`.
+/// Route a single fixture sample to `updater`. Planner's PromQL Top-K item
+/// is the series identity; other keyed fixtures project no item labels.
 #[cfg(test)]
 pub(crate) fn apply_sample(
     updater: &mut dyn AccumulatorUpdater,
     series_key: &str,
     val: f64,
     ts: i64,
-    config: &PrecomputeMaterialization,
+    family: &planner_types::post_asap::SummaryFamilyType,
 ) {
+    use planner_types::post_asap::{SketchAlgorithm, SummaryFamilyType};
     if updater.is_keyed() {
-        // Planner's PromQL Top-K item is the series identity. When no
-        // explicit aggregated labels are projected, retain the canonical
-        // series key instead of collapsing every series onto an empty item.
-        let key = if config.aggregated_labels.labels.is_empty()
-            && matches!(
-                config.aggregation_type,
-                crate::storage_engines::types::AggregationType::CountMinSketchWithHeap
-                    | crate::storage_engines::types::AggregationType::CountSketchWithHeap
-            ) {
+        let key = if matches!(family, SummaryFamilyType::Sketch(kind, _)
+            if matches!(kind.algorithm(), SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap))
+        {
             KeyByLabelValues::new_with_labels(vec![series_key.to_string()])
         } else {
-            extract_aggregated_key_from_series(series_key, config)
+            KeyByLabelValues::new_with_labels(Vec::new())
         };
         updater.update_keyed(&key, val, ts);
     } else {
         updater.update_single(val, ts);
     }
-}
-
-/// Convert a cumulative counter sample into a non-negative, reset-aware
-/// increment. Only the immediately preceding sample per series is retained;
-/// pane rotation therefore cannot lose the boundary increment.
-/// Whether a sample must be converted to a counter delta before it reaches the
-/// accumulator.
-///
-/// Only the legacy configured update rule does this. A selected Planner program
-/// never does: rate is an explicit upstream operator in the DAG, so the sample
-/// reaches the accumulator unchanged. Both call sites used to ask the program
-/// and were always told `false`.
-fn legacy_counter_delta(state: &GroupState) -> bool {
-    state.program.is_none()
-        && matches!(
-            state.config.sample_update_rule(),
-            SampleUpdateRule::CounterDelta { .. }
-        )
-}
-
-pub(crate) fn reset_aware_counter_delta(
-    previous: &mut HashMap<String, (i64, f64)>,
-    series_key: &str,
-    value: f64,
-    timestamp_ms: i64,
-) -> Option<f64> {
-    if !value.is_finite() {
-        return None;
-    }
-    match previous.get(series_key).copied() {
-        Some((previous_ts, _)) if timestamp_ms <= previous_ts => None,
-        Some((_, previous_value)) => {
-            previous.insert(series_key.to_owned(), (timestamp_ms, value));
-            Some(if value >= previous_value {
-                value - previous_value
-            } else {
-                value.max(0.0)
-            })
-        }
-        None => {
-            previous.insert(series_key.to_owned(), (timestamp_ms, value));
-            None
-        }
-    }
-}
-
-/// Extract aggregated label values from a series key string.
-/// These are the labels that form the key dimension *inside* keyed accumulators
-/// (MultipleSum, CMS, HydraKLL), matching Arroyo's `agg_columns`.
-fn extract_aggregated_key_from_series(
-    series_key: &str,
-    config: &PrecomputeMaterialization,
-) -> KeyByLabelValues {
-    let labels = parse_labels_from_series_key(series_key);
-    let mut values = Vec::new();
-
-    for label_name in &config.aggregated_labels.labels {
-        if let Some(val) = labels.get(label_name.as_str()) {
-            values.push(val.to_string());
-        } else {
-            values.push(String::new());
-        }
-    }
-
-    KeyByLabelValues::new_with_labels(values)
 }
 
 #[cfg(test)]
@@ -1793,30 +1718,6 @@ mod tests {
             )>());
         }
         crate::precompute_engine::group_key::intern_pairs([("group", value)])
-    }
-
-    #[test]
-    fn counter_delta_is_reset_aware_series_local_and_cross_pane_safe() {
-        let mut previous = HashMap::new();
-        assert_eq!(reset_aware_counter_delta(&mut previous, "a", 10.0, 1), None);
-        assert_eq!(reset_aware_counter_delta(&mut previous, "b", 40.0, 1), None);
-        assert_eq!(
-            reset_aware_counter_delta(&mut previous, "a", 15.0, 2),
-            Some(5.0)
-        );
-        assert_eq!(
-            reset_aware_counter_delta(&mut previous, "a", 3.0, 3),
-            Some(3.0)
-        );
-        assert_eq!(
-            reset_aware_counter_delta(&mut previous, "b", 44.0, 4),
-            Some(4.0)
-        );
-        assert_eq!(reset_aware_counter_delta(&mut previous, "a", 99.0, 2), None);
-        assert_eq!(
-            reset_aware_counter_delta(&mut previous, "a", 5.0, 5),
-            Some(2.0)
-        );
     }
 
     use flate2::{write::GzEncoder, Compression};
@@ -1905,64 +1806,52 @@ mod tests {
     use asap_types::sds::StoredOutputId;
     use asap_types::AggregationType;
 
-    fn make_agg_config(
-        id: u64,
-        metric: &str,
-        agg_type: AggregationType,
-        agg_sub_type: &str,
-        window_secs: u64,
-        slide_secs: u64,
-        grouping: Vec<&str>,
-    ) -> PrecomputeMaterialization {
-        make_agg_config_full(
-            id,
-            metric,
-            agg_type,
-            agg_sub_type,
-            window_secs,
-            slide_secs,
-            grouping,
-            vec![],
-        )
+    thread_local! {
+        /// Stored state family of each fixture output, keyed by its allocated id.
+        static FIXTURE_FAMILIES: std::cell::RefCell<
+            HashMap<asap_types::sds::StoredOutputId, planner_types::post_asap::SummaryFamilyType>,
+        > = Default::default();
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn make_agg_config_full(
+    /// Give `config` the stored state `family`, allocating its id from it.
+    fn set_fixture_family(
+        config: &mut PrecomputeMaterialization,
+        family: planner_types::post_asap::SummaryFamilyType,
+    ) {
+        config.allocate_stored_output_id(&family);
+        FIXTURE_FAMILIES.with(|families| {
+            families
+                .borrow_mut()
+                .insert(config.stored_output_id, family)
+        });
+    }
+
+    fn make_agg_config(
         _id: u64,
         metric: &str,
         agg_type: AggregationType,
-        agg_sub_type: &str,
+        _agg_sub_type: &str,
         window_secs: u64,
         slide_secs: u64,
         grouping: Vec<&str>,
-        aggregated: Vec<&str>,
     ) -> PrecomputeMaterialization {
-        // `_id` is unused after PR 5 — identity is content-addressed
-        // via `PolicyFingerprint::from_config`. Callers below build the
-        // streaming-config map by reading `config.policy_fp_u64()`
-        // from the returned value.
         let window_type = if slide_secs == 0 || slide_secs == window_secs {
             WindowKind::Tumbling
         } else {
             WindowKind::Sliding
         };
-        PrecomputeMaterialization::new(
-            agg_type,
-            agg_sub_type.to_string(),
-            HashMap::new(),
+        let mut config = PrecomputeMaterialization::new(
+            metric,
             asap_types::KeyByLabelNames::new(grouping.iter().map(|s| s.to_string()).collect()),
-            asap_types::KeyByLabelNames::new(aggregated.iter().map(|s| s.to_string()).collect()),
-            asap_types::KeyByLabelNames::new(vec![]),
-            String::new(),
             window_secs,
             slide_secs,
             window_type,
-            metric.to_string(),
-            metric.to_string(),
-            None,
-            None,
-            None,
-        )
+        );
+        set_fixture_family(
+            &mut config,
+            crate::tests::test_utilities::outputs::family(agg_type, &serde_json::json!({})),
+        );
+        config
     }
 
     fn make_worker(
@@ -2012,8 +1901,14 @@ mod tests {
     fn make_hot_reload(
         configs: HashMap<u64, PrecomputeMaterialization>,
     ) -> crate::storage_engines::types::InstalledPrecomputePlanHandle {
+        let outputs = configs.into_iter().map(|(id, mut config)| {
+            let family = FIXTURE_FAMILIES
+                .with(|families| families.borrow()[&config.stored_output_id].clone());
+            config.stored_output_id = asap_types::sds::StoredOutputId(id);
+            (config, family)
+        });
         crate::storage_engines::types::InstalledPrecomputePlanHandle::new(
-            crate::storage_engines::types::InstalledPrecomputePlan::from_raw_ids(configs),
+            crate::storage_engines::types::InstalledPrecomputePlan::new(outputs),
         )
     }
 
@@ -2028,57 +1923,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test: raw mode — each sample forwarded as an exact Sum with sum==value
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn initial_counter_observation_publishes_an_empty_delta_window() {
-        let mut config = make_agg_config(1, "counter", AggregationType::Sum, "sum", 1, 1, vec![]);
-        config
-            .parameters
-            .insert("weight_mode".into(), serde_json::json!("counter_delta"));
-        let fingerprint = config.policy_fingerprint();
-        let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker(
-            HashMap::from([(fingerprint.0, config)]),
-            sink.clone(),
-            false,
-            0,
-            LateDataPolicy::Drop,
-        );
-        worker.current_input_revision = Some(Arc::new(
-            crate::storage_engines::types::SummaryInputRevision {
-                generation: Arc::new(asap_types::sds::CatalogGeneration {
-                    schema_version: 1,
-                    plan_id: 1,
-                    plan_version: 1,
-                    snapshot_sha256: "test".into(),
-                }),
-                first_revision: 1,
-                revision: 1,
-            },
-        ));
-        worker
-            .process_group_samples(
-                1,
-                fingerprint,
-                &test_group_key(""),
-                vec![("counter".into(), 1000, 7.0)],
-            )
-            .unwrap();
-        worker.force_close_all().unwrap();
-        let captured = sink.drain();
-        assert_eq!(captured.len(), 1);
-        assert_eq!(captured[0].0.input_revision.as_ref().unwrap().revision, 1);
-        assert_eq!(
-            captured[0]
-                .1
-                .as_any()
-                .downcast_ref::<asap_physical_operators::summary_kernels::exact::ExactAccumulator>()
-                .map(crate::tests::accumulator_fixture::sum_view)
-                .unwrap()
-                .sum,
-            0.0
-        );
-    }
 
     #[test]
     fn test_raw_mode_forwarding() {
@@ -2120,15 +1964,7 @@ mod tests {
     #[test]
     fn test_tumbling_window_correctness() {
         // 10s tumbling window
-        let config = make_agg_config(
-            1,
-            "cpu",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            10,
-            0,
-            vec![],
-        );
+        let config = make_agg_config(1, "cpu", AggregationType::Sum, "", 10, 0, vec![]);
         let mut agg_configs = HashMap::new();
         agg_configs.insert(1, config);
 
@@ -2203,17 +2039,9 @@ mod tests {
 
     #[test]
     fn test_group_by_merges_series() {
-        // SingleSubpopulation Sum with no grouping labels
+        // Sum with no grouping labels
         // Two different series in the same group → both feed same accumulator
-        let config = make_agg_config(
-            1,
-            "cpu",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            10,
-            0,
-            vec![],
-        );
+        let config = make_agg_config(1, "cpu", AggregationType::Sum, "", 10, 0, vec![]);
         let mut agg_configs = HashMap::new();
         agg_configs.insert(1, config);
 
@@ -2275,15 +2103,7 @@ mod tests {
 
     #[test]
     fn test_different_groups_separate_outputs() {
-        let config = make_agg_config(
-            1,
-            "cpu",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            10,
-            0,
-            vec!["pattern"],
-        );
+        let config = make_agg_config(1, "cpu", AggregationType::Sum, "", 10, 0, vec!["pattern"]);
         let mut agg_configs = HashMap::new();
         agg_configs.insert(1, config);
 
@@ -2364,9 +2184,13 @@ mod tests {
             0,
             vec!["pattern"],
         );
-        config
-            .parameters
-            .insert("K".to_string(), serde_json::Value::from(20_u64));
+        set_fixture_family(
+            &mut config,
+            crate::tests::test_utilities::outputs::family(
+                AggregationType::DatasketchesKLL,
+                &serde_json::json!({"K": 20}),
+            ),
+        );
         let mut agg_configs = HashMap::new();
         agg_configs.insert(1, config);
 
@@ -2439,15 +2263,7 @@ mod tests {
     #[test]
     fn test_sliding_window_pane_sharing() {
         // 30s window, 10s slide → W=3 panes per window
-        let config = make_agg_config(
-            2,
-            "cpu",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            30,
-            10,
-            vec![],
-        );
+        let config = make_agg_config(2, "cpu", AggregationType::Sum, "", 30, 10, vec![]);
         let mut agg_configs = HashMap::new();
         agg_configs.insert(2, config);
 
@@ -2499,15 +2315,7 @@ mod tests {
 
     #[test]
     fn full_window_layout_materializes_each_overlapping_slide() {
-        let mut config = make_agg_config(
-            2,
-            "cpu",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            30,
-            10,
-            vec![],
-        );
+        let mut config = make_agg_config(2, "cpu", AggregationType::Sum, "", 30, 10, vec![]);
         config.window_layout = asap_types::WindowMaterializationLayout::FullWindow;
         let policy = config.policy_fingerprint();
         let sink = Arc::new(CapturingOutputSink::new());
@@ -2565,90 +2373,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_keyed_accumulator_aggregated_labels() {
-        // Like planner output for `sum by (host) (cpu)`:
-        // grouping=[] (empty), aggregated=[host] (key inside KeyedSumCountAccumulator)
-        let config = make_agg_config_full(
-            3,
-            "cpu",
-            AggregationType::MultipleSubpopulation,
-            "Sum",
-            10,
-            0,
-            vec![],       // grouping: empty — one output group
-            vec!["host"], // aggregated: host is the key INSIDE the sketch
-        );
-        let mut agg_configs = HashMap::new();
-        agg_configs.insert(3, config);
-
-        let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
-
-        // Both series go to the SAME bucket (group_key="" since grouping is empty).
-        // The host label is extracted as the aggregated key inside the accumulator.
-        let pf = PolicyFingerprint(3);
-        worker
-            .process_group_samples(
-                3,
-                pf,
-                &test_group_key(""),
-                vec![
-                    ("cpu{host=\"A\"}".to_string(), 1000, 10.0),
-                    ("cpu{host=\"B\"}".to_string(), 2000, 20.0),
-                ],
-            )
-            .unwrap();
-
-        // Close the single bucket's window
-        worker
-            .process_group_samples(
-                3,
-                pf,
-                &test_group_key(""),
-                group_samples("cpu{host=\"A\"}", vec![(10000, 0.0)]),
-            )
-            .unwrap();
-
-        let captured = sink.drain();
-        assert_eq!(
-            captured.len(),
-            1,
-            "one group → one output (both hosts inside)"
-        );
-
-        let (_output, acc) = &captured[0];
-        let ms_acc = acc
-            .as_any()
-            .downcast_ref::<ExactAccumulator>()
-            .expect("should be a keyed exact Sum");
-        assert!(ms_acc.is_keyed(), "both host keys inside one accumulator");
-        let sum = |host: &str| {
-            ms_acc
-                .readout(
-                    asap_types::Statistic::Sum,
-                    None,
-                    Some(&KeyByLabelValues::new_with_labels(vec![host.into()])),
-                )
-                .unwrap()
-                .unwrap()
-        };
-        let found_a = (sum("A") - 10.0).abs() < 1e-10;
-        let found_b = (sum("B") - 20.0).abs() < 1e-10;
-        assert!(found_a, "expected key A inside accumulator");
-        assert!(found_b, "expected key B inside accumulator");
-    }
-
-    #[test]
     fn test_late_data_drop() {
-        let config = make_agg_config(
-            4,
-            "cpu",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            10,
-            0,
-            vec![],
-        );
+        let config = make_agg_config(4, "cpu", AggregationType::Sum, "", 10, 0, vec![]);
         let mut agg_configs = HashMap::new();
         agg_configs.insert(4, config);
 
@@ -2704,15 +2430,7 @@ mod tests {
 
     #[test]
     fn test_late_data_forward_to_store() {
-        let config = make_agg_config(
-            5,
-            "cpu",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            10,
-            0,
-            vec![],
-        );
+        let config = make_agg_config(5, "cpu", AggregationType::Sum, "", 10, 0, vec![]);
         let mut agg_configs = HashMap::new();
         agg_configs.insert(5, config);
 
@@ -2804,21 +2522,11 @@ mod tests {
     #[test]
     fn test_extract_key_from_series() {
         let config = PrecomputeMaterialization::new(
-            AggregationType::SingleSubpopulation,
-            "Sum".to_string(),
-            HashMap::new(),
+            "http_requests_total",
             asap_types::KeyByLabelNames::new(vec!["method".to_string(), "status".to_string()]),
-            asap_types::KeyByLabelNames::new(vec![]),
-            asap_types::KeyByLabelNames::new(vec![]),
-            String::new(),
             60,
             0,
             WindowKind::Tumbling,
-            "http_requests_total".to_string(),
-            "http_requests_total".to_string(),
-            Some(60),
-            None,
-            None,
         );
 
         let key = extract_key_from_series(
@@ -2881,15 +2589,7 @@ mod tests {
         // Two groups on the same worker. Group A advances to t=100s while
         // group B remains active at t=5s. Group A is not evidence that group
         // B's source has completed its earlier window.
-        let config = make_agg_config(
-            1,
-            "cpu",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            10,
-            0,
-            vec![],
-        );
+        let config = make_agg_config(1, "cpu", AggregationType::Sum, "", 10, 0, vec![]);
         let agg_configs = HashMap::from([(1, config)]);
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
@@ -2980,15 +2680,7 @@ mod tests {
 
     #[test]
     fn repeated_flushes_do_not_make_fixed_timestamp_input_late() {
-        let config = make_agg_config(
-            1,
-            "cpu",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            1,
-            0,
-            vec![],
-        );
+        let config = make_agg_config(1, "cpu", AggregationType::Sum, "", 1, 0, vec![]);
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker_with_lateness(
             HashMap::from([(1, config)]),
@@ -3033,15 +2725,7 @@ mod tests {
 
     #[test]
     fn allowed_lateness_delays_event_time_window_close() {
-        let config = make_agg_config(
-            1,
-            "cpu",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            10,
-            0,
-            vec![],
-        );
+        let config = make_agg_config(1, "cpu", AggregationType::Sum, "", 10, 0, vec![]);
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker_with_lateness(
             HashMap::from([(1, config)]),
@@ -3091,15 +2775,7 @@ mod tests {
 
     #[test]
     fn first_catch_up_batch_closes_every_complete_window() {
-        let config = make_agg_config(
-            1,
-            "cpu",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            5,
-            0,
-            vec![],
-        );
+        let config = make_agg_config(1, "cpu", AggregationType::Sum, "", 5, 0, vec![]);
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker_with_lateness(
             HashMap::from([(1, config)]),
@@ -3138,15 +2814,7 @@ mod tests {
 
     #[test]
     fn test_flush_publishes_worker_watermark() {
-        let config = make_agg_config(
-            1,
-            "cpu",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            10,
-            0,
-            vec![],
-        );
+        let config = make_agg_config(1, "cpu", AggregationType::Sum, "", 10, 0, vec![]);
         let agg_configs = HashMap::from([(1, config)]);
         let sink = Arc::new(CapturingOutputSink::new());
         let wm = Arc::new(AtomicI64::new(i64::MIN));
@@ -3590,15 +3258,7 @@ mod tests {
 
     #[test]
     fn wall_clock_fallback_does_not_close_active_raw_ingest() {
-        let cfg = make_agg_config(
-            7,
-            "netflow_bytes",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            1,
-            0,
-            vec![],
-        );
+        let cfg = make_agg_config(7, "netflow_bytes", AggregationType::Sum, "", 1, 0, vec![]);
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker_with_wall_clock_policy(
             HashMap::from([(7, cfg)]),
@@ -3659,15 +3319,7 @@ mod tests {
 
     #[test]
     fn absolute_wall_clock_deadline_closes_active_raw_ingest() {
-        let cfg = make_agg_config(
-            9,
-            "netflow_bytes",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            1,
-            0,
-            vec![],
-        );
+        let cfg = make_agg_config(9, "netflow_bytes", AggregationType::Sum, "", 1, 0, vec![]);
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker_with_wall_clock_policy(
             HashMap::from([(9, cfg)]),
@@ -3734,15 +3386,7 @@ mod tests {
 
     #[test]
     fn absolute_deadline_is_disabled_for_drop_policy() {
-        let cfg = make_agg_config(
-            11,
-            "netflow_bytes",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            1,
-            0,
-            vec![],
-        );
+        let cfg = make_agg_config(11, "netflow_bytes", AggregationType::Sum, "", 1, 0, vec![]);
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker_with_wall_clock_policy(
             HashMap::from([(11, cfg)]),
@@ -3969,15 +3613,7 @@ mod tests {
     // A pooled Sum is correct only for an explicit cross-entity reduction.
     #[test]
     fn pooled_sum_does_not_preserve_per_entity_output_rows() {
-        let config = make_agg_config(
-            1,
-            "gauge",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            10,
-            0,
-            vec![],
-        );
+        let config = make_agg_config(1, "gauge", AggregationType::Sum, "", 10, 0, vec![]);
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(
             HashMap::from([(1, config)]),
@@ -4026,8 +3662,8 @@ mod tests {
         let config = make_agg_config(
             1,
             "requests_total",
-            AggregationType::SingleSubpopulation,
-            "Increase",
+            AggregationType::Increase,
+            "",
             10,
             0,
             vec![],
@@ -4072,15 +3708,7 @@ mod tests {
     // Acknowledgement proves FIFO input processing and trailing-window publication.
     #[tokio::test]
     async fn finite_input_drain_publishes_before_acknowledging() {
-        let config = make_agg_config(
-            1,
-            "cpu",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            10,
-            0,
-            vec![],
-        );
+        let config = make_agg_config(1, "cpu", AggregationType::Sum, "", 10, 0, vec![]);
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(
             HashMap::from([(1, config)]),
@@ -4137,15 +3765,7 @@ mod tests {
                 Err("deliberate sink failure".into())
             }
         }
-        let config = make_agg_config(
-            1,
-            "cpu",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            10,
-            0,
-            vec![],
-        );
+        let config = make_agg_config(1, "cpu", AggregationType::Sum, "", 10, 0, vec![]);
         let mut worker = make_worker(
             HashMap::from([(1, config)]),
             Arc::new(CapturingOutputSink::new()),
@@ -4207,15 +3827,7 @@ mod tests {
                 Err(Box::new(asap_physical_operators::dag::Error::MemoryLimit))
             }
         }
-        let config = make_agg_config(
-            1,
-            "cpu",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            10,
-            0,
-            vec![],
-        );
+        let config = make_agg_config(1, "cpu", AggregationType::Sum, "", 10, 0, vec![]);
         let mut worker = make_worker(
             HashMap::from([(1, config)]),
             Arc::new(CapturingOutputSink::new()),
@@ -4252,15 +3864,7 @@ mod tests {
     fn shutdown_force_close_emits_trailing_sample_window() {
         // 10s tumbling window; make_worker uses grace=0, isolating the
         // force-close from the wall-clock fallback.
-        let config = make_agg_config(
-            1,
-            "cpu",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            10,
-            0,
-            vec![],
-        );
+        let config = make_agg_config(1, "cpu", AggregationType::Sum, "", 10, 0, vec![]);
         let mut agg_configs = HashMap::new();
         agg_configs.insert(1, config);
         let sink = Arc::new(CapturingOutputSink::new());
@@ -4547,6 +4151,12 @@ mod dag_execution_tests {
                 .expect("ASAP producer required")
                 .clone();
             let fp = config.policy_fingerprint();
+            let agg_type = asap_types::aggregation_type_for_family(
+                plan.precompute_plan
+                    .state_family(config.stored_output_id)
+                    .unwrap(),
+            )
+            .unwrap();
             let streaming =
                 InstalledPrecomputePlan::from_precompute_plan(plan.precompute_plan).unwrap();
             let sink = Arc::new(CapturingOutputSink::new());
@@ -4615,7 +4225,7 @@ mod dag_execution_tests {
             let group =
                 crate::query_engines::asap_query_engine::summary_executor::GroupState::ExactAgg {
                     entries: vec![std::rc::Rc::new(states)],
-                    agg_type: config.aggregation_type,
+                    agg_type,
                 };
             assert_eq!(
                 group.exact_value_for(readout, &None, 0, 5000),
@@ -4715,11 +4325,15 @@ mod dag_execution_tests {
                     == Some(asap_types::sds::PopulationPartitioning::PerEntity)
                     || (config.partitioning.is_none()
                         && matches!(
-                            config.aggregation_type,
-                            asap_types::AggregationType::Increase
-                                | asap_types::AggregationType::Rate
-                                | asap_types::AggregationType::Min
-                                | asap_types::AggregationType::Max
+                            installed
+                                .state_family(config.stored_output_id)
+                                .and_then(asap_types::aggregation_type_for_family),
+                            Some(
+                                asap_types::AggregationType::Increase
+                                    | asap_types::AggregationType::Rate
+                                    | asap_types::AggregationType::Min
+                                    | asap_types::AggregationType::Max
+                            )
                         ));
                 // Routing identity as Remote Write assigns it.
                 let mut groups = BTreeMap::<Vec<(String, String)>, Vec<(String, i64, f64)>>::new();
@@ -4776,11 +4390,7 @@ mod dag_execution_tests {
                     config.pane_origin_ms,
                     &config.window_layout,
                 );
-                let right_closed = config
-                    .parameters
-                    .get("promql_right_closed")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
+                let right_closed = installed.right_closed_panes(config.stored_output_id);
                 let mut expected = BTreeMap::new();
                 let mut backfill = BTreeMap::new();
                 for (key, samples) in &groups {
@@ -4862,7 +4472,8 @@ mod dag_execution_tests {
                     "{}",
                     config.metric
                 );
-                assert_eq!(actual, expected, "{:?}", config.aggregation_type);
+                let family = installed.state_family(config.stored_output_id).unwrap();
+                assert_eq!(actual, expected, "{family:?}");
                 // Backfill builds each window with the same installed graph.
                 let backfilled = backfill
                     .into_iter()
@@ -4877,14 +4488,10 @@ mod dag_execution_tests {
                         ((key, start, end), state.serialize_to_bytes())
                     })
                     .collect::<BTreeMap<_, _>>();
-                assert_eq!(
-                    backfilled, expected,
-                    "backfill {:?}",
-                    config.aggregation_type
-                );
+                assert_eq!(backfilled, expected, "backfill {family:?}");
                 outputs += 1;
                 families.insert(
-                    format!("{:?}", config.accumulator_spec().unwrap().family)
+                    format!("{family:?}")
                         .split(['(', ' ', ','])
                         .find(|part| {
                             [
@@ -4989,11 +4596,8 @@ mod dag_execution_tests {
             config.pane_origin_ms,
             &config.window_layout,
         );
-        let right_closed = config
-            .parameters
-            .get("promql_right_closed")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        // Raw PromQL programs close panes on the right, like `(start, end]` ranges.
+        let right_closed = true;
         let mut panes = BTreeMap::<(i64, i64), Vec<(&str, i64, f64)>>::new();
         for (time, value) in [(1100, 10.0), (1200, 20.0), (1300, 30.0), (1400, 40.0)] {
             let pane_time = if right_closed { time - 1 } else { time };

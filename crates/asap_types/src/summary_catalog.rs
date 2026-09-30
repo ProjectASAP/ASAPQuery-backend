@@ -12,7 +12,7 @@ use crate::sds::{
 use crate::PolicyFingerprint;
 use serde::{Deserialize, Serialize};
 
-pub const SUMMARY_CATALOG_SCHEMA_VERSION: u32 = 6;
+pub const SUMMARY_CATALOG_SCHEMA_VERSION: u32 = 7;
 
 /// Canonical definition binds operator and population descriptors. Writer
 /// layout and concrete state belong to installed plans and runtime instances.
@@ -98,24 +98,51 @@ impl SummaryCatalog {
         })
     }
 
-    pub fn from_materializations(
-        plan_id: u64,
-        plan_version: u64,
-        materializations: &[crate::PrecomputeMaterialization],
+    /// The catalog of every output of `plan`: its schema's state family and
+    /// its Planner DAG input predicate.
+    pub fn from_plan(
+        plan: &crate::precompute_plan::PrecomputePlan,
     ) -> Result<Self, SummaryCatalogError> {
-        let entries = materializations
+        let outputs = plan
+            .materializations
             .iter()
             .map(|config| {
-                let summary = SummaryDescriptor::from_config(config)
+                let family = plan.state_family(config.stored_output_id).ok_or(
+                    SummaryCatalogError::MissingDescriptor(config.stored_output_id.as_u64()),
+                )?;
+                let filter = plan
+                    .population_filter(config)
+                    .map_err(SummaryCatalogError::Descriptor)?;
+                Ok((config, family, filter))
+            })
+            .collect::<Result<Vec<_>, SummaryCatalogError>>()?;
+        Self::from_outputs(plan.envelope.plan_id, plan.envelope.plan_version, outputs)
+    }
+
+    /// Each output is paired with its state family and canonical input predicate.
+    pub fn from_outputs(
+        plan_id: u64,
+        plan_version: u64,
+        outputs: Vec<(
+            &crate::PrecomputeMaterialization,
+            &planner_types::post_asap::SummaryFamilyType,
+            String,
+        )>,
+    ) -> Result<Self, SummaryCatalogError> {
+        let entries = outputs
+            .iter()
+            .map(|(config, family, filter)| {
+                let summary = SummaryDescriptor::from_family(family)
                     .map_err(|error| SummaryCatalogError::Descriptor(error.to_string()))?;
                 let source = config.source_identity();
                 let value_projection = config.effective_value_projection().clone();
+                config
+                    .table_population_canonical()
+                    .map_err(SummaryCatalogError::Descriptor)?;
                 let data = DataDescriptor::new_typed(
                     source,
                     value_projection,
-                    config
-                        .population_filter_canonical()
-                        .map_err(SummaryCatalogError::Descriptor)?,
+                    filter.clone(),
                     config.grouping_labels.names(),
                     if config.table_name.is_some() && !config.grouping_labels.is_empty() {
                         crate::grouping_projection::TABLE_GROUP_OBSERVATION_SEMANTICS
@@ -132,7 +159,7 @@ impl SummaryCatalog {
             .collect::<Result<Vec<_>, SummaryCatalogError>>()?;
         let mut catalog = Self::build(plan_id, plan_version, entries)?;
         let mut semantic_bindings = BTreeMap::new();
-        for config in materializations {
+        for (config, _, _) in &outputs {
             let output = catalog
                 .outputs
                 .get_mut(&StoredOutputId::from(config.policy_fingerprint()))
@@ -343,25 +370,51 @@ impl SummaryCatalog {
 mod tests {
     use super::*;
     use crate::sds::ValueProjectionIdentity;
-    use crate::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
+    use crate::{KeyByLabelNames, PrecomputeMaterialization, WindowKind};
+    use planner_types::post_asap::{ExactKind, ExactParams, SummaryFamilyType};
 
-    fn config(metric: &str, filter: &str, window: u64) -> PrecomputeMaterialization {
-        PrecomputeMaterialization::new(
-            AggregationType::Sum,
-            String::new(),
-            Default::default(),
+    fn sum() -> SummaryFamilyType {
+        SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum)
+    }
+
+    fn allocated(mut config: PrecomputeMaterialization, filter: &str) -> PrecomputeMaterialization {
+        config.allocate_stored_output_id(&("sum", filter));
+        config
+    }
+
+    /// An allocated output with the given DAG input filter.
+    fn config(metric: &str, filter: &str, window: u64) -> (PrecomputeMaterialization, String) {
+        let config = PrecomputeMaterialization::new(
+            metric,
             KeyByLabelNames::new(vec!["job".into()]),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            String::new(),
             window,
             window,
             WindowKind::Tumbling,
-            filter.into(),
-            metric.into(),
-            None,
-            None,
-            None,
+        );
+        (allocated(config, filter), filter.into())
+    }
+
+    fn catalog(
+        plan_id: u64,
+        plan_version: u64,
+        outputs: &[(PrecomputeMaterialization, String)],
+    ) -> Result<SummaryCatalog, SummaryCatalogError> {
+        with_family(plan_id, plan_version, outputs, &sum())
+    }
+
+    fn with_family(
+        plan_id: u64,
+        plan_version: u64,
+        outputs: &[(PrecomputeMaterialization, String)],
+        family: &SummaryFamilyType,
+    ) -> Result<SummaryCatalog, SummaryCatalogError> {
+        SummaryCatalog::from_outputs(
+            plan_id,
+            plan_version,
+            outputs
+                .iter()
+                .map(|(config, filter)| (config, family, filter.clone()))
+                .collect(),
         )
     }
 
@@ -370,7 +423,7 @@ mod tests {
     fn table_populations_have_distinct_materialization_and_data_identities() {
         use crate::table_population::{TableColumnPredicate, TablePopulation};
         use planner_types::pre_asap::{CompareOpKind, ScalarValue};
-        let mut requests = config("raw_samples.value", "", 60);
+        let (mut requests, _) = config("raw_samples.value", "", 60);
         requests.table_name = Some("raw_samples".into());
         requests.value_projection = Some(ValueProjectionIdentity::Column {
             name: "value".into(),
@@ -382,15 +435,17 @@ mod tests {
                 value: ScalarValue::Utf8("requests".into()),
             }],
         });
+        let requests = allocated(requests, "");
         let mut errors = requests.clone();
         errors.table_population.as_mut().unwrap().predicates[0].value =
             ScalarValue::Utf8("errors".into());
+        let errors = allocated(errors, "");
         assert_ne!(requests.policy_fingerprint(), errors.policy_fingerprint());
         let mut other_table = requests.clone();
         other_table.table_name = Some("other_samples".into());
         assert_ne!(
             requests.policy_fingerprint(),
-            other_table.policy_fingerprint()
+            allocated(other_table, "").policy_fingerprint()
         );
         let mut other_value = requests.clone();
         other_value.value_projection = Some(ValueProjectionIdentity::Column {
@@ -398,23 +453,27 @@ mod tests {
         });
         assert_ne!(
             requests.policy_fingerprint(),
-            other_value.policy_fingerprint()
+            allocated(other_value, "").policy_fingerprint()
         );
         let mut other_time = requests.clone();
         other_time.table_timestamp_column = Some("event_time_ms".into());
+        let other_time = allocated(other_time, "");
         assert_ne!(
             requests.policy_fingerprint(),
             other_time.policy_fingerprint()
         );
-        let mut invalid_labels = requests.clone();
-        invalid_labels.table_population = None;
-        invalid_labels.spatial_filter = "job=\"requests\"".into();
-        assert!(SummaryCatalog::from_materializations(1, 1, &[invalid_labels]).is_err());
         let mut invalid_time = requests.clone();
         invalid_time.table_timestamp_column = Some("time; DROP TABLE samples".into());
-        assert!(SummaryCatalog::from_materializations(1, 1, &[invalid_time]).is_err());
-        let catalog =
-            SummaryCatalog::from_materializations(1, 1, &[requests, errors, other_time]).unwrap();
+        assert!(catalog(1, 1, &[(allocated(invalid_time, ""), String::new())]).is_err());
+        let catalog = catalog(
+            1,
+            1,
+            &[requests, errors, other_time].map(|config| {
+                let filter = config.table_population_canonical().unwrap();
+                (config, filter)
+            }),
+        )
+        .unwrap();
         assert_eq!(catalog.data_descriptors.len(), 3);
         assert_eq!(catalog.outputs.len(), 3);
     }
@@ -423,10 +482,10 @@ mod tests {
     fn snapshot_reference_is_deterministic_and_content_sensitive() {
         let a = config("requests", "", 60);
         let b = config("errors", "", 60);
-        let left = SummaryCatalog::from_materializations(1, 2, &[a.clone(), b.clone()]).unwrap();
-        let reordered = SummaryCatalog::from_materializations(1, 2, &[b, a.clone()]).unwrap();
+        let left = catalog(1, 2, &[a.clone(), b.clone()]).unwrap();
+        let reordered = catalog(1, 2, &[b, a.clone()]).unwrap();
         assert_eq!(left.reference().unwrap(), reordered.reference().unwrap());
-        let changed = SummaryCatalog::from_materializations(1, 2, &[a]).unwrap();
+        let changed = catalog(1, 2, &[a]).unwrap();
         assert_ne!(left.reference().unwrap(), changed.reference().unwrap());
         left.reference()
             .unwrap()
@@ -444,8 +503,7 @@ mod tests {
     fn shares_descriptors_across_windows_and_deduplicates_materializations() {
         let one = config("requests", "", 60);
         let two = config("requests", "", 120);
-        let catalog =
-            SummaryCatalog::from_materializations(7, 2, &[one.clone(), two, one]).unwrap();
+        let catalog = catalog(7, 2, &[one.clone(), two, one]).unwrap();
         assert_eq!(catalog.summary_descriptors.len(), 1);
         assert_eq!(catalog.data_descriptors.len(), 1);
         assert_eq!(catalog.outputs.len(), 2);
@@ -455,7 +513,7 @@ mod tests {
     // Stored pane duration identifies a deployment output, not the summary meaning.
     #[test]
     fn semantic_definition_is_shared_across_deployed_pane_outputs() {
-        let catalog = SummaryCatalog::from_materializations(
+        let catalog = catalog(
             1,
             1,
             &[config("requests", "", 60), config("requests", "", 120)],
@@ -469,10 +527,10 @@ mod tests {
     #[test]
     fn hot_and_rebuild_have_one_definition_and_two_bound_outputs() {
         let mut hot = config("latency", "", 60);
-        hot.stored_output_id = Some(StoredOutputId(41));
+        hot.0.stored_output_id = StoredOutputId(41);
         let mut rebuild = hot.clone();
-        rebuild.stored_output_id = Some(StoredOutputId(42));
-        let catalog = SummaryCatalog::from_materializations(7, 42, &[hot, rebuild]).unwrap();
+        rebuild.0.stored_output_id = StoredOutputId(42);
+        let catalog = catalog(7, 42, &[hot, rebuild]).unwrap();
         assert_eq!(catalog.definitions.len(), 1);
         let hot = catalog.output_reference(StoredOutputId(41)).unwrap();
         let rebuild = catalog.output_reference(StoredOutputId(42)).unwrap();
@@ -499,7 +557,7 @@ mod tests {
     // Source/population changes never alias, while the operator can be reused.
     #[test]
     fn separates_population_and_operator_identity() {
-        let catalog = SummaryCatalog::from_materializations(
+        let catalog = catalog(
             1,
             1,
             &[
@@ -516,15 +574,23 @@ mod tests {
     // Operator changes share population metadata without sharing state identity.
     #[test]
     fn changing_operator_parameters_creates_a_new_summary_descriptor() {
-        let mut a = config("requests", "", 60);
-        a.aggregation_type = AggregationType::DatasketchesKLL;
-        a.parameters.insert("K".into(), serde_json::json!(100));
-        let mut b = a.clone();
-        b.parameters.insert("K".into(), serde_json::json!(200));
-        let catalog = SummaryCatalog::from_materializations(1, 1, &[a, b]).unwrap();
-        assert_eq!(catalog.summary_descriptors.len(), 2);
+        use planner_types::post_asap::{
+            GroupingStrategy, SketchAlgorithm, SketchKind, SketchParams,
+        };
+        let kll = |k| {
+            SummaryFamilyType::Sketch(
+                SketchKind::new(SketchAlgorithm::Kll, SketchParams::Kll { k }),
+                GroupingStrategy::PerSubpopulationInstance,
+            )
+        };
+        let a = with_family(1, 1, &[config("requests", "", 60)], &kll(100)).unwrap();
+        let b = with_family(1, 1, &[config("requests", "", 60)], &kll(200)).unwrap();
+        assert_ne!(a.summary_descriptors, b.summary_descriptors);
+        assert_eq!(a.data_descriptors, b.data_descriptors);
+        let catalog = a;
+        assert_eq!(catalog.summary_descriptors.len(), 1);
         assert_eq!(catalog.data_descriptors.len(), 1);
-        assert_eq!(catalog.outputs.len(), 2);
+        assert_eq!(catalog.outputs.len(), 1);
     }
 
     // Construction order cannot affect the published snapshot bytes.
@@ -532,8 +598,8 @@ mod tests {
     fn snapshot_is_deterministic_and_round_trips() {
         let a = config("requests", "", 60);
         let b = config("errors", "", 60);
-        let forward = SummaryCatalog::from_materializations(7, 2, &[a.clone(), b.clone()]).unwrap();
-        let backward = SummaryCatalog::from_materializations(7, 2, &[b, a]).unwrap();
+        let forward = catalog(7, 2, &[a.clone(), b.clone()]).unwrap();
+        let backward = catalog(7, 2, &[b, a]).unwrap();
         let bytes = serde_json::to_vec(&forward).unwrap();
         assert_eq!(bytes, serde_json::to_vec(&backward).unwrap());
         let decoded: SummaryCatalog = serde_json::from_slice(&bytes).unwrap();
@@ -543,10 +609,11 @@ mod tests {
 
     #[test]
     fn catalog_definitions_do_not_store_writer_layout() {
-        let mut materialization = config("requests", "", 60);
+        let (mut materialization, _) = config("requests", "", 60);
         materialization.pane_origin_ms = Some(7_000);
+        let materialization = allocated(materialization, "");
         let id = StoredOutputId::from(materialization.policy_fingerprint());
-        let catalog = SummaryCatalog::from_materializations(7, 2, &[materialization]).unwrap();
+        let catalog = catalog(7, 2, &[(materialization, String::new())]).unwrap();
         assert!(catalog.outputs.contains_key(&id));
         assert!(
             !serde_json::to_value(&catalog).unwrap()["outputs"][id.as_u64().to_string()]
@@ -565,8 +632,7 @@ mod tests {
     fn conflicting_materialization_is_rejected() {
         let first = config("requests", "", 60);
         let second = config("errors", "", 60);
-        let catalog =
-            SummaryCatalog::from_materializations(1, 1, &[first.clone(), second]).unwrap();
+        let catalog = catalog(1, 1, &[first.clone(), second]).unwrap();
         let summary = catalog.summary_descriptors.values().next().unwrap().clone();
         let data = catalog
             .data_descriptors
@@ -577,8 +643,12 @@ mod tests {
             1,
             1,
             [
-                (first.policy_fingerprint(), summary.clone(), data[0].clone()),
-                (first.policy_fingerprint(), summary, data[1].clone()),
+                (
+                    first.0.policy_fingerprint(),
+                    summary.clone(),
+                    data[0].clone(),
+                ),
+                (first.0.policy_fingerprint(), summary, data[1].clone()),
             ],
         )
         .unwrap_err();
@@ -591,8 +661,7 @@ mod tests {
     // Imported catalogs must resolve every foreign key and content identity.
     #[test]
     fn rejects_dangling_refs_tampered_keys_and_unknown_schema() {
-        let catalog =
-            SummaryCatalog::from_materializations(1, 1, &[config("requests", "", 60)]).unwrap();
+        let catalog = catalog(1, 1, &[config("requests", "", 60)]).unwrap();
         let mut broken = catalog.clone();
         broken.data_descriptors.clear();
         assert!(matches!(
@@ -631,7 +700,7 @@ mod tests {
     // Native exact-only plans have a valid empty catalog, not dummy state.
     #[test]
     fn empty_catalog_is_valid() {
-        let catalog = SummaryCatalog::from_materializations(1, 1, &[]).unwrap();
+        let catalog = catalog(1, 1, &[]).unwrap();
         assert!(catalog.outputs.is_empty());
         catalog.validate().unwrap();
     }

@@ -199,35 +199,24 @@ mod tests {
     use asap_types::KeyByLabelNames;
     use std::collections::HashMap;
 
-    fn sum_agg_config(id: u64) -> PrecomputeMaterialization {
-        PrecomputeMaterialization {
-            stored_output_id: None,
-            semantic_fragment: None,
-            population_key_encoding: Default::default(),
-            aggregation_type: AggregationType::Sum,
-            aggregation_sub_type: String::new(),
-            parameters: HashMap::new(),
-            grouping_labels: KeyByLabelNames::empty().into(),
-            aggregated_labels: KeyByLabelNames::empty(),
-            rollup_labels: KeyByLabelNames::empty(),
-            original_yaml: String::new(),
-            window_size: 1,
-            slide_interval: 1,
-            window_type: WindowKind::Tumbling,
-            window_layout: asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 },
-            pane_origin_ms: None,
-            spatial_filter: String::new(),
-            spatial_filter_normalized: String::new(),
-            metric: format!("metric_{id}"),
-            num_aggregates_to_retain: None,
-            table_name: None,
-            value_projection: None,
-            table_population: None,
-            derived_input: None,
-            table_timestamp_column: None,
-            partitioning: None,
-            value_source_column: None,
-        }
+    fn sum_agg_config(
+        id: u64,
+    ) -> (
+        PrecomputeMaterialization,
+        planner_types::post_asap::SummaryFamilyType,
+    ) {
+        let mut config = PrecomputeMaterialization::new(
+            format!("metric_{id}"),
+            KeyByLabelNames::empty(),
+            1,
+            1,
+            WindowKind::Tumbling,
+        );
+        config.window_layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 };
+        crate::tests::test_utilities::outputs::allocated(
+            config,
+            AggregationType::Sum.planner_exact_family().unwrap(),
+        )
     }
 
     /// Build a streaming-config keyed on the policy-fingerprint u64
@@ -235,18 +224,14 @@ mod tests {
     /// marker_id → fingerprint mapping so callers can look up the
     /// right key.
     fn make_streaming_config(ids: &[u64]) -> (Arc<InstalledPrecomputePlan>, HashMap<u64, u64>) {
-        let mut map = HashMap::new();
+        let mut outputs = Vec::new();
         let mut id_to_fp = HashMap::new();
         for &id in ids {
             let cfg = sum_agg_config(id);
-            let fp = cfg.policy_fp_u64();
-            id_to_fp.insert(id, fp);
-            map.insert(fp, cfg);
+            id_to_fp.insert(id, cfg.0.policy_fp_u64());
+            outputs.push(cfg);
         }
-        (
-            Arc::new(InstalledPrecomputePlan::from_raw_ids(map)),
-            id_to_fp,
-        )
+        (Arc::new(InstalledPrecomputePlan::new(outputs)), id_to_fp)
     }
 
     fn write_one(
@@ -280,6 +265,9 @@ mod tests {
             .ingest_precompute_for_agg_config(
                 |m, fp, ak| resolver.resolve(m, fp, ak),
                 agg_cfg,
+                &installed_precompute_plan
+                    .agg_kind(agg_cfg.stored_output_id)
+                    .unwrap(),
                 &output,
                 &acc,
             )

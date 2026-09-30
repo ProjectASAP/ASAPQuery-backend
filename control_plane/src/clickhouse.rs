@@ -260,7 +260,7 @@ pub async fn compile_automatic_clickhouse_workload(
         let selection_trace = std::mem::take(&mut planned.selection_trace);
         let template = planned.canonical_sql.clone();
         let (entry, installed) = compile_selected_sql(query, planned, |node, family| {
-            let config = materialize_selected_sql(node, family, query)
+            let (config, family) = materialize_selected_sql(node, family, query)
                 .map_err(crate::query_plan::QueryPlanError::Invalid)?;
             let binding = MaterializationBinding {
                 full_window_slide_ms: matches!(
@@ -276,11 +276,12 @@ pub async fn compile_automatic_clickhouse_workload(
                 window_ms: config.stored_window_ms(),
                 pane_origin_ms: config.pane_origin_ms,
                 readout_lookback_ms: Some(query.end_ms - query.start_ms),
-                item_labels: config.aggregated_labels.labels.clone(),
+                // SQL table summaries project no per-item dimension.
+                item_labels: Vec::new(),
             };
             materializations
                 .entry(config.policy_fingerprint())
-                .or_insert(config);
+                .or_insert((config, family));
             Ok(binding)
         })?;
         index_sql_template(&mut window_templates, template, &entry);
@@ -300,15 +301,11 @@ pub async fn compile_automatic_clickhouse_workload(
         );
     }
     let configs: Vec<_> = materializations.into_values().collect();
-    let sds = SummaryCatalog::from_materializations(
-        request.envelope.plan_id,
-        request.envelope.plan_version,
-        &configs,
-    )
-    .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
     let mut precompute = PrecomputePlan::build_backend_local(request.envelope.clone(), configs)
         .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
     precompute.executable_dags = installed_dags;
+    let sds = SummaryCatalog::from_plan(&precompute)
+        .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
     precompute
         .bind_catalog(&sds)
         .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
@@ -350,7 +347,13 @@ fn materialize_selected_sql(
     node: &planner_types::post_asap::SummaryNode,
     family: &planner_types::post_asap::SummaryFamilyType,
     query: &ClickHouseSqlWorkloadEntry,
-) -> Result<asap_types::PrecomputeMaterialization, String> {
+) -> Result<
+    (
+        asap_types::PrecomputeMaterialization,
+        planner_types::post_asap::SummaryFamilyType,
+    ),
+    String,
+> {
     use crate::physical::backend_stage::{AggregationInput, BackendAggregation};
     use planner_types::{post_asap::SummaryExpr, pre_asap::Reduction};
     let SummaryExpr::SummaryAgg {
@@ -401,11 +404,12 @@ fn materialize_selected_sql(
         heap_update_mode: None,
         aggregation_input: AggregationInput::Raw,
     };
-    let mut config = crate::physical::compiler::aggregation_config_for_materialization(
-        &aggregation,
-        asap_types::QueryLanguage::ClickHouseSql,
-    )
-    .map_err(|error| error.to_string())?;
+    let (mut config, computation) =
+        crate::physical::compiler::aggregation_config_for_materialization(
+            &aggregation,
+            asap_types::QueryLanguage::ClickHouseSql,
+        )
+        .map_err(|error| error.to_string())?;
     config.table_name = Some(table);
     config.grouping_labels = grouping;
     config.value_projection = Some(value);
@@ -418,7 +422,8 @@ fn materialize_selected_sql(
             .map_err(|_| "SQL evaluation timestamp exceeds runtime range")?,
     );
     config.num_aggregates_to_retain = Some(2);
-    Ok(config)
+    config.allocate_stored_output_id(&computation);
+    Ok((config, computation.0))
 }
 
 pub async fn compile_clickhouse_workload(
@@ -620,7 +625,7 @@ fn bind_selected_node(
         .map_err(crate::query_plan::QueryPlanError::Invalid)?;
     let expected = family.clone();
     let selected = select_materialization(
-        &request.precompute_plan.materializations,
+        &request.precompute_plan,
         &table_ref,
         &value_column,
         &spatial_filter.canonical(),
@@ -646,7 +651,7 @@ fn bind_selected_node(
         window_ms: selected.stored_window_ms(),
         pane_origin_ms: selected.pane_origin_ms,
         readout_lookback_ms: source_window.map(|seconds| seconds.saturating_mul(1000)),
-        item_labels: selected.aggregated_labels.labels.clone(),
+        item_labels: Vec::new(),
     })
 }
 
@@ -920,21 +925,18 @@ fn clickhouse_materialization_leaf_contract(
 }
 
 fn select_materialization<'a>(
-    materializations: &'a [asap_types::PrecomputeMaterialization],
+    plan: &'a asap_types::precompute_plan::PrecomputePlan,
     table_ref: &str,
     value_projection: &asap_types::sds::ValueProjectionIdentity,
     spatial_filter: &str,
     expected: &planner_types::post_asap::SummaryFamilyType,
     semantic_window_seconds: u64,
 ) -> Result<&'a asap_types::PrecomputeMaterialization, crate::query_plan::QueryPlanError> {
-    let mut matches = materializations.iter().filter(|candidate| {
+    let mut matches = plan.materializations.iter().filter(|candidate| {
         candidate.table_name.as_deref() == Some(table_ref)
             && candidate.effective_value_projection() == value_projection
-            && candidate.population_filter_canonical().ok().as_deref() == Some(spatial_filter)
-            && candidate
-                .accumulator_spec()
-                .ok()
-                .is_some_and(|spec| spec.family == *expected)
+            && candidate.table_population_canonical().ok().as_deref() == Some(spatial_filter)
+            && plan.state_family(candidate.stored_output_id) == Some(expected)
             && semantic_window_seconds
                 .checked_mul(1000)
                 .is_some_and(|window| window % candidate.window_size.saturating_mul(1000) == 0)
@@ -956,6 +958,7 @@ fn select_materialization<'a>(
 mod tests {
     use super::*;
     use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
+    use planner_types::post_asap::SummaryFamilyType;
     use planner_types::pre_asap::{Column, DataType, Schema};
 
     // A dashboard refresh must reuse the installed identity without treating
@@ -1042,33 +1045,54 @@ mod tests {
         }
     }
 
+    fn exact(agg: AggregationType) -> SummaryFamilyType {
+        agg.planner_exact_family().unwrap()
+    }
+
+    fn ddsketch(alpha: f64) -> SummaryFamilyType {
+        use planner_types::post_asap::{
+            GroupingStrategy, SketchAlgorithm, SketchKind, SketchParams,
+        };
+        SummaryFamilyType::Sketch(
+            SketchKind::new(SketchAlgorithm::DDSketch, SketchParams::DDSketch { alpha }),
+            GroupingStrategy::PerSubpopulationInstance,
+        )
+    }
+
     fn materialization(
-        agg: AggregationType,
+        family: SummaryFamilyType,
         value_column: &str,
         window: u64,
         slide: u64,
-        parameter: (&str, serde_json::Value),
-    ) -> PrecomputeMaterialization {
+    ) -> (PrecomputeMaterialization, SummaryFamilyType) {
         let mut value = PrecomputeMaterialization::new(
-            agg,
-            String::new(),
-            std::collections::HashMap::from([(parameter.0.into(), parameter.1)]),
+            format!("telemetry.{value_column}"),
             KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            String::new(),
             window,
             slide,
             WindowKind::Tumbling,
-            String::new(),
-            format!("telemetry.{value_column}"),
-            None,
-            Some("telemetry".into()),
-            Some(value_column.into()),
         );
+        value.table_name = Some("telemetry".into());
+        value.value_projection = Some(asap_types::sds::ValueProjectionIdentity::Column {
+            name: value_column.into(),
+        });
         value.pane_origin_ms = Some(0);
         value.table_timestamp_column = Some("timestamp_ms".into());
-        value
+        value.allocate_stored_output_id(&family);
+        (value, family)
+    }
+
+    fn envelope(plan_id: u64) -> crate::physical::compiler::PlanEnvelope {
+        crate::physical::compiler::PlanEnvelope {
+            plan_id,
+            plan_version: 1,
+            generated_at_unix_ms: 0,
+            activation_unix_ms: 0,
+            expiry_unix_ms: None,
+            backend_compat: crate::physical::compiler::BACKEND_COMPAT.into(),
+            planner_revision: crate::physical::compiler::PLANNER_REVISION.into(),
+            capability_snapshot_id: "clickhouse-test".into(),
+        }
     }
 
     /// A table leaf whose value column has the given producer typing.
@@ -1108,16 +1132,7 @@ mod tests {
             ],
             schema,
         };
-        let family = materialization(
-            AggregationType::Sum,
-            "value",
-            60,
-            60,
-            ("variant", serde_json::json!(1)),
-        )
-        .accumulator_spec()
-        .unwrap()
-        .family;
+        let family = exact(AggregationType::Sum);
         let summary_schema = SummarySchema {
             fields: vec![],
             time_index: None,
@@ -1208,16 +1223,7 @@ mod tests {
             fields: vec![],
             time_index: None,
         };
-        let family = materialization(
-            AggregationType::Sum,
-            "value",
-            60,
-            60,
-            ("variant", serde_json::json!(1)),
-        )
-        .accumulator_spec()
-        .unwrap()
-        .family;
+        let family = exact(AggregationType::Sum);
         let node = SummaryNode {
             expr: SummaryExpr::SummaryAgg {
                 child: std::rc::Rc::new(SummaryNode {
@@ -1246,130 +1252,55 @@ mod tests {
 
     #[test]
     fn selected_nodes_bind_unique_family_parameters_source_and_window() {
-        let sum_60 = materialization(
-            AggregationType::Sum,
-            "requests",
-            60,
-            10,
-            ("variant", serde_json::json!(1)),
-        );
-        let count_60 = materialization(
-            AggregationType::Max,
-            "requests",
-            60,
-            10,
-            ("variant", serde_json::json!(2)),
-        );
-        let sum_300 = materialization(
-            AggregationType::Sum,
-            "requests",
-            300,
-            30,
-            ("variant", serde_json::json!(3)),
-        );
-        let other = materialization(
-            AggregationType::Sum,
-            "latency",
-            60,
-            10,
-            ("variant", serde_json::json!(1)),
-        );
-        let dd_2 = materialization(
-            AggregationType::DDSketch,
-            "requests",
-            60,
-            10,
-            ("relativeAccuracy", serde_json::json!(0.02)),
-        );
-        let dd_5 = materialization(
-            AggregationType::DDSketch,
-            "requests",
-            60,
-            10,
-            ("relativeAccuracy", serde_json::json!(0.05)),
-        );
-        let configs = vec![
-            sum_60.clone(),
-            count_60.clone(),
-            sum_300,
-            other,
-            dd_2.clone(),
-            dd_5,
-        ];
-        let sum_family = sum_60.accumulator_spec().unwrap().family;
-        let count_family = count_60.accumulator_spec().unwrap().family;
-        assert_eq!(
-            select_materialization(
-                &configs,
-                "telemetry",
-                &asap_types::sds::ValueProjectionIdentity::Column {
-                    name: "requests".into()
-                },
-                "",
-                &sum_family,
-                60
-            )
-            .unwrap()
-            .policy_fingerprint(),
-            sum_60.policy_fingerprint()
-        );
-        let dd_family = dd_2.accumulator_spec().unwrap().family;
-        assert_eq!(
-            select_materialization(
-                &configs,
-                "telemetry",
-                &asap_types::sds::ValueProjectionIdentity::Column {
-                    name: "requests".into()
-                },
-                "",
-                &dd_family,
-                60
-            )
-            .unwrap()
-            .policy_fingerprint(),
-            dd_2.policy_fingerprint()
-        );
-        assert_eq!(
-            select_materialization(
-                &configs,
-                "telemetry",
-                &asap_types::sds::ValueProjectionIdentity::Column {
-                    name: "requests".into()
-                },
-                "",
-                &count_family,
-                60
-            )
-            .unwrap()
-            .policy_fingerprint(),
-            count_60.policy_fingerprint()
-        );
-        assert!(select_materialization(
-            &configs,
-            "telemetry",
-            &asap_types::sds::ValueProjectionIdentity::Column {
-                name: "missing".into()
-            },
-            "",
-            &sum_family,
-            60
+        let sum_60 = materialization(exact(AggregationType::Sum), "requests", 60, 60);
+        let count_60 = materialization(exact(AggregationType::Max), "requests", 60, 60);
+        let sum_300 = materialization(exact(AggregationType::Sum), "requests", 300, 300);
+        let other = materialization(exact(AggregationType::Sum), "latency", 60, 60);
+        let dd_2 = materialization(ddsketch(0.02), "requests", 60, 60);
+        let dd_5 = materialization(ddsketch(0.05), "requests", 60, 60);
+        let plan = PrecomputePlan::build_backend_local(
+            envelope(1),
+            vec![
+                sum_60.clone(),
+                count_60.clone(),
+                sum_300,
+                other,
+                dd_2.clone(),
+                dd_5,
+            ],
         )
-        .is_err());
-        let mut ambiguous = configs.clone();
-        ambiguous.push(sum_60);
-        assert!(select_materialization(
-            &ambiguous,
-            "telemetry",
-            &asap_types::sds::ValueProjectionIdentity::Column {
-                name: "requests".into()
-            },
-            "",
-            &sum_family,
-            60
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("ambiguous"));
+        .unwrap();
+        let requests = asap_types::sds::ValueProjectionIdentity::Column {
+            name: "requests".into(),
+        };
+        let select = |plan, projection, family| {
+            select_materialization(plan, "telemetry", projection, "", family, 60)
+                .map(|selected| selected.policy_fingerprint())
+        };
+        for expected in [&sum_60, &count_60, &dd_2] {
+            assert_eq!(
+                select(&plan, &requests, &expected.1).unwrap(),
+                expected.0.policy_fingerprint()
+            );
+        }
+        let missing = asap_types::sds::ValueProjectionIdentity::Column {
+            name: "missing".into(),
+        };
+        assert!(select(&plan, &missing, &sum_60.1).is_err());
+        let mut ambiguous = plan.clone();
+        let mut duplicate = sum_60.0.clone();
+        duplicate.stored_output_id = asap_types::sds::StoredOutputId(1);
+        ambiguous.materializations.push(duplicate.clone());
+        ambiguous
+            .schemas
+            .push(asap_types::precompute_plan::StateSchemaContract {
+                materialization: duplicate.stored_output_id,
+                ..plan.schemas[0].clone()
+            });
+        assert!(select(&ambiguous, &requests, &sum_60.1)
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous"));
     }
 
     #[test]
@@ -1414,27 +1345,11 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_mixed_snapshots_and_preserves_local_sql_contracts() {
-        let config = materialization(
-            AggregationType::Sum,
-            "value",
-            2,
-            2,
-            ("variant", serde_json::json!(1)),
-        );
-        let sds =
-            SummaryCatalog::from_materializations(71, 1, std::slice::from_ref(&config)).unwrap();
-        let envelope = crate::physical::compiler::PlanEnvelope {
-            plan_id: 71,
-            plan_version: 1,
-            generated_at_unix_ms: 0,
-            activation_unix_ms: 0,
-            expiry_unix_ms: None,
-            backend_compat: crate::physical::compiler::BACKEND_COMPAT.into(),
-            planner_revision: crate::physical::compiler::PLANNER_REVISION.into(),
-            capability_snapshot_id: "clickhouse-mixed-compile-test".into(),
-        };
+        let config = materialization(exact(AggregationType::Sum), "value", 2, 2);
+        let envelope = envelope(71);
         let mut precompute =
             PrecomputePlan::build_backend_local(envelope.clone(), vec![config]).unwrap();
+        let sds = SummaryCatalog::from_plan(&precompute).unwrap();
         precompute.bind_catalog(&sds).unwrap();
         let mut transmission = crate::physical::compiler::build_transmission_plan(
             envelope,
@@ -1734,11 +1649,14 @@ mod tests {
                 value: planner_types::pre_asap::ScalarValue::Utf8("requests".into()),
             }],
         });
-        request.summary_catalog =
-            SummaryCatalog::from_materializations(71, 1, &[config.clone()]).unwrap();
+        config.allocate_stored_output_id(&exact(AggregationType::Sum));
         let envelope = request.precompute_plan.envelope.clone();
-        request.precompute_plan =
-            PrecomputePlan::build_backend_local(envelope.clone(), vec![config]).unwrap();
+        request.precompute_plan = PrecomputePlan::build_backend_local(
+            envelope.clone(),
+            vec![(config, exact(AggregationType::Sum))],
+        )
+        .unwrap();
+        request.summary_catalog = SummaryCatalog::from_plan(&request.precompute_plan).unwrap();
         request
             .precompute_plan
             .bind_catalog(&request.summary_catalog)

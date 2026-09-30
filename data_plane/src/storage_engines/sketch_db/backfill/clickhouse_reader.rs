@@ -242,7 +242,7 @@ pub fn clickhouse_reader_factory(config: ClickHouseReaderConfig) -> ReaderFactor
                     return Err("table materialization has no explicit value projection".into())
                 }
             }
-            materialization.population_filter_canonical()?;
+            materialization.table_population_canonical()?;
             let mut reader = ClickHouseReader::new(source_config)?;
             reader.population = Some(materialization.table_population.clone().unwrap_or_default());
             reader.value_projection = Some(materialization.effective_value_projection().clone());
@@ -548,22 +548,16 @@ mod tests {
     #[test]
     fn typed_source_enters_clickhouse_backfill_lifecycle() {
         let mut materialization = asap_types::PrecomputeMaterialization::new(
-            asap_types::AggregationType::Sum,
-            String::new(),
-            Default::default(),
+            "samples.value",
             asap_types::KeyByLabelNames::empty(),
-            asap_types::KeyByLabelNames::empty(),
-            asap_types::KeyByLabelNames::empty(),
-            String::new(),
             1,
             1,
             asap_types::WindowKind::Tumbling,
-            String::new(),
-            "samples.value".into(),
-            None,
-            Some("another_table".into()),
-            Some("value".into()),
         );
+        materialization.table_name = Some("another_table".into());
+        materialization.value_projection = Some(asap_types::sds::ValueProjectionIdentity::Column {
+            name: "value".into(),
+        });
         let factory = clickhouse_reader_factory(config("samples"));
         materialization.table_timestamp_column = Some("timestamp_ms".into());
         let reader = factory(

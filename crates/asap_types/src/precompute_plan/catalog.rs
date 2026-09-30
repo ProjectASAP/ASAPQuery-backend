@@ -44,12 +44,7 @@ impl PrecomputePlan {
         catalog: &SummaryCatalog,
     ) -> Result<(), PrecomputePlanError> {
         catalog.validate().map_err(|e| invalid(e.to_string()))?;
-        let expected = SummaryCatalog::from_materializations(
-            catalog.plan_id,
-            catalog.plan_version,
-            &self.materializations,
-        )
-        .map_err(|e| invalid(e.to_string()))?;
+        let expected = SummaryCatalog::from_plan(self).map_err(|e| invalid(e.to_string()))?;
         if catalog.outputs != expected.outputs || catalog.definitions != expected.definitions {
             return Err(invalid(
                 "stored output semantics differ from installed writer computation",
@@ -118,8 +113,11 @@ impl PrecomputePlan {
         for config in &self.materializations {
             let id = StoredOutputId::from(config.policy_fingerprint());
             let binding = &catalog.outputs[&id];
+            let family = self
+                .state_family(id)
+                .ok_or(PrecomputePlanError::SchemaSetMismatch)?;
             let expected =
-                SummaryDescriptor::from_config(config).map_err(|e| invalid(e.to_string()))?;
+                SummaryDescriptor::from_family(family).map_err(|e| invalid(e.to_string()))?;
             if binding.summary_descriptor_id != expected.id {
                 return Err(invalid(
                     "summary operator/update contract differs from catalog",
@@ -149,27 +147,16 @@ impl PrecomputePlan {
                 || data.source != expected_source
                 || &data.value_projection != expected_projection
                 || data.population_filter_canonical
-                    != config.population_filter_canonical().map_err(invalid)?
+                    != self.population_filter(config).map_err(invalid)?
                 || data.group_by_keys != config.grouping_labels
             {
                 return Err(invalid("source/population/grouping differs from catalog"));
-            }
-            if config.spatial_filter_normalized
-                != crate::utils::normalize_spatial_filter(&config.spatial_filter)
-            {
-                return Err(invalid("normalized population predicate drift"));
             }
             let schema = self
                 .schemas
                 .iter()
                 .find(|s| s.materialization == id)
                 .ok_or(PrecomputePlanError::SchemaSetMismatch)?;
-            let family = config
-                .accumulator_spec()
-                .map_err(|e| invalid(e.to_string()))?
-                .family;
-            let expected_family = StateFamilyContract::try_from(&family)
-                .map_err(|_| PrecomputePlanError::UnsupportedFamily(id.as_u64()))?;
             let source = if let Some(table) = &config.table_name {
                 Source::Table {
                     table_ref: table.clone(),
@@ -202,7 +189,6 @@ impl PrecomputePlan {
                     .output_reference(id)
                     .map_err(|e| invalid(e.to_string()))?
                 || schema.schema_id != state_schema_id(id.fingerprint())
-                || schema.family != expected_family
                 || schema.source != source
                 || &schema.value_projection != projection
                 || schema.group_by != config.grouping_labels
@@ -215,7 +201,7 @@ impl PrecomputePlan {
                     schema_id: schema.schema_id.clone(),
                 });
             }
-            if !state_encodings_match(&family, &schema.encodings) {
+            if !state_encodings_match(family, &schema.encodings) {
                 return Err(invalid("encoding does not match state family"));
             }
             if config.num_aggregates_to_retain == Some(0) {

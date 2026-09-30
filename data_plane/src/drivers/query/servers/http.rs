@@ -2531,7 +2531,7 @@ mod tests {
             capability_snapshot_id: "test".into(),
         };
         let catalog = Arc::new(
-            asap_types::summary_catalog::SummaryCatalog::from_materializations(7, 1, &[]).unwrap(),
+            asap_types::summary_catalog::SummaryCatalog::from_outputs(7, 1, Vec::new()).unwrap(),
         );
         let generation = catalog.reference().unwrap();
         let summary_store = Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
@@ -3267,46 +3267,30 @@ mod tests {
         // retirement) can find them. The matching sid in the catalog
         // is registered via the canonical ingest path so its content
         // hash matches what `create_checked` would compute.
-        let mut agg_map = HashMap::new();
+        let mut agg_map = Vec::new();
         let mut marker_to_fp = std::collections::HashMap::new();
         for marker in active_agg_ids {
             let metric = format!("metric_{marker}");
-            let cfg = PrecomputeMaterialization {
-                stored_output_id: None,
-                semantic_fragment: None,
-                population_key_encoding: Default::default(),
-                aggregation_type: AggregationType::Sum,
-                aggregation_sub_type: String::new(),
-                parameters: HashMap::new(),
-                grouping_labels: KeyByLabelNames::empty().into(),
-                aggregated_labels: KeyByLabelNames::empty(),
-                rollup_labels: KeyByLabelNames::empty(),
-                original_yaml: String::new(),
-                window_size: 1,
-                slide_interval: 1,
-                window_type: WindowKind::Tumbling,
-                window_layout: asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 },
-                pane_origin_ms: None,
-                spatial_filter: String::new(),
-                spatial_filter_normalized: String::new(),
-                metric: metric.clone(),
-                num_aggregates_to_retain: None,
-                table_name: None,
-                value_projection: None,
-                table_population: None,
-                derived_input: None,
-                table_timestamp_column: None,
-                partitioning: None,
-                value_source_column: None,
-            };
+            let mut cfg = PrecomputeMaterialization::new(
+                metric.clone(),
+                KeyByLabelNames::empty(),
+                1,
+                1,
+                WindowKind::Tumbling,
+            );
+            cfg.window_layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 };
+            let cfg = crate::tests::test_utilities::outputs::allocated(
+                cfg,
+                AggregationType::Sum.planner_exact_family().unwrap(),
+            );
             // PR 5: streaming-config is keyed on the policy
             // fingerprint. Build a marker→fingerprint map so the test
             // POSTs the right id on the wire.
-            let fp = cfg.policy_fp_u64();
+            let fp = cfg.0.policy_fp_u64();
             marker_to_fp.insert(*marker, fp);
-            agg_map.insert(fp, cfg);
+            agg_map.push(cfg);
         }
-        let installed_precompute_plan = Arc::new(InstalledPrecomputePlan::from_raw_ids(agg_map));
+        let installed_precompute_plan = Arc::new(InstalledPrecomputePlan::new(agg_map));
         let hot_reload = InstalledPrecomputePlanHandle::from_arc(installed_precompute_plan.clone());
         let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let summary_store = Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
@@ -3687,10 +3671,8 @@ mod tests {
         };
         // Pin `storage_backend` on the streaming config so the http
         // dispatcher reads it back through the hot-reload handle.
-        let streaming_cfg = InstalledPrecomputePlan::with_storage_backend(
-            Default::default(),
-            metric_storage_backend,
-        );
+        let streaming_cfg =
+            InstalledPrecomputePlan::with_storage_backend(Vec::new(), metric_storage_backend);
         let streaming_arc = Arc::new(streaming_cfg);
         let hot_reload = InstalledPrecomputePlanHandle::from_arc(streaming_arc.clone());
         let query_engine = Arc::new(ASAPQueryEngine::new(15000));
@@ -5017,10 +4999,8 @@ mod tests {
             handle_http_requests: true,
             adapter_config,
         };
-        let streaming_cfg = InstalledPrecomputePlan::with_storage_backend(
-            Default::default(),
-            metric_storage_backend,
-        );
+        let streaming_cfg =
+            InstalledPrecomputePlan::with_storage_backend(Vec::new(), metric_storage_backend);
         let streaming_arc = Arc::new(streaming_cfg);
         let hot_reload = InstalledPrecomputePlanHandle::from_arc(streaming_arc.clone());
         let query_engine = Arc::new(ASAPQueryEngine::new(15000));
@@ -6555,6 +6535,25 @@ mod catalog_install_tests {
             request,
             Arc::new(crate::storage_engines::types::BackendStorageRouting::empty()),
         )
+    }
+
+    // A physical plan compiled before materializations became deployment-only
+    // is refused at decode by its schema version, not by a field-level error.
+    #[test]
+    fn install_request_from_the_computation_carrying_schema_is_rejected_by_version() {
+        let mut encoded = serde_json::to_value(request()).unwrap();
+        assert!(serde_json::from_value::<PhysicalPlanInstallRequest>(encoded.clone()).is_ok());
+        encoded["precompute_plan"]["envelope"]["backend_compat"] =
+            serde_json::json!("asap-query-backend.v1");
+        encoded["precompute_plan"]["materializations"][0]["aggregation_type"] =
+            serde_json::json!("DDSketch");
+        let error = serde_json::from_value::<PhysicalPlanInstallRequest>(encoded)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unsupported installed precompute plan schema asap-query-backend.v1"),
+            "{error}"
+        );
     }
 
     #[test]

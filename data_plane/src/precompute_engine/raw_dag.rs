@@ -89,18 +89,16 @@ impl RawDagProgram {
                         source: Source::TimeSeries { metric },
                         ..
                     } if metric == &config.metric => {
-                        let (metric, window, filter) =
-                            control_plane::physical::compiler::raw_time_series_input_contract(
+                        let (metric, window, _) =
+                            asap_types::precompute_plan::raw_time_series_input_contract(
                                 expression,
                                 matches!(family, SummaryFamilyType::ExactAggregate(..)),
                             )?;
                         if metric != config.metric
                             || window.is_some_and(|seconds| seconds != config.window_size)
-                            || asap_types::utils::normalize_spatial_filter(&filter)
-                                != config.spatial_filter_normalized
                         {
                             return Err(
-                                "raw DAG source filter/window differs from physical binding".into(),
+                                "raw DAG source window differs from physical binding".into()
                             );
                         }
                     }
@@ -151,35 +149,6 @@ impl RawDagProgram {
                         return Err("raw exact update differs from stored source projection".into());
                     }
                 }
-                if &config.accumulator_spec().map_err(|e| e.to_string())?.family != family {
-                    return Err(
-                        "materialization storage family differs from selected Planner node".into(),
-                    );
-                }
-                // The stored descriptor must name the same update semantics; its
-                // content identity cannot be reused for an unrelated DAG program.
-                let update_matches = match (&input.weight, config.sample_update_rule()) {
-                    (
-                        SummaryInputExpr::Column(_),
-                        asap_types::SampleUpdateRule::Value { scale },
-                    ) => scale == 1.0,
-                    (SummaryInputExpr::Constant(value), asap_types::SampleUpdateRule::Count) => {
-                        *value == 1.0
-                    }
-                    _ => {
-                        asap_types::accumulator_spec::is_unit_sample_frequency(input)
-                            || (matches!(
-                                family,
-                                SummaryFamilyType::ExactAggregate(
-                                    planner_types::post_asap::ExactKind::Count,
-                                    _
-                                )
-                            ) && input.weight == SummaryInputExpr::Constant(1.0))
-                    }
-                };
-                if !update_matches {
-                    return Err("DAG update differs from stored summary identity".into());
-                }
                 let compiled = installed
                     .native_program(node.id)?
                     .ok_or("raw materialization lacks its Planner precompute graph")?;
@@ -218,6 +187,21 @@ impl RawDagProgram {
             }
         }
         selected.ok_or_else(|| "raw materialization has no selected post-ASAP DAG producer".into())
+    }
+
+    /// A program with the given node semantics and no executable graph, for
+    /// tests of consumers that only inspect the node.
+    #[cfg(test)]
+    pub(crate) fn fixture(family: SummaryFamilyType, input: SummaryUpdate) -> Self {
+        Self {
+            node: PostAsapNodeId(1),
+            family,
+            input,
+            grouping: GroupingStrategy::PerSubpopulationInstance,
+            reduction: planner_types::pre_asap::Reduction::PerEntity,
+            program: std::sync::Arc::from(Vec::new()),
+            source: 0,
+        }
     }
 
     /// Execute the Planner graph over one pane's samples as one typed batch.

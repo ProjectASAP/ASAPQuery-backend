@@ -5,7 +5,8 @@ use std::ops::Index;
 
 use super::storage_backend::StorageBackend;
 use asap_types::sds::StoredOutputId;
-use asap_types::{PolicyRegistry, PrecomputeMaterialization};
+use asap_types::PrecomputeMaterialization;
+use planner_types::post_asap::SummaryFamilyType;
 
 #[derive(Debug, Clone)]
 pub struct InstalledPrecomputePlan {
@@ -14,16 +15,33 @@ pub struct InstalledPrecomputePlan {
         HashMap<u64, std::sync::Arc<crate::precompute_engine::raw_dag::RawDagProgram>>,
     pub(crate) precompute_plan: Option<asap_types::precompute_plan::PrecomputePlan>,
     pub(crate) materializations_by_output: HashMap<StoredOutputId, PrecomputeMaterialization>,
+    /// Each output's stored state family, from its schema contract.
+    state_families: HashMap<StoredOutputId, SummaryFamilyType>,
+    /// Each output's canonical input predicate, from its Planner DAG scan.
+    population_filters: HashMap<StoredOutputId, String>,
+    /// The per-item dimension of outputs whose Planner update keys items by a label.
+    item_labels: HashMap<StoredOutputId, String>,
     pub(crate) storage_backend: StorageBackend,
 }
 
 impl InstalledPrecomputePlan {
-    fn derived_view(materializations: HashMap<StoredOutputId, PrecomputeMaterialization>) -> Self {
+    fn derived_view(
+        outputs: impl IntoIterator<Item = (PrecomputeMaterialization, SummaryFamilyType)>,
+    ) -> Self {
+        let mut materializations = HashMap::new();
+        let mut state_families = HashMap::new();
+        for (config, family) in outputs {
+            state_families.insert(config.stored_output_id, family);
+            materializations.insert(config.stored_output_id, config);
+        }
         Self {
             partitioning: Default::default(),
             raw_programs: HashMap::new(),
             precompute_plan: None,
             materializations_by_output: materializations,
+            state_families,
+            population_filters: HashMap::new(),
+            item_labels: HashMap::new(),
             storage_backend: StorageBackend::default(),
         }
     }
@@ -31,6 +49,53 @@ impl InstalledPrecomputePlan {
     /// Production construction always validates the executable DAG and bindings.
     pub fn from_precompute_plan(plan: asap_types::precompute_plan::PrecomputePlan) -> Result<Self> {
         let materializations = plan.runtime_materializations()?;
+        let outputs = materializations
+            .into_values()
+            .map(|config| {
+                let family = plan
+                    .state_family(config.stored_output_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("stored output has no state schema"))?;
+                Ok((config, family))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let population_filters = outputs
+            .iter()
+            .map(|(config, _)| {
+                plan.population_filter(config)
+                    .map(|filter| (config.stored_output_id, filter))
+                    .map_err(anyhow::Error::msg)
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        let mut item_labels = HashMap::new();
+        for (config, _) in &outputs {
+            use planner_types::post_asap::{PostAsapOperatorPayload, SummaryInputExpr};
+            use planner_types::pre_asap::ColumnRef;
+            let Some((node, _)) = plan
+                .summary_producer(config.stored_output_id)
+                .map_err(anyhow::Error::msg)?
+            else {
+                continue;
+            };
+            if let PostAsapOperatorPayload::SummaryAgg {
+                input:
+                    planner_types::post_asap::SummaryUpdate {
+                        item:
+                            Some(SummaryInputExpr::Column(
+                                ColumnRef::Named(label) | ColumnRef::Qualified { name: label, .. },
+                            )),
+                        ..
+                    },
+                ..
+            } = node.payload
+            {
+                item_labels.insert(config.stored_output_id, label);
+            }
+        }
+        let materializations: HashMap<_, _> = outputs
+            .iter()
+            .map(|(config, _)| (config.stored_output_id, config.clone()))
+            .collect();
         let mut programs = HashMap::new();
         for config in materializations.values().filter(|config| {
             config.derived_input.is_none()
@@ -42,7 +107,9 @@ impl InstalledPrecomputePlan {
                     .map_err(anyhow::Error::msg)?;
             programs.insert(config.policy_fp_u64(), std::sync::Arc::new(program));
         }
-        let mut view = Self::derived_view(materializations);
+        let mut view = Self::derived_view(outputs);
+        view.population_filters = population_filters;
+        view.item_labels = item_labels;
         view.partitioning =
             crate::precompute_engine::partitioning::DagPartitioning::from_plan(&plan);
         view.precompute_plan = Some(plan);
@@ -52,30 +119,20 @@ impl InstalledPrecomputePlan {
 
     // Isolated kernel/storage fixtures can omit a physical installation. This
     // constructor is absent from the production library and binary.
+    /// Each output is paired with its stored state family.
     #[cfg(test)]
-    pub fn new(materializations: HashMap<StoredOutputId, PrecomputeMaterialization>) -> Self {
-        Self::derived_view(materializations)
-    }
-
-    /// Fixtures hold raw output ids, so say that once here rather than
-    /// wrapping every literal. Production construction goes through
-    /// `from_precompute_plan`, which takes the ids from the plan itself.
-    #[cfg(test)]
-    pub fn from_raw_ids(materializations: HashMap<u64, PrecomputeMaterialization>) -> Self {
-        Self::new(
-            materializations
-                .into_iter()
-                .map(|(id, value)| (StoredOutputId(id), value))
-                .collect(),
-        )
+    pub fn new(
+        outputs: impl IntoIterator<Item = (PrecomputeMaterialization, SummaryFamilyType)>,
+    ) -> Self {
+        Self::derived_view(outputs)
     }
 
     #[cfg(test)]
     pub fn with_storage_backend(
-        materializations: HashMap<StoredOutputId, PrecomputeMaterialization>,
+        outputs: impl IntoIterator<Item = (PrecomputeMaterialization, SummaryFamilyType)>,
         storage_backend: StorageBackend,
     ) -> Self {
-        let mut view = Self::derived_view(materializations);
+        let mut view = Self::derived_view(outputs);
         view.storage_backend = storage_backend;
         view
     }
@@ -92,19 +149,21 @@ impl InstalledPrecomputePlan {
         });
         #[cfg(test)]
         let selected = selected.or_else(|| {
-            let materializations = self
+            let outputs = self
                 .materializations_by_output
                 .values()
-                .cloned()
-                .collect::<Vec<_>>();
-            asap_types::summary_catalog::SummaryCatalog::from_materializations(
-                0,
-                0,
-                &materializations,
-            )
-            .ok()?
-            .output_reference(definition)
-            .ok()
+                .map(|config| {
+                    Some((
+                        config,
+                        self.state_family(config.stored_output_id)?,
+                        self.population_filter(config.stored_output_id).to_owned(),
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            asap_types::summary_catalog::SummaryCatalog::from_outputs(0, 0, outputs)
+                .ok()?
+                .output_reference(definition)
+                .ok()
         });
         selected
     }
@@ -134,8 +193,41 @@ impl InstalledPrecomputePlan {
         self.materializations_by_output.contains_key(&output)
     }
 
-    pub fn policy_registry(&self) -> PolicyRegistry {
-        PolicyRegistry::from_configs(self.materializations_by_output.values().cloned())
+    /// The stored state family of `output`.
+    pub fn state_family(&self, output: StoredOutputId) -> Option<&SummaryFamilyType> {
+        self.state_families.get(&output)
+    }
+
+    /// The physical stored-state kind of `output`.
+    pub fn agg_kind(
+        &self,
+        output: StoredOutputId,
+    ) -> Option<crate::storage_engines::sketch_db::index::AggKind> {
+        self.state_family(output).map(|family| {
+            crate::storage_engines::sketch_db::data::agg_kind_for_family(
+                family,
+                self.population_filter(output),
+            )
+        })
+    }
+
+    /// Whether `output`'s panes follow PromQL's `(start, end]` range
+    /// convention. Raw Planner programs read only time-series scans, whose
+    /// ranges are PromQL ranges.
+    pub fn right_closed_panes(&self, output: StoredOutputId) -> bool {
+        self.raw_programs.contains_key(&output.as_u64())
+    }
+
+    /// The label that keys `output`'s items, when its Planner update has one.
+    pub fn item_label(&self, output: StoredOutputId) -> Option<&str> {
+        self.item_labels.get(&output).map(String::as_str)
+    }
+
+    /// The canonical input predicate of `output`; empty when unfiltered.
+    pub fn population_filter(&self, output: StoredOutputId) -> &str {
+        self.population_filters
+            .get(&output)
+            .map_or("", String::as_str)
     }
 }
 
@@ -170,6 +262,40 @@ impl Default for InstalledPrecomputePlan {
 
 #[cfg(test)]
 mod tests {
+    // A raw output's input predicate, pane convention and stored state kind
+    // come from its installed Planner producer, not from the materialization.
+    #[test]
+    fn raw_output_computation_comes_from_its_planner_producer() {
+        let mut snapshot: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        snapshot["query_workload"]["repeating_queries"][0]["query"] =
+            serde_json::json!("quantile_over_time(0.99, m{job=\"api\"}[1m])");
+        let plan = crate::tests::test_utilities::planning::quoted_snapshot(
+            serde_json::from_value(snapshot).unwrap(),
+            false,
+        )
+        .compile_promql()
+        .unwrap();
+        let installed =
+            super::InstalledPrecomputePlan::from_precompute_plan(plan.precompute_plan.clone())
+                .unwrap();
+        let output = plan.precompute_plan.materializations[0].stored_output_id;
+        assert_eq!(installed.population_filter(output), "{job=\"api\"}");
+        assert!(installed.right_closed_panes(output));
+        let family = installed.state_family(output).unwrap();
+        assert_eq!(Some(family), plan.precompute_plan.state_family(output));
+        assert_eq!(
+            installed.agg_kind(output).unwrap().canonical_string(),
+            crate::storage_engines::sketch_db::data::agg_kind_for_family(family, "{job=\"api\"}")
+                .canonical_string()
+        );
+        let data = &plan.summary_catalog.data_descriptors
+            [&plan.summary_catalog.outputs[&output].data_descriptor_id];
+        assert_eq!(data.population_filter_canonical, "{job=\"api\"}");
+    }
+
     // Flat lists cannot enter through the authoritative physical-plan document.
     #[test]
     fn rejects_flat_aggregation_documents() {

@@ -458,10 +458,13 @@ pub(crate) fn encode_state(
 
 pub(crate) fn decode_state(
     record: &RevisionRecord,
-    config: &asap_types::PrecomputeMaterialization,
+    family: &SummaryFamilyType,
 ) -> Result<Arc<dyn AggregateCore>, RevisionError> {
-    let family = config.accumulator_spec()?.family;
-    let batch = native::decode_batch(&record.payload, state_schema(family), record.payload.len())?;
+    let batch = native::decode_batch(
+        &record.payload,
+        state_schema(family.clone()),
+        record.payload.len(),
+    )?;
     match batch.rows() {
         [row] => match row.as_slice() {
             [Value::Summary { state, .. }] => {
@@ -632,7 +635,12 @@ impl RevisionRuntime {
                     if decode_native_record(&plan, record, self.policy.max_checkpoint_bytes)?
                         .is_none()
                     {
-                        decode_state(record, config)?;
+                        decode_state(
+                            record,
+                            plan.precompute_plan
+                                .state_family(config.stored_output_id)
+                                .ok_or("recovered revision has no state schema")?,
+                        )?;
                     }
                 }
             }

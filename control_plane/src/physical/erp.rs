@@ -396,17 +396,17 @@ impl ErpPlanningInput {
                 .summary_descriptors
                 .get(&materialization.summary_descriptor_id)
                 .ok_or("ERP summary descriptor is absent from the active catalog")?;
-            let actual_semantics = match &summary.operator {
+            let algorithm = match &summary.operator {
                 asap_types::sds::SummaryOperator::Configured {
-                    aggregation_type: asap_types::AggregationType::HLL,
-                    ..
-                } => Some(
+                    family: planner_types::post_asap::SummaryFamilyType::Sketch(kind, _),
+                } => Some(kind.algorithm()),
+                _ => None,
+            };
+            let actual_semantics = match algorithm {
+                Some(planner_types::post_asap::SketchAlgorithm::Hll) => Some(
                     asap_types::erp_observation::ErpObservationInputSemantics::ScalarSampleValue,
                 ),
-                asap_types::sds::SummaryOperator::Configured {
-                    aggregation_type: asap_types::AggregationType::UnivMon,
-                    ..
-                } => Some(
+                Some(planner_types::post_asap::SketchAlgorithm::UnivMon) => Some(
                     asap_types::erp_observation::ErpObservationInputSemantics::UnitSampleFrequency,
                 ),
                 _ => None,
@@ -1468,14 +1468,24 @@ mod tests {
         // Catalog resolution is independent of Planner selection. Build an
         // HLL catalog fixture from a compiled source identity; production
         // selection cannot deploy HLL without a known confidence guarantee.
-        let mut materialization = plan.precompute_plan.materializations[0].clone();
-        materialization.aggregation_type = asap_types::AggregationType::HLL;
-        materialization.parameters =
-            serde_json::from_value(serde_json::json!({"precision": 14})).unwrap();
-        let catalog = asap_types::summary_catalog::SummaryCatalog::from_materializations(
+        let materialization = &plan.precompute_plan.materializations[0];
+        let hll = planner_types::post_asap::SummaryFamilyType::Sketch(
+            planner_types::post_asap::SketchKind::new(
+                SketchAlgorithm::Hll,
+                SketchParams::Hll { precision: 14 },
+            ),
+            planner_types::post_asap::GroupingStrategy::PerSubpopulationInstance,
+        );
+        let catalog = asap_types::summary_catalog::SummaryCatalog::from_outputs(
             plan.summary_catalog.plan_id,
             plan.summary_catalog.plan_version,
-            &[materialization],
+            vec![(
+                materialization,
+                &hll,
+                plan.precompute_plan
+                    .population_filter(materialization)
+                    .unwrap(),
+            )],
         )
         .unwrap();
         let (mut policy, mut observed) = online_population_fixture();

@@ -684,10 +684,7 @@ async fn route_otlp_to_precompute(
         let ts_ms = (point.timestamp_nanos / 1_000_000) as i64;
         let mut matched = false;
         for config in agg_configs.values() {
-            if config.metric != point.name
-                && config.spatial_filter_normalized != point.name
-                && config.spatial_filter != point.name
-            {
+            if config.metric != point.name {
                 continue;
             }
             let group_key = IngestState::extract_group_key_for(&series_key, config);
@@ -761,10 +758,7 @@ async fn route_otlp_to_precompute(
         let sketch_type = identify_sketch_type(&point.payload);
         let mut matched = false;
         for config in agg_configs.values() {
-            if config.metric != point.name
-                && config.spatial_filter_normalized != point.name
-                && config.spatial_filter != point.name
-            {
+            if config.metric != point.name {
                 continue;
             }
             let group_key = IngestState::extract_group_key_for(&series_key, config);
@@ -1399,18 +1393,15 @@ async fn route_modified_otlp_sketches_to_precompute(
                             // into the matched policy's parameters — recorded on the sid
                             // below so the query engine can answer per-item estimate(key)
                             // (the CMS/CountSketch FrequencyEstimate gate consults it).
-                            let item_label_for_sid: Option<String> = {
-                                snap.get_aggregation_config(policy_fp.into())
-                                    .or_else(|| {
-                                        snap.materializations()
-                                            .values()
-                                            .find(|c| c.metric == canonical_name)
-                                    })
-                                    .and_then(|c| c.parameters.get("item_label"))
-                                    .and_then(|v| v.as_str())
-                                    .filter(|s| !s.is_empty())
-                                    .map(|s| s.to_string())
-                            };
+                            let item_label_for_sid: Option<String> = snap
+                                .get_aggregation_config(policy_fp.into())
+                                .or_else(|| {
+                                    snap.materializations()
+                                        .values()
+                                        .find(|c| c.metric == canonical_name)
+                                })
+                                .and_then(|c| snap.item_label(c.stored_output_id))
+                                .map(str::to_owned);
                             ingest_state.summary_store.register(SummarySeriesMetadata {
                                 storage_handle: sid,
                                 metric_name: canonical_name.clone(),
@@ -1763,11 +1754,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                         &asap_types::aggregation_config::PrecomputeMaterialization,
                     > = agg_configs
                         .values()
-                        .filter(|config| {
-                            config.metric == canonical_name
-                                || config.spatial_filter_normalized == canonical_name
-                                || config.spatial_filter == canonical_name
-                        })
+                        .filter(|config| config.metric == canonical_name)
                         .collect();
                     let matched_any = !matching_configs.is_empty();
 
@@ -1887,87 +1874,6 @@ async fn route_modified_otlp_sketches_to_precompute(
     })
 }
 
-/// Map `SketchAlgorithm` to the corresponding wire-format
-/// `AggregationType`. Inverse direction is in
-/// `sketch_algorithm_for` above. Used by
-/// [`derive_sketch_policy_fp`] to find the policy whose
-/// `PrecomputeMaterialization.aggregation_type` matches a freshly-ingested
-/// sketch.
-///
-/// `Any` is a control-plane analysis-time wildcard — it doesn't
-/// appear on the ingest path. Returns `None` so the policy lookup
-/// fails the (rare) defensive path explicitly.
-fn aggregation_type_for_sketch_algorithm(
-    handle: crate::storage_engines::sketch_db::index::SketchAlgorithm,
-) -> Option<asap_types::AggregationType> {
-    use crate::storage_engines::sketch_db::index::SketchAlgorithm;
-    use asap_types::AggregationType;
-    match handle {
-        SketchAlgorithm::DDSketch => Some(AggregationType::DDSketch),
-        SketchAlgorithm::Kll => Some(AggregationType::DatasketchesKLL),
-        SketchAlgorithm::Hll => Some(AggregationType::HLL),
-        SketchAlgorithm::UnivMon => Some(AggregationType::UnivMon),
-        SketchAlgorithm::CountSketch => Some(AggregationType::CountSketch),
-        SketchAlgorithm::CountSketchWithHeap => Some(AggregationType::CountSketchWithHeap),
-        SketchAlgorithm::Cms => Some(AggregationType::CountMinSketch),
-        SketchAlgorithm::CmsWithHeap => Some(AggregationType::CountMinSketchWithHeap),
-        SketchAlgorithm::Kmv | SketchAlgorithm::Theta => None,
-    }
-}
-
-/// Render a `SketchConfig` into the param map the streaming-config
-/// stores. The control plane authors these as
-/// `parameters: {<name>: <value>}` JSON; the data plane has the
-/// parameters typed in `SketchConfig`. This function converts.
-///
-/// Keys MUST match what the control plane emits (see
-/// `crates/asap_types/src/aggregation_config.rs::from_yaml_data` for
-/// the canonical names). Drift here surfaces as policy lookups that
-/// silently miss.
-fn sketch_config_to_params(
-    cfg: &crate::storage_engines::sketch_db::data::SketchConfig,
-) -> std::collections::HashMap<String, serde_json::Value> {
-    use crate::storage_engines::sketch_db::data::SketchConfig;
-    let mut params = std::collections::HashMap::new();
-    match cfg {
-        SketchConfig::UnivMon {
-            heap_size,
-            sketch_rows,
-            sketch_cols,
-            layers,
-        } => {
-            params.insert("heap_size".into(), serde_json::json!(heap_size));
-            params.insert("sketch_rows".into(), serde_json::json!(sketch_rows));
-            params.insert("sketch_cols".into(), serde_json::json!(sketch_cols));
-            params.insert("layers".into(), serde_json::json!(layers));
-        }
-        SketchConfig::DDSketch { relative_accuracy } => {
-            params.insert(
-                "relative_accuracy".to_string(),
-                serde_json::json!(*relative_accuracy),
-            );
-        }
-        SketchConfig::Kll { k } => {
-            params.insert("k".to_string(), serde_json::json!(*k));
-        }
-        SketchConfig::Hll { precision } => {
-            params.insert("precision".to_string(), serde_json::json!(*precision));
-        }
-        SketchConfig::CountSketch { rows, cols } | SketchConfig::CountMin { rows, cols } => {
-            // Canonical key mapping (matches the controller's
-            // `sketch_params_to_json` in
-            // `control_plane::emit::stage_config`): `w` is the
-            // matrix width (=cols), `d` is the depth (=rows). The
-            // controller writes `{w, d}` into the streaming-config
-            // `parameters`, so the policy_fp content match has to
-            // probe the same keys.
-            params.insert("w".to_string(), serde_json::json!(*cols));
-            params.insert("d".to_string(), serde_json::json!(*rows));
-        }
-    }
-    params
-}
-
 // Snapshot and delta bases are scoped to the producer, never only its semantics.
 fn bound_sketch_series_key(
     name: &str,
@@ -1997,21 +1903,34 @@ fn derive_sketch_policy_fp(
     group_by_keys: &std::collections::BTreeSet<String>,
     bound_output: Option<asap_types::sds::StoredOutputId>,
 ) -> asap_types::PolicyFingerprint {
-    let Some(agg_type) = aggregation_type_for_sketch_algorithm(kind) else {
-        return asap_types::PolicyFingerprint::UNSET;
-    };
-    let params = sketch_config_to_params(cfg);
+    use crate::storage_engines::sketch_db::index::AggKind;
+    // An unfiltered output of this exact sketch state and grouping; ambiguous
+    // or absent matches fail closed.
+    let expected = AggKind::Sketch {
+        algorithm: kind,
+        config: cfg.clone(),
+        spatial_filter_canonical: String::new(),
+    }
+    .canonical_string();
     let snap = ingest_state.config_snapshot();
-    let registry = snap.policy_registry();
-    let registry = if let Some(output) = bound_output {
-        asap_types::PolicyRegistry::from_configs(registry.get(output.fingerprint()).cloned())
-    } else {
-        registry
-    };
-    let index = asap_types::RoutingIndex::build(registry);
-    index
-        .find_policy_by_content(metric, group_by_keys, agg_type, &params)
-        .unwrap_or(asap_types::PolicyFingerprint::UNSET)
+    let mut hit = None;
+    for config in snap.materializations().values() {
+        let keys: std::collections::BTreeSet<_> = config.grouping_labels.iter().cloned().collect();
+        if bound_output.is_some_and(|output| output != config.stored_output_id)
+            || config.metric != metric
+            || &keys != group_by_keys
+            || snap
+                .agg_kind(config.stored_output_id)
+                .is_none_or(|installed| installed.canonical_string() != expected)
+        {
+            continue;
+        }
+        if hit.is_some() {
+            return asap_types::PolicyFingerprint::UNSET;
+        }
+        hit = Some(config.policy_fingerprint());
+    }
+    hit.unwrap_or(asap_types::PolicyFingerprint::UNSET)
 }
 
 /// Phase 5 helper — map a `ModifiedOtlpSketchDp` to the matching
@@ -3325,70 +3244,6 @@ mod policy_fp_lookup_tests {
     use crate::storage_engines::sketch_db::data::SketchConfig;
     use crate::storage_engines::sketch_db::index::SketchAlgorithm;
     use asap_types::AggregationType;
-
-    #[test]
-    fn handle_to_agg_type_round_trips_canonical_kinds() {
-        // Locks in the data-plane → control-plane name mapping.
-        // Drift surfaces as policy lookups that silently miss because
-        // the handle resolves to an `AggregationType` no policy uses.
-        assert_eq!(
-            aggregation_type_for_sketch_algorithm(SketchAlgorithm::DDSketch),
-            Some(AggregationType::DDSketch)
-        );
-        assert_eq!(
-            aggregation_type_for_sketch_algorithm(SketchAlgorithm::Kll),
-            Some(AggregationType::DatasketchesKLL)
-        );
-        assert_eq!(
-            aggregation_type_for_sketch_algorithm(SketchAlgorithm::Hll),
-            Some(AggregationType::HLL)
-        );
-        assert_eq!(
-            aggregation_type_for_sketch_algorithm(SketchAlgorithm::Cms),
-            Some(AggregationType::CountMinSketch)
-        );
-        assert_eq!(
-            aggregation_type_for_sketch_algorithm(SketchAlgorithm::CmsWithHeap),
-            Some(AggregationType::CountMinSketchWithHeap)
-        );
-        assert_eq!(
-            aggregation_type_for_sketch_algorithm(SketchAlgorithm::CountSketch),
-            Some(AggregationType::CountSketch)
-        );
-        // `Any` is a control-plane wildcard, not a real DP shape.
-        assert_eq!(
-            aggregation_type_for_sketch_algorithm(SketchAlgorithm::Kmv),
-            None
-        );
-    }
-
-    #[test]
-    fn sketch_config_to_params_uses_canonical_keys() {
-        // The param-name vocabulary must match what the control plane
-        // writes in streaming-config YAML (see
-        // `asap_types::aggregation_config::PrecomputeMaterialization::from_yaml_data`).
-        // Drift surfaces as `find_policy_by_content` missing matches.
-        let dd = sketch_config_to_params(&SketchConfig::DDSketch {
-            relative_accuracy: 0.01,
-        });
-        assert_eq!(dd.get("relative_accuracy"), Some(&serde_json::json!(0.01)));
-
-        let kll = sketch_config_to_params(&SketchConfig::Kll { k: 200 });
-        assert_eq!(kll.get("k"), Some(&serde_json::json!(200)));
-
-        let hll = sketch_config_to_params(&SketchConfig::Hll { precision: 14 });
-        assert_eq!(hll.get("precision"), Some(&serde_json::json!(14)));
-
-        let cs = sketch_config_to_params(&SketchConfig::CountSketch { rows: 4, cols: 256 });
-        // Canonical keys: w (=cols, width) and d (=rows, depth) —
-        // matches `control_plane::emit::stage_config::sketch_params_to_json`.
-        assert_eq!(cs.get("w"), Some(&serde_json::json!(256)));
-        assert_eq!(cs.get("d"), Some(&serde_json::json!(4)));
-
-        let cm = sketch_config_to_params(&SketchConfig::CountMin { rows: 4, cols: 256 });
-        assert_eq!(cm.get("w"), Some(&serde_json::json!(256)));
-        assert_eq!(cm.get("d"), Some(&serde_json::json!(4)));
-    }
 }
 
 #[cfg(test)]
@@ -4481,23 +4336,19 @@ mod sid_bucketing_tests {
     }
 
     fn sum_agg_config(metric: &str, grouping: &[&str]) -> PrecomputeMaterialization {
-        PrecomputeMaterialization::new(
-            AggregationType::SingleSubpopulation,
-            "Sum".to_string(),
-            HashMap::new(),
+        let mut config = PrecomputeMaterialization::new(
+            metric,
             KeyByLabelNames::new(grouping.iter().map(|s| s.to_string()).collect()),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            String::new(),
             10,
             10,
             WindowKind::Tumbling,
-            String::new(),
-            metric.to_string(),
-            None,
-            None,
-            None,
-        )
+        );
+        config.allocate_stored_output_id(&sum_family());
+        config
+    }
+
+    fn sum_family() -> planner_types::post_asap::SummaryFamilyType {
+        AggregationType::Sum.planner_exact_family().unwrap()
     }
 
     /// Build a Gauge request with one DataPoint per (zone, value) entry.
@@ -4573,9 +4424,7 @@ mod sid_bucketing_tests {
         let metric = "cpu_seconds";
         let cfg = sum_agg_config(metric, &["zone"]);
         let policy_fp = asap_types::PolicyFingerprint(cfg.policy_fp_u64());
-        let mut configs = HashMap::new();
-        configs.insert(cfg.policy_fp_u64(), cfg.clone());
-        let streaming = InstalledPrecomputePlan::from_raw_ids(configs);
+        let streaming = InstalledPrecomputePlan::new([(cfg.clone(), sum_family())]);
         let hot_reload = InstalledPrecomputePlanHandle::new(streaming);
 
         let resolver = Arc::new(SeriesIdResolver::new());
@@ -4659,8 +4508,10 @@ mod sid_bucketing_tests {
         // regardless of group_key shape — the test pin is on sid
         // assignment, not on group_key content), then verify the
         // sid matches the resolver mint for THAT zone.
-        let agg_kind_canonical =
-            crate::storage_engines::sketch_db::data::materialization_kind_for_config(&cfg);
+        let agg_kind_canonical = crate::storage_engines::sketch_db::data::materialization_kind(
+            &cfg,
+            &crate::storage_engines::sketch_db::data::agg_kind_for_family(&sum_family(), ""),
+        );
         for (sid, _, _, samples) in &groups {
             let mut vals: Vec<f64> = samples.iter().map(|(_, _, v)| *v).collect();
             vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -4693,7 +4544,7 @@ mod sid_bucketing_tests {
             ("asap.frame.plan_version".into(), "3".into()),
             (
                 "asap.frame.backend_compat".into(),
-                "asap-query-backend.v1".into(),
+                "asap-query-backend.v2".into(),
             ),
             ("asap.frame.materialization".into(), "99".into()),
             (

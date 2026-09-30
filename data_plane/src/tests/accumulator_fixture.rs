@@ -1,34 +1,40 @@
-//! Config fixtures for backend integration tests; production binds Planner payloads.
+//! Kernel fixtures for backend unit tests: a stored state family and the
+//! Planner update it ingests. Production executes the bound Planner DAG.
 use asap_physical_operators::factory::*;
 use asap_physical_operators::summary_kernels::exact::ExactAccumulator;
-use asap_summary_state::{AggregateCore, KeyByLabelValues};
-use asap_types::{accumulator_spec::cms_params, PrecomputeMaterialization};
-use planner_types::post_asap::{ExactKind, SketchAlgorithm, SketchParams, SummaryFamilyType};
-#[cfg(test)]
-/// Return `true` if `config` produces a keyed (MultipleSubpopulation) updater,
-/// without allocating an updater object.
+use asap_summary_state::{AggregateCore, AggregationType, KeyByLabelValues};
+use planner_types::post_asap::{
+    ExactKind, GroupingStrategy, HydraParams, SketchAlgorithm, SketchParams, SummaryFamilyType,
+    SummaryInputExpr, SummaryUpdate,
+};
+
+/// Whether `family` stores a keyed (multi-population) accumulator.
 ///
 /// **Contract:** this must agree with every concrete `AccumulatorUpdater::is_keyed()`
 /// implementation. When a new accumulator type is added, update both here and
 /// in the corresponding struct.
-pub fn config_is_keyed(config: &PrecomputeMaterialization) -> bool {
-    config
-        .accumulator_spec()
-        .expect("valid fixture")
-        .grouping
-        .is_some()
+#[cfg(test)]
+pub fn family_is_keyed(family: &SummaryFamilyType) -> bool {
+    match family {
+        SummaryFamilyType::Sketch(_, GroupingStrategy::SharedMultiSubpopulation { .. }) => true,
+        SummaryFamilyType::Sketch(kind, _) => matches!(
+            kind.algorithm(),
+            SketchAlgorithm::Cms
+                | SketchAlgorithm::CmsWithHeap
+                | SketchAlgorithm::CountSketch
+                | SketchAlgorithm::CountSketchWithHeap
+        ),
+        _ => false,
+    }
 }
 
-/// Top-k ranking quantity, selected by `weight_mode` or its alias `topk_weight`.
-///
-/// * `value` / `sum`: sum values per key (default).
-/// * `count` / `frequency` / `freq`: count occurrences per key.
+/// Top-k ranking quantity: a unit weight counts occurrences per key,
+/// otherwise values are summed.
 #[cfg(test)]
-fn topk_weight_param(config: &PrecomputeMaterialization) -> TopkWeight {
-    match config.sample_update_rule() {
-        asap_types::SampleUpdateRule::Count => TopkWeight::Count,
-        asap_types::SampleUpdateRule::Value { .. }
-        | asap_types::SampleUpdateRule::CounterDelta { .. } => TopkWeight::Value,
+fn topk_weight(update: &SummaryUpdate) -> TopkWeight {
+    match update.weight {
+        SummaryInputExpr::Constant(1.0) => TopkWeight::Count,
+        _ => TopkWeight::Value,
     }
 }
 
@@ -101,17 +107,14 @@ fn ddsketch_alpha(params: &SketchParams) -> f64 {
 /// Production execution requires a validated Planner DAG program.
 #[cfg(test)]
 pub fn create_fixture_accumulator(
-    config: &PrecomputeMaterialization,
+    family: &SummaryFamilyType,
+    update: &SummaryUpdate,
 ) -> Box<dyn AccumulatorUpdater> {
-    let spec = config
-        .accumulator_spec()
-        .expect("invalid isolated kernel fixture");
+    let keyed = family_is_keyed(family);
 
-    let keyed = spec.grouping.is_some();
-
-    match (&spec.family, keyed) {
+    match (family, keyed) {
         (SummaryFamilyType::ExactAggregate(..), keyed) => Box::new(ExactUpdater {
-            acc: ExactAccumulator::new(spec.family.clone(), keyed).expect("exact fixture family"),
+            acc: ExactAccumulator::new(family.clone(), keyed).expect("exact fixture family"),
         }),
 
         (SummaryFamilyType::Sketch(kind, _), false)
@@ -119,18 +122,20 @@ pub fn create_fixture_accumulator(
         {
             Box::new(KllAccumulatorUpdater::new(kll_k(kind.params())))
         }
-        // HydraKLL: `k` comes off the typed params like the unkeyed case,
-        // but the `(row, col)` tiling grid has no `SketchParams::Kll`
-        // field to live in (see `asap_types::accumulator_spec`'s module
-        // doc) — read it the same way bare CMS does, via `cms_params`.
-        (SummaryFamilyType::Sketch(kind, _), true) if kind.algorithm() == &SketchAlgorithm::Kll => {
-            let (row_num, col_num) = cms_params(config);
-            Box::new(HydraKllAccumulatorUpdater::new(
-                row_num,
-                col_num,
-                kll_k(kind.params()),
-            ))
-        }
+        // HydraKLL: `k` comes off the typed params like the unkeyed case;
+        // the shared bucket count is the tiling width over four rows.
+        (
+            SummaryFamilyType::Sketch(
+                kind,
+                GroupingStrategy::SharedMultiSubpopulation {
+                    params: HydraParams::HydraKll { shared_buckets, .. },
+                    ..
+                },
+            ),
+            true,
+        ) if kind.algorithm() == &SketchAlgorithm::Kll => Box::new(
+            HydraKllAccumulatorUpdater::new(4, *shared_buckets as usize, kll_k(kind.params())),
+        ),
 
         // Bare CMS: point-frequency only, min-of-rows estimator. `keyed=false`
         // can't actually arise here today (no `AggregationType` resolves to
@@ -165,7 +170,7 @@ pub fn create_fixture_accumulator(
                 row_num,
                 col_num,
                 heap_size,
-                topk_weight_param(config),
+                topk_weight(update),
             ))
         }
 
@@ -178,7 +183,7 @@ pub fn create_fixture_accumulator(
                 row_num,
                 col_num,
                 heap_size,
-                topk_weight_param(config),
+                topk_weight(update),
             ))
         }
 
@@ -203,7 +208,7 @@ pub fn create_fixture_accumulator(
                 unreachable!("validated UnivMon family parameters")
             };
             create_planner_accumulator(
-                &spec.family,
+                family,
                 &planner_types::post_asap::SummaryUpdate::column(
                     planner_types::pre_asap::ColumnRef::SampleValue,
                 ),
@@ -219,7 +224,7 @@ pub fn create_fixture_accumulator(
                 unreachable!("validated HLL family parameters")
             };
             create_planner_accumulator(
-                &spec.family,
+                family,
                 &planner_types::post_asap::SummaryUpdate::column(
                     planner_types::pre_asap::ColumnRef::SampleValue,
                 ),

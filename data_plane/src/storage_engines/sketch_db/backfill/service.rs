@@ -352,29 +352,22 @@ mod tests {
 
     fn sum_config(_agg_id: u64, metric: &str) -> PrecomputeMaterialization {
         // `_agg_id` is unused after PR 5 — identity is content-addressed.
-        PrecomputeMaterialization::new(
-            AggregationType::Sum,
-            String::new(),
-            std::collections::HashMap::new(),
+        let mut config = PrecomputeMaterialization::new(
+            metric,
             KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            String::new(),
             60,
             60,
             WindowKind::Tumbling,
-            String::new(),
-            metric.to_string(),
-            None,
-            None,
-            None,
-        )
+        );
+        config.allocate_stored_output_id(&AggregationType::Sum.planner_exact_family().unwrap());
+        config
     }
 
     fn streaming_with(cfg: PrecomputeMaterialization) -> Arc<InstalledPrecomputePlan> {
-        let mut m = std::collections::HashMap::new();
-        m.insert(cfg.policy_fp_u64(), cfg);
-        Arc::new(InstalledPrecomputePlan::from_raw_ids(m))
+        Arc::new(InstalledPrecomputePlan::new([(
+            cfg,
+            AggregationType::Sum.planner_exact_family().unwrap(),
+        )]))
     }
 
     async fn wait_for_status(

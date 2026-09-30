@@ -638,6 +638,7 @@ impl SketchStore {
         &self,
         sid: u64,
         config: &asap_types::PrecomputeMaterialization,
+        kind: &AggKind,
         output: &crate::storage_engines::types::PrecomputedOutput,
         state: &dyn AggregateCore,
         sources: &[FrozenExactWindows],
@@ -646,6 +647,7 @@ impl SketchStore {
         self.publish_frozen_output(
             sid,
             config,
+            kind,
             output,
             state,
             FrozenPublicationInputs::Requested(sources),
@@ -657,6 +659,7 @@ impl SketchStore {
         &self,
         sid: u64,
         config: &asap_types::PrecomputeMaterialization,
+        kind: &AggKind,
         output: &crate::storage_engines::types::PrecomputedOutput,
         state: &dyn AggregateCore,
         cohort: &CompleteRawMaintenanceCohort,
@@ -665,6 +668,7 @@ impl SketchStore {
         self.publish_frozen_output(
             sid,
             config,
+            kind,
             output,
             state,
             FrozenPublicationInputs::Complete(cohort),
@@ -676,6 +680,7 @@ impl SketchStore {
         &self,
         sid: u64,
         config: &asap_types::PrecomputeMaterialization,
+        kind: &AggKind,
         output: &crate::storage_engines::types::PrecomputedOutput,
         state: &dyn AggregateCore,
         proof: FrozenPublicationInputs<'_>,
@@ -711,7 +716,7 @@ impl SketchStore {
             return Err("derived publication differs from its installed input identity".into());
         }
         let labels = self
-            .register_precompute_output_with_instances(sid, config, output, &mut instances)
+            .register_precompute_output_with_instances(sid, config, kind, output, &mut instances)
             .ok_or("derived output registration failed")?;
         let _mutation = self.begin_state_mutation();
         let binding = instances.get(&sid).ok_or("derived output was removed")?;
@@ -799,6 +804,32 @@ mod tests {
     use super::*;
     use crate::storage_engines::types::PrecomputedOutput;
 
+    fn sum_family() -> planner_types::post_asap::SummaryFamilyType {
+        asap_types::AggregationType::Sum
+            .planner_exact_family()
+            .unwrap()
+    }
+
+    fn sum_kind() -> AggKind {
+        crate::storage_engines::sketch_db::data::agg_kind_for_family(&sum_family(), "")
+    }
+
+    fn sum_catalog(
+        plan_version: u64,
+        configs: &[asap_types::PrecomputeMaterialization],
+    ) -> asap_types::summary_catalog::SummaryCatalog {
+        let family = sum_family();
+        asap_types::summary_catalog::SummaryCatalog::from_outputs(
+            1,
+            plan_version,
+            configs
+                .iter()
+                .map(|c| (c, &family, String::new()))
+                .collect(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn complete_population_keeps_every_sid_and_rejects_missing_live_binding() {
         // Multiple SIDs are inventory entries, never an implicit singleton;
@@ -812,18 +843,16 @@ mod tests {
             .compile_promql()
             .unwrap();
         let mut first = plan.precompute_plan.materializations[0].clone();
-        first.aggregation_type = asap_types::AggregationType::Sum;
-        first.aggregation_sub_type = "sum".into();
         first.grouping_labels = ["instance".to_string()].into_iter().collect();
+        first.allocate_stored_output_id(&"sum");
         let mut target = first.clone();
         target.derived_input = Some(asap_types::derived_input::DerivedInputIdentity {
             inputs: BTreeSet::from([first.policy_fingerprint().into()]),
             program_sha256: "0".repeat(64),
         });
+        target.allocate_stored_output_id(&"sum");
         let configs = [first.clone(), first, target];
-        let catalog =
-            asap_types::summary_catalog::SummaryCatalog::from_materializations(1, 1, &configs)
-                .unwrap();
+        let catalog = sum_catalog(1, &configs);
         let store = Arc::new(SketchStore::new());
         store
             .install_summary_catalog(Arc::new(catalog.clone()))
@@ -864,7 +893,15 @@ mod tests {
                     revision,
                     revision,
                     2000,
-                    |writer| writer.ingest_precompute_with_series_id(sid, config, &output, &sum),
+                    |writer| {
+                        writer.ingest_precompute_with_series_id(
+                            sid,
+                            config,
+                            &sum_kind(),
+                            &output,
+                            &sum,
+                        )
+                    },
                 )
                 .unwrap();
         }
@@ -923,11 +960,11 @@ mod tests {
             .compile_promql()
             .unwrap();
         let mut first = plan.precompute_plan.materializations[0].clone();
-        first.aggregation_type = asap_types::AggregationType::Sum;
-        first.aggregation_sub_type = "sum".into();
         first.grouping_labels = std::iter::empty::<String>().collect();
+        first.allocate_stored_output_id(&"sum");
         let mut second = first.clone();
         second.metric = "cohort_second".into();
+        second.allocate_stored_output_id(&"sum");
         let mut target = first.clone();
         target.derived_input = Some(asap_types::derived_input::DerivedInputIdentity {
             inputs: BTreeSet::from([
@@ -936,10 +973,9 @@ mod tests {
             ]),
             program_sha256: "0".repeat(64),
         });
+        target.allocate_stored_output_id(&"sum");
         let configs = [first, second, target];
-        let catalog =
-            asap_types::summary_catalog::SummaryCatalog::from_materializations(1, 1, &configs)
-                .unwrap();
+        let catalog = sum_catalog(1, &configs);
         let mut store = Arc::new(SketchStore::new());
         store
             .install_summary_catalog(Arc::new(catalog.clone()))
@@ -979,7 +1015,15 @@ mod tests {
                     revision,
                     revision,
                     2000,
-                    |writer| writer.ingest_precompute_with_series_id(sid, config, &output, &sum),
+                    |writer| {
+                        writer.ingest_precompute_with_series_id(
+                            sid,
+                            config,
+                            &sum_kind(),
+                            &output,
+                            &sum,
+                        )
+                    },
                 )
                 .unwrap();
             requests.push((
@@ -1018,6 +1062,7 @@ mod tests {
                     writer.ingest_precompute_with_series_id(
                         900,
                         &configs[0],
+                        &sum_kind(),
                         &extra_window,
                         &extra_sum,
                     )
@@ -1056,7 +1101,13 @@ mod tests {
         sum.update(None, 11.0, 0);
         assert!(store
             .publish_complete_raw_maintenance_output(
-                902, target, &output, &sum, &complete, [42; 32]
+                902,
+                target,
+                &sum_kind(),
+                &output,
+                &sum,
+                &complete,
+                [42; 32]
             )
             .unwrap());
         assert!(store
@@ -1093,11 +1144,17 @@ mod tests {
         let mut extra = PrecomputedOutput::new(0, 1000, None, configs[0].policy_fingerprint());
         extra.catalog_generation = Some(Arc::clone(&generation));
         assert!(store
-            .register_precompute_output(904, &configs[0], &extra)
+            .register_precompute_output(904, &configs[0], &sum_kind(), &extra)
             .is_some());
         assert!(store
             .publish_complete_raw_maintenance_output(
-                905, target, &output, &sum, &complete, [42; 32]
+                905,
+                target,
+                &sum_kind(),
+                &output,
+                &sum,
+                &complete,
+                [42; 32]
             )
             .is_err());
         assert!(!store.instances.read().unwrap().contains_key(&905));
@@ -1111,7 +1168,15 @@ mod tests {
             .any(|record| record.storage_handle == 905));
         store.force_expire(901).unwrap();
         assert!(store
-            .publish_frozen_maintenance_output(903, target, &output, &sum, &cohort, [42; 32])
+            .publish_frozen_maintenance_output(
+                903,
+                target,
+                &sum_kind(),
+                &output,
+                &sum,
+                &cohort,
+                [42; 32]
+            )
             .is_err());
         assert!(store
             .recover_frozen_maintenance_output(902, target, &cohort, [42; 32], (0, 1000))
@@ -1204,7 +1269,15 @@ mod tests {
                     revision,
                     revision,
                     120_000,
-                    |writer| writer.ingest_precompute_with_series_id(700, source, &output, &sum),
+                    |writer| {
+                        writer.ingest_precompute_with_series_id(
+                            700,
+                            source,
+                            &sum_kind(),
+                            &output,
+                            &sum,
+                        )
+                    },
                 )
                 .unwrap();
         }
@@ -1409,7 +1482,9 @@ mod tests {
                 revision,
                 revision,
                 120_000,
-                |writer| writer.ingest_precompute_with_series_id(702, source, &output, &sum),
+                |writer| {
+                    writer.ingest_precompute_with_series_id(702, source, &sum_kind(), &output, &sum)
+                },
             )
             .unwrap();
         let deadline =
@@ -1479,21 +1554,15 @@ mod tests {
         let plan = crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
             .compile_promql()
             .unwrap();
-        let mut source_config = plan.precompute_plan.materializations[0].clone();
-        source_config.aggregation_type = asap_types::AggregationType::Sum;
-        source_config.aggregation_sub_type = "sum".into();
+        let source_config = plan.precompute_plan.materializations[0].clone();
         let source_id = source_config.policy_fingerprint().into();
         let mut target = source_config.clone();
         target.derived_input = Some(asap_types::derived_input::DerivedInputIdentity {
             inputs: BTreeSet::from([source_id]),
             program_sha256: "0".repeat(64),
         });
-        let catalog = asap_types::summary_catalog::SummaryCatalog::from_materializations(
-            1,
-            1,
-            &[source_config.clone(), target.clone()],
-        )
-        .unwrap();
+        target.allocate_stored_output_id(&"sum");
+        let catalog = sum_catalog(1, &[source_config.clone(), target.clone()]);
         let store = Arc::new(SketchStore::new());
         store.install_summary_catalog(Arc::new(catalog)).unwrap();
         let directory = tempfile::tempdir().unwrap();
@@ -1510,10 +1579,10 @@ mod tests {
         let mut source_output = output.clone();
         source_output.policy_fp = source_config.policy_fingerprint();
         store
-            .register_precompute_output(600, &source_config, &source_output)
+            .register_precompute_output(600, &source_config, &sum_kind(), &source_output)
             .unwrap();
         store
-            .register_precompute_output(601, &target, &output)
+            .register_precompute_output(601, &target, &sum_kind(), &output)
             .unwrap();
         let record = store
             .metadata_record(&store.instances.read().unwrap()[&601])

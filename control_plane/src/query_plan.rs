@@ -918,26 +918,25 @@ mod catalog_binding_tests {
     use crate::physical::summary_catalog::SummaryCatalog;
     use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
 
-    fn fixture() -> (QueryPlan, SummaryCatalog) {
+    /// A catalog over one `m` output grouped by `job`, with `kind` state.
+    fn output(kind: AggregationType) -> (PrecomputeMaterialization, SummaryCatalog) {
+        let family = kind.planner_exact_family().unwrap();
         let mut config = PrecomputeMaterialization::new(
-            AggregationType::Sum,
-            String::new(),
-            Default::default(),
+            "m",
             KeyByLabelNames::new(vec!["job".into()]),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            String::new(),
             10,
             10,
             WindowKind::Tumbling,
-            String::new(),
-            "m".into(),
-            None,
-            None,
-            None,
         );
         config.pane_origin_ms = Some(0);
-        let catalog = SummaryCatalog::from_materializations(7, 2, &[config.clone()]).unwrap();
+        config.allocate_stored_output_id(&family);
+        let catalog =
+            SummaryCatalog::from_outputs(7, 2, vec![(&config, &family, String::new())]).unwrap();
+        (config, catalog)
+    }
+
+    fn fixture() -> (QueryPlan, SummaryCatalog) {
+        let (config, catalog) = output(AggregationType::Sum);
         let entry = QueryPlanEntry {
             physical_dag: None,
             language: crate::query_plan::QueryLanguage::PromQl,
@@ -1062,26 +1061,7 @@ mod catalog_binding_tests {
             .to_string()
             .contains("exact counter SDS"));
 
-        let mut counter = PrecomputeMaterialization::new(
-            AggregationType::Increase,
-            String::new(),
-            Default::default(),
-            KeyByLabelNames::new(vec!["job".into()]),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            String::new(),
-            10,
-            10,
-            WindowKind::Tumbling,
-            String::new(),
-            "m".into(),
-            None,
-            None,
-            None,
-        );
-        counter.pane_origin_ms = Some(0);
-        let counter_catalog =
-            SummaryCatalog::from_materializations(7, 2, &[counter.clone()]).unwrap();
+        let (counter, counter_catalog) = output(AggregationType::Increase);
         let (mut counter_plan, _) = fixture();
         binding(&mut counter_plan).materialization = counter.policy_fingerprint().into();
         binding(&mut counter_plan).stored_output_reference = counter_catalog

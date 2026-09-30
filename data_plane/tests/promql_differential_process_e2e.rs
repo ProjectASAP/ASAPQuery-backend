@@ -335,24 +335,16 @@ async fn production_backend_matches_raw_oracle_and_range_endpoint() {
     }
 }
 
-fn ddsketch_config() -> asap_types::PrecomputeMaterialization {
-    use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
-    PrecomputeMaterialization::new(
-        AggregationType::DDSketch,
-        String::new(),
-        std::collections::HashMap::from([("relative_accuracy".into(), serde_json::json!(ALPHA))]),
-        KeyByLabelNames::new(vec!["service".into()]),
-        KeyByLabelNames::empty(),
-        KeyByLabelNames::empty(),
-        String::new(),
-        1,
-        1,
-        WindowKind::Tumbling,
-        String::new(),
-        METRIC.into(),
-        None,
-        None,
-        None,
+fn ddsketch_config() -> (
+    asap_types::PrecomputeMaterialization,
+    planner_types::post_asap::SummaryFamilyType,
+) {
+    physical_fixture::materialization(
+        METRIC,
+        physical_fixture::sketch_family(
+            asap_types::AggregationType::DDSketch,
+            &serde_json::json!({"relative_accuracy": ALPHA}),
+        ),
     )
 }
 
@@ -362,9 +354,9 @@ async fn bound_sds_keeps_hot_and_rebuild_outputs_and_groups_isolated() {
     use asap_types::query_plan::QueryPlanNode;
     use asap_types::sds::StoredOutputId;
     let mut hot = ddsketch_config();
-    hot.stored_output_id = Some(StoredOutputId(1001));
+    hot.0.stored_output_id = StoredOutputId(1001);
     let mut rebuild = hot.clone();
-    rebuild.stored_output_id = Some(StoredOutputId(1002));
+    rebuild.0.stored_output_id = StoredOutputId(1002);
     let mut install = physical_fixture::artifact_from_materializations(vec![hot, rebuild]);
     assert_eq!(install.summary_catalog.definitions.len(), 1);
     assert_eq!(install.summary_catalog.outputs.len(), 2);

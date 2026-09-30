@@ -8,40 +8,97 @@ use data_plane::{
 };
 use std::{collections::BTreeMap, sync::Arc};
 
-/// Imported-state fixtures bind explicit storage metadata, never a flat runtime config.
+/// An imported-state output with its stored state family. Imported-state
+/// fixtures bind explicit storage metadata, never a flat runtime config.
 #[allow(dead_code)]
 pub fn materialization(
     metric: &str,
-    family: asap_types::AggregationType,
-    parameters: std::collections::HashMap<String, serde_json::Value>,
-) -> asap_types::PrecomputeMaterialization {
-    asap_types::PrecomputeMaterialization::new(
-        family,
-        String::new(),
-        parameters,
+    family: planner_types::post_asap::SummaryFamilyType,
+) -> (
+    asap_types::PrecomputeMaterialization,
+    planner_types::post_asap::SummaryFamilyType,
+) {
+    let mut config = asap_types::PrecomputeMaterialization::new(
+        metric,
         asap_types::KeyByLabelNames::new(vec!["service".into()]),
-        asap_types::KeyByLabelNames::empty(),
-        asap_types::KeyByLabelNames::empty(),
-        String::new(),
         1,
         1,
         asap_types::enums::WindowKind::Tumbling,
-        String::new(),
-        metric.into(),
-        None,
-        None,
-        None,
+    );
+    config.allocate_stored_output_id(&family);
+    (config, family)
+}
+
+/// The sketch family an imported-state fixture's collector produces, from
+/// the sketch kind and the dimensions it was spelled with.
+#[allow(dead_code)]
+pub fn sketch_family(
+    kind: asap_types::AggregationType,
+    parameters: &serde_json::Value,
+) -> planner_types::post_asap::SummaryFamilyType {
+    use asap_types::AggregationType as A;
+    use planner_types::post_asap::{SketchAlgorithm, SketchKind, SketchParams};
+    let get = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|name| parameters.get(*name).and_then(serde_json::Value::as_f64))
+    };
+    let (width, depth) = (
+        get(&["w"]).unwrap_or(1000.0) as u32,
+        get(&["d"]).unwrap_or(4.0) as u32,
+    );
+    let (algorithm, params) = match kind {
+        A::DatasketchesKLL => (
+            SketchAlgorithm::Kll,
+            SketchParams::Kll {
+                k: get(&["k", "K"]).unwrap_or(200.0) as u32,
+            },
+        ),
+        A::HLL => (
+            SketchAlgorithm::Hll,
+            SketchParams::Hll {
+                precision: get(&["precision", "p"]).unwrap_or(14.0) as u8,
+            },
+        ),
+        A::CountMinSketch => (SketchAlgorithm::Cms, SketchParams::Cms { width, depth }),
+        A::CountSketch => (
+            SketchAlgorithm::CountSketch,
+            SketchParams::CountSketch { width, depth },
+        ),
+        A::DDSketch => (
+            SketchAlgorithm::DDSketch,
+            SketchParams::DDSketch {
+                alpha: get(&["alpha", "relative_accuracy"]).unwrap_or(0.01),
+            },
+        ),
+        other => panic!("no imported-state fixture for {other:?}"),
+    };
+    planner_types::post_asap::SummaryFamilyType::Sketch(
+        SketchKind::new(algorithm, params),
+        Default::default(),
     )
 }
 
 pub fn artifact(config: &InstalledPrecomputePlan) -> PhysicalPlanInstallRequest {
-    artifact_from_materializations(config.materializations().values().cloned().collect())
+    artifact_from_materializations(
+        config
+            .materializations()
+            .values()
+            .map(|c| {
+                let family = config.state_family(c.stored_output_id).unwrap().clone();
+                (c.clone(), family)
+            })
+            .collect(),
+    )
 }
 
 /// Same as [`artifact`], but from materializations the planner produced
 /// directly — no legacy `InstalledPrecomputePlan` document in between.
 pub fn artifact_from_materializations(
-    mut configs: Vec<asap_types::PrecomputeMaterialization>,
+    mut configs: Vec<(
+        asap_types::PrecomputeMaterialization,
+        planner_types::post_asap::SummaryFamilyType,
+    )>,
 ) -> PhysicalPlanInstallRequest {
     let envelope = PlanEnvelope {
         plan_id: 1,
@@ -56,7 +113,7 @@ pub fn artifact_from_materializations(
     // Installed physical plans always carry an explicit pane phase. Inputs that
     // predate that contract bind to the Unix epoch grid before deriving catalog
     // identities and bindings.
-    for config in &mut configs {
+    for (config, _) in &mut configs {
         config.pane_origin_ms.get_or_insert(0);
         // These fixtures import synthetic states and replace the producer's
         // window layout. They do not install the original Planner DAG, so
@@ -68,12 +125,10 @@ pub fn artifact_from_materializations(
         );
         config.semantic_fragment = None;
     }
-    let catalog = control_plane::physical::summary_catalog::SummaryCatalog::from_materializations(
-        1, 1, &configs,
-    )
-    .unwrap();
     let mut precompute =
         PrecomputePlan::build(envelope.clone(), configs, &["fixture".into()]).unwrap();
+    let catalog =
+        control_plane::physical::summary_catalog::SummaryCatalog::from_plan(&precompute).unwrap();
     precompute.bind_catalog(&catalog).unwrap();
     let mut transmission = control_plane::physical::compiler::build_transmission_plan(
         envelope,
@@ -93,7 +148,8 @@ pub fn artifact_from_materializations(
         use data_plane::storage_engines::types::AggregationType;
         let metric = &config.metric;
         let mut queries = Vec::new();
-        match config.aggregation_type {
+        let family = precompute.state_family(config.stored_output_id).unwrap();
+        match asap_types::aggregation_type_for_family(family).unwrap() {
             AggregationType::DatasketchesKLL | AggregationType::DDSketch => {
                 for (window, ms) in [
                     ("1s", 1_000),
@@ -165,7 +221,7 @@ pub fn artifact_from_materializations(
                                             config.policy_fingerprint().into(),
                                         ),
                                     output_grouping,
-                                    item_labels: config.aggregated_labels.labels.clone(),
+                                    item_labels: Vec::new(),
                                     window_ms: config.slide_interval * 1000,
                                     pane_origin_ms: config.pane_origin_ms,
                                     readout_lookback_ms: Some(lookback_ms),

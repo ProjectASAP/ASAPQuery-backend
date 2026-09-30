@@ -629,7 +629,7 @@ mod tests {
                     let result = execute_sql_dag_with_external(
                         &SketchStore::new(),
                         &entry,
-                        &SummaryCatalog::from_materializations(1, 1, &[]).unwrap(),
+                        &SummaryCatalog::from_outputs(1, 1, Vec::new()).unwrap(),
                         &[(QueryNodeId(0), relation)].into(),
                         0,
                         1000,
@@ -821,7 +821,7 @@ mod tests {
             (QueryNodeId(2), relation),
         ]);
         let index = SketchStore::new();
-        let catalog = SummaryCatalog::from_materializations(1, 1, &[]).unwrap();
+        let catalog = SummaryCatalog::from_outputs(1, 1, Vec::new()).unwrap();
         let run =
             || execute_sql_dag_with_external(&index, &entry, &catalog, &prepared, 0, 1000, false);
         assert!(matches!(run(), ClickHouseDagOutcome::Accelerated(_)));

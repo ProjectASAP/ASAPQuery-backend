@@ -71,6 +71,6 @@
     "plan_version": 1,
     "activation_unix_ms": 10000,
     "expiry_unix_ms": null,
-    "backend_compat": "asap-query-backend.v1"
+    "backend_compat": "asap-query-backend.v2"
   }
 }

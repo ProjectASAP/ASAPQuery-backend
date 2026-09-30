@@ -106,10 +106,8 @@ impl SketchStoreSink {
     /// Missing configuration or incompatible state must surface as failure:
     /// a finite-input completion barrier cannot acknowledge dropped outputs.
     ///
-    /// PR-6 follow-up: resolves the source `PrecomputeMaterialization` via
-    /// `PolicyRegistry::get(output.policy_fp)`. The legacy
-    /// `aggregation_id` fallback branch (PR 4) is gone — `policy_fp`
-    /// is the only identity handle on `PrecomputedOutput`. Outputs
+    /// Resolves the stored output from the installed plan by
+    /// `output.policy_fp`, the only identity handle on `PrecomputedOutput`. Outputs
     /// emitted with the `PolicyFingerprint::UNSET` sentinel (e.g.
     /// raw-mode fast-path that has no source config) are skipped
     /// rather than routed by a parallel id.
@@ -122,9 +120,11 @@ impl SketchStoreSink {
             return false;
         }
         let cfg = self.hot_reload.snapshot();
-        let registry = cfg.policy_registry();
-        let agg_cfg = match registry.get(output.policy_fp) {
-            Some(c) => c.clone(),
+        let installed = cfg
+            .get_aggregation_config(output.policy_fp.into())
+            .zip(cfg.agg_kind(output.policy_fp.into()));
+        let (agg_cfg, kind) = match installed {
+            Some(installed) => installed,
             None => {
                 // CQ-6 — policy-miss drop: a content-addressed policy_fp
                 // that the running streaming-config registry doesn't know
@@ -138,7 +138,6 @@ impl SketchStoreSink {
                 return false;
             }
         };
-        let agg_cfg = &agg_cfg;
         let Some(reference) = cfg.stored_output_reference(output.policy_fp.into()) else {
             return false;
         };
@@ -175,6 +174,7 @@ impl SketchStoreSink {
                         &address,
                         &self.series_resolver,
                         agg_cfg,
+                        &kind,
                         output,
                         accumulator,
                     )
@@ -372,50 +372,33 @@ mod tests {
         );
     }
 
-    fn sum_agg_config(_id: u64, metric: &str, grouping_keys: &[&str]) -> PrecomputeMaterialization {
-        // `_id` is unused after PR 5 — identity is content-addressed
-        // via `PolicyFingerprint::from_config`. Callers obtain the id
-        // via `config.policy_fp_u64()`.
-        PrecomputeMaterialization {
-            stored_output_id: None,
-            semantic_fragment: None,
-            population_key_encoding: Default::default(),
-            aggregation_type: AggregationType::Sum,
-            aggregation_sub_type: String::new(),
-            parameters: HashMap::new(),
-            grouping_labels: KeyByLabelNames::new(
-                grouping_keys.iter().map(|s| s.to_string()).collect(),
-            )
-            .into(),
-            aggregated_labels: KeyByLabelNames::empty(),
-            rollup_labels: KeyByLabelNames::empty(),
-            original_yaml: String::new(),
-            window_size: 1,
-            slide_interval: 1,
-            window_type: WindowKind::Tumbling,
-            window_layout: asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 },
-            pane_origin_ms: None,
-            spatial_filter: String::new(),
-            spatial_filter_normalized: String::new(),
-            metric: metric.to_string(),
-            num_aggregates_to_retain: None,
-            table_name: None,
-            value_projection: None,
-            table_population: None,
-            derived_input: None,
-            table_timestamp_column: None,
-            partitioning: None,
-            value_source_column: None,
-        }
+    fn sum_agg_config(
+        _id: u64,
+        metric: &str,
+        grouping_keys: &[&str],
+    ) -> (
+        PrecomputeMaterialization,
+        planner_types::post_asap::SummaryFamilyType,
+    ) {
+        let mut config = PrecomputeMaterialization::new(
+            metric,
+            KeyByLabelNames::new(grouping_keys.iter().map(|s| s.to_string()).collect()),
+            1,
+            1,
+            WindowKind::Tumbling,
+        );
+        config.window_layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 };
+        crate::tests::test_utilities::outputs::allocated(
+            config,
+            AggregationType::Sum.planner_exact_family().unwrap(),
+        )
     }
 
     #[test]
     fn sketch_index_sink_writes_to_index() {
         let cfg = sum_agg_config(7, "cpu_seconds", &["zone"]);
-        let agg_id = cfg.policy_fp_u64();
-        let mut configs = HashMap::new();
-        configs.insert(agg_id, cfg);
-        let streaming = InstalledPrecomputePlan::from_raw_ids(configs);
+        let agg_id = cfg.0.policy_fp_u64();
+        let streaming = InstalledPrecomputePlan::new([cfg]);
         let hot_reload = InstalledPrecomputePlanHandle::new(streaming.clone());
 
         let summary_store = Arc::new(SketchStore::new());
@@ -469,11 +452,11 @@ mod tests {
     #[test]
     fn sink_reactivates_catalog_series_without_reusing_retired_payload() {
         let cfg = sum_agg_config(7, "cpu_seconds", &[]);
-        let fingerprint = cfg.policy_fingerprint();
-        let catalog = asap_types::summary_catalog::SummaryCatalog::from_materializations(
+        let fingerprint = cfg.0.policy_fingerprint();
+        let catalog = asap_types::summary_catalog::SummaryCatalog::from_outputs(
             1,
             1,
-            &[cfg.clone()],
+            vec![(&cfg.0, &cfg.1, String::new())],
         )
         .unwrap();
         let store = Arc::new(SketchStore::new());
@@ -485,9 +468,7 @@ mod tests {
             Arc::new(SeriesIdResolver::open(temporary.path().join("resolver.wal")).unwrap());
         let sink = SketchStoreSink::new(
             store.clone(),
-            InstalledPrecomputePlanHandle::new(InstalledPrecomputePlan::from_raw_ids(
-                HashMap::from([(fingerprint.0, cfg)]),
-            )),
+            InstalledPrecomputePlanHandle::new(InstalledPrecomputePlan::new([cfg])),
             resolver,
         );
         let original_generation = Arc::new(catalog.reference().unwrap());
@@ -572,14 +553,16 @@ mod tests {
 
     #[test]
     fn sketch_policy_is_registered_and_stored_as_sketch_state() {
-        let mut cfg = sum_agg_config(8, "latency", &[]);
-        cfg.aggregation_type = AggregationType::DDSketch;
-        cfg.parameters
-            .insert("alpha".into(), serde_json::json!(0.01));
-        let policy_fp = cfg.policy_fp_u64();
-        let hot_reload = InstalledPrecomputePlanHandle::new(InstalledPrecomputePlan::from_raw_ids(
-            HashMap::from([(policy_fp, cfg)]),
-        ));
+        let (cfg, _) = sum_agg_config(8, "latency", &[]);
+        let cfg = crate::tests::test_utilities::outputs::allocated(
+            cfg,
+            crate::tests::test_utilities::outputs::family(
+                AggregationType::DDSketch,
+                &serde_json::json!({"alpha": 0.01}),
+            ),
+        );
+        let policy_fp = cfg.0.policy_fp_u64();
+        let hot_reload = InstalledPrecomputePlanHandle::new(InstalledPrecomputePlan::new([cfg]));
         let summary_store = Arc::new(SketchStore::new());
         let sink = SketchStoreSink::new(
             summary_store.clone(),
