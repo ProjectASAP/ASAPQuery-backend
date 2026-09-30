@@ -61,6 +61,7 @@ fn encoding_to_tag(enc: SketchEncoding) -> u8 {
         SketchEncoding::MsgpackFull => t::MSGPACK_FULL,
         SketchEncoding::MsgpackDelta => t::MSGPACK_DELTA,
         SketchEncoding::NativeBatchV1 => t::NATIVE_BATCH_V1,
+        SketchEncoding::WeightedFrequencyV1 => t::WEIGHTED_FREQUENCY_V1,
     }
 }
 
@@ -75,6 +76,7 @@ fn tag_to_encoding(tag: u8) -> SketchEncoding {
         t::MSGPACK_FULL => SketchEncoding::MsgpackFull,
         t::MSGPACK_DELTA => SketchEncoding::MsgpackDelta,
         t::NATIVE_BATCH_V1 => SketchEncoding::NativeBatchV1,
+        t::WEIGHTED_FREQUENCY_V1 => SketchEncoding::WeightedFrequencyV1,
         // t::PROTO_FULL and t::UNKNOWN (legacy) both → Full.
         _ => SketchEncoding::ProtoFull,
     }
@@ -3409,7 +3411,14 @@ impl SketchStore {
                 window,
                 SketchSampleState {
                     bytes: accumulator.serialize_to_bytes(),
-                    encoding: SketchEncoding::MsgpackFull,
+                    // Planner heap states are not legacy msgpack heap frames.
+                    encoding: if accumulator.as_any().is::<
+                        asap_summary_state::summary_kernels::weighted_frequency::WeightedFrequency,
+                    >() {
+                        SketchEncoding::WeightedFrequencyV1
+                    } else {
+                        SketchEncoding::MsgpackFull
+                    },
                 },
             ),
             AggKind::ExactAgg { .. } => self.append_precompute_with_binding(

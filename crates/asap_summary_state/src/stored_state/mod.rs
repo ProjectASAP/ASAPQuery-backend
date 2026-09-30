@@ -19,4 +19,7 @@ pub enum SketchEncoding {
     MsgpackDelta,
     /// Versioned typed physical output; never a legacy sketch frame.
     NativeBatchV1,
+    /// A complete Planner weighted-frequency heap state (sketchlib
+    /// `WeightedFrequency` bytes); never a legacy integer heap frame.
+    WeightedFrequencyV1,
 }
