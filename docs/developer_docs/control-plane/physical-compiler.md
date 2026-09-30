@@ -235,6 +235,15 @@ PromQL selector, keeps no state and forwards the whole query as
 whether PromQL drops `__name__` from its result, since Planner keeps it in the
 series identity.
 
+Planner matches per-series rows in query-time arithmetic (`avg_over_time` as
+sum/count, `rate(a) / rate(b)`, `rate(x) * 2`) only by the series identity
+column. When a selected computation does not compile over the canonical roots,
+the workload is selected again over roots typed with the series identity
+(`promql_rows::with_series_identity`). Every query is retyped so shared states
+keep one semantic definition. The typed workload is preferred if it deploys;
+otherwise it remains a candidate forest. The adapter fills the identity column
+from each readout series' labels and decodes result labels from it.
+
 Graph traversal is separate from node definitions and store semantics.
 Activation validates roots, edges, bindings, reachability, and cycles.
 The shared physical DAG runtime creates one producer per reachable node and

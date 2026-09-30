@@ -411,12 +411,17 @@ async fn temporal_average_overflow_falls_back_after_state_is_warm() {
                 };
                 asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(dag)
                     .unwrap();
-                let document: serde_json::Value = serde_json::from_slice(dag).unwrap();
-                document["nodes"].as_object().unwrap().values().any(|node| {
-                    node["Operator"]["operator"]["kind"]["VectorBinary"]["operator"]
-                        ["checked_finite_division"]
-                        == true
-                })
+                fn checked(value: &Value) -> bool {
+                    match value {
+                        Value::Object(map) => map.iter().any(|(key, value)| {
+                            (key == "checked_finite_division" && value == &Value::Bool(true))
+                                || checked(value)
+                        }),
+                        Value::Array(items) => items.iter().any(checked),
+                        _ => false,
+                    }
+                }
+                checked(&serde_json::from_slice(dag).unwrap())
             }),
         "average must retain its native finite-division contract"
     );

@@ -1024,11 +1024,78 @@ impl BackendLocalPlanningInput {
             )?;
             query.retain_physical_candidate()?;
         }
+        let mut planner_candidate_forests = Vec::new();
+        // Planner matches per-series rows in query-time arithmetic only by the
+        // series identity. When a selected computation does not compile over
+        // the canonical roots' readouts but does over identity-typed roots,
+        // the workload selected over typed roots is an alternative. Every
+        // query is selected over typed roots so the states they share keep
+        // one semantic definition.
+        let mut typed_workload = None;
+        let uncompiled = |root: &Rc<SummaryNode>| {
+            crate::query_plan::is_query_computation(root)
+                && crate::query_plan::compile_query_computation(root).is_err()
+        };
+        if queries
+            .iter()
+            .any(|query| uncompiled(&query.selected_plan_root))
+        {
+            let typed_roots: Vec<_> = canonical_roots
+                .iter()
+                .map(|root| {
+                    asap_physical_operators::physical_planner::promql_rows::with_series_identity(
+                        root,
+                    )
+                    .map_or_else(|_| Rc::clone(root), Rc::new)
+                })
+                .collect();
+            let retyped: Vec<_> = typed_roots
+                .iter()
+                .zip(&canonical_roots)
+                .map(|(typed, canonical)| !Rc::ptr_eq(typed, canonical))
+                .collect();
+            let mut typed = queries.clone();
+            if let Some(trace) = select_logical_roots_with_scoped_evidence_and_trace(
+                &mut typed,
+                typed_roots,
+                &topk_evidence_by_id,
+                &scoped_evidence_by_id,
+                &exact_costs_by_id,
+                self.physical_inputs.erp.as_ref(),
+                self.environment.observed_at_unix_ms,
+            )
+            .ok()
+            .filter(|_| {
+                queries.iter().zip(&typed).any(|(canonical, typed)| {
+                    uncompiled(&canonical.selected_plan_root)
+                        && !uncompiled(&typed.selected_plan_root)
+                }) && typed.iter_mut().all(|query| {
+                    prepare_window_implementations(
+                        query,
+                        &self.physical_inputs.window_cost_model,
+                        self.environment.target,
+                        self.physical_inputs.query_retention_margin_ms,
+                    )
+                    .is_ok()
+                })
+            }) {
+                // Native realizations of typed roots are bound only through
+                // their lifecycle placement below.
+                for (query, retyped) in typed.iter_mut().zip(retyped) {
+                    if retyped {
+                        query.retain(None)?;
+                    } else {
+                        query.retain_physical_candidate()?;
+                    }
+                }
+                planner_selection_trace.extend(trace);
+                typed_workload = Some(typed);
+            }
+        }
         // Native physical realizations need the complete series identity in
         // their rows. Planner's PlanSpace proposes them for the identity-typed
         // root; each is a logical alternative whose readout-built states are
         // placed by lifecycle, then substituted into the preferred workload.
-        let mut planner_candidate_forests = Vec::new();
         for (index, root) in canonical_roots.iter().enumerate() {
             let Ok(typed) =
                 asap_physical_operators::physical_planner::promql_rows::with_series_identity(root)
@@ -1132,30 +1199,42 @@ impl BackendLocalPlanningInput {
             }
         }
         // Composable lowering residualizes unsafe leaves individually; retain Planner siblings.
-        Ok((
-            PhysicalCompilationRequest {
-                planner_candidate_forests,
-                planner_selection_trace: planner_selection_trace.into(),
-                allow_mixed_summary_and_exact_execution: true,
-                require_backend_local_execution: self
-                    .physical_inputs
-                    .require_backend_local_execution,
-                query_workload: Some(workload),
-                data_workload: Some(data_workload),
-                canonical_roots,
-                queries,
-                topk_membership_evidence_by_query_id: topk_evidence_by_id,
-                exact_composition_costs: exact_costs_by_id,
-                erp: self.physical_inputs.erp,
-                planner_revision: PLANNER_REVISION.into(),
-                scrape_interval_ms: Some(self.physical_inputs.scrape_interval_ms),
-                query_retention_margin_ms: self.physical_inputs.query_retention_margin_ms,
-                retained_summary_memory_budget_bytes: Some(
-                    self.physical_inputs.retained_summary_memory_budget_bytes,
-                ),
-            },
-            self.environment,
-        ))
+        let mut request = PhysicalCompilationRequest {
+            planner_candidate_forests,
+            planner_selection_trace: planner_selection_trace.into(),
+            allow_mixed_summary_and_exact_execution: true,
+            require_backend_local_execution: self.physical_inputs.require_backend_local_execution,
+            query_workload: Some(workload),
+            data_workload: Some(data_workload),
+            canonical_roots,
+            queries,
+            topk_membership_evidence_by_query_id: topk_evidence_by_id,
+            exact_composition_costs: exact_costs_by_id,
+            erp: self.physical_inputs.erp,
+            planner_revision: PLANNER_REVISION.into(),
+            scrape_interval_ms: Some(self.physical_inputs.scrape_interval_ms),
+            query_retention_margin_ms: self.physical_inputs.query_retention_margin_ms,
+            retained_summary_memory_budget_bytes: Some(
+                self.physical_inputs.retained_summary_memory_budget_bytes,
+            ),
+        };
+        // The typed workload is preferred when it deploys; typing can make an
+        // unrelated root infeasible, so it otherwise remains an alternative.
+        if let Some(typed) = typed_workload {
+            let mut preferred = request.clone();
+            preferred.queries = typed.clone();
+            preferred.planner_candidate_forests.clear();
+            if DeploymentPlanCompiler
+                .compile_promql(preferred, self.environment.clone())
+                .is_ok()
+            {
+                let canonical = std::mem::replace(&mut request.queries, typed);
+                request.planner_candidate_forests.insert(0, canonical);
+            } else {
+                request.planner_candidate_forests.insert(0, typed);
+            }
+        }
+        Ok((request, self.environment))
     }
 }
 
@@ -5151,31 +5230,38 @@ pub(crate) mod tests {
         assert!(plan.precompute_plan.materializations.is_empty());
     }
 
-    // Per-series arithmetic over stored readouts runs as one Planner fragment
-    // over those readouts, not as an exact fallback.
+    // Per-series arithmetic over stored readouts has a candidate that runs
+    // as one Planner fragment over those readouts, not as an exact fallback.
     #[test]
     fn per_series_arithmetic_executes_as_a_planner_fragment() {
         for query in [
-            "avg_over_time(a[1m])",
+            "avg_over_time(data[5m])",
             "rate(a[5m]) / rate(b[5m])",
-            "rate(a[5m]) * 2",
+            "rate(data[5m]) * 2",
             "sum_over_time(a[1m]) + sum_over_time(a{job=\"x\"}[1m])",
         ] {
-            let mut environment = environment(10_000);
-            environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
-            environment.target_collector_ids.clear();
-            let plan = DeploymentPlanCompiler
-                .compile_promql(request("arithmetic", query), environment)
-                .unwrap();
-            let entry = plan.query_plan.lookup(query).unwrap();
-            assert!(
-                matches!(
-                    &entry.nodes[&entry.root],
-                    crate::query_plan::QueryPlanNode::PhysicalFragment { .. }
-                ),
-                "{query}: {entry:?}"
-            );
-            assert!(!entry.materialization_bindings().is_empty(), "{query}");
+            let mut snapshot = planning_snapshot();
+            let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+            entry.query = Query(query.into());
+            entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+            let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
+            let warm =
+                super::super::workload_cost::enumerate_exact_and_materialized_candidates(request)
+                    .unwrap()
+                    .into_iter()
+                    .filter_map(|candidate| {
+                        DeploymentPlanCompiler
+                            .compile_promql(candidate, environment.clone())
+                            .ok()
+                    })
+                    .any(|plan| {
+                        let entry = plan.query_plan.lookup(query).unwrap();
+                        matches!(
+                            &entry.nodes[&entry.root],
+                            crate::query_plan::QueryPlanNode::PhysicalFragment { .. }
+                        ) && !entry.materialization_bindings().is_empty()
+                    });
+            assert!(warm, "{query}");
         }
     }
 
