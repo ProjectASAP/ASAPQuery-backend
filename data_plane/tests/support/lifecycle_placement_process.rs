@@ -212,8 +212,9 @@ async fn mixed_placement_combines_raw_series_with_stored_state_within_the_lag_bo
     const MIXED: &str = "sum(rate(a[1m])) + sum(rate(b[10m]))";
     let origin = origin_ms();
     let at_ms = origin + 650_000;
-    // Counters rising 1/s (raw `a`) and 2/s (stored `b`): each rate is exact
-    // for any window their samples span.
+    // Raw `a` rises 1/s. Stored `b` rises 2/s, then 4/s over the last 5 s
+    // before t_q, so its rate tells which stored window was read. Its samples
+    // sit mid-second, off every window boundary.
     let raw: Vec<_> = (0..6)
         .map(|i| {
             let ms = at_ms - 50_000 + i * 10_000;
@@ -223,8 +224,9 @@ async fn mixed_placement_combines_raw_series_with_stored_state_within_the_lag_bo
     let deployment = deploy_query(MIXED, "a", 1e-3, raw, true).await;
     let client = reqwest::Client::new();
     // Samples past t_q close the stored window that ends at t_q.
+    let counter = |i: i64| 10_000.0 + 2.0 * i as f64 + 2.0 * (i - 645).max(0) as f64;
     let stored: Vec<_> = (1..=700)
-        .map(|i| (origin + i * 1000, 10_000.0 + 2.0 * i as f64))
+        .map(|i| (origin + i * 1000 + 500, counter(i)))
         .collect();
     let wire = WriteRequest {
         timeseries: vec![series_with_labels("b", &[("instance", "a")], &stored)],
@@ -258,10 +260,17 @@ async fn mixed_placement_combines_raw_series_with_stored_state_within_the_lag_bo
         panic!("no mixed answer: {last}\nbackend log:\n{log}")
     });
     assert!(lag <= 10_000, "lag {lag} beyond one slide");
+    assert_eq!(lag % 10_000, 0, "stored windows end on the 10 s grid");
     // Exact reference: rate(a) over (t_q - 1m, t_q] plus rate(b) over the
-    // stored window (t_q - lag - 10m, t_q - lag].
+    // stored window (t_s - 10m, t_s], t_s = t_q - lag. Its samples span 599 s
+    // and extrapolate half a second to each window edge.
+    let end = 650 - lag as i64 / 1000;
+    let expected = 1.0 + (counter(end - 1) - counter(end - 600)) / 599.0;
     let value = first_value(&last, "value").unwrap();
-    assert!((value - 3.0).abs() < 1e-9, "{last}");
+    assert!(
+        (value - expected).abs() < 1e-9,
+        "expected {expected}: {last}"
+    );
     let requests = deployment.requests.lock().await;
     assert!(
         requests.iter().any(|request| {

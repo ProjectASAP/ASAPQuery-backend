@@ -362,23 +362,28 @@ fn free_store_keeps_the_group_decision_for_two_states() {
     assert!(raw_scans(&plan).is_empty());
 }
 
-// Leaf Sum states are stored per population, not as native batches, so no
-// mix is admissible and both states move together.
+// Leaf Sum states are stored per population and a grouped Sum is no single
+// batch, so neither query has an admissible mix: its states move together.
 #[test]
 fn inadmissible_mix_keeps_the_group_decision() {
-    let plan = two_state_plan(
+    for query in [
         "sum(sum_over_time(a[10m])) + sum(sum_over_time(b[1m]))",
-        1e-3,
-    );
-    assert_eq!(placements(&plan), ["ephemeral", "ephemeral"]);
-    let event = mixed_event(&plan);
-    assert_eq!(event["selected"], "group");
-    assert!(event["units"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|unit| unit["retained_beside_raw_cost"].is_null()));
-    assert!(plan.precompute_plan.materializations.is_empty());
-    let entry = plan.query_plan.entries.values().next().unwrap();
-    assert!(!entry.mixes_raw_and_stored_inputs());
+        "sum by (job) (rate(a[1m])) + sum by (job) (rate(b[10m]))",
+    ] {
+        let plan = two_state_plan(query, 1e-3);
+        let placed = placements(&plan);
+        assert!(placed.len() >= 2, "{query}: {placed:?}");
+        assert!(
+            placed.iter().all(|selected| selected == &placed[0]),
+            "{query}: {placed:?}"
+        );
+        assert!(plan
+            .planner_selection_trace
+            .iter()
+            .filter(|entry| entry["stage"] == "deployment.mixed_placement")
+            .all(|event| event["selected"] == "group"));
+        for entry in plan.query_plan.entries.values() {
+            assert!(!entry.mixes_raw_and_stored_inputs(), "{query}");
+        }
+    }
 }
