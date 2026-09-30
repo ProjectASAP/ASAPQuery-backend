@@ -222,7 +222,7 @@ impl RawDagProgram {
         selected.ok_or_else(|| "raw materialization has no selected post-ASAP DAG producer".into())
     }
 
-    /// Execute the Planner graph over one pane's samples in arrival order.
+    /// Execute the Planner graph over one pane's samples as one typed batch.
     /// Returns `None` when the graph admits no population from them.
     pub fn build<'a>(
         &self,
@@ -231,6 +231,7 @@ impl RawDagProgram {
         max_bytes: usize,
     ) -> Result<Option<Box<dyn AggregateCore>>, String> {
         use futures::StreamExt;
+        let samples = pane_batch(samples);
         // Stored heap readout decodes only the backend heap kernel, not
         // Planner's weighted frequency state, so heaps stay on that kernel.
         if matches!(&self.family, SummaryFamilyType::Sketch(kind, _) if matches!(
@@ -257,7 +258,7 @@ impl RawDagProgram {
             Box::new(Operator::source(schema, vec![batch]).map_err(|e| e.to_string())?)
                 as PhysicalSource<'_>,
         )]);
-        let program = CompiledPhysicalDag::decode(&self.program).map_err(|e| e.to_string())?;
+        let program = decoded(&self.program)?;
         let graph = program.instantiate(sources).map_err(|e| e.to_string())?;
         let context = RunContext::new(
             Scope::Ingestion {
@@ -410,4 +411,41 @@ pub(crate) fn series_labels(series: &str) -> std::collections::BTreeMap<String, 
         labels.insert("__name__".into(), metric.to_owned());
     }
     labels
+}
+
+/// A pane's samples as ingestion delivers them to Planner: in timestamp
+/// order (stable for equal times), with one sample per series and timestamp;
+/// a repeated `(series, timestamp)` is the same sample, so the first is kept.
+fn pane_batch<'a>(
+    samples: impl IntoIterator<Item = (&'a str, i64, f64)>,
+) -> Vec<(&'a str, i64, f64)> {
+    let mut samples = samples.into_iter().collect::<Vec<_>>();
+    samples.sort_by_key(|(_, time, _)| *time);
+    let mut seen = std::collections::HashSet::new();
+    samples.retain(|(series, time, _)| seen.insert((*series, *time)));
+    samples
+}
+
+/// Decoded graphs are not `Send`, so each thread decodes an installed graph
+/// once. Holding the encoded bytes keeps their address from being reused.
+fn decoded(encoded: &std::sync::Arc<[u8]>) -> Result<std::rc::Rc<CompiledPhysicalDag>, String> {
+    type Cache =
+        std::collections::HashMap<usize, (std::sync::Arc<[u8]>, std::rc::Rc<CompiledPhysicalDag>)>;
+    thread_local! {
+        static DECODED: std::cell::RefCell<Cache> = Default::default();
+    }
+    DECODED.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let key = encoded.as_ptr() as usize;
+        if let Some((_, program)) = cache.get(&key) {
+            return Ok(program.clone());
+        }
+        if cache.len() >= 1024 {
+            cache.clear();
+        }
+        let program =
+            std::rc::Rc::new(CompiledPhysicalDag::decode(encoded).map_err(|e| e.to_string())?);
+        cache.insert(key, (encoded.clone(), program.clone()));
+        Ok(program)
+    })
 }

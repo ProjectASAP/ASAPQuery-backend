@@ -59,7 +59,7 @@ struct GroupState {
     window_manager: WindowManager,
     /// Samples admitted to each open pane, keyed by pane_start_ms, in arrival
     /// order. The installed Planner graph builds the pane's state at close.
-    active_panes: BTreeMap<i64, Vec<(String, i64, f64)>>,
+    active_panes: BTreeMap<i64, Vec<(Arc<str>, i64, f64)>>,
     /// Last cumulative counter sample per source series for heap membership
     /// materializations. This is bounded O(series) derivative state, not a
     /// raw-sample history, and deliberately survives pane rotation.
@@ -630,6 +630,8 @@ impl Worker {
         // layouts update one non-overlapping base pane; FullWindow updates
         // every overlapping semantic window that contains the sample.
         for (series_key, ts, val) in &samples {
+            // Shared by every pane (overlapping full windows) the sample enters.
+            let series: Arc<str> = Arc::from(series_key.as_str());
             let too_late = previous_event_time != i64::MIN
                 && pane_timestamp(*ts)
                     < watermark_for_event_time(previous_event_time, allowed_lateness_ms);
@@ -695,7 +697,7 @@ impl Worker {
                             let Some(correction) = build_pane(
                                 state.program.as_deref(),
                                 &state.config,
-                                &[(series_key.clone(), *ts, *val)],
+                                &[(Arc::from(series_key.as_str()), *ts, *val)],
                                 (bucket_start, bucket_end),
                             )?
                             else {
@@ -748,7 +750,7 @@ impl Worker {
                 state.touch_pane(bucket_start, now_ms);
                 let pane = state.active_panes.entry(bucket_start).or_default();
                 if let Some(value) = value {
-                    pane.push((series_key.clone(), *ts, value));
+                    pane.push((Arc::clone(&series), *ts, value));
                     if let (Some(observer), Some(revision)) = (&self.erp_observer, &input_revision)
                     {
                         observer.observe(
@@ -1590,14 +1592,14 @@ pub fn decode_label_value(s: &str) -> std::borrow::Cow<'_, str> {
 fn build_pane(
     program: Option<&super::raw_dag::RawDagProgram>,
     config: &PrecomputeMaterialization,
-    samples: &[(String, i64, f64)],
+    samples: &[(Arc<str>, i64, f64)],
     pane: (i64, i64),
 ) -> Result<Option<Box<dyn AggregateCore>>, String> {
     if let Some(program) = program {
         return program.build(
             samples
                 .iter()
-                .map(|(series, time, value)| (series.as_str(), *time, *value)),
+                .map(|(series, time, value)| (series.as_ref(), *time, *value)),
             pane,
             asap_physical_operators::runtime::Limits::default().max_bytes,
         );
@@ -1618,20 +1620,22 @@ fn build_pane(
     }
 }
 
-/// Remove a closed pane and build its state from every sample it admitted.
+/// Build a closed pane's state from every sample it admitted, then remove it.
 fn close_pane(
     state: &mut GroupState,
     start: i64,
 ) -> Result<Option<Box<dyn AggregateCore>>, String> {
-    let Some(samples) = state.active_panes.remove(&start) else {
+    let Some(samples) = state.active_panes.get(&start) else {
         return Ok(None);
     };
-    build_pane(
+    let built = build_pane(
         state.program.as_deref(),
         &state.config,
-        &samples,
+        samples,
         state.bucket_bounds(start),
-    )
+    )?;
+    state.active_panes.remove(&start);
+    Ok(built)
 }
 
 /// Route a single sample to `updater`, dispatching keyed vs. non-keyed based on config.
@@ -4721,7 +4725,7 @@ mod dag_execution_tests {
                     InstalledPrecomputePlanHandle::new(installed.clone()),
                     WorkerRuntimeConfig {
                         max_buffer_per_series: 100,
-                        allowed_lateness_ms: 60_000,
+                        allowed_lateness_ms: 0,
                         pass_raw_samples: false,
                         raw_mode_aggregation_id: 0,
                         late_data_policy: LateDataPolicy::Drop,
@@ -4743,7 +4747,7 @@ mod dag_execution_tests {
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
                 let mut expected = BTreeMap::new();
-                for (sid, (key, samples)) in groups.iter().enumerate() {
+                for (key, samples) in &groups {
                     let group_key = Arc::new(GroupKey::new(
                         key.iter().map(|(k, v)| (k.as_str(), v.as_str())),
                     ));
@@ -4763,9 +4767,19 @@ mod dag_execution_tests {
                                 .unwrap();
                         }
                     }
-                    worker
-                        .process_group_samples(sid as u64 + 1, fp, &group_key, samples.clone())
-                        .unwrap();
+                }
+                // One batch per scrape, so the watermark closes earlier panes
+                // while later ones are open; shutdown closes the rest.
+                for time in (500..=9500).step_by(1000) {
+                    for (sid, (key, samples)) in groups.iter().enumerate() {
+                        let group_key = Arc::new(GroupKey::new(
+                            key.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+                        ));
+                        let batch = samples.iter().filter(|s| s.1 == time).cloned().collect();
+                        worker
+                            .process_group_samples(sid as u64 + 1, fp, &group_key, batch)
+                            .unwrap();
+                    }
                 }
                 worker.force_close_all().unwrap();
                 let actual = sink
@@ -4837,6 +4851,141 @@ mod dag_execution_tests {
             .to_string()
             .contains("DAG producer"));
     }
+    fn single_worker(
+        plan: &control_plane::physical::compiler::CompiledPhysicalPlan,
+        sink: Arc<CapturingOutputSink>,
+        late_data_policy: LateDataPolicy,
+    ) -> Worker {
+        let (_tx, rx) = mpsc::channel(8);
+        Worker::new(
+            0,
+            rx,
+            sink,
+            InstalledPrecomputePlanHandle::new(
+                InstalledPrecomputePlan::from_precompute_plan(plan.precompute_plan.clone())
+                    .unwrap(),
+            ),
+            WorkerRuntimeConfig {
+                max_buffer_per_series: 100,
+                allowed_lateness_ms: 0,
+                pass_raw_samples: false,
+                raw_mode_aggregation_id: 0,
+                late_data_policy,
+                wall_clock_idle_grace_period_ms: 0,
+                wall_clock_max_open_grace_period_ms: 0,
+            },
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicI64::new(0)),
+        )
+    }
+
+    // A counter pane is delivered to Planner in timestamp order with one sample
+    // per series and timestamp; arrival order and a resent sample do not fail it.
+    #[test]
+    fn counter_pane_orders_and_deduplicates_samples() {
+        let plan = plan("rate(asap_demo_counter_total[5s])");
+        let config = plan.precompute_plan.materializations[0].clone();
+        let program = InstalledPrecomputePlan::from_precompute_plan(plan.precompute_plan.clone())
+            .unwrap()
+            .raw_programs[&config.policy_fp_u64()]
+            .clone();
+        let series = format!("{}{{job=\"api\"}}", config.metric);
+        let arrived = [
+            (1100, 10.0),
+            (1300, 30.0),
+            (1200, 20.0),
+            (1300, 99.0),
+            (1400, 40.0),
+        ];
+        let sink = Arc::new(CapturingOutputSink::new());
+        let mut worker = single_worker(&plan, sink.clone(), LateDataPolicy::Drop);
+        worker
+            .process_group_samples(
+                1,
+                config.policy_fingerprint(),
+                &Arc::new(GroupKey::new([("job", "api")])),
+                arrived
+                    .iter()
+                    .map(|(t, v)| (series.clone(), *t, *v))
+                    .collect(),
+            )
+            .unwrap();
+        worker.force_close_all().unwrap();
+        let manager = WindowManager::with_layout(
+            config.window_size,
+            config.slide_interval,
+            config.pane_origin_ms,
+            &config.window_layout,
+        );
+        let right_closed = config
+            .parameters
+            .get("promql_right_closed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let mut panes = BTreeMap::<(i64, i64), Vec<(&str, i64, f64)>>::new();
+        for (time, value) in [(1100, 10.0), (1200, 20.0), (1300, 30.0), (1400, 40.0)] {
+            let pane_time = if right_closed { time - 1 } else { time };
+            for start in manager.stored_bucket_starts(pane_time) {
+                panes
+                    .entry(manager.stored_bucket_bounds(start))
+                    .or_default()
+                    .push((series.as_str(), time, value));
+            }
+        }
+        let actual = sink
+            .drain()
+            .into_iter()
+            .map(|(output, state)| {
+                (
+                    (output.start_timestamp as i64, output.end_timestamp as i64),
+                    state.serialize_to_bytes(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let expected = panes
+            .into_iter()
+            .map(|(pane, samples)| {
+                let state = program.build(samples, pane, 1 << 20).unwrap().unwrap();
+                (pane, state.serialize_to_bytes())
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert!(!expected.is_empty());
+        assert_eq!(actual, expected);
+    }
+
+    // A late sample forwarded to a closed pane is its own Planner-built correction.
+    #[test]
+    fn late_forwarded_sample_is_built_by_the_planner_graph() {
+        let plan = plan("sum_over_time(asap_demo_gauge[5s])");
+        let config = plan.precompute_plan.materializations[0].clone();
+        let sink = Arc::new(CapturingOutputSink::new());
+        let mut worker = single_worker(&plan, sink.clone(), LateDataPolicy::ForwardToStore);
+        let group = Arc::new(GroupKey::new([]));
+        let fp = config.policy_fingerprint();
+        let series = config.metric.clone();
+        for time in [1000, 12_000] {
+            worker
+                .process_group_samples(1, fp, &group, vec![(series.clone(), time, 2.0)])
+                .unwrap();
+        }
+        sink.drain();
+        worker
+            .process_group_samples(1, fp, &group, vec![(series.clone(), 1500, 7.0)])
+            .unwrap();
+        let corrections = sink.drain();
+        assert!(!corrections.is_empty(), "late sample must be forwarded");
+        for (_, state) in corrections {
+            let exact =
+                ExactAccumulator::deserialize_from_bytes(&state.serialize_to_bytes()).unwrap();
+            assert_eq!(
+                exact
+                    .query_statistic(asap_types::Statistic::Sum, &None, &Default::default())
+                    .unwrap(),
+                7.0
+            );
+        }
+    }
+
     // A raw output installs only with its Planner-compiled precompute graph.
     #[test]
     fn raw_output_requires_its_planner_precompute_graph() {

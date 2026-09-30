@@ -71,7 +71,11 @@ pub fn render(plan: &CompiledPhysicalPlan) -> String {
             render_native(
                 &mut dot,
                 &format!("maintenance_{dag_index}_{}", sink.0),
-                "Planner maintenance operators",
+                if installed.reads_raw_samples(*sink) {
+                    "Planner raw precompute operators"
+                } else {
+                    "Planner maintenance operators"
+                },
                 program,
             );
         }
