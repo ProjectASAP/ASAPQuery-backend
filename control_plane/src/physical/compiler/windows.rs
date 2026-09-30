@@ -158,8 +158,7 @@ pub fn prepare_window_implementations(
     })?;
     let cohorts = cohort_nodes(&states);
     let native_cohort =
-        super::rate_placement::compile_fixed_window_rate_aggregation(&query.selected_plan_root)
-            .is_ok();
+        super::placement::root_fixed_window_candidate(&query.selected_plan_root).is_ok();
     let requirements = states
         .iter()
         .map(|state| {

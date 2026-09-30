@@ -41,7 +41,6 @@ use crate::types::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
 mod placement;
-mod rate_placement;
 mod windows;
 pub(super) use windows::gcd;
 pub use windows::{prepare_window_implementations, WindowCostModel};
@@ -95,24 +94,19 @@ pub struct QueryCompilationInput {
 }
 
 impl QueryCompilationInput {
-    /// Physical planning precedes deployment feasibility and cost selection.
+    /// Retain Planner's native realization of the selected root under the
+    /// timing its lifecycle choice wrote into it, before deployment pricing.
     pub(crate) fn retain_physical_candidate(&mut self) -> Result<(), CompileError> {
-        use asap_physical_operators::physical_planner::{promql_rows, PhysicalCandidate};
-        let candidate =
-            rate_placement::compile_fixed_window_rate_aggregation(&self.selected_plan_root)
-                .or_else(|_| {
-                    promql_rows::compile_current_series_readout(&self.selected_plan_root)
-                        .or_else(|_| {
-                            promql_rows::compile_rate_ranking(&self.selected_plan_root)
-                                .map(|(_, dag)| dag)
-                        })
-                        .map(|query| PhysicalCandidate {
-                            precompute: None,
-                            query,
-                            materialized_outputs: BTreeMap::new(),
-                        })
-                })
-                .ok();
+        let candidate = placement::root_fixed_window_candidate(&self.selected_plan_root)
+            .ok()
+            .or_else(|| placement::query_time_candidate(&self.selected_plan_root));
+        self.retain(candidate)
+    }
+
+    fn retain(
+        &mut self,
+        candidate: Option<asap_physical_operators::physical_planner::PhysicalCandidate>,
+    ) -> Result<(), CompileError> {
         self.physical_candidate = candidate
             .map(|candidate| candidate.encode())
             .transpose()
@@ -1012,8 +1006,7 @@ impl BackendLocalPlanningInput {
                 exact_costs_by_id.insert(format!("compat-query-{index}"), rows.clone());
             }
         }
-        let mut candidate_roots = Vec::new();
-        let mut planner_selection_trace = logical_roots_and_candidates(
+        let mut planner_selection_trace = select_logical_roots_with_scoped_evidence_and_trace(
             &mut queries,
             canonical_roots.clone(),
             &topk_evidence_by_id,
@@ -1021,90 +1014,7 @@ impl BackendLocalPlanningInput {
             &exact_costs_by_id,
             self.physical_inputs.erp.as_ref(),
             self.environment.observed_at_unix_ms,
-            Some(&mut candidate_roots),
         )?;
-        // Resolve physical row identity before asking Planner for snapshot heap
-        // candidates. Keep canonical query semantics and exact candidates intact.
-        for (index, (query, root)) in queries.iter().zip(&canonical_roots).enumerate() {
-            let Ok(typed) =
-                asap_physical_operators::physical_planner::promql_rows::with_series_identity(root)
-            else {
-                continue;
-            };
-            let evidence = QueryEvidence {
-                topk: topk_evidence_by_id.get(&query.query_id),
-                scoped: scoped_evidence_by_id.get(&query.query_id),
-                now_ms: self.environment.observed_at_unix_ms,
-            };
-            let strategy =
-                asap_aware_mapping::SketchAlgorithmStrategy::new_with_planning_inputs_and_evidence(
-                    &asap_aware_mapping::cost_model::DefaultCostModel,
-                    &asap_aware_mapping::accuracy::DefaultAccuracyModel,
-                    &asap_aware_mapping::accuracy::EqualSplitAllocator,
-                    &evidence,
-                );
-            let typed = Rc::new(typed);
-            let mut proposed =
-                strategy.current_series_topk_candidates(&typed, &query.accuracy_target);
-            let direct = asap_aware_mapping::ReplacementStrategy::propose(
-                &strategy,
-                &asap_aware_mapping::TargetSubDAG::new(&typed),
-            );
-            proposed
-                .candidates
-                .extend(rate_placement::fixed_window_rate_candidates(
-                    &direct.candidates,
-                    &typed,
-                ));
-            proposed
-                .candidates
-                .extend(rate_placement::query_time_rate_aggregation_candidates(
-                    &direct.candidates,
-                    &typed,
-                ));
-            proposed.candidates.extend(direct.candidates);
-            proposed.rejected.extend(direct.rejected);
-            for candidate in proposed.candidates {
-                let asap_aware_mapping::Replacement::Summary(root) = candidate.replacement else {
-                    continue;
-                };
-                let root = asap_aware_mapping::replacement::finalize_query_candidate(root, &typed)
-                    .map_err(|error| CompileError::Snapshot(error.to_string()))?;
-                let compiled = asap_physical_operators::physical_planner::promql_rows::compile_current_series_readout(&root)
-                    .or_else(|_| asap_physical_operators::physical_planner::promql_rows::compile_rate_ranking(&root).map(|(_, program)| program));
-                if let Ok(physical) = rate_placement::compile_fixed_window_rate_aggregation(&root) {
-                    planner_selection_trace.push(serde_json::json!({
-                        "stage":"planner.physical_candidate", "query_id":query.query_id,
-                        "logical_root_id":crate::planner_selection::explained_root_id(&root, &query.accuracy_target),
-                        "rationale":candidate.rationale, "physical_candidate":serde_json::from_slice::<Value>(&physical.encode().map_err(|e| CompileError::Snapshot(e.to_string()))?).map_err(|e| CompileError::Snapshot(e.to_string()))?,
-                        "guarantee":root.guarantee,
-                    }));
-                    candidate_roots.push(vec![(index, root)]);
-                    continue;
-                }
-                match compiled {
-                    Ok(program) => {
-                        planner_selection_trace.push(serde_json::json!({
-                            "stage": "planner.physical_candidate", "query_id": query.query_id,
-                            "logical_root_id": crate::planner_selection::explained_root_id(&root, &query.accuracy_target),
-                            "rationale": candidate.rationale, "physical_dag": serde_json::from_slice::<Value>(&program.encode().map_err(|error| CompileError::Snapshot(error.to_string()))?).map_err(|error| CompileError::Snapshot(error.to_string()))?,
-                            "guarantee": root.guarantee,
-                        }));
-                        candidate_roots.push(vec![(index, root)]);
-                    }
-                    Err(error) => planner_selection_trace.push(serde_json::json!({
-                        "stage": "planner.physical_candidate", "query_id": query.query_id,
-                        "status": "unsupported", "reason": error.to_string(),
-                    })),
-                }
-            }
-            for rejected in proposed.rejected {
-                planner_selection_trace.push(serde_json::json!({
-                    "stage": "planner.physical_candidate", "query_id": query.query_id,
-                    "status": "rejected", "reason": rejected.error.to_string(),
-                }));
-            }
-        }
         for query in &mut queries {
             prepare_window_implementations(
                 query,
@@ -1112,40 +1022,114 @@ impl BackendLocalPlanningInput {
                 self.environment.target,
                 self.physical_inputs.query_retention_margin_ms,
             )?;
+            query.retain_physical_candidate()?;
         }
+        // Native physical realizations need the complete series identity in
+        // their rows. Planner's PlanSpace proposes them for the identity-typed
+        // root; each is a logical alternative whose readout-built states are
+        // placed by lifecycle, then substituted into the preferred workload.
         let mut planner_candidate_forests = Vec::new();
-        for roots in candidate_roots {
-            let mut forest = queries.clone();
-            let changed: BTreeSet<_> = roots.iter().map(|(index, _)| *index).collect();
-            for (index, root) in roots {
-                forest[index].selected_plan_root = root;
+        for (index, root) in canonical_roots.iter().enumerate() {
+            let Ok(typed) =
+                asap_physical_operators::physical_planner::promql_rows::with_series_identity(root)
+            else {
+                continue;
+            };
+            let query = &queries[index];
+            let evidence = QueryEvidence {
+                topk: topk_evidence_by_id.get(&query.query_id),
+                scoped: scoped_evidence_by_id.get(&query.query_id),
+                now_ms: self.environment.observed_at_unix_ms,
+            };
+            // The identity-typed root reaches row-level realizations; the
+            // canonical root's search proposes whole-root realizations (such as
+            // a current-series heap) that add the identity themselves.
+            let mut candidates: Vec<(bool, Rc<SummaryNode>)> = Vec::new();
+            for (typed_search, search_root) in [(true, Rc::new(typed)), (false, Rc::clone(root))] {
+                let inventory = crate::planner_selection::enumerate_workload_candidates(
+                    vec![(index, search_root)],
+                    query.accuracy_target.clone(),
+                    &ControlPlaneCostModel::new(query.accuracy_target.clone()),
+                    &evidence,
+                    &asap_aware_mapping::DefaultAccuracyModel,
+                )
+                .map_err(|error| CompileError::Snapshot(error.to_string()))?;
+                for reason in inventory
+                    .rejected_assemblies
+                    .into_iter()
+                    .filter(|_| typed_search)
+                {
+                    planner_selection_trace.push(serde_json::json!({
+                        "stage": "planner.physical_candidate", "query_id": query.query_id,
+                        "status": "rejected", "reason": reason,
+                    }));
+                }
+                for (_, candidate) in inventory.candidates.into_iter().flatten() {
+                    if !candidates.iter().any(|(_, known)| **known == *candidate) {
+                        candidates.push((typed_search, candidate));
+                    }
+                }
             }
-            // Unchanged roots already have prepared windows in `queries`.
-            let preparation = changed.into_iter().try_for_each(|index| {
-                prepare_window_implementations(
+            for (typed_search, candidate) in candidates {
+                let Some(timed) = placement::time_native_candidate(
+                    &candidate,
+                    query,
+                    &workload,
+                    &data_workload,
+                    index,
+                    &self.environment,
+                ) else {
+                    if typed_search {
+                        planner_selection_trace.push(serde_json::json!({
+                            "stage": "planner.physical_candidate", "query_id": query.query_id,
+                            "logical_root_id": crate::planner_selection::explained_root_id(&candidate, &query.accuracy_target),
+                            "status": "unsupported",
+                            "reason": "no native physical realization under any lifecycle choice",
+                        }));
+                    }
+                    continue;
+                };
+                let mut forest = queries.clone();
+                forest[index].selected_plan_root = Rc::clone(&timed.root);
+                // Unchanged roots already have prepared windows in `queries`.
+                if let Err(error) = prepare_window_implementations(
                     &mut forest[index],
                     &self.physical_inputs.window_cost_model,
                     self.environment.target,
                     self.physical_inputs.query_retention_margin_ms,
-                )
-            });
-            if let Err(error) = preparation {
-                planner_selection_trace.push(serde_json::json!({
-                    "stage": "deployment.window_feasibility",
-                    "status": "rejected",
-                    "logical_root_ids": forest.iter().map(|query| crate::planner_selection::explained_root_id(
-                        &query.selected_plan_root, &query.accuracy_target)).collect::<Vec<_>>(),
-                    "reason": error.to_string(),
-                }));
-                continue;
+                ) {
+                    planner_selection_trace.push(serde_json::json!({
+                        "stage": "deployment.window_feasibility",
+                        "status": "rejected",
+                        "query_id": query.query_id,
+                        "logical_root_id": crate::planner_selection::explained_root_id(&timed.root, &query.accuracy_target),
+                        "reason": error.to_string(),
+                    }));
+                    continue;
+                }
+                let encode = |bytes: Result<Vec<u8>, asap_physical_operators::Error>| {
+                    bytes
+                        .map_err(|e| CompileError::Snapshot(e.to_string()))
+                        .and_then(|bytes| {
+                            serde_json::from_slice::<Value>(&bytes)
+                                .map_err(|e| CompileError::Snapshot(e.to_string()))
+                        })
+                };
+                let mut event = serde_json::json!({
+                    "stage": "planner.physical_candidate", "query_id": query.query_id,
+                    "logical_root_id": crate::planner_selection::explained_root_id(&timed.root, &query.accuracy_target),
+                    "guarantee": timed.root.guarantee,
+                });
+                if timed.physical.precompute.is_some() {
+                    event["physical_candidate"] = encode(timed.physical.encode())?;
+                } else {
+                    event["physical_dag"] = encode(timed.physical.query.encode())?;
+                }
+                planner_selection_trace.push(event);
+                planner_selection_trace.extend(timed.trace);
+                forest[index].retain(Some(timed.physical))?;
+                planner_candidate_forests.push(forest);
             }
-            planner_candidate_forests.push(forest);
-        }
-        for query in queries
-            .iter_mut()
-            .chain(planner_candidate_forests.iter_mut().flatten())
-        {
-            query.retain_physical_candidate()?;
         }
         // Composable lowering residualizes unsafe leaves individually; retain Planner siblings.
         Ok((
@@ -2935,7 +2919,6 @@ pub fn select_logical_roots_with_scoped_evidence_and_trace(
         exact_costs,
         erp,
         now_ms,
-        None,
     )
 }
 
@@ -2947,7 +2930,6 @@ fn logical_roots_and_candidates(
     exact_costs: &HashMap<String, Vec<ExactCompositionCostEvidence>>,
     erp: Option<&super::erp::ErpPlanningInput>,
     now_ms: u64,
-    mut candidates_out: Option<&mut Vec<Vec<(usize, Rc<SummaryNode>)>>>,
 ) -> Result<Vec<serde_json::Value>, CompileError> {
     let mut traces = Vec::new();
     if roots.len() != queries.len() {
@@ -3023,27 +3005,6 @@ fn logical_roots_and_candidates(
                 AccuracyTarget::Exact => 0.0,
             },
         };
-        let mut candidate_assembly_rejections = Vec::new();
-        if let Some(output) = candidates_out.as_deref_mut() {
-            let inventory = crate::planner_selection::enumerate_workload_candidates(
-                roots.clone(),
-                accuracy.clone(),
-                &model,
-                &QueryEvidence {
-                    topk: certificate,
-                    scoped: scoped_certificate,
-                    now_ms,
-                },
-                &accuracy_model,
-            )
-            .map_err(|error| CompileError::Snapshot(error.to_string()))?;
-            candidate_assembly_rejections = inventory.rejected_assemblies;
-            let candidates = inventory.candidates;
-            // Retain every root's candidates without multiplying independent
-            // cohorts. Deployment evaluates each root substitution in the
-            // preferred workload context; this is not exhaustive joint search.
-            output.extend(candidates);
-        }
         let (selected, mut trace) =
             crate::planner_selection::select_workload_with_accuracy_model_and_trace(
                 roots,
@@ -3057,14 +3018,6 @@ fn logical_roots_and_candidates(
                 &accuracy_model,
             )
             .map_err(|error| CompileError::Snapshot(error.to_string()))?;
-        trace["candidate_assembly_rejections"] = serde_json::json!(candidate_assembly_rejections);
-        if candidates_out.is_some() {
-            trace["computation_search_scope"] = serde_json::json!({
-                "inventory": "all_root_candidates",
-                "deployment_evaluation": "single_root_substitutions_in_preferred_workload",
-                "joint_workload_search_exhaustive": false,
-            });
-        }
         if let Some(evidence) = scoped_certificate {
             trace["accuracy_evidence_scope"] = serde_json::json!({
                 "query_id": scope,
@@ -4718,7 +4671,7 @@ fn collect_selected_materializations(
         physical_source.as_ref().unwrap_or(node),
         None,
         composable,
-        rate_placement::compile_fixed_window_rate_aggregation(node).is_ok(),
+        placement::root_fixed_window_candidate(node).is_ok(),
         None,
         &mut selected,
     )?;

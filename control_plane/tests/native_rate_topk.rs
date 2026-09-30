@@ -7,6 +7,13 @@ use control_plane::physical::{
 use serde_json::{json, Value};
 
 fn fixture(certified: bool) -> BackendLocalPlanningInput {
+    placed_fixture(certified, 0.0)
+}
+
+/// A positive summary-store price makes rebuilding a heap per query from the
+/// retained counter readouts cheaper than maintaining it. Local-only execution
+/// keeps the counter state itself precomputed rather than read raw.
+fn placed_fixture(certified: bool, store_per_byte_second: f64) -> BackendLocalPlanningInput {
     let mut wire: Value = serde_json::from_str(include_str!(
         "../../docs/examples/asapquery-compatibility-demo-snapshot.json"
     ))
@@ -18,6 +25,10 @@ fn fixture(certified: bool) -> BackendLocalPlanningInput {
         json!({"explicit":{"EpsilonDelta":{"epsilon":0.1,"delta":0.1}}});
     wire["query_workload"]["repeating_queries"] = json!([entry]);
     wire["implementation"]["topk_evidence"] = json!({});
+    wire["implementation"]["lifecycle_costs"]["store_per_byte_second"] =
+        store_per_byte_second.into();
+    wire["implementation"]["require_backend_local_execution"] =
+        (store_per_byte_second > 0.0).into();
     wire["implementation"]["data_snapshot_id"] = "snapshot-topk-test".into();
     if certified {
         wire["implementation"]["accuracy_evidence"] = json!({query: {
@@ -36,7 +47,9 @@ fn fixture(certified: bool) -> BackendLocalPlanningInput {
 // external whole-query fallback or accumulate counter samples as heap weights.
 #[test]
 fn rate_heap_candidates_bind_durable_counter_windows() {
-    let (request, environment) = fixture(true).into_physical_compilation_request().unwrap();
+    let (request, environment) = placed_fixture(true, 1.0)
+        .into_physical_compilation_request()
+        .unwrap();
     let mut families = std::collections::BTreeSet::new();
     for candidate in enumerate_exact_and_materialized_candidates(request).unwrap() {
         let Ok(plan) = DeploymentPlanCompiler.compile_promql(candidate, environment.clone()) else {
@@ -122,7 +135,7 @@ fn rate_heap_costs_can_select_each_compiled_candidate() {
         workload_cost::{manifest, WorkloadCostEvidence, WorkloadQuote},
     };
     for preferred in ["exact", "CmsWithHeap", "CountSketchWithHeap"] {
-        let mut input = fixture(true);
+        let mut input = placed_fixture(true, 1.0);
         let (request, environment) = input.clone().into_physical_compilation_request().unwrap();
         let quotes = enumerate_exact_and_materialized_candidates(request)
             .unwrap()
@@ -233,49 +246,57 @@ fn fixed_window_rate_heap_candidates_install_both_physical_graphs() {
     );
 }
 
-// Rate must precede grouped Sum in both placements; deployment chooses ownership.
+// Rate precedes grouped Sum in both placements; the summary-store price
+// chooses between maintaining the Sum and rebuilding it per query.
 #[test]
-fn grouped_rate_has_native_query_and_maintenance_candidates() {
-    let mut wire = serde_json::to_value(fixture(false)).unwrap();
-    let entry = &mut wire["query_workload"]["repeating_queries"][0];
-    entry["query"] = "sum by(job)(rate(requests_total[1m]))".into();
-    entry["requirements"]["accuracy"] = json!({"explicit":"Exact"});
-    entry["demand"]["fixed_interval_at"]["interval"] = 5_000.into();
-    entry["demand"]["fixed_interval_at"]["evaluation_phase"] = 0.into();
-    wire["implementation"]["accuracy_evidence"] = json!({});
-    let input: BackendLocalPlanningInput = serde_json::from_value(wire).unwrap();
-    let (request, environment) = input.into_physical_compilation_request().unwrap();
-    let mut placements = std::collections::BTreeSet::new();
-    let mut errors = Vec::new();
-    for candidate in enumerate_exact_and_materialized_candidates(request).unwrap() {
-        let plan = match DeploymentPlanCompiler.compile_promql(candidate, environment.clone()) {
-            Ok(plan) => plan,
-            Err(error) => {
-                errors.push(error.to_string());
+fn grouped_rate_placement_follows_summary_store_cost() {
+    for (store, maintained) in [(0.0, true), (1.0, false)] {
+        let mut wire = serde_json::to_value(placed_fixture(false, store)).unwrap();
+        let entry = &mut wire["query_workload"]["repeating_queries"][0];
+        entry["query"] = "sum by(job)(rate(requests_total[1m]))".into();
+        entry["requirements"]["accuracy"] = json!({"explicit":"Exact"});
+        entry["demand"]["fixed_interval_at"]["interval"] = 5_000.into();
+        entry["demand"]["fixed_interval_at"]["evaluation_phase"] = 0.into();
+        wire["implementation"]["accuracy_evidence"] = json!({});
+        let input: BackendLocalPlanningInput = serde_json::from_value(wire).unwrap();
+        let (request, environment) = input.into_physical_compilation_request().unwrap();
+        let mut placements = std::collections::BTreeSet::new();
+        let mut errors = Vec::new();
+        for candidate in enumerate_exact_and_materialized_candidates(request).unwrap() {
+            let plan = match DeploymentPlanCompiler.compile_promql(candidate, environment.clone()) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    errors.push(error.to_string());
+                    continue;
+                }
+            };
+            let entry = plan.query_plan.entries.values().next().unwrap();
+            let Some(program) = &entry.physical_dag else {
+                continue;
+            };
+            if entry.physical_vector_binding().is_none() {
                 continue;
             }
-        };
-        let entry = plan.query_plan.entries.values().next().unwrap();
-        let Some(program) = &entry.physical_dag else {
-            continue;
-        };
-        if entry.physical_vector_binding().is_none() {
-            continue;
+            entry.recover_vector_physical_dag().unwrap();
+            let stored = plan
+                .precompute_plan
+                .executable_dags
+                .values()
+                .any(|dag| !dag.native_programs.is_empty());
+            let rebuilt = program.to_string().contains("SummaryBuild");
+            assert!(!(stored && rebuilt));
+            // Planner also offers a relational Sum over the readouts, which has
+            // no Sum state to place.
+            if stored || rebuilt {
+                placements.insert(stored);
+            }
         }
-        entry.recover_vector_physical_dag().unwrap();
-        let stored = plan
-            .precompute_plan
-            .executable_dags
-            .values()
-            .any(|dag| !dag.native_programs.is_empty());
-        assert_eq!(program.to_string().contains("SummaryBuild"), !stored);
-        placements.insert(stored);
+        assert_eq!(
+            placements,
+            std::collections::BTreeSet::from([maintained]),
+            "{errors:#?}"
+        );
     }
-    assert_eq!(
-        placements,
-        std::collections::BTreeSet::from([false, true]),
-        "{errors:#?}"
-    );
 }
 
 // Deployment must install the exact retained Planner graphs, including roots,
