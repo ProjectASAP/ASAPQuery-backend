@@ -216,6 +216,8 @@ pub struct PhysicalCompilationRequest {
     pub query_workload: Option<QueryWorkload>,
     /// Source evidence supplied independently from query demand.
     pub data_workload: Option<DataWorkload>,
+    /// Per-metric samples/second used to price raw selector folds.
+    pub source_ingestion_rates: BTreeMap<String, Evidence<Rate>>,
     /// Workload-lowered roots retained across physical candidate enumeration.
     pub canonical_roots: Vec<Rc<QueryExpr>>,
     pub queries: Vec<QueryCompilationInput>,
@@ -438,6 +440,10 @@ pub struct BackendLocalPhysicalInputs {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub require_backend_local_execution: bool,
     pub lifecycle_costs: LifecycleUnitCosts,
+    /// Samples/second by metric, before label filtering. Missing or stale
+    /// evidence falls back to the conservative workload-wide ingestion rate.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_ingestion_rates: BTreeMap<String, Evidence<Rate>>,
     pub evidence_observed_at_unix_ms: u64,
     pub evidence_valid_for_ms: u64,
     pub horizon_seconds: f64,
@@ -855,6 +861,18 @@ impl BackendLocalPlanningInput {
                 "compatibility workload requires backend_local_remote_write target".into(),
             ));
         }
+        for (metric, evidence) in &self.physical_inputs.source_ingestion_rates {
+            if metric.trim().is_empty()
+                || evidence
+                    .value
+                    .is_some_and(|rate| !rate.0.is_finite() || rate.0 < 0.0)
+            {
+                return Err(CompileError::Snapshot(
+                    "source_ingestion_rates requires named metrics and finite nonnegative rates"
+                        .into(),
+                ));
+            }
+        }
         let workload = self.query_workload;
         let mut data_workload = self.data_workload.clone();
         let scoped_snapshot_id = self
@@ -1185,6 +1203,7 @@ impl BackendLocalPlanningInput {
             require_backend_local_execution: self.physical_inputs.require_backend_local_execution,
             query_workload: Some(workload),
             data_workload: Some(data_workload),
+            source_ingestion_rates: self.physical_inputs.source_ingestion_rates,
             canonical_roots,
             queries,
             topk_membership_evidence_by_query_id: topk_evidence_by_id,
@@ -6043,6 +6062,7 @@ pub(crate) mod tests {
             require_backend_local_execution: false,
             query_workload: None,
             data_workload: None,
+            source_ingestion_rates: BTreeMap::new(),
             queries: vec![QueryCompilationInput {
                 query_id: query_id.into(),
                 query_string: promql.into(),
@@ -8944,6 +8964,7 @@ pub(crate) mod tests {
             physical_inputs: BackendLocalPhysicalInputs {
                 require_backend_local_execution: false,
                 lifecycle_costs: template.summary_lifecycle_inputs.costs,
+                source_ingestion_rates: BTreeMap::new(),
                 evidence_observed_at_unix_ms: 9_500,
                 evidence_valid_for_ms: 60_000,
                 horizon_seconds: 300.0,
