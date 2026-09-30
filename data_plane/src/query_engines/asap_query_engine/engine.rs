@@ -519,19 +519,29 @@ impl ASAPQueryEngine {
                 inputs.iter().all(|id| {
                     matches!(
                         entry.nodes.get(id),
-                        Some(asap_types::query_plan::QueryPlanNode::ReadMaterialization { .. })
+                        Some(
+                            asap_types::query_plan::QueryPlanNode::ReadMaterialization { .. }
+                                | asap_types::query_plan::QueryPlanNode::Logical {
+                                    operator: asap_types::query_plan::query_time::QueryTimeOperator::Scan { .. },
+                                    ..
+                                }
+                        )
                     )
                 })
             });
         let result = if native_stored {
-            let store = index.ok_or_else(|| {
-                EngineError::capability_miss("native_stored", "summary store unavailable")
-            })?;
+            // Query-time raw reads are external queries under the forwarding policy.
+            let raw_endpoint = self
+                .exact_subquery_endpoint
+                .as_deref()
+                .filter(|_| self.query_forwarding_policy.allows_external_queries())
+                .map(|endpoint| (&self.exact_subquery_client, endpoint));
             super::logical_dag::native_values::execute_stored(
                 entry,
                 physical.query_plan.plan_id,
                 physical.query_plan.plan_version,
-                store,
+                index,
+                raw_endpoint,
                 at,
             )
         } else {

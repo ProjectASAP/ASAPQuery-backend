@@ -7,6 +7,7 @@ mod exact_subqueries;
 pub mod live_serve;
 pub mod logical_dag;
 pub mod post_asap_readout;
+mod raw_source;
 pub mod summary_executor;
 
 pub use crate::storage_engines::sketch_db::query as asap_tier;
