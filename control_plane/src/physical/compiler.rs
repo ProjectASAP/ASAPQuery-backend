@@ -1511,11 +1511,6 @@ impl DeploymentPlanCompiler {
             request.queries[id].selected_plan_root = root;
         }
         let placement = placement::place(&request, &environment, frontend);
-        for (index, query) in request.queries.iter_mut().enumerate() {
-            if let Some(root) = placement.root(index) {
-                query.selected_plan_root = Rc::clone(root);
-            }
-        }
         let population_operators = super::maintained_population::operators(&request)?;
         let mut compiled_materializations = Vec::with_capacity(request.queries.len());
         let mut output_computations = BTreeMap::<_, OutputComputation>::new();
