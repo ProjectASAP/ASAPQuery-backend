@@ -369,6 +369,49 @@ fn issue_701_702_uncertified_ratios_require_exact_fallback() {
     }
 }
 
+/// Price candidates that read stored state for every query below the rest,
+/// so selection does not depend on candidate order.
+fn quote_stateful_snapshot(mut snapshot: BackendLocalPlanningInput) -> BackendLocalPlanningInput {
+    let (request, environment) = snapshot
+        .clone()
+        .into_physical_compilation_request()
+        .unwrap();
+    let quotes = workload_cost::enumerate_exact_and_materialized_candidates(request)
+        .unwrap()
+        .into_iter()
+        .filter_map(|candidate| {
+            let plan = DeploymentPlanCompiler
+                .compile_promql(candidate.clone(), environment.clone())
+                .ok()?;
+            let stateful = plan
+                .query_plan
+                .entries
+                .values()
+                .all(|entry| !entry.materialization_bindings().is_empty());
+            let manifest = workload_cost::manifest(&plan, &candidate.queries).unwrap();
+            Some(WorkloadQuote {
+                unit_costs: manifest
+                    .components
+                    .keys()
+                    .map(|key| (key.clone(), if stateful { 1.0 } else { 1e12 }))
+                    .collect(),
+                manifest,
+                executable: true,
+            })
+        })
+        .collect();
+    snapshot.workload_cost_evidence = Some(WorkloadCostEvidence {
+        backend_revision: BACKEND_REVISION.into(),
+        planner_revision: PLANNER_REVISION.into(),
+        data_snapshot_id: "issue-701-702-process".into(),
+        model_version: "synthetic-correctness-quotes".into(),
+        observed_at_unix_ms: environment.observed_at_unix_ms,
+        valid_for_ms: environment.max_evidence_age_ms,
+        quotes,
+    });
+    snapshot
+}
+
 // Finite input can overflow sum; the installed average must fall back while zero stays warm.
 #[tokio::test]
 async fn temporal_average_overflow_falls_back_after_state_is_warm() {
@@ -397,7 +440,7 @@ async fn temporal_average_overflow_falls_back_after_state_is_warm() {
         })
         .to_vec()
         .into();
-    let snapshot = quote_snapshot_for_test(serde_json::from_value(fixture).unwrap());
+    let snapshot = quote_stateful_snapshot(serde_json::from_value(fixture).unwrap());
     let plan = snapshot.clone().compile_promql().unwrap();
     assert!(
         plan.query_plan
