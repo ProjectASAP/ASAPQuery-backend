@@ -364,7 +364,7 @@ dependencies = [
 [[package]]
 name = "asap-aware-mapping"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=bd367a3c043e10ddbca9d994edb6c8e785c46a6a#bd367a3c043e10ddbca9d994edb6c8e785c46a6a"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=a049a3b6c17cee4c51c79e478799b32280a7d71d#a049a3b6c17cee4c51c79e478799b32280a7d71d"
 dependencies = [
  "asap-types",
  "asap_sketchlib 0.3.0 (git+https://github.com/ProjectASAP/asap_sketchlib)",
@@ -376,7 +376,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-promql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=bd367a3c043e10ddbca9d994edb6c8e785c46a6a#bd367a3c043e10ddbca9d994edb6c8e785c46a6a"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=a049a3b6c17cee4c51c79e478799b32280a7d71d#a049a3b6c17cee4c51c79e478799b32280a7d71d"
 dependencies = [
  "asap-types",
  "promql-parser 0.10.0 (git+https://github.com/ProjectASAP/promql-parser?rev=9fede7eecca923c9882fe256484d00d37f8706cb)",
@@ -385,7 +385,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-sql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=bd367a3c043e10ddbca9d994edb6c8e785c46a6a#bd367a3c043e10ddbca9d994edb6c8e785c46a6a"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=a049a3b6c17cee4c51c79e478799b32280a7d71d#a049a3b6c17cee4c51c79e478799b32280a7d71d"
 dependencies = [
  "asap-sql-function-catalog",
  "asap-types",
@@ -396,7 +396,7 @@ dependencies = [
 [[package]]
 name = "asap-physical-operators"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=bd367a3c043e10ddbca9d994edb6c8e785c46a6a#bd367a3c043e10ddbca9d994edb6c8e785c46a6a"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=a049a3b6c17cee4c51c79e478799b32280a7d71d#a049a3b6c17cee4c51c79e478799b32280a7d71d"
 dependencies = [
  "asap-types",
  "asap_sketchlib 0.3.0 (git+https://github.com/ProjectASAP/asap_sketchlib?rev=5f03ccbd798ed5fec62bdd839bcb331123cab369)",
@@ -411,12 +411,12 @@ dependencies = [
 [[package]]
 name = "asap-sql-function-catalog"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=bd367a3c043e10ddbca9d994edb6c8e785c46a6a#bd367a3c043e10ddbca9d994edb6c8e785c46a6a"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=a049a3b6c17cee4c51c79e478799b32280a7d71d#a049a3b6c17cee4c51c79e478799b32280a7d71d"
 
 [[package]]
 name = "asap-types"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=bd367a3c043e10ddbca9d994edb6c8e785c46a6a#bd367a3c043e10ddbca9d994edb6c8e785c46a6a"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=a049a3b6c17cee4c51c79e478799b32280a7d71d#a049a3b6c17cee4c51c79e478799b32280a7d71d"
 dependencies = [
  "serde",
  "serde_json",
