@@ -262,7 +262,7 @@ fn raw_installation_id(
     }
     let aggregation =
         physical_aggregation(query, state, query.query_id.clone(), environment.target);
-    let (mut config, _) = scoped_materialization(&aggregation, &state.node).ok()?;
+    let (mut config, computation) = scoped_materialization(&aggregation, &state.node).ok()?;
     config.window_size = pane_secs;
     config.slide_interval = pane_secs;
     config.window_type = asap_types::WindowKind::Tumbling;
@@ -274,6 +274,7 @@ fn raw_installation_id(
     )
     .ok()?;
     config.pane_origin_ms?;
+    config.allocate_stored_output_id(&computation);
     Some(config.policy_fingerprint())
 }
 
