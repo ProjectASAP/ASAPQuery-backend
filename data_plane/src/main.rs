@@ -159,6 +159,12 @@ struct Args {
     #[arg(long)]
     disable_query_forwarding: bool,
 
+    /// Largest staleness of stored state combined with raw series read at the
+    /// query time, applied to every stored output; beyond it the query uses
+    /// the exact fallback. Unset: one slide interval of each stored output.
+    #[arg(long)]
+    max_stored_input_lag_ms: Option<u64>,
+
     /// Database path (currently unused, kept for compatibility)
     #[arg(long, default_value = "sketchdb.db")]
     db_path: String,
@@ -762,6 +768,7 @@ async fn main() -> Result<()> {
         .with_sketch_index(summary_store.clone())
         .with_active_physical_plan(active_physical_plan.clone())
         .with_query_forwarding_policy(query_forwarding_policy)
+        .with_max_stored_input_lag_ms(args.max_stored_input_lag_ms)
         .with_exact_subquery_endpoint(args.prometheus_server.clone())
         .with_metricsql_exact_subquery_endpoint(args.victoriametrics_url.clone());
 

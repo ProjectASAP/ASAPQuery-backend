@@ -774,11 +774,19 @@ where
 
 pub(in crate::query_engines::asap_query_engine) fn execute_stored(
     entry: &asap_types::query_plan::QueryPlanEntry,
-    plan_id: u64,
-    plan_version: u64,
-    store: Option<&crate::storage_engines::sketch_db::index::SketchStore>,
     raw_endpoint: Option<(&reqwest::Client, &str)>,
+    max_stored_lag_ms: Option<u64>,
     at: u64,
+    // Reads one stored native batch for a window under its installed binding.
+    read: &mut dyn FnMut(
+        &asap_types::query_plan::MaterializationBinding,
+        asap_types::sds::HalfOpenTimeRange,
+        Schema,
+        usize,
+    ) -> Result<
+        Batch,
+        crate::storage_engines::sketch_db::index::NativeReadError,
+    >,
 ) -> Result<
     (
         crate::query_engines::query_result::QueryResult,
@@ -793,7 +801,9 @@ pub(in crate::query_engines::asap_query_engine) fn execute_stored(
         .recover_vector_physical_dag()
         .map_err(|e| miss(e.to_string()))?;
     let drop_metric_name = entry.drops_metric_name();
-    execute_batches(
+    let mixed = entry.mixes_raw_and_stored_inputs();
+    let mut observed_lag = None;
+    let (result, mut stats) = execute_batches(
         &program,
         max_bytes,
         inputs.len(),
@@ -818,41 +828,102 @@ pub(in crate::query_engines::asap_query_engine) fn execute_stored(
             else {
                 return Err(miss("native stored source has no deployed summary binding"));
             };
-            let store = store.ok_or_else(|| {
-                EngineError::capability_miss("native_stored", "summary store unavailable")
-            })?;
-            let end = i64::try_from(at).map_err(|_| miss("native timestamp overflow"))?;
-            let start = at
-                .checked_sub(binding.window_ms)
-                .ok_or_else(|| miss("native window underflow"))?;
-            let address = asap_types::sds::StoredSummaryKey {
-                plan_id,
-                plan_version,
-                stored_output_id: binding.stored_output_reference.stored_output_id,
-                population: std::collections::BTreeMap::new(),
-                window: asap_types::sds::HalfOpenTimeRange {
-                    start_ms: start as i64,
-                    end_ms: end,
-                },
+            let mut read = |end: u64| {
+                let start = end
+                    .checked_sub(binding.window_ms)
+                    .ok_or("native window underflow")?;
+                let window = asap_types::sds::HalfOpenTimeRange {
+                    start_ms: i64::try_from(start).map_err(|_| "native timestamp overflow")?,
+                    end_ms: i64::try_from(end).map_err(|_| "native timestamp overflow")?,
+                };
+                read(binding, window, schema.clone(), max_bytes as usize)
             };
-            store
-                .read_bound_native_summary(
-                    &address,
-                    &binding.stored_output_reference,
-                    schema.clone(),
-                    max_bytes as usize,
-                )
-                .map(BoundInput::Rows)
-                .map_err(|error| match error {
-                    crate::storage_engines::sketch_db::index::NativeReadError::Unavailable(
-                        message,
-                    ) => miss(message),
-                    crate::storage_engines::sketch_db::index::NativeReadError::Physical(error) => {
-                        EngineError::from(error)
-                    }
-                })
+            if !mixed {
+                return read(at).map(BoundInput::Rows).map_err(native_read_error);
+            }
+            let (batch, lag) = read_within_lag(binding, at, max_stored_lag_ms, &mut read)?;
+            observed_lag = observed_lag.max(Some(lag));
+            Ok(BoundInput::Rows(batch))
         },
-    )
+    )?;
+    stats.stored_input_lag_ms = observed_lag;
+    Ok((result, stats))
+}
+
+fn native_read_error(
+    error: crate::storage_engines::sketch_db::index::NativeReadError,
+) -> EngineError {
+    match error {
+        crate::storage_engines::sketch_db::index::NativeReadError::Unavailable(message) => {
+            miss(message)
+        }
+        crate::storage_engines::sketch_db::index::NativeReadError::Physical(error) => {
+            EngineError::from(error)
+        }
+    }
+}
+
+/// Bind a stored input beside raw inputs read at `at`: its newest complete
+/// window, ending at `t_s`, is admitted only when `at - t_s` is within the
+/// bound, which defaults to one slide of the stored output. Otherwise the
+/// query misses and takes the exact fallback rather than mixing staler state.
+/// Returns the batch and its observed lag.
+fn read_within_lag(
+    binding: &asap_types::query_plan::MaterializationBinding,
+    at: u64,
+    max_lag_ms: Option<u64>,
+    read: &mut dyn FnMut(
+        u64,
+    ) -> Result<
+        Batch,
+        crate::storage_engines::sketch_db::index::NativeReadError,
+    >,
+) -> Result<(Batch, u64), EngineError> {
+    use crate::storage_engines::sketch_db::index::NativeReadError;
+    let max_lag = max_lag_ms.unwrap_or_else(|| binding.slide_ms());
+    let mut end = binding
+        .latest_window_end_at_or_before(at)
+        .ok_or_else(|| miss("stored input has no complete window grid before the query time"))?;
+    let mut unavailable = String::new();
+    loop {
+        let lag = at - end;
+        if lag > max_lag {
+            tracing::debug!(
+                stored_output = ?binding.stored_output_reference.stored_output_id,
+                query_time_ms = at,
+                lag_ms = lag,
+                max_lag_ms = max_lag,
+                "stored input exceeds bounded lag; using exact fallback"
+            );
+            return Err(miss(format!(
+                "stored input lag {lag}ms exceeds bound {max_lag}ms at {at}: {unavailable}"
+            )));
+        }
+        match read(end) {
+            Ok(batch) => {
+                tracing::debug!(
+                    stored_output = ?binding.stored_output_reference.stored_output_id,
+                    query_time_ms = at,
+                    stored_watermark_ms = end,
+                    lag_ms = lag,
+                    max_lag_ms = max_lag,
+                    "stored input admitted within bounded lag"
+                );
+                return Ok((batch, lag));
+            }
+            // The window is not complete yet; an older one may still be in bound.
+            Err(NativeReadError::Unavailable(message)) => unavailable = message,
+            Err(error) => return Err(native_read_error(error)),
+        }
+        end = match end.checked_sub(binding.slide_ms()) {
+            Some(older) if older >= binding.window_ms => older,
+            _ => {
+                return Err(miss(format!(
+                    "stored input has no complete window within its lag bound: {unavailable}"
+                )))
+            }
+        };
+    }
 }
 
 /// Stored and protocol inputs are read before execution; query-time raw
