@@ -822,6 +822,10 @@ pub enum QueryPlanNode {
         inputs: Vec<QueryNodeId>,
         source_nodes: Vec<u64>,
         max_bytes: u64,
+        /// PromQL removes `__name__` from the series identity of this result;
+        /// Planner keeps it in the identity it computes.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        drop_metric_name: bool,
     },
     /// Complete Planner-compiled relation computation; inputs follow its typed slots.
     PhysicalRelation {

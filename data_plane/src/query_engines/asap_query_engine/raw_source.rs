@@ -596,6 +596,13 @@ mod tests {
                         inputs: vec![QueryNodeId(0)],
                         source_nodes: vec![slot],
                         max_bytes,
+                        drop_metric_name: !control_plane::query_plan::result_keeps_metric_name(
+                            &control_plane::query_parser::parse_query_expr_canonical(
+                                QUERY,
+                                planner_types::types::AccuracyTarget::Exact,
+                            )
+                            .unwrap(),
+                        ),
                     },
                 ),
             ]),
@@ -652,6 +659,24 @@ mod tests {
             ])
         );
         assert_eq!(seen.lock().unwrap().len(), 1);
+        server.abort();
+    }
+
+    // PromQL drops the metric name from a function result; the raw rows keep
+    // it in their series identity, so the adapter removes it.
+    #[tokio::test]
+    async fn raw_program_results_drop_the_metric_name() {
+        let (endpoint, _, server) = prometheus(200, matrix(), std::time::Duration::ZERO).await;
+        let result = engine(endpoint).execute_at(QUERY, AT as u64).await.unwrap();
+        let crate::query_engines::query_result::QueryResult::Vector(result) = result else {
+            panic!("expected an instant vector")
+        };
+        assert_eq!(result.values.len(), 2);
+        for point in &result.values {
+            let keys = point.label_keys_override.as_ref().unwrap();
+            assert!(!keys.iter().any(|key| key == "__name__"), "{keys:?}");
+            assert!(keys.iter().any(|key| key == "instance"), "{keys:?}");
+        }
         server.abort();
     }
 

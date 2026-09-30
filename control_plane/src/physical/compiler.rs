@@ -2244,7 +2244,12 @@ impl DeploymentPlanCompiler {
                 None
             };
             let mut entry = if let Some(raw) = placement.raw_program(query_index) {
-                Ok(raw_query_time_entry(query, canonical.clone(), raw)?)
+                Ok(raw_query_time_entry(
+                    query,
+                    canonical.clone(),
+                    &original_root(query, query_index, &request.canonical_roots)?,
+                    raw,
+                )?)
             } else if let Some((source, program)) = native_rate {
                 let native_state_binding = if let SummaryExpr::SummaryAgg {
                     family:
@@ -2320,6 +2325,9 @@ impl DeploymentPlanCompiler {
                         max_bytes: request
                             .retained_summary_memory_budget_bytes
                             .unwrap_or(64 * 1024 * 1024),
+                        drop_metric_name: !crate::query_plan::result_keeps_metric_name(
+                            &original_root(query, query_index, &request.canonical_roots)?,
+                        ),
                     },
                 );
                 entry.root = root;
@@ -2735,6 +2743,7 @@ fn exact_query_entry(
 fn raw_query_time_entry(
     query: &QueryCompilationInput,
     canonical: String,
+    root_expr: &QueryExpr,
     raw: &placement::RawQueryTimeProgram,
 ) -> Result<QueryPlanEntry, CompileError> {
     let mut nodes = BTreeMap::new();
@@ -2759,6 +2768,7 @@ fn raw_query_time_entry(
             inputs,
             source_nodes,
             max_bytes: 64 * 1024 * 1024,
+            drop_metric_name: !crate::query_plan::result_keeps_metric_name(root_expr),
         },
     );
     let entry = QueryPlanEntry {

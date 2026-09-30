@@ -231,7 +231,9 @@ decoded values is one `PhysicalFragment` per query-time region, compiled by
 contracts. Before binding, `preserve_uncompiled_computation_roots` checks that
 compilation; a root Planner cannot compile, or one whose region reads a raw
 PromQL selector, keeps no state and forwards the whole query as
-`ExactFallback`.
+`ExactFallback`. A query-time program over raw selectors (`Physical`) records
+whether PromQL drops `__name__` from its result, since Planner keeps it in the
+series identity.
 
 Graph traversal is separate from node definitions and store semantics.
 Activation validates roots, edges, bindings, reachability, and cycles.

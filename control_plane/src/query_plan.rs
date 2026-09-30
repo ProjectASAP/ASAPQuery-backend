@@ -652,6 +652,27 @@ where
     }
 }
 
+/// Does PromQL keep `__name__` on this query's result series? Only a series
+/// selector keeps it, through ordering, selection, subqueries and
+/// `last_over_time`; functions, aggregations and arithmetic drop it.
+pub fn result_keeps_metric_name(expr: &planner_types::pre_asap::QueryExpr) -> bool {
+    use planner_types::pre_asap::{AggIntent, QueryExpr};
+    match expr {
+        QueryExpr::Scan { .. } => true,
+        QueryExpr::TimeRange { child, .. }
+        | QueryExpr::TimeShift { child, .. }
+        | QueryExpr::Sort { child, .. }
+        | QueryExpr::Limit { child, .. }
+        | QueryExpr::PromqlSubquery { child, .. } => result_keeps_metric_name(child),
+        QueryExpr::Aggregate {
+            child, measures, ..
+        } if matches!(measures.as_slice(), [AggIntent::LastOverTime]) => {
+            result_keeps_metric_name(child)
+        }
+        _ => false,
+    }
+}
+
 /// Parameters of each `kind` operator inside a physical fragment, for tests.
 #[cfg(test)]
 pub(crate) fn operator_parameters(node: &QueryPlanNode, kind: &str) -> Vec<serde_json::Value> {
