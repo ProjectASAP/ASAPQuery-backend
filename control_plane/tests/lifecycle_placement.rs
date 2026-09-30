@@ -282,3 +282,103 @@ fn out_of_phase_consumers_are_priced_as_separate_installs() {
         + cost(&alone_second, "continuously_maintained_cost");
     assert!((cost(&shared, "continuously_maintained_cost") - expected).abs() < 1e-9);
 }
+
+/// Two per-series Rate states under ungrouped Sums; the query lookback is
+/// the 10m window.
+const MIXED_QUERY: &str = "sum(rate(a[1m])) + sum(rate(b[10m]))";
+
+/// The fixture evaluating `query` under `store` per retained byte-second.
+fn two_state_plan(query: &str, store: f64) -> CompiledPhysicalPlan {
+    let mut wire = serde_json::to_value(fixture(store, false)).unwrap();
+    wire["query_workload"]["repeating_queries"][0]["query"] = query.into();
+    selected_plan(serde_json::from_value(wire).unwrap())
+}
+
+fn mixed_event(plan: &CompiledPhysicalPlan) -> Value {
+    let [event] = plan
+        .planner_selection_trace
+        .iter()
+        .filter(|entry| entry["stage"] == "deployment.mixed_placement")
+        .cloned()
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    event
+}
+
+// Where rebuilding the 1m Rate beats retaining it but the 10m branch is cheap
+// as one complete window, the query rebuilds `a` from raw series beside the
+// stored native batch of `sum(rate(b[10m]))`, the cheapest admissible choice.
+#[test]
+fn cheapest_assignment_retains_one_state_beside_a_rebuilt_one() {
+    let plan = two_state_plan(MIXED_QUERY, 1e-3);
+    assert_eq!(placements(&plan), ["ephemeral", "continuously_maintained"]);
+    let event = mixed_event(&plan);
+    assert_eq!(event["selected"], "mixed");
+    assert!(cost(&event, "mixed_cost") < cost(&event, "group_cost"));
+    let installed = &plan.precompute_plan.materializations;
+    assert_eq!(installed.len(), 2, "b's Rate and its Sum batch");
+    for state in installed {
+        assert_eq!(state.metric, "b");
+        assert_eq!(
+            (
+                state.window_size,
+                state.slide_interval,
+                &state.window_layout
+            ),
+            (
+                600,
+                10,
+                &asap_types::WindowMaterializationLayout::FullWindow
+            ),
+            "a complete window sliding at the evaluation interval"
+        );
+    }
+    assert!(installed.iter().any(|state| state.derived_input.is_some()));
+    assert_eq!(
+        raw_scans(&plan),
+        [&QueryTimeOperator::Scan {
+            metric: Some("a".into()),
+            matchers: vec![],
+            range_ms: Some(60_000),
+            offset_ms: 0,
+        }]
+    );
+    let entry = plan.query_plan.entries.values().next().unwrap();
+    entry.recover_vector_physical_dag().unwrap();
+    assert!(entry.mixes_raw_and_stored_inputs());
+}
+
+// Without a store price, retaining both states stays cheapest; the plan is
+// the group decision and has no raw input.
+#[test]
+fn free_store_keeps_the_group_decision_for_two_states() {
+    let plan = two_state_plan(MIXED_QUERY, 0.0);
+    assert_eq!(
+        placements(&plan),
+        ["continuously_maintained", "continuously_maintained"]
+    );
+    assert_eq!(mixed_event(&plan)["selected"], "group");
+    assert!(raw_scans(&plan).is_empty());
+}
+
+// Leaf Sum states are stored per population, not as native batches, so no
+// mix is admissible and both states move together.
+#[test]
+fn inadmissible_mix_keeps_the_group_decision() {
+    let plan = two_state_plan(
+        "sum(sum_over_time(a[10m])) + sum(sum_over_time(b[1m]))",
+        1e-3,
+    );
+    assert_eq!(placements(&plan), ["ephemeral", "ephemeral"]);
+    let event = mixed_event(&plan);
+    assert_eq!(event["selected"], "group");
+    assert!(event["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|unit| unit["retained_beside_raw_cost"].is_null()));
+    assert!(plan.precompute_plan.materializations.is_empty());
+    let entry = plan.query_plan.entries.values().next().unwrap();
+    assert!(!entry.mixes_raw_and_stored_inputs());
+}

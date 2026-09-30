@@ -17,10 +17,25 @@ struct Deployment {
 /// Start the production binary from the fixture priced with `store` per
 /// retained byte-second. Its Prometheus serves `samples` of `m` for raw reads.
 async fn deploy(store: f64, samples: Vec<(i64, f64)>) -> Deployment {
+    deploy_query(QUERY, "m", store, samples, false).await
+}
+
+/// [`deploy`] for `query`, whose Prometheus serves `samples` of `metric` for
+/// its one-minute raw selector. Stored native batches are read only from
+/// pinned Remote Write `revisions`.
+async fn deploy_query(
+    query: &str,
+    metric: &'static str,
+    store: f64,
+    samples: Vec<(i64, f64)>,
+    revisions: bool,
+) -> Deployment {
+    let raw_selector = format!(r#"{{__name__="{metric}"}}[60000ms]"#);
     let mut fixture: Value = serde_json::from_str(include_str!(
         "../../../docs/examples/asapquery-planning-snapshot.json"
     ))
     .unwrap();
+    fixture["query_workload"]["repeating_queries"][0]["query"] = query.into();
     fixture["implementation"]["scrape_interval_ms"] = 1000.into();
     fixture["data_workload"]["data_ingestion_interval"]["value"] = 1000.into();
     fixture["implementation"]["lifecycle_costs"]["store_per_byte_second"] = store.into();
@@ -30,7 +45,7 @@ async fn deploy(store: f64, samples: Vec<(i64, f64)>) -> Deployment {
     let requests = Arc::new(Mutex::new(Vec::<HashMap<String, String>>::new()));
     let recorded = requests.clone();
     let matrix = serde_json::json!({"status": "success", "data": {"resultType": "matrix",
-        "result": [{"metric": {"__name__": "m", "instance": "a"},
+        "result": [{"metric": {"__name__": metric, "instance": "a"},
             "values": samples.iter().map(|(ms, value)| serde_json::json!([*ms as f64 / 1000.0, value.to_string()])).collect::<Vec<_>>()}]}});
     let empty =
         serde_json::json!({"status": "success", "data": {"resultType": "vector", "result": []}});
@@ -45,7 +60,7 @@ async fn deploy(store: f64, samples: Vec<(i64, f64)>) -> Deployment {
                     "/api/v1/query",
                     get(move |Query(params): Query<HashMap<String, String>>| {
                         let recorded = recorded.clone();
-                        let raw = params.get("query").map(String::as_str) == Some(RAW_SELECTOR);
+                        let raw = params.get("query") == Some(&raw_selector);
                         let response = if raw { matrix.clone() } else { empty.clone() };
                         async move {
                             recorded.lock().await.push(params);
@@ -61,8 +76,15 @@ async fn deploy(store: f64, samples: Vec<(i64, f64)>) -> Deployment {
     let path = output.path().join("planning.json");
     std::fs::write(&path, serde_json::to_vec(&priced).unwrap()).unwrap();
     let port = unused_port();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_data_plane"));
+    if revisions {
+        command
+            .arg("--remote-write-revision-dir")
+            .arg(output.path().join("revisions"))
+            .args(["--remote-write-correction-horizon-ms", "3600000"]);
+    }
     let mut child = ChildGuard(
-        Command::new(env!("CARGO_BIN_EXE_data_plane"))
+        command
             .args(["--profile", "asapquery", "--planning-snapshot"])
             .arg(path)
             .args([
@@ -177,6 +199,83 @@ async fn expensive_summary_store_rebuilds_state_from_raw_series() {
             .iter()
             .any(|request| request.get("query").map(String::as_str) == Some(QUERY)),
         "the backend, not Prometheus, answers the query: {requests:?}"
+    );
+    deployment.prometheus.abort();
+}
+
+// With a mid-priced store, the query rebuilds `sum(rate(a[1m]))` from raw `a`
+// read at t_q and reads `sum(rate(b[10m]))` as the stored batch of its newest
+// complete window; the answer is exact for that window, whose lag is within
+// the default bound of one 10 s slide.
+#[tokio::test]
+async fn mixed_placement_combines_raw_series_with_stored_state_within_the_lag_bound() {
+    const MIXED: &str = "sum(rate(a[1m])) + sum(rate(b[10m]))";
+    let origin = origin_ms();
+    let at_ms = origin + 650_000;
+    // Counters rising 1/s (raw `a`) and 2/s (stored `b`): each rate is exact
+    // for any window their samples span.
+    let raw: Vec<_> = (0..6)
+        .map(|i| {
+            let ms = at_ms - 50_000 + i * 10_000;
+            (ms, 10_000.0 + (ms - origin) as f64 / 1000.0)
+        })
+        .collect();
+    let deployment = deploy_query(MIXED, "a", 1e-3, raw, true).await;
+    let client = reqwest::Client::new();
+    // Samples past t_q close the stored window that ends at t_q.
+    let stored: Vec<_> = (1..=700)
+        .map(|i| (origin + i * 1000, 10_000.0 + 2.0 * i as f64))
+        .collect();
+    let wire = WriteRequest {
+        timeseries: vec![series_with_labels("b", &[("instance", "a")], &stored)],
+    };
+    assert_eq!(remote_write(&client, &deployment.backend, &wire).await, 204);
+    let mut last = Value::Null;
+    let mut lag = None;
+    for _ in 0..80 {
+        let response = client
+            .get(format!("{}/api/v1/query", deployment.backend))
+            .query(&[
+                ("query", MIXED.to_string()),
+                ("time", (at_ms as f64 / 1000.0).to_string()),
+            ])
+            .send()
+            .await
+            .unwrap();
+        lag = response
+            .headers()
+            .get("x-asap-stored-input-lag-ms")
+            .map(|value| value.to_str().unwrap().parse::<u64>().unwrap());
+        last = response.json().await.unwrap();
+        if is_warm(&last) && lag.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let lag = lag.unwrap_or_else(|| {
+        let log = std::fs::read_to_string(deployment._output.path().join("query_engine.log"))
+            .unwrap_or_default();
+        panic!("no mixed answer: {last}\nbackend log:\n{log}")
+    });
+    assert!(lag <= 10_000, "lag {lag} beyond one slide");
+    // Exact reference: rate(a) over (t_q - 1m, t_q] plus rate(b) over the
+    // stored window (t_q - lag - 10m, t_q - lag].
+    let value = first_value(&last, "value").unwrap();
+    assert!((value - 3.0).abs() < 1e-9, "{last}");
+    let requests = deployment.requests.lock().await;
+    assert!(
+        requests.iter().any(|request| {
+            request.get("query").map(String::as_str) == Some(r#"{__name__="a"}[60000ms]"#)
+                && request.get("time").map(String::as_str)
+                    == Some(format!("{:.3}", at_ms as f64 / 1000.0).as_str())
+        }),
+        "raw `a` is read at t_q: {requests:?}"
+    );
+    assert!(
+        !requests.iter().any(|request| request
+            .get("query")
+            .is_some_and(|query| query.contains(r#""b""#))),
+        "stored `b` is not read from Prometheus: {requests:?}"
     );
     deployment.prometheus.abort();
 }

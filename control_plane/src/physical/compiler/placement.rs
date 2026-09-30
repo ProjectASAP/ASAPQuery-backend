@@ -19,16 +19,28 @@ use crate::query_plan::query_time::{LabelMatch, LabelMatcher, QueryTimeOperator}
 
 /// A query whose every state is `Ephemeral` keeps nothing between queries.
 /// Planner's PromQL Fallback lowering compiles it once over raw-series inputs,
-/// each read at query time by the matching range-selector `Scan`.
+/// each read at query time by the matching range-selector `Scan`. A mixed
+/// query also reads its retained states, as stored native batches.
 pub(super) struct RawQueryTimeProgram {
     pub(super) program: CompiledPhysicalDag,
     pub(super) scans: Vec<(u64, QueryTimeOperator)>,
+    /// Retained states read beside the raw inputs. The executor binds each at
+    /// its newest complete window within its lag bound (#803).
+    pub(super) stored: Vec<(u64, Rc<SummaryNode>)>,
 }
 
 #[derive(Default)]
 pub(super) struct Placement {
     ephemeral: Vec<Vec<Rc<SummaryNode>>>,
     raw: Vec<Option<RawQueryTimeProgram>>,
+    /// Native branches a mixed query maintains and reads as stored batches.
+    native: Vec<Vec<Rc<SummaryNode>>>,
+    /// The precompute program building each native branch's batch.
+    branch_programs: Vec<Vec<(Rc<SummaryNode>, CompiledPhysicalDag)>>,
+    /// Retained states of a mixed query, each installed as a complete window.
+    complete_window: Vec<Vec<Rc<SummaryNode>>>,
+    /// A mixed query's root, its raw selectors typed with the series identity.
+    roots: Vec<Option<Rc<SummaryNode>>>,
     pub(super) trace: Vec<Value>,
 }
 
@@ -41,6 +53,30 @@ impl Placement {
 
     pub(super) fn raw_program(&self, query: usize) -> Option<&RawQueryTimeProgram> {
         self.raw.get(query).and_then(Option::as_ref)
+    }
+
+    /// Whether retained `state` serves stored input beside `query`'s raw inputs.
+    pub(super) fn beside_raw(&self, query: usize, state: &Rc<SummaryNode>) -> bool {
+        self.complete_window
+            .get(query)
+            .is_some_and(|states| states.iter().any(|s| Rc::ptr_eq(s, state)))
+    }
+
+    /// The root a mixed query compiles instead of Planner's selected root.
+    pub(super) fn root(&self, query: usize) -> Option<&Rc<SummaryNode>> {
+        self.roots.get(query).and_then(Option::as_ref)
+    }
+
+    pub(super) fn native_branches(&self, query: usize) -> &[Rc<SummaryNode>] {
+        self.native.get(query).map_or(&[], Vec::as_slice)
+    }
+
+    /// Each native branch of `query` with the precompute program building it.
+    pub(super) fn branch_programs(
+        &self,
+        query: usize,
+    ) -> &[(Rc<SummaryNode>, CompiledPhysicalDag)] {
+        self.branch_programs.get(query).map_or(&[], Vec::as_slice)
     }
 }
 
@@ -128,15 +164,16 @@ impl CostModel for LifecycleCosts {
 }
 
 /// The window implementation compilation installs for `state` when `query`
-/// retains it, with the number of states that layout keeps in the store for
-/// the state's own window. A derived state reading a longer window over it
-/// retains more, so this is a lower bound there.
+/// retains it, possibly `beside_raw` inputs, with the number of states that
+/// layout keeps in the store for the state's own window. A derived state
+/// reading a longer window over it retains more, so this is a lower bound there.
 fn installed_window(
     query: &QueryCompilationInput,
     state: &SelectedMaterialization,
     query_states: &[SelectedMaterialization],
     environment: &PhysicalDeploymentContext,
     retention_margin_ms: u64,
+    beside_raw: bool,
 ) -> Option<(WindowRealizationCandidate, u64)> {
     let native_cohort = query
         .retained_physical()
@@ -147,6 +184,7 @@ fn installed_window(
         state,
         &super::windows::cohort_nodes(query_states),
         native_cohort,
+        beside_raw,
     );
     let model = ControlPlaneCostModel::new(branch.accuracy_target.clone())
         .with_window_implementation_costs(
@@ -224,6 +262,10 @@ pub(super) fn place(
     let mut placement = Placement {
         ephemeral: vec![Vec::new(); queries.len()],
         raw: (0..queries.len()).map(|_| None).collect(),
+        native: vec![Vec::new(); queries.len()],
+        branch_programs: (0..queries.len()).map(|_| Vec::new()).collect(),
+        complete_window: vec![Vec::new(); queries.len()],
+        roots: vec![None; queries.len()],
         trace: Vec::new(),
     };
     let (Some(workload), Some(data), Some(first)) = (
@@ -341,6 +383,7 @@ pub(super) fn place(
                         &selected_states[query],
                         environment,
                         request.query_retention_margin_ms,
+                        false,
                     )
                 });
             let layout = installed
@@ -462,7 +505,7 @@ pub(super) fn place(
             .sum::<Option<f64>>()
             .map(Cost)
     };
-    let ephemeral: Vec<bool> = (0..states.len())
+    let mut ephemeral: Vec<bool> = (0..states.len())
         .map(|state| {
             rebuild_is_cheaper(
                 total(linked[state], |decision| decision.2),
@@ -470,6 +513,172 @@ pub(super) fn place(
             )
         })
         .collect();
+    // A query that alone consumes its states may instead retain some and
+    // rebuild the others: raw inputs are read at t_q and each stored native
+    // batch at its newest complete window within the lag bound (#803). A
+    // retained unit is a native branch, read as its batch, with its sources;
+    // every other state is rebuilt. Each option is priced as it would run.
+    let mut mixed: Vec<Option<MixedPlacement>> = (0..queries.len()).map(|_| None).collect();
+    for (query, owned) in query_states.iter().enumerate() {
+        let members: Vec<usize> = owned.iter().filter_map(index_of).collect();
+        if !raw_bindable
+            || members.len() < 2
+            || members.iter().any(|&member| states[member].1 != [query])
+        {
+            continue;
+        }
+        let root = &queries[query].selected_plan_root;
+        let lifecycle = &queries[query].summary_lifecycle_inputs;
+        // Rebuilt beside retained state, a program folds only the samples of
+        // the rebuilt states' own selectors.
+        let alone = |member: usize| {
+            let (
+                _,
+                QueryTimeOperator::Scan {
+                    range_ms: Some(range_ms),
+                    ..
+                },
+            ) = leaf_selector(&states[member].0)?
+            else {
+                return None;
+            };
+            let costs = LifecycleUnitCosts {
+                build: lifecycle.costs.build
+                    + update_rate? * range_ms as f64 / 1_000.0
+                        * lifecycle.costs.maintenance_per_update,
+                ..lifecycle.costs.clone()
+            };
+            price(
+                &states[member].0,
+                &[query],
+                SummaryMaintenanceLifecycle::Ephemeral,
+                &model(costs, None, lifecycle.evaluation_interval_ms),
+            )
+        };
+        let stored = |branch: &Rc<SummaryNode>, sources: &[usize]| {
+            let installed =
+                collect_selected_materializations_with(root, true, std::slice::from_ref(branch))
+                    .ok()?;
+            let unit: Vec<_> = std::iter::once(Rc::clone(branch))
+                .chain(sources.iter().map(|&member| Rc::clone(&states[member].0)))
+                .collect();
+            unit.iter()
+                .map(|state| {
+                    let selected = installed
+                        .iter()
+                        .find(|selected| Rc::ptr_eq(&selected.node, state))?;
+                    let (window, retained) = installed_window(
+                        &queries[query],
+                        selected,
+                        &installed,
+                        environment,
+                        request.query_retention_margin_ms,
+                        true,
+                    )?;
+                    // The executor reads the batch as one window of the query lookback.
+                    if Rc::ptr_eq(state, branch)
+                        && window.window_secs.saturating_mul(1_000)
+                            != queries[query].query_lookback_ms
+                    {
+                        return None;
+                    }
+                    price(
+                        state,
+                        &[query],
+                        SummaryMaintenanceLifecycle::ContinuouslyMaintained,
+                        &model(
+                            lifecycle.costs.clone(),
+                            Some(retained),
+                            lifecycle.evaluation_interval_ms,
+                        ),
+                    )
+                    .map(|cost| cost.0)
+                })
+                .sum::<Option<f64>>()
+                .map(Cost)
+        };
+        // Each unit: an optional native branch and the member states it
+        // retains or rebuilds; a state outside every branch is rebuilt.
+        let mut units: Vec<(Option<Rc<SummaryNode>>, Vec<usize>)> = batch_branches(root)
+            .into_iter()
+            .filter_map(|branch| {
+                let sources = immutable_materialization_sources(&branch)?
+                    .iter()
+                    .map(|source| {
+                        members
+                            .iter()
+                            .copied()
+                            .find(|&member| Rc::ptr_eq(&states[member].0, source))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some((Some(branch), sources))
+            })
+            .collect();
+        for &member in &members {
+            if !units.iter().any(|(_, unit)| unit.contains(&member)) {
+                units.push((None, vec![member]));
+            }
+        }
+        let options: Vec<MixedOption> = units
+            .iter()
+            .map(|(branch, unit)| MixedOption {
+                beside_raw: branch.as_ref().and_then(|branch| stored(branch, unit)),
+                alone: unit
+                    .iter()
+                    .map(|&member| alone(member).map(|cost| cost.0))
+                    .sum::<Option<f64>>()
+                    .map(Cost),
+            })
+            .collect();
+        let group = if ephemeral[members[0]] {
+            total(linked[members[0]], |decision| decision.3)
+        } else {
+            total(linked[members[0]], |decision| decision.2)
+        };
+        let target = &queries[query].accuracy_target;
+        let mut event = json!({
+            "stage": "deployment.mixed_placement",
+            "query_ids": [&queries[query].query_id],
+            "group_cost": group.map(|cost| cost.0),
+            "units": units.iter().zip(&options).map(|((branch, unit), option)| json!({
+                "native_branch_id": branch.as_ref().map(|branch| crate::planner_selection::explained_root_id(branch, target)),
+                "logical_root_ids": unit.iter().map(|&member| crate::planner_selection::explained_root_id(&states[member].0, target)).collect::<Vec<_>>(),
+                "retained_beside_raw_cost": option.beside_raw.map(|cost| cost.0),
+                "rebuilt_cost": option.alone.map(|cost| cost.0),
+            })).collect::<Vec<_>>(),
+            "selected": "group",
+        });
+        match cheapest_mix(&options) {
+            Err(reason) => event["reason"] = reason.into(),
+            Ok(Some((rebuild, cost))) if rebuild_is_cheaper(group, Some(cost)) => {
+                event["mixed_cost"] = cost.0.into();
+                let mut rebuilt = Vec::new();
+                let mut branches = Vec::new();
+                for ((branch, unit), &rebuild) in units.iter().zip(&rebuild) {
+                    match branch {
+                        Some(branch) if !rebuild => branches.push(Rc::clone(branch)),
+                        _ => {
+                            rebuilt.extend(unit.iter().map(|&member| Rc::clone(&states[member].0)))
+                        }
+                    }
+                }
+                match mixed_placement(root, &rebuilt, &branches) {
+                    Ok(placed) => {
+                        event["selected"] = "mixed".into();
+                        for ((_, unit), &rebuild) in units.iter().zip(&rebuild) {
+                            for &member in unit {
+                                ephemeral[member] = rebuild;
+                            }
+                        }
+                        mixed[query] = Some(placed);
+                    }
+                    Err(reason) => event["reason"] = reason.into(),
+                }
+            }
+            Ok(_) => {}
+        }
+        placement.trace.push(event);
+    }
     for (state_index, bindable, retained, rebuilt, retained_states) in decisions {
         let (state, consumers) = &states[state_index];
         placement.trace.push(json!({
@@ -493,9 +702,18 @@ pub(super) fn place(
             placement.raw[query] = raw_programs[query].as_ref().map(|raw| RawQueryTimeProgram {
                 program: raw.program.clone(),
                 scans: raw.scans.clone(),
+                stored: Vec::new(),
             });
         }
         placement.ephemeral[query] = chosen;
+        if let Some(mixed) = mixed[query].take() {
+            placement.roots[query] = Some(mixed.root);
+            placement.ephemeral[query] = mixed.rebuilt;
+            placement.native[query] = mixed.branches.iter().map(|(b, _)| Rc::clone(b)).collect();
+            placement.branch_programs[query] = mixed.branches;
+            placement.complete_window[query] = mixed.retained;
+            placement.raw[query] = Some(mixed.program);
+        }
     }
     placement
 }
@@ -524,7 +742,337 @@ fn raw_query_time_program(root: &QueryExpr) -> Result<RawQueryTimeProgram, Strin
         return Err("query reads no raw series".into());
     }
     let program = compile(&dag, inputs, &[u64::from(dag.root.0)]).map_err(|e| e.to_string())?;
-    Ok(RawQueryTimeProgram { program, scans })
+    Ok(RawQueryTimeProgram {
+        program,
+        scans,
+        stored: Vec::new(),
+    })
+}
+
+/// A mixed query's plan: its identity-typed root, rebuilt states, native
+/// branches read as batches with the precompute program building each, every
+/// retained state, and the query-time program.
+struct MixedPlacement {
+    root: Rc<SummaryNode>,
+    rebuilt: Vec<Rc<SummaryNode>>,
+    branches: Vec<(Rc<SummaryNode>, CompiledPhysicalDag)>,
+    retained: Vec<Rc<SummaryNode>>,
+    program: RawQueryTimeProgram,
+}
+
+/// A unit's prices in a mixed plan: retained, with its batch read beside raw
+/// inputs, and rebuilt from its own raw selectors. `None` is inadmissible or
+/// unpriced.
+struct MixedOption {
+    beside_raw: Option<Cost>,
+    alone: Option<Cost>,
+}
+
+/// Per-state placement enumerates all 2^n assignments of a query's n units.
+const MAX_MIXED_UNITS: usize = 8;
+
+/// The cheapest assignment that retains at least one unit and rebuilds at
+/// least one, as the units to rebuild, or `None` when no such assignment is
+/// admissible and priced.
+fn cheapest_mix(options: &[MixedOption]) -> Result<Option<(Vec<bool>, Cost)>, String> {
+    if options.len() > MAX_MIXED_UNITS {
+        return Err(format!(
+            "per-state placement enumerates at most {MAX_MIXED_UNITS} units of a query, not {}; the group decision is kept",
+            options.len()
+        ));
+    }
+    let every = (1u32 << options.len()) - 1;
+    let mut best: Option<(u32, f64)> = None;
+    for rebuilt in 1..every {
+        let cost = options
+            .iter()
+            .enumerate()
+            .map(|(index, option)| {
+                if rebuilt >> index & 1 == 1 {
+                    option.alone
+                } else {
+                    option.beside_raw
+                }
+                .map(|cost| cost.0)
+            })
+            .sum::<Option<f64>>();
+        if let Some(cost) = cost.filter(|cost| best.is_none_or(|(_, known)| *cost < known)) {
+            best = Some((rebuilt, cost));
+        }
+    }
+    Ok(best.map(|(rebuilt, cost)| {
+        (
+            (0..options.len())
+                .map(|index| rebuilt >> index & 1 == 1)
+                .collect(),
+            Cost(cost),
+        )
+    }))
+}
+
+/// Branches of `root` the executor can read as stored native batches beside
+/// raw inputs (#803): an ungrouped Sum or sketch the precompute program builds
+/// from retained readouts. A state over raw samples is stored per population.
+fn batch_branches(root: &Rc<SummaryNode>) -> Vec<Rc<SummaryNode>> {
+    fn walk(node: &Rc<SummaryNode>, branches: &mut Vec<Rc<SummaryNode>>) {
+        let ungrouped = matches!(&node.expr, SummaryExpr::SummaryAgg {
+            family: SummaryFamilyType::Sketch(..)
+                | SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _),
+            reduction: planner_types::pre_asap::Reduction::Reduce(keys),
+            ..
+        } if keys.keys().is_empty() && !keys.is_without());
+        if ungrouped && over_readouts(node) && immutable_materialization_sources(node).is_some() {
+            branches.push(Rc::clone(node));
+            return;
+        }
+        match &node.expr {
+            SummaryExpr::ValueOperation { child, .. } | SummaryExpr::SummaryAgg { child, .. } => {
+                walk(child, branches)
+            }
+            SummaryExpr::SummaryEstimate { summary_input, .. } => walk(summary_input, branches),
+            SummaryExpr::BinaryOp { lhs, rhs, .. } => {
+                walk(lhs, branches);
+                walk(rhs, branches);
+            }
+            _ => {}
+        }
+    }
+    let mut branches = Vec::new();
+    walk(root, &mut branches);
+    branches
+}
+
+/// The raw range selector a leaf state summarizes, and its query-time `Scan`.
+fn leaf_selector(state: &SummaryNode) -> Option<(Rc<QueryExpr>, QueryTimeOperator)> {
+    let SummaryExpr::SummaryAgg { child, .. } = &state.expr else {
+        return None;
+    };
+    let SummaryExpr::KeepPreAsap(selector) = &child.expr else {
+        return None;
+    };
+    let scan = range_selector_scan(selector).ok()?;
+    Some((Rc::clone(selector), scan))
+}
+
+/// A leaf state of an identity-typed root: its original and retyped nodes,
+/// its raw leaf, and the `Scan` that reads that leaf at query time.
+struct TypedState {
+    original: Rc<SummaryNode>,
+    state: Rc<SummaryNode>,
+    leaf: Rc<SummaryNode>,
+    scan: QueryTimeOperator,
+}
+
+/// `root` with each of `states`' raw selectors typed with the complete series
+/// identity: raw rows read at query time carry it, and Planner's native
+/// realization of a branch needs it. A per-series node keeps its input's
+/// columns, so it gains the identity too; every other node is unchanged.
+fn identity_typed(
+    root: &Rc<SummaryNode>,
+    states: &[Rc<SummaryNode>],
+) -> Result<(Rc<SummaryNode>, Vec<TypedState>), String> {
+    use asap_physical_operators::physical_planner::promql_rows::SERIES_IDENTITY_COLUMN;
+    fn names(schema: &planner_types::post_asap::SummarySchema) -> Vec<&str> {
+        schema
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect()
+    }
+    // A node that passed its old input's columns through passes the identity on.
+    fn follow(
+        next: &mut SummaryNode,
+        old: &planner_types::post_asap::SummarySchema,
+        new: &planner_types::post_asap::SummarySchema,
+    ) {
+        if names(&next.schema) == names(old) {
+            if let Some(identity) = new
+                .fields
+                .iter()
+                .find(|field| field.name == SERIES_IDENTITY_COLUMN)
+            {
+                next.schema.fields.push(identity.clone());
+            }
+        }
+    }
+    fn retype(
+        node: &Rc<SummaryNode>,
+        states: &[Rc<SummaryNode>],
+        typed: &mut Vec<TypedState>,
+    ) -> Result<Rc<SummaryNode>, String> {
+        let mut next = node.as_ref().clone();
+        if states.iter().any(|state| Rc::ptr_eq(state, node)) {
+            let (selector, scan) = leaf_selector(node).ok_or("state has no raw selector")?;
+            let selector =
+                asap_physical_operators::physical_planner::promql_rows::with_series_identity(
+                    &selector,
+                )
+                .map_err(|e| e.to_string())?;
+            let SummaryExpr::SummaryAgg { child, .. } = &mut next.expr else {
+                unreachable!("leaf_selector matched a SummaryAgg")
+            };
+            let mut leaf = crate::planner_selection::keep_pre_asap(&selector)
+                .map_err(|e| e.to_string())?
+                .as_ref()
+                .clone();
+            leaf.guarantee = child.guarantee.clone();
+            let (old, leaf) = (Rc::clone(child), Rc::new(leaf));
+            *child = Rc::clone(&leaf);
+            follow(&mut next, &old.schema, &leaf.schema);
+            let state = Rc::new(next);
+            typed.push(TypedState {
+                original: Rc::clone(node),
+                state: Rc::clone(&state),
+                leaf,
+                scan,
+            });
+            return Ok(state);
+        }
+        let unchanged = match &mut next.expr {
+            SummaryExpr::KeepPreAsap(_) => true,
+            SummaryExpr::ValueOperation { child, .. } | SummaryExpr::SummaryAgg { child, .. } => {
+                let old = Rc::clone(child);
+                *child = retype(child, states, typed)?;
+                let unchanged = Rc::ptr_eq(&old, child);
+                let new = Rc::clone(child);
+                follow(&mut next, &old.schema, &new.schema);
+                unchanged
+            }
+            SummaryExpr::SummaryEstimate { summary_input, .. } => {
+                let old = Rc::clone(summary_input);
+                *summary_input = retype(summary_input, states, typed)?;
+                Rc::ptr_eq(&old, summary_input)
+            }
+            SummaryExpr::BinaryOp { lhs, rhs, .. } => {
+                let (left, right) = (Rc::clone(lhs), Rc::clone(rhs));
+                *lhs = retype(lhs, states, typed)?;
+                *rhs = retype(rhs, states, typed)?;
+                Rc::ptr_eq(&left, lhs) && Rc::ptr_eq(&right, rhs)
+            }
+            _ => return Err("mixed placement supports no such operator".into()),
+        };
+        Ok(if unchanged {
+            Rc::clone(node)
+        } else {
+            Rc::new(next)
+        })
+    }
+    let mut typed = Vec::new();
+    let root = retype(root, states, &mut typed)?;
+    if typed.len() != states.len() {
+        return Err("a state is not reachable as a leaf of the root".into());
+    }
+    Ok((root, typed))
+}
+
+/// Type `root` for a mixed plan that rebuilds `rebuilt` from raw rows and
+/// reads each of `branches` as its stored native batch. Raw rows and Planner's
+/// native precompute of a branch both carry the complete series identity.
+fn mixed_placement(
+    root: &Rc<SummaryNode>,
+    rebuilt: &[Rc<SummaryNode>],
+    branches: &[Rc<SummaryNode>],
+) -> Result<MixedPlacement, String> {
+    let mut leaves = rebuilt.to_vec();
+    for branch in branches {
+        leaves.extend(immutable_materialization_sources(branch).ok_or("branch has no sources")?);
+    }
+    let (root, typed) = identity_typed(root, &leaves)?;
+    let (rebuilt, sources): (Vec<_>, Vec<_>) = typed
+        .into_iter()
+        .partition(|state| rebuilt.iter().any(|s| Rc::ptr_eq(s, &state.original)));
+    // A branch is the Sum or sketch over readouts of its typed sources.
+    let typed_branches: Vec<_> = batch_branches(&root)
+        .into_iter()
+        .filter(|branch| {
+            immutable_materialization_sources(branch).is_some_and(|inputs| {
+                !inputs.is_empty()
+                    && inputs
+                        .iter()
+                        .all(|input| sources.iter().any(|s| Rc::ptr_eq(&s.state, input)))
+            })
+        })
+        .collect();
+    if typed_branches.len() != branches.len() {
+        return Err("a stored branch lost its sources while typing".into());
+    }
+    let compiled = planner_types::post_asap::compile_post_asap_dag_with_node_ids(&root)
+        .map_err(|e| e.to_string())?;
+    let id = |node: &Rc<SummaryNode>| {
+        compiled
+            .node_ids
+            .node_id(node)
+            .map(|id| u64::from(id.0))
+            .ok_or("mixed input is absent from the compiled DAG")
+    };
+    // As in Planner's fixed-window realization, precompute builds the batch
+    // from the complete states of its sources.
+    let precompute = typed_branches
+        .iter()
+        .map(|branch| {
+            let inputs = immutable_materialization_sources(branch)
+                .expect("filtered above")
+                .iter()
+                .map(|source| {
+                    let schema = std::sync::Arc::new(source.schema.clone());
+                    Ok((id(source)?, InputContract::bounded(schema)))
+                })
+                .collect::<Result<BTreeMap<_, _>, String>>()?;
+            let program = compile(&compiled.dag, inputs, &[id(branch)?])
+                .map_err(|e| format!("stored branch precompute: {e}"))?;
+            Ok((Rc::clone(branch), program))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let program = mixed_program(&compiled, &rebuilt, &typed_branches)?;
+    let mut retained = typed_branches;
+    retained.extend(sources.into_iter().map(|state| state.state));
+    Ok(MixedPlacement {
+        root,
+        rebuilt: rebuilt.into_iter().map(|state| state.state).collect(),
+        branches: precompute,
+        retained,
+        program,
+    })
+}
+
+/// Compile the typed DAG with each `stored` batch as a stored input and each
+/// `rebuilt` state built from its leaf's raw rows at query time.
+fn mixed_program(
+    compiled: &planner_types::post_asap::PostAsapDagCompilation,
+    rebuilt: &[TypedState],
+    stored: &[Rc<SummaryNode>],
+) -> Result<RawQueryTimeProgram, String> {
+    let id = |node: &Rc<SummaryNode>| {
+        compiled
+            .node_ids
+            .node_id(node)
+            .map(|id| u64::from(id.0))
+            .ok_or("mixed input is absent from the compiled DAG")
+    };
+    let mut inputs = BTreeMap::new();
+    let mut scans = Vec::new();
+    for state in rebuilt {
+        let slot = id(&state.leaf)?;
+        let schema = std::sync::Arc::new(state.leaf.schema.clone());
+        inputs.insert(slot, InputContract::bounded(schema));
+        scans.push((slot, state.scan.clone()));
+    }
+    let stored = stored
+        .iter()
+        .map(|batch| {
+            let slot = id(batch)?;
+            let schema = std::sync::Arc::new(batch.schema.clone());
+            inputs.insert(slot, InputContract::bounded(schema));
+            Ok((slot, Rc::clone(batch)))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let program = compile(&compiled.dag, inputs, &[u64::from(compiled.dag.root.0)])
+        .map_err(|e| e.to_string())?;
+    Ok(RawQueryTimeProgram {
+        program,
+        scans,
+        stored,
+    })
 }
 
 /// `TimeRange { range, [TimeShift { offset }], Scan }` as a Prometheus range
@@ -799,6 +1347,52 @@ fn find(root: &Rc<SummaryNode>, summary: &SummaryNode) -> Option<Rc<SummaryNode>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn option(beside_raw: Option<f64>, alone: Option<f64>) -> MixedOption {
+        MixedOption {
+            beside_raw: beside_raw.map(Cost),
+            alone: alone.map(Cost),
+        }
+    }
+
+    // The cheapest mix retains and rebuilds at least one unit each, and a unit
+    // with no stored batch is always rebuilt.
+    #[test]
+    fn cheapest_mix_is_the_cheapest_admissible_assignment() {
+        let (rebuilt, cost) =
+            cheapest_mix(&[option(None, Some(5.0)), option(Some(1.0), Some(9.0))])
+                .unwrap()
+                .unwrap();
+        assert_eq!((rebuilt, cost.0), (vec![true, false], 6.0));
+        let (rebuilt, _) = cheapest_mix(&[
+            option(Some(4.0), Some(1.0)),
+            option(Some(1.0), Some(4.0)),
+            option(Some(1.0), Some(4.0)),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(rebuilt, [true, false, false]);
+        assert!(
+            cheapest_mix(&[option(None, Some(1.0)), option(None, Some(1.0))])
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cheapest_mix(&[option(Some(1.0), None), option(Some(1.0), Some(1.0))])
+                .unwrap()
+                .is_some_and(|(rebuilt, _)| rebuilt == [false, true])
+        );
+    }
+
+    // Beyond the enumeration cap the search reports why it kept the group decision.
+    #[test]
+    fn cheapest_mix_rejects_more_units_than_its_cap() {
+        let options: Vec<_> = (0..=MAX_MIXED_UNITS)
+            .map(|_| option(Some(1.0), Some(1.0)))
+            .collect();
+        let error = cheapest_mix(&options).unwrap_err();
+        assert!(error.contains("at most 8 units"), "{error}");
+    }
 
     // Only a priced, strictly cheaper rebuild moves a state to query time.
     #[test]
