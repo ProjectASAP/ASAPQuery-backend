@@ -16,17 +16,10 @@ fn miss(message: impl Into<String>) -> EngineError {
     EngineError::capability_miss("exact_subquery", message.into())
 }
 
-/// Traverse only the installed graph.
-#[derive(Debug, Clone)]
-enum ExactLeaf {
-    Legacy(QueryTimeOperator),
-    External(ExternalExactRequest),
-}
-
 fn leaves(
     entry: &QueryPlanEntry,
     times: &[u64],
-) -> Result<BTreeMap<(QueryNodeId, i64), ExactLeaf>, EngineError> {
+) -> Result<BTreeMap<(QueryNodeId, i64), ExternalExactRequest>, EngineError> {
     let mut pending = Vec::new();
     for at in times {
         pending.push((
@@ -54,7 +47,9 @@ fn leaves(
                 }
                 QueryTimeOperator::ExactSubquery { .. }
                 | QueryTimeOperator::CandidateExactSubquery { .. } => {
-                    result.insert((id, at), ExactLeaf::Legacy(operator.clone()));
+                    return Err(miss(
+                        "legacy exact operators are not executable; recompile the plan",
+                    ));
                 }
                 _ => pending.extend(inputs.iter().map(|input| (*input, at))),
             },
@@ -82,7 +77,7 @@ fn leaves(
 
             QueryPlanNode::ExternalExact { request, inputs } => {
                 pending.extend(inputs.iter().map(|input| (*input, at)));
-                result.insert((id, at), ExactLeaf::External(request.clone()));
+                result.insert((id, at), request.clone());
             }
             // Existing bound summary subtrees are read by the synchronous callback.
             _ => {}
@@ -96,24 +91,13 @@ pub(super) fn external_dependencies(
     times: &[u64],
 ) -> Result<Vec<(QueryNodeId, QueryNodeId, i64)>, EngineError> {
     let mut result = Vec::new();
-    for ((id, at), leaf) in leaves(entry, times)? {
-        if matches!(leaf, ExactLeaf::External(_)) {
-            result.extend(
-                entry.nodes[&id]
-                    .inputs()
-                    .iter()
-                    .map(|input| (id, *input, at)),
-            );
-        } else if matches!(
-            leaf,
-            ExactLeaf::Legacy(QueryTimeOperator::CandidateExactSubquery { .. })
-        ) {
-            let input = *entry.nodes[&id]
+    for ((id, at), _) in leaves(entry, times)? {
+        result.extend(
+            entry.nodes[&id]
                 .inputs()
-                .first()
-                .ok_or_else(|| miss("candidate exact subtree has no membership input"))?;
-            result.push((id, input, at));
-        }
+                .iter()
+                .map(|input| (id, *input, at)),
+        );
     }
     Ok(result)
 }
@@ -292,36 +276,23 @@ pub(super) async fn prepare_external(
     let mut remote_cache = HashMap::<(QueryLanguage, String, i64), Value>::new();
     for ((id, at), leaf) in leaves(entry, times)? {
         u64::try_from(at).map_err(|_| miss("subquery predates epoch"))?;
-        let (language, query, candidate_input) = match &leaf {
-            ExactLeaf::Legacy(QueryTimeOperator::ExactSubquery { query }) => {
-                (QueryLanguage::PromQl, query.clone(), None)
+        if !matches!(
+            leaf.language,
+            QueryLanguage::PromQl | QueryLanguage::MetricsQl
+        ) {
+            return Err(miss(format!(
+                "external exact language {:?} has no installed adapter",
+                leaf.language
+            )));
+        }
+        let candidate_input = match leaf.input_contracts.as_slice() {
+            [] => None,
+            [ExternalExactInput::CandidateMembership { item_label }] => {
+                Some((entry.nodes[&id].inputs()[0], item_label.as_str()))
             }
-            ExactLeaf::Legacy(QueryTimeOperator::CandidateExactSubquery { query, item_label }) => (
-                QueryLanguage::PromQl,
-                query.clone(),
-                Some((entry.nodes[&id].inputs()[0], item_label.as_str())),
-            ),
-            ExactLeaf::External(request) => {
-                if !matches!(
-                    request.language,
-                    QueryLanguage::PromQl | QueryLanguage::MetricsQl
-                ) {
-                    return Err(miss(format!(
-                        "external exact language {:?} has no installed adapter",
-                        request.language
-                    )));
-                }
-                let candidate = match request.input_contracts.as_slice() {
-                    [] => None,
-                    [ExternalExactInput::CandidateMembership { item_label }] => {
-                        Some((entry.nodes[&id].inputs()[0], item_label.as_str()))
-                    }
-                    _ => return Err(miss("unsupported external exact input contract")),
-                };
-                (request.language, request.expression.clone(), candidate)
-            }
-            _ => return Err(miss("prepared leaf is not an exact subtree")),
+            _ => return Err(miss("unsupported external exact input contract")),
         };
+        let (language, query) = (leaf.language, leaf.expression.clone());
         let (query, candidate_filtered) = if let Some((candidate_input, item_label)) =
             candidate_input
         {
@@ -809,6 +780,21 @@ mod tests {
         ));
         server.abort();
     }
+    fn external_exact_leaf(expression: &str) -> QueryPlanNode {
+        QueryPlanNode::ExternalExact {
+            request: ExternalExactRequest {
+                language: QueryLanguage::PromQl,
+                expression: expression.into(),
+                output: asap_types::query_plan::ExternalExactOutput::InstantVector,
+                parameters: BTreeMap::new(),
+                start_parameter: None,
+                end_parameter: None,
+                input_contracts: vec![],
+            },
+            inputs: vec![],
+        }
+    }
+
     /// Planner's label-map division, the computation over a prepared exact leaf.
     fn planner_division() -> Vec<u8> {
         use planner_types::{
@@ -863,13 +849,7 @@ mod tests {
                 QueryNodeId(1),
                 QueryPlanNode::SummaryMerge { inputs: vec![] },
             ),
-            (
-                QueryNodeId(2),
-                QueryPlanNode::Logical {
-                    operator: QueryTimeOperator::ExactSubquery { query: "b".into() },
-                    inputs: vec![],
-                },
-            ),
+            (QueryNodeId(2), external_exact_leaf("b")),
         ]));
         let leaves = prepare(
             &entry,
@@ -905,13 +885,9 @@ mod tests {
         assert_eq!(stats.summary_readout_evaluations, 1);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let mut repeated = entry.clone();
-        repeated.nodes.insert(
-            QueryNodeId(1),
-            QueryPlanNode::Logical {
-                operator: QueryTimeOperator::ExactSubquery { query: "b".into() },
-                inputs: vec![],
-            },
-        );
+        repeated
+            .nodes
+            .insert(QueryNodeId(1), external_exact_leaf("b"));
         let prepared = prepare(
             &repeated,
             &[1000],
@@ -992,15 +968,7 @@ mod tests {
                     pruning: None,
                 },
             ),
-            (
-                QueryNodeId(1),
-                QueryPlanNode::Logical {
-                    operator: QueryTimeOperator::ExactSubquery {
-                        query: exact_query.into(),
-                    },
-                    inputs: vec![],
-                },
-            ),
+            (QueryNodeId(1), external_exact_leaf(exact_query)),
             (
                 QueryNodeId(2),
                 QueryPlanNode::ExactReadout {
@@ -1069,6 +1037,27 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         server.abort();
     }
+    // Legacy exact operators never reach the runtime or trigger a PromQL reparse.
+    #[test]
+    fn legacy_exact_leaves_are_rejected_before_execution() {
+        for operator in [
+            QueryTimeOperator::ExactSubquery { query: "m".into() },
+            QueryTimeOperator::CandidateExactSubquery {
+                query: "m".into(),
+                item_label: "job".into(),
+            },
+        ] {
+            let entry = entry(BTreeMap::from([(
+                QueryNodeId(0),
+                QueryPlanNode::Logical {
+                    operator,
+                    inputs: vec![],
+                },
+            )]));
+            assert!(leaves(&entry, &[1000]).is_err());
+        }
+    }
+
     #[test]
     fn deployed_raw_scan_is_rejected_before_execution() {
         let entry = entry(BTreeMap::from([(

@@ -431,9 +431,7 @@ impl ASAPQueryEngine {
             asap_types::query_plan::QueryPlanNode::ExternalExact { .. } => false,
             asap_types::query_plan::QueryPlanNode::Logical { operator, .. } => !matches!(
                 operator,
-                asap_types::query_plan::query_time::QueryTimeOperator::ExactSubquery { .. }
-                    | asap_types::query_plan::query_time::QueryTimeOperator::CandidateExactSubquery { .. }
-                    | asap_types::query_plan::query_time::QueryTimeOperator::Scan { .. }
+                asap_types::query_plan::query_time::QueryTimeOperator::Scan { .. }
             ),
             _ => true,
         }) {
