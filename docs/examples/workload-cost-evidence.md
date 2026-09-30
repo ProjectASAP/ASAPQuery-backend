@@ -98,13 +98,27 @@ reads, retention and retirement; retention adds the state's estimated bytes
 times its retained panes times `store_per_byte_second` (default 0). An
 ephemeral state costs build, read and retirement per read, and is offered only
 when the deployment can read raw series from Prometheus at query time (not
-under `require_backend_local_execution`). A query rebuilds all of its states or
-none; with no state left it runs natively over raw series. The manifest of the
+under `require_backend_local_execution`). A query may retain admissible native
+branches beside raw inputs when their bounded-lag mixed assignment costs less;
+otherwise its states retain their group placement. With no retained state it
+runs natively over raw series. The manifest of the
 resulting placement is quoted like any other. A state built from another
 retained state's readouts (such as that heap) is placed the same way: retained,
 it is maintained over complete per-series states each window; ephemeral, it is
 rebuilt per query from the readouts. This does not
 claim exhaustive search over every lifecycle, engine or Planner algorithm.
+Retention prices use the chosen installed layout, including downstream
+maintenance lookbacks and the configured retention margin. Raw additive
+states within one query that share the same generated panes charge their
+producer and longest retention once, while preserving each logical read cost.
+
+`implementation.source_ingestion_rates` optionally maps metric names to
+samples-per-second evidence, using the same `Evidence<Rate>` format as
+`data_workload.ingestion_rate`. Fresh observations price both retained
+maintenance and raw selector folds. Rates must be finite and nonnegative.
+Missing or expired metric evidence uses the workload-wide rate as a
+conservative bound; label filters do not imply an invented selectivity.
+
 An exact alternative without an accessible native backend is unavailable even
 if its numeric quote would be cheap.
 

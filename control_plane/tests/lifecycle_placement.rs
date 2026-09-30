@@ -387,3 +387,124 @@ fn inadmissible_mix_keeps_the_group_decision() {
         }
     }
 }
+
+// Explicit per-metric sample-rate evidence prices each selector's raw fold;
+// absent evidence retains the conservative workload-wide rate.
+#[test]
+fn raw_selector_folds_use_their_own_source_rates() {
+    let mut wire = serde_json::to_value(fixture(1.0, false)).unwrap();
+    wire["query_workload"]["repeating_queries"][0]["query"] = MIXED_QUERY.into();
+    let baseline = selected_plan(serde_json::from_value(wire.clone()).unwrap());
+    let retained_cost = |plan: &CompiledPhysicalPlan| {
+        plan.planner_selection_trace
+            .iter()
+            .filter(|event| event["stage"] == "deployment.lifecycle_placement")
+            .map(|event| cost(event, "continuously_maintained_cost"))
+            .sum::<f64>()
+    };
+    let mut a = wire["data_workload"]["ingestion_rate"].clone();
+    a["value"] = 1.0.into();
+    let mut b = a.clone();
+    b["value"] = 2.0.into();
+    wire["implementation"]["source_ingestion_rates"] = serde_json::json!({"a": a, "b": b});
+    let input: BackendLocalPlanningInput = serde_json::from_value(wire).unwrap();
+    let costs = input.physical_inputs.lifecycle_costs.clone();
+    let evaluations = input.physical_inputs.horizon_seconds / 10.0;
+    let plan = selected_plan(input);
+    let priced: f64 = plan
+        .planner_selection_trace
+        .iter()
+        .filter(|event| event["stage"] == "deployment.lifecycle_placement")
+        .map(|event| cost(event, "ephemeral_cost"))
+        .sum();
+    let expected = evaluations
+        * (2.0 * (costs.build + costs.read + costs.retirement)
+            + (60.0 + 2.0 * 600.0) * costs.maintenance_per_update);
+    assert!((priced - expected).abs() < 1e-9, "{priced} != {expected}");
+    let expected_saving = evaluations * 10.0 * (200.0 - 3.0) * costs.maintenance_per_update;
+    assert!((retained_cost(&baseline) - retained_cost(&plan) - expected_saving).abs() < 1e-9);
+}
+
+// Native lifecycle candidates price the complete windows their retained
+// realization installs, including the configured retention margin.
+#[test]
+fn native_lifecycle_prices_complete_window_retention() {
+    for (margin, expected) in [(0, 1), (25_000, 4)] {
+        let mut wire = serde_json::to_value(fixture(1e-12, false)).unwrap();
+        wire["query_workload"]["repeating_queries"][0]["query"] = "sum(rate(m[1m]))".into();
+        wire["implementation"]["query_staleness_margin_ms"] = margin.into();
+        let (request, _) = serde_json::from_value::<BackendLocalPlanningInput>(wire)
+            .unwrap()
+            .into_physical_compilation_request()
+            .unwrap();
+        let native: Vec<_> = request
+            .planner_selection_trace
+            .iter()
+            .filter(|event| event["stage"] == "deployment.native_candidate_placement")
+            .collect();
+        assert!(!native.is_empty());
+        for event in native {
+            assert_eq!(event["retained_states"].as_u64(), Some(expected), "{event}");
+        }
+    }
+}
+
+// Stale per-metric evidence uses the workload rate, and invalid observations
+// are rejected instead of allowing a negative raw execution cost.
+#[test]
+fn source_rate_evidence_requires_fresh_nonnegative_values() {
+    let mut input = fixture(1.0, false);
+    let baseline = decision(&selected_plan(input.clone()));
+    let mut rate = input.data_workload.ingestion_rate.clone();
+    rate.value = Some(planner_types::workload::Rate(1.0));
+    rate.observed_at_ms = Some(input.environment.observed_at_unix_ms.saturating_sub(1));
+    rate.valid_for_ms = Some(0);
+    input
+        .physical_inputs
+        .source_ingestion_rates
+        .insert("m".into(), rate.clone());
+    let stale = decision(&selected_plan(input.clone()));
+    assert_eq!(
+        cost(&stale, "ephemeral_cost"),
+        cost(&baseline, "ephemeral_cost")
+    );
+    rate.value = Some(planner_types::workload::Rate(-1.0));
+    input
+        .physical_inputs
+        .source_ingestion_rates
+        .insert("m".into(), rate);
+    let error = input.into_physical_compilation_request().unwrap_err();
+    assert!(error.to_string().contains("finite nonnegative rates"));
+}
+
+// Different logical lookbacks sharing one installed raw producer charge its
+// maintenance and maximum retained pane population once, while keeping both reads.
+#[test]
+fn shared_physical_panes_are_priced_once_across_logical_lookbacks() {
+    let plan = two_state_plan(
+        "sum(sum_over_time(m[1m])) / sum(sum_over_time(m[10m]))",
+        1e-12,
+    );
+    assert_eq!(plan.precompute_plan.materializations.len(), 1);
+    let installed = plan.precompute_plan.materializations[0]
+        .num_aggregates_to_retain
+        .unwrap();
+    assert_eq!(installed, 61);
+    let priced: u64 = plan
+        .planner_selection_trace
+        .iter()
+        .filter(|event| event["stage"] == "deployment.lifecycle_placement")
+        .map(|event| event["retained_states"].as_u64().unwrap())
+        .sum();
+    assert_eq!(priced, installed);
+    let retained_cost = |plan: &CompiledPhysicalPlan| {
+        plan.planner_selection_trace
+            .iter()
+            .filter(|event| event["stage"] == "deployment.lifecycle_placement")
+            .map(|event| cost(event, "continuously_maintained_cost"))
+            .sum::<f64>()
+    };
+    let longest = two_state_plan("sum(sum_over_time(m[10m]))", 1e-12);
+    // Same producer and 61 panes, plus the shorter logical read every 10s.
+    assert!((retained_cost(&plan) - retained_cost(&longest) - 3.0).abs() < 1e-9);
+}

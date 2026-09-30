@@ -661,6 +661,7 @@ fn compile_physical_plan_request(
         planner_selection_trace: planner_selection_trace.into(),
         query_workload: Some(query_workload),
         data_workload: Some(request.data_workload),
+        source_ingestion_rates: Default::default(),
         canonical_roots,
         queries,
         allow_mixed_summary_and_exact_execution: request.target

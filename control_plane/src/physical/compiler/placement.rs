@@ -163,8 +163,7 @@ impl CostModel for LifecycleCosts {
 
 /// The window implementation compilation installs for `state` when `query`
 /// retains it, possibly `beside_raw` inputs, with the number of states that
-/// layout keeps in the store for the state's own window. A derived state
-/// reading a longer window over it retains more, so this is a lower bound there.
+/// layout keeps for both query readouts and downstream maintenance windows.
 fn installed_window(
     query: &QueryCompilationInput,
     state: &SelectedMaterialization,
@@ -196,13 +195,86 @@ fn installed_window(
             id.as_ref() == Some(&candidate.realization_id) && &candidate.framework == framework
         })?
         .clone();
+    let maintenance_lookback = query_states
+        .iter()
+        .filter(|consumer| {
+            immutable_materialization_sources(&consumer.node)
+                .is_some_and(|sources| sources.iter().any(|source| Rc::ptr_eq(source, &state.node)))
+        })
+        .map(|consumer| {
+            consumer
+                .window_secs
+                .map(|seconds| seconds.saturating_mul(1_000))
+                .unwrap_or(query.query_lookback_ms)
+        })
+        .max()
+        .unwrap_or(0);
     let retained = retained_state_count(
-        branch.query_lookback_ms,
+        branch.query_lookback_ms.max(maintenance_lookback),
         retention_margin_ms,
         window.slide_secs.saturating_mul(1_000),
         &window.layout,
     );
     Some((window, retained))
+}
+
+/// Identity of a raw, non-cohort installation after window selection. This
+/// uses the deployment fingerprint so logical lookbacks sharing panes share
+/// maintenance cost too. Derived/native cohorts are priced by their own layouts.
+fn raw_installation_id(
+    request: &PhysicalCompilationRequest,
+    query_index: usize,
+    state: &SelectedMaterialization,
+    states: &[SelectedMaterialization],
+    window: &WindowRealizationCandidate,
+    environment: &PhysicalDeploymentContext,
+) -> Option<asap_types::PolicyFingerprint> {
+    let asap_types::WindowMaterializationLayout::Pane { pane_secs } = window.layout else {
+        return None;
+    };
+    if !window.derived
+        || pane_secs == 0
+        || leaf_selector(&state.node).is_none()
+        || !matches!(
+            state.family,
+            SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _)
+        )
+        || windows::cohort_nodes(states).contains(&(Rc::as_ptr(&state.node) as usize))
+    {
+        return None;
+    }
+    let query = &request.queries[query_index];
+    // With identical pane widths, reuse keeps all read costs and strictly
+    // saves one producer iff its non-read implementation cost is positive.
+    let mut maintenance = query.summary_lifecycle_inputs.clone();
+    maintenance.costs.read = 0.0;
+    let cost = derived_window_cost(
+        &window.cost,
+        &maintenance,
+        window.window_secs,
+        window.slide_secs,
+        &window.layout,
+        request.query_retention_margin_ms,
+    )
+    .weighted_cost;
+    if !cost.is_finite() || cost <= 0.0 {
+        return None;
+    }
+    let aggregation =
+        physical_aggregation(query, state, query.query_id.clone(), environment.target);
+    let mut config = scoped_materialization(&aggregation, &state.node).ok()?;
+    config.window_size = pane_secs;
+    config.slide_interval = pane_secs;
+    config.window_type = asap_types::WindowKind::Tumbling;
+    config.window_layout = window.layout.clone();
+    config.pane_origin_ms = shared_pane_origin_ms(
+        request.query_workload.as_ref(),
+        [query_index],
+        pane_secs.saturating_mul(1_000),
+    )
+    .ok()?;
+    config.pane_origin_ms?;
+    Some(config.policy_fingerprint())
 }
 
 /// A state's index, raw bindability, retained and rebuilt costs, and
@@ -246,6 +318,24 @@ fn alternative_cost(
 /// never displaces retention, the placement used without lifecycle evidence.
 fn rebuild_is_cheaper(retained: Option<Cost>, rebuilt: Option<Cost>) -> bool {
     matches!((retained, rebuilt), (Some(retained), Some(rebuilt)) if rebuilt.0 < retained.0)
+}
+
+/// Apply the same source observation to retained maintenance and raw folds.
+fn source_data(
+    data: &DataWorkload,
+    rates: &BTreeMap<String, Evidence<Rate>>,
+    metric: &str,
+    now: u64,
+) -> DataWorkload {
+    let mut scoped = data.clone();
+    if let Some(evidence) = rates.get(metric).filter(|evidence| {
+        evidence
+            .value_at(now)
+            .is_some_and(|rate| rate.0.is_finite() && rate.0 >= 0.0)
+    }) {
+        scoped.ingestion_rate = evidence.clone();
+    }
+    scoped
 }
 
 /// Choose one lifecycle per unique state reachable from the (already shared)
@@ -315,7 +405,22 @@ pub(super) fn place(
         .collect();
     let horizon = Some(Horizon(first.summary_lifecycle_inputs.horizon_seconds));
     let now = environment.observed_at_unix_ms;
-    let update_rate = data.ingestion_rate.value_at(now).map(|rate| rate.0);
+    let update_rate = |scan: &QueryTimeOperator| {
+        let metric_rate = match scan {
+            QueryTimeOperator::Scan {
+                metric: Some(metric),
+                ..
+            } => request
+                .source_ingestion_rates
+                .get(metric)
+                .and_then(|evidence| evidence.value_at(now)),
+            _ => None,
+        };
+        metric_rate
+            .or_else(|| data.ingestion_rate.value_at(now))
+            .filter(|rate| rate.0.is_finite() && rate.0 >= 0.0)
+            .map(|rate| rate.0)
+    };
     let model =
         |costs: LifecycleUnitCosts, retained_states, evaluation_interval_ms| LifecycleCosts {
             costs,
@@ -329,6 +434,10 @@ pub(super) fn place(
                  consumers: &[usize],
                  lifecycle: SummaryMaintenanceLifecycle,
                  model: &LifecycleCosts| {
+        let scoped = selected_input_contract(state)
+            .ok()
+            .map(|(metric, _, _)| source_data(data, &request.source_ingestion_rates, &metric, now));
+        let data = scoped.as_ref().unwrap_or(data);
         let candidates = enumerate_summary_maintenance_lifecycles(
             Rc::clone(state),
             WorkloadDemand::new_with_data(workload, data, consumers),
@@ -437,20 +546,19 @@ pub(super) fn place(
                 .iter()
                 .map(|&query| {
                     let raw = raw_programs[query].as_ref()?;
-                    let scanned_seconds = raw
+                    let scanned_samples = raw
                         .scans
                         .iter()
                         .map(|(_, scan)| match scan {
                             QueryTimeOperator::Scan {
                                 range_ms: Some(range_ms),
                                 ..
-                            } => Some(*range_ms as f64 / 1_000.0),
+                            } => Some(update_rate(scan)? * *range_ms as f64 / 1_000.0),
                             _ => None,
                         })
                         .sum::<Option<f64>>()?;
                     let lifecycle = &queries[query].summary_lifecycle_inputs;
-                    let fold =
-                        update_rate? * scanned_seconds * lifecycle.costs.maintenance_per_update;
+                    let fold = scanned_samples * lifecycle.costs.maintenance_per_update;
                     let costs = LifecycleUnitCosts {
                         build: lifecycle.costs.build + fold / query_states[query].len() as f64,
                         ..lifecycle.costs.clone()
@@ -473,6 +581,73 @@ pub(super) fn place(
             .map(|install| install.retained_states)
             .sum::<Option<u64>>();
         decisions.push((state_index, bindable, retained, rebuilt, retained_states));
+    }
+    // Distinct logical lookbacks can install the same raw panes. Within one
+    // query their placement moves together, so charge shared maintenance and
+    // the largest retention once; each logical read still pays its read cost.
+    let mut physical_groups = BTreeMap::<(usize, asap_types::PolicyFingerprint), Vec<usize>>::new();
+    for (index, (state, consumers)) in states.iter().enumerate() {
+        let [query] = consumers.as_slice() else {
+            continue;
+        };
+        let selected = &selected_states[*query];
+        let Some(state) = selected
+            .iter()
+            .find(|selected| Rc::ptr_eq(&selected.node, state))
+        else {
+            continue;
+        };
+        let Some((window, _)) = installed_window(
+            &queries[*query],
+            state,
+            selected,
+            environment,
+            request.query_retention_margin_ms,
+            false,
+        ) else {
+            continue;
+        };
+        if let Some(identity) =
+            raw_installation_id(request, *query, state, selected, &window, environment)
+        {
+            physical_groups
+                .entry((*query, identity))
+                .or_default()
+                .push(index);
+        }
+    }
+    for ((query, _), group) in physical_groups
+        .into_iter()
+        .filter(|(_, group)| group.len() > 1)
+    {
+        if group
+            .iter()
+            .any(|&index| decisions[index].2.is_none() || decisions[index].4.is_none())
+        {
+            continue;
+        }
+        let owner = *group
+            .iter()
+            .max_by_key(|&&index| decisions[index].4)
+            .unwrap();
+        let lifecycle = &queries[query].summary_lifecycle_inputs;
+        for index in group.into_iter().filter(|&index| index != owner) {
+            let costs = LifecycleUnitCosts {
+                build: 0.0,
+                maintenance_per_update: 0.0,
+                read: lifecycle.costs.read,
+                retention_per_second: 0.0,
+                retirement: 0.0,
+                store_per_byte_second: 0.0,
+            };
+            decisions[index].2 = price(
+                &states[index].0,
+                &[query],
+                SummaryMaintenanceLifecycle::ContinuouslyMaintained,
+                &model(costs, Some(0), lifecycle.evaluation_interval_ms),
+            );
+            decisions[index].4 = Some(0);
+        }
     }
     // First choose a group baseline: states linked through a query move
     // together when rebuilding all consumers costs less than retaining them.
@@ -528,19 +703,17 @@ pub(super) fn place(
         // Rebuilt beside retained state, a program folds only the samples of
         // the rebuilt states' own selectors.
         let alone = |member: usize| {
-            let (
-                _,
-                QueryTimeOperator::Scan {
-                    range_ms: Some(range_ms),
-                    ..
-                },
-            ) = leaf_selector(&states[member].0)?
+            let (_, scan) = leaf_selector(&states[member].0)?;
+            let QueryTimeOperator::Scan {
+                range_ms: Some(range_ms),
+                ..
+            } = &scan
             else {
                 return None;
             };
             let costs = LifecycleUnitCosts {
                 build: lifecycle.costs.build
-                    + update_rate? * range_ms as f64 / 1_000.0
+                    + update_rate(&scan)? * *range_ms as f64 / 1_000.0
                         * lifecycle.costs.maintenance_per_update,
                 ..lifecycle.costs.clone()
             };
@@ -1221,6 +1394,16 @@ pub(super) fn time_native_candidate(
             trace: Vec::new(),
         })
     };
+    let scoped_data = match &query.legacy_query_source {
+        Source::TimeSeries { metric } => source_data(
+            data,
+            &inputs.source_ingestion_rates,
+            metric,
+            environment.observed_at_unix_ms,
+        ),
+        _ => data.clone(),
+    };
+    let data = &scoped_data;
     let lifecycle = &query.summary_lifecycle_inputs;
     // Enumerate lifecycle choices first; each retained native alternative is
     // repriced below using its hypothetical installed window layout.
@@ -1352,6 +1535,42 @@ fn find(root: &Rc<SummaryNode>, summary: &SummaryNode) -> Option<Rc<SummaryNode>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A derived consumer's longer window retains and prices the source panes
+    // that maintenance needs, even when the source has a shorter own readout.
+    #[test]
+    fn derived_consumer_extends_priced_source_retention() {
+        let mut wire: Value = serde_json::from_str(include_str!(
+            "../../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        wire["query_workload"]["repeating_queries"][0]["query"] =
+            "quantile(0.9, sum_over_time(m[1m]))".into();
+        let snapshot: BackendLocalPlanningInput = serde_json::from_value(wire).unwrap();
+        let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
+        let query = &request.queries[0];
+        let mut states =
+            collect_selected_materializations(&query.selected_plan_root, true).unwrap();
+        let derived = states
+            .iter_mut()
+            .find(|state| immutable_materialization_sources(&state.node).is_some())
+            .expect("derived consumer");
+        let source = immutable_materialization_sources(&derived.node)
+            .unwrap()
+            .remove(0);
+        derived.window_secs = Some(600);
+        let source = states
+            .iter()
+            .find(|state| Rc::ptr_eq(&state.node, &source))
+            .unwrap();
+        let (window, retained) =
+            installed_window(query, source, &states, &environment, 0, false).unwrap();
+        assert_eq!(
+            retained,
+            retained_state_count(600_000, 0, window.slide_secs * 1_000, &window.layout)
+        );
+        assert_eq!(retained, 11);
+    }
 
     fn option(beside_raw: Option<f64>, alone: Option<f64>) -> MixedOption {
         MixedOption {
