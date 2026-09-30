@@ -1473,11 +1473,10 @@ fn preserve_uncompiled_computation_roots(
     Ok(())
 }
 
-/// A MetricsQL query whose only selected states are Prometheus-specific
-/// counter readouts has no backend materialization to bind. Keep the original
-/// query as one native exact root. Mixed queries retain their other selected
-/// summaries and let query-time lowering cut only the counter branches.
-fn preserve_metricsql_counter_only_roots(
+/// MetricsQL counter readouts cannot bind Prometheus-specific stored states.
+/// Preserve the whole native query when any branch requires such a readout,
+/// including binary roots whose other operand could use a stored summary.
+fn preserve_metricsql_counter_roots(
     queries: &mut [QueryCompilationInput],
     canonical_roots: &[Rc<QueryExpr>],
     composable: bool,
@@ -1488,18 +1487,16 @@ fn preserve_metricsql_counter_only_roots(
                 query_id: query.query_id.clone(),
                 reason,
             })?;
-        if selected.is_empty()
-            || !selected.iter().all(|state| {
-                matches!(
-                    state.family,
-                    SummaryFamilyType::ExactAggregate(
-                        planner_types::post_asap::ExactKind::Rate
-                            | planner_types::post_asap::ExactKind::Increase,
-                        _
-                    )
+        if !selected.iter().any(|state| {
+            matches!(
+                state.family,
+                SummaryFamilyType::ExactAggregate(
+                    planner_types::post_asap::ExactKind::Rate
+                        | planner_types::post_asap::ExactKind::Increase,
+                    _
                 )
-            })
-        {
+            )
+        }) {
             continue;
         }
         let parsed = original_root(query, index, canonical_roots)?;
@@ -1598,7 +1595,7 @@ impl DeploymentPlanCompiler {
         }
 
         if frontend == QueryFrontend::MetricsQl {
-            preserve_metricsql_counter_only_roots(
+            preserve_metricsql_counter_roots(
                 &mut request.queries,
                 &request.canonical_roots,
                 request.allow_mixed_summary_and_exact_execution,
@@ -7292,13 +7289,13 @@ pub(crate) mod tests {
             );
             assert!(!entry.materialization_bindings().is_empty());
         }
-        // The grouped division is a Planner join over the two readouts.
+        // The grouped division combines the two readouts with Planner series matching.
         assert!(bundle
             .query_plan
             .entries
             .values()
             .flat_map(|entry| entry.nodes.values())
-            .any(|node| !crate::query_plan::operator_parameters(node, "Join").is_empty()));
+            .any(|node| !crate::query_plan::operator_parameters(node, "SeriesBinary").is_empty()));
     }
 
     #[test]
