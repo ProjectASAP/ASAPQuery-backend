@@ -4640,7 +4640,6 @@ mod tests {
     //    canonical strings → different resolver cache keys → different
     //    sids by construction.
 
-    #[test]
     // Unkeyed Planner exact MIN panes feed the MIN rollup.
     #[test]
     fn planner_exact_min_panes_feed_the_min_rollup() {
