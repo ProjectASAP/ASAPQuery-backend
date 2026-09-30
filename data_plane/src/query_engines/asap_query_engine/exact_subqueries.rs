@@ -87,10 +87,25 @@ fn leaves(
             },
             // A join is a typed composition node rather than a Logical
             // wrapper, but its value input can still be a Prometheus leaf.
-            QueryPlanNode::PhysicalFragment { inputs, .. }
-            | QueryPlanNode::Physical { inputs, .. } => {
+            QueryPlanNode::PhysicalFragment { inputs, .. } => {
                 pending.extend(inputs.iter().map(|input| (*input, at)));
             }
+            // Raw Scan inputs of a physical program are bound as lazy physical
+            // sources at execution, not prepared as exact leaves.
+            QueryPlanNode::Physical { inputs, .. } => pending.extend(
+                inputs
+                    .iter()
+                    .filter(|input| {
+                        !matches!(
+                            entry.nodes.get(input),
+                            Some(QueryPlanNode::Logical {
+                                operator: QueryTimeOperator::Scan { .. },
+                                ..
+                            })
+                        )
+                    })
+                    .map(|input| (*input, at)),
+            ),
 
             QueryPlanNode::ExternalExact { request, inputs } => {
                 pending.extend(inputs.iter().map(|input| (*input, at)));
