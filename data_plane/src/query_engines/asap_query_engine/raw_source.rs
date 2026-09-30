@@ -866,6 +866,7 @@ mod tests {
                     kind: BinaryOpKind::Arithmetic(ArithmeticOpKind::Add),
                     vector_match: None,
                 },
+                [false, false],
             )
             .unwrap();
             let program = CompiledPhysicalDag::from_operators(

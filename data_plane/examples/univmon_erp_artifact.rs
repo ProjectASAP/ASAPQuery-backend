@@ -1,7 +1,7 @@
 //! Measure readout-specific ERP evidence from finite JSONL evaluation data.
 //! This offline tool retains samples; the production backend does not.
 use asap_physical_operators::summary_kernels::hll_sketch::HllSketchAccumulator;
-use asap_summary_state::univmon::UnivMonAccumulator;
+use asap_physical_operators::summary_kernels::univmon::UnivMonAccumulator;
 use data_plane::storage_engines::types::{AggregateCore, StoredState};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
@@ -109,7 +109,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|e| e.to_string())?;
             }
             left.merge_in_place(&right).map_err(|e| e.to_string())?;
-            bytes = bytes.max(left.to_bytes().map_err(|e| e.to_string())?.len());
+            bytes = bytes.max(
+                left.sketch()
+                    .serialize_to_bytes()
+                    .map_err(|e| e.to_string())?
+                    .len(),
+            );
             for (i, stat) in [
                 planner_types::post_asap::SketchQuery::Cardinality,
                 planner_types::post_asap::SketchQuery::FrequencyL2,

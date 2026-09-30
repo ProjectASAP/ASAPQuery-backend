@@ -2885,7 +2885,7 @@ mod tests {
             // positive-only is the realistic shape.
             s.update(*v);
         }
-        DDSketchAccumulator { inner: s }
+        DDSketchAccumulator::from_sketch(s, 1.0).expect("validated sampling probability")
     }
 
     /// Pinning test: a single-group, single-window sketch ingest must
@@ -2957,7 +2957,7 @@ mod tests {
         assert_eq!(output.end_timestamp, 90_000);
         assert_eq!(
             acc.type_name(),
-            "DDSketchAccumulator",
+            "DDSketchAccumulatorV2",
             "persisted accumulator must round-trip as DDSketchAccumulator (not silently demoted)"
         );
 
@@ -3228,7 +3228,7 @@ mod tests {
         assert_eq!(output.end_timestamp, 30_000);
         assert_eq!(
             acc.type_name(),
-            "DDSketchAccumulator",
+            "DDSketchAccumulatorV2",
             "wall-clock-fallback-emitted accumulator must round-trip as DDSketchAccumulator"
         );
         let dd = acc
@@ -3970,7 +3970,7 @@ mod tests {
         let (output, acc) = &captured[0];
         assert_eq!(output.start_timestamp, 0);
         assert_eq!(output.end_timestamp, 30_000);
-        assert_eq!(acc.type_name(), "DDSketchAccumulator");
+        assert_eq!(acc.type_name(), "DDSketchAccumulatorV2");
         let dd = acc
             .as_any()
             .downcast_ref::<DDSketchAccumulator>()

@@ -36,7 +36,8 @@ fn ddsketch_bare_state_is_rejected_and_envelope_supports_query_readout() {
     assert!(asap_sketch_codec::reconstruct_ddsketch(&bare).is_err());
     let (decoded, _) = asap_sketch_codec::reconstruct_ddsketch(&envelope).unwrap();
     let accumulator =
-        asap_physical_operators::summary_kernels::DDSketchAccumulator { inner: decoded };
+        asap_physical_operators::summary_kernels::DDSketchAccumulator::from_sketch(decoded, 1.0)
+            .expect("validated sampling probability");
     let median = accumulator
         .estimate(&planner_types::post_asap::SketchQuery::Quantile { q: 0.5 })
         .unwrap();

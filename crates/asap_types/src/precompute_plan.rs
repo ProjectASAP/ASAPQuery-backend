@@ -196,6 +196,8 @@ pub enum StateEncoding {
     ExactAccumulatorV1,
     /// Persisted backend state with explicit Planner family and population layout.
     PlannerExactAccumulatorV1,
+    /// Compensated Planner exact state; V1 payloads are retired.
+    PlannerExactAccumulatorV2,
     ExactCounterAccumulatorV2,
 }
 
@@ -1266,11 +1268,11 @@ pub(crate) fn state_encodings(family: &SummaryFamilyType) -> Vec<StateEncoding> 
             _,
         ) => vec![
             StateEncoding::ExactCounterAccumulatorV2,
-            StateEncoding::PlannerExactAccumulatorV1,
+            StateEncoding::PlannerExactAccumulatorV2,
         ],
         SummaryFamilyType::ExactAggregate(..) => vec![
             StateEncoding::ExactAccumulatorV1,
-            StateEncoding::PlannerExactAccumulatorV1,
+            StateEncoding::PlannerExactAccumulatorV2,
         ],
         SummaryFamilyType::Sketch(kind, _)
             if matches!(

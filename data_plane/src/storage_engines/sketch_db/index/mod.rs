@@ -94,7 +94,7 @@ fn reconstruct_exact_agg(
     bytes: &[u8],
 ) -> Result<Option<Box<dyn crate::storage_engines::types::AggregateCore>>, String> {
     use asap_summary_state::stored_state::codec;
-    if type_name != codec::EXACT_V1 && !codec::is_retired_exact(type_name) {
+    if type_name != codec::EXACT_V2 && !codec::is_retired_exact(type_name) {
         return Ok(None);
     }
     codec::decode(type_name, bytes)

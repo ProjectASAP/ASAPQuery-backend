@@ -1,5 +1,5 @@
 use super::*;
-use asap_summary_state::univmon::UnivMonAccumulator;
+use asap_physical_operators::summary_kernels::univmon::UnivMonAccumulator;
 use control_plane::physical::erp::ErpShapeObserver;
 use data_plane::storage_engines::types::AggregateCore;
 
@@ -48,7 +48,7 @@ fn measured_artifact() -> Value {
             }
             let other = panes[1].clone();
             panes[0].merge_in_place(&other).unwrap();
-            bytes = bytes.max(panes[0].to_bytes().unwrap().len());
+            bytes = bytes.max(panes[0].sketch().serialize_to_bytes().unwrap().len());
             for (i, stat) in [
                 planner_types::post_asap::SketchQuery::Cardinality,
                 planner_types::post_asap::SketchQuery::FrequencyL2,

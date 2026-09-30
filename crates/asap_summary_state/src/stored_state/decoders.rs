@@ -11,17 +11,23 @@ use asap_sketchlib::{
 };
 use prost::Message;
 
-/// Planner kernels carry no edge sampling probability, so a sampled frame
-/// (`0 < sample_p < 1`) would silently read as unscaled counts. `0` (proto3
-/// default) and `1` both mean unsampled.
-fn unsampled(what: &str, sample_p: f64) -> Result<(), String> {
-    if sample_p.is_finite() && sample_p > 0.0 && sample_p < 1.0 {
+/// Validate edge probability; proto3's omitted zero means unsampled.
+fn checked_probability(sample_p: f64) -> Result<f64, String> {
+    let p = if sample_p == 0.0 { 1.0 } else { sample_p };
+    if !p.is_finite() || p <= 0.0 || p > 1.0 {
         return Err(format!(
-            "{what} frame is edge-sampled (sample_p={sample_p}); sampled sketch \
-             state is not supported by Planner kernels"
+            "invalid sketch sample_p={sample_p}; expected 0 < p <= 1"
         ));
     }
-    Ok(())
+    Ok(p)
+}
+
+/// Sampling metadata of a full envelope; bare state/delta frames are unsampled.
+pub fn sample_probability(buffer: &[u8]) -> Result<f64, String> {
+    match SketchEnvelope::decode(buffer) {
+        Ok(envelope) if envelope.sketch_state.is_some() => checked_probability(envelope.sample_p),
+        _ => Ok(1.0),
+    }
 }
 
 /// Envelope-wrapped state, or the bare state for producers that omit the
@@ -61,7 +67,7 @@ pub fn carries_sketch_state(buffer: &[u8]) -> bool {
 /// A `SketchEnvelope{DdSketchState}` frame. Bare states are rejected.
 pub fn ddsketch_from_proto(buffer: &[u8]) -> Result<DdSketch, String> {
     let (state, sample_p) = asap_sketch_codec::ddsketch_state(buffer)?;
-    unsampled("DDSketch", sample_p)?;
+    checked_probability(sample_p)?;
     if !(state.alpha > 0.0 && state.alpha < 1.0) {
         return Err(format!(
             "DDSketchState alpha {} out of range (expected 0 < alpha < 1)",
@@ -177,7 +183,7 @@ fn read_uvarint(buf: &[u8]) -> Option<(u64, usize)> {
     let mut result: u64 = 0;
     for (i, &b) in buf.iter().enumerate() {
         let shift = 7 * i as u32;
-        if shift >= 64 {
+        if shift >= 64 || (shift == 63 && b & 0x7e != 0) {
             return None;
         }
         result |= u64::from(b & 0x7f) << shift;
@@ -224,7 +230,7 @@ pub fn hll_from_proto(buffer: &[u8]) -> Result<HllSketch, String> {
             sketch_envelope::SketchState::Hll(state) => Some(state),
             _ => None,
         })?;
-    unsampled("HLL", sample_p)?;
+    checked_probability(sample_p)?;
     if state.precision == 0 || state.precision > 20 {
         return Err(format!(
             "HyperLogLogState precision {} out of range (expected 1..=20)",
@@ -269,8 +275,32 @@ pub fn hll_from_msgpack(buffer: &[u8]) -> Result<HllSketch, String> {
 
 /// Apply an `HLLDelta` register frame (register-wise max) onto `sketch`.
 pub fn apply_hll_proto_delta(sketch: &mut HllSketch, buffer: &[u8]) -> Result<(), String> {
+    use asap_sketchlib::{proto::sketchlib::HllDelta, HllSketchDelta};
+    let frame = HllDelta::decode(buffer).map_err(|e| format!("decode HLLDelta: {e}"))?;
+    let mut updates = Vec::new();
+    let (mut previous, mut offset) = (0_u64, 0_usize);
+    while offset < frame.packed_updates.len() {
+        let (delta, used) = read_uvarint(&frame.packed_updates[offset..])
+            .ok_or("HLLDelta: corrupt index varint")?;
+        offset += used;
+        let (value, used) = read_uvarint(&frame.packed_updates[offset..])
+            .ok_or("HLLDelta: corrupt value varint")?;
+        offset += used;
+        let index = previous
+            .checked_add(delta)
+            .ok_or("HLLDelta: index overflow")?;
+        if index >= sketch.registers.len() as u64 || (!updates.is_empty() && delta == 0) {
+            return Err("HLLDelta: invalid register index".into());
+        }
+        updates.push((
+            u32::try_from(index).map_err(|_| "HLLDelta: index overflow")?,
+            u8::try_from(value).map_err(|_| "HLLDelta: register value exceeds u8")?,
+        ));
+        previous = index;
+    }
+    // Validate the whole frame before sketchlib mutates the cached registers.
     sketch
-        .apply_delta_bytes(buffer)
+        .apply_delta(&HllSketchDelta { updates })
         .map_err(|e| format!("apply HLLDelta: {e}"))
 }
 
@@ -340,7 +370,7 @@ pub fn cms_from_proto(buffer: &[u8]) -> Result<CountMinSketch, String> {
         sketch_envelope::SketchState::CountMin(state) => Some(state),
         _ => None,
     })?;
-    unsampled("CountMin", sample_p)?;
+    checked_probability(sample_p)?;
     let (m, rows, cols) = matrix(
         "CountMinState",
         state.rows,
@@ -397,7 +427,7 @@ pub fn cs_from_proto(buffer: &[u8]) -> Result<CountSketch, String> {
             sketch_envelope::SketchState::CountSketch(state) => Some(state),
             _ => None,
         })?;
-    unsampled("CountSketch", sample_p)?;
+    checked_probability(sample_p)?;
     let (m, rows, cols) = matrix(
         "CountSketchState",
         state.rows,
@@ -423,6 +453,14 @@ pub fn apply_cs_proto_delta(sketch: &mut CountSketch, buffer: &[u8]) -> Result<(
         &pb.cell_cols,
         &pb.d_counts,
     )?;
+    if pb.rows as usize != sketch.rows
+        || pb.cols as usize != sketch.cols
+        || cells
+            .iter()
+            .any(|(row, col, _)| *row as usize >= sketch.rows || *col as usize >= sketch.cols)
+    {
+        return Err("CountSketchDelta dimensions or cell indices differ from cached base".into());
+    }
     let delta = CountSketchDelta {
         rows: pb.rows,
         cols: pb.cols,
@@ -646,9 +684,9 @@ mod tests {
         );
     }
 
-    // Malformed shapes, wrong families and sampled frames are rejected.
+    // Malformed shapes and wrong families fail; valid sampled frames decode.
     #[test]
-    fn invalid_or_sampled_frames_are_rejected() {
+    fn invalid_frames_fail_and_sampled_frames_decode() {
         assert!(cms_from_proto(&cms_state(2, 4, vec![1]).encode_to_vec()).is_err());
         assert!(cms_from_proto(&cms_state(0, 4, vec![]).encode_to_vec()).is_err());
         assert!(cms_from_proto(&cms_state(64, 1 << 20, vec![]).encode_to_vec()).is_err());
@@ -661,9 +699,8 @@ mod tests {
             sketch_envelope::SketchState::CountMin(cms_state(1, 2, vec![1, 1])),
             0.5,
         );
-        assert!(cms_from_proto(&sampled)
-            .unwrap_err()
-            .contains("edge-sampled"));
+        assert!(cms_from_proto(&sampled).is_ok());
+        assert_eq!(sample_probability(&sampled).unwrap(), 0.5);
         let mut dd = DdSketch::new(0.01);
         dd.update(1.0);
         let mut dd_state =
@@ -674,8 +711,7 @@ mod tests {
             sketch_envelope::SketchState::Ddsketch(dd_state.clone()),
             0.25
         ))
-        .unwrap_err()
-        .contains("edge-sampled"));
+        .is_ok());
         dd_state.alpha = 0.0;
         assert!(ddsketch_from_proto(&envelope(
             sketch_envelope::SketchState::Ddsketch(dd_state),
@@ -747,6 +783,37 @@ mod tests {
         };
         apply_hll_proto_delta(&mut sketch, &delta.encode_to_vec()).unwrap();
         assert_eq!(&sketch.registers[..2], &[2, 3]);
+    }
+
+    // Rejected deltas must leave the base unchanged even after valid leading updates.
+    #[test]
+    fn invalid_delta_is_atomic() {
+        let mut hll = HllSketch::new(HllVariant::Regular, 4);
+        let before = hll.to_msgpack().unwrap();
+        let delta = pb::HllDelta {
+            packed_updates: vec![0, 3, 16, 5],
+        }
+        .encode_to_vec();
+        assert!(apply_hll_proto_delta(&mut hll, &delta).is_err());
+        assert_eq!(hll.to_msgpack().unwrap(), before);
+    }
+
+    // Rejected matrix deltas do not retain valid leading cell updates.
+    #[test]
+    fn invalid_cs_delta_is_atomic() {
+        let mut cs = CountSketch::new(3, 8);
+        let before = cs.to_msgpack().unwrap();
+        let delta = pb::CountSketchDelta {
+            rows: 3,
+            cols: 8,
+            cell_rows: vec![0, 3],
+            cell_cols: vec![0, 0],
+            d_counts: vec![2, 4],
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert!(apply_cs_proto_delta(&mut cs, &delta).is_err());
+        assert_eq!(cs.to_msgpack().unwrap(), before);
     }
 
     // KLL frames reconstruct from their level layout and reject bad layouts.
