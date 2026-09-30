@@ -44,11 +44,14 @@ impl Placement {
 }
 
 /// Backend lifecycle prices for any summary state. Retention charges the
-/// state's estimated bytes for every retained pane at the summary-store price;
-/// an unknown size under a positive price leaves retention unpriced.
+/// state's estimated bytes for every retained pane and partition at the
+/// summary-store price; an unknown size under a positive price leaves
+/// retention unpriced. Panes are estimated from the evaluation interval
+/// because the window layout is chosen only for retained state.
 struct LifecycleCosts<'a> {
     costs: &'a LifecycleUnitCosts,
     evaluation_interval_ms: u32,
+    input_cardinality: Option<u64>,
     delete: bool,
 }
 
@@ -76,9 +79,22 @@ impl CostModel for LifecycleCosts<'_> {
                 .max(1.0)
             });
         let store = match &summary.expr {
-            SummaryExpr::SummaryAgg { family, .. } if costs.store_per_byte_second > 0.0 => {
+            SummaryExpr::SummaryAgg {
+                family, reduction, ..
+            } if costs.store_per_byte_second > 0.0 => {
+                // Per-series and grouped state keeps one instance per input series at most.
+                let partitioned =
+                    matches!(reduction, planner_types::pre_asap::Reduction::PerEntity)
+                        || reduction
+                            .group_keys()
+                            .is_some_and(|keys| !keys.keys().is_empty());
+                let partitions = if partitioned {
+                    self.input_cardinality.unwrap_or(1).max(1) as f64
+                } else {
+                    1.0
+                };
                 crate::physical::post_asap::cost_model::analytical_state_bytes(family)
-                    .map(|bytes| bytes * panes * costs.store_per_byte_second)
+                    .map(|bytes| bytes * panes * partitions * costs.store_per_byte_second)
             }
             _ => Some(0.0),
         };
@@ -118,13 +134,10 @@ fn alternative_cost(
         .and_then(|alternative| alternative.total_cost)
 }
 
-/// Unknown cost never makes a lifecycle win.
+/// Rebuilding must be priced cheaper than retaining. An unpriced alternative
+/// never displaces retention, the placement used without lifecycle evidence.
 fn rebuild_is_cheaper(retained: Option<Cost>, rebuilt: Option<Cost>) -> bool {
-    match (retained, rebuilt) {
-        (Some(retained), Some(rebuilt)) => rebuilt.0 < retained.0,
-        (None, Some(_)) => true,
-        _ => false,
-    }
+    matches!((retained, rebuilt), (Some(retained), Some(rebuilt)) if rebuilt.0 < retained.0)
 }
 
 /// Choose one lifecycle per unique state reachable from the (already shared)
@@ -226,6 +239,10 @@ pub(super) fn place(
         let model = LifecycleCosts {
             costs: &lead.costs,
             evaluation_interval_ms: interval,
+            input_cardinality: data
+                .input_cardinality
+                .value_at(environment.observed_at_unix_ms)
+                .copied(),
             delete: environment.target == PhysicalDeploymentTarget::BackendLocalRemoteWrite,
         };
         let Ok(candidates) = enumerate_summary_maintenance_lifecycles(
@@ -360,6 +377,9 @@ fn range_selector_scan(selector: &QueryExpr) -> Result<QueryTimeOperator, String
     else {
         return Err("raw input does not read a named time series".into());
     };
+    if metric.is_empty() {
+        return Err("raw selector has no metric name".into());
+    }
     let matchers = predicates
         .iter()
         .map(|predicate| {
@@ -391,9 +411,23 @@ fn range_selector_scan(selector: &QueryExpr) -> Result<QueryTimeOperator, String
         })
         .collect::<Result<_, _>>()?;
     Ok(QueryTimeOperator::Scan {
-        metric: (!metric.is_empty()).then(|| metric.clone()),
+        metric: Some(metric.clone()),
         matchers,
         range_ms: Some(u64::try_from(range.as_millis()).map_err(|e| e.to_string())?),
         offset_ms,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Only a priced, strictly cheaper rebuild moves a state to query time.
+    #[test]
+    fn unpriced_alternatives_never_displace_retention() {
+        assert!(rebuild_is_cheaper(Some(Cost(2.0)), Some(Cost(1.0))));
+        assert!(!rebuild_is_cheaper(Some(Cost(1.0)), Some(Cost(1.0))));
+        assert!(!rebuild_is_cheaper(None, Some(Cost(1.0))));
+        assert!(!rebuild_is_cheaper(Some(Cost(1.0)), None));
+    }
 }
