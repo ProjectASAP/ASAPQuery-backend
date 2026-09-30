@@ -237,8 +237,12 @@ fn decode_full(
 
 /// Render a ranked heap item as the legacy heap key: item parts joined by
 /// `;`, with a canonical series identity (it names `__name__`) shown as its
-/// series key.
-fn heap_item_key(items: &[asap_physical_operators::values::Value]) -> String {
+/// series key. A grouped heap's identity omits the labels it is partitioned
+/// by; those are stored as the heap's group labels and restored here.
+fn heap_item_key(
+    items: &[asap_physical_operators::values::Value],
+    group: &std::collections::BTreeMap<String, String>,
+) -> String {
     use asap_physical_operators::values::Value;
     items
         .iter()
@@ -247,7 +251,13 @@ fn heap_item_key(items: &[asap_physical_operators::values::Value]) -> String {
                 asap_physical_operators::physical_planner::promql_rows::decode_series_identity(text)
                     .ok()
                     .filter(|labels| labels.contains_key("__name__"))
-                    .map(|labels| series_key(&labels))
+                    .map(|mut labels| {
+                        // An empty group value is a series without that label.
+                        for (name, value) in group.iter().filter(|(_, v)| !v.is_empty()) {
+                            labels.entry(name.clone()).or_insert_with(|| value.clone());
+                        }
+                        series_key(&labels)
+                    })
                     .unwrap_or_else(|| text.to_string())
             }
             Value::Null => String::new(),
@@ -543,8 +553,11 @@ impl SummaryState {
     /// `None` for anything other than a heap-bearing state — the
     /// heap-less Frequency states (`Cms`/`CountSketch`) carry no item
     /// universe to enumerate, and the quantile/cardinality states have
-    /// no heap at all.
-    pub fn topk_items(&self) -> Option<Vec<(String, f64)>> {
+    /// no heap at all. `group` is the stored group the state belongs to.
+    pub fn topk_items(
+        &self,
+        group: &std::collections::BTreeMap<String, String>,
+    ) -> Option<Vec<(String, f64)>> {
         match self {
             SummaryState::CmsWithHeap(h) => Some(
                 h.topk_heap_items()
@@ -566,7 +579,7 @@ impl SummaryState {
                         else {
                             return None;
                         };
-                        Some((heap_item_key(&row), score))
+                        Some((heap_item_key(&row, group), score))
                     })
                     .collect(),
             ),
@@ -890,7 +903,7 @@ mod tests {
         let state = cumulative_summary_state(&[(1000, &first), (2000, &second)], heap)
             .unwrap()
             .unwrap();
-        let mut items = state.topk_items().unwrap();
+        let mut items = state.topk_items(&Default::default()).unwrap();
         items.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
             items,
@@ -911,6 +924,36 @@ mod tests {
             heap_size: 8,
         };
         assert!(cumulative_summary_state(&[(1000, &first)], narrower).is_err());
+    }
+
+    // A grouped heap's item identity omits its partition labels; readout
+    // restores non-empty ones from the stored group and keeps identity values.
+    #[test]
+    fn weighted_frequency_items_restore_group_labels() {
+        use crate::summary_kernels::weighted_frequency::{
+            FrequencyAlgorithm, PhysicalWeightedFrequency,
+        };
+        use asap_physical_operators::values::Value;
+        let mut state = PhysicalWeightedFrequency::new(FrequencyAlgorithm::Cms, 64, 3, 8).unwrap();
+        let identity = r#"{"__name__":"m","endpoint":"a"}"#;
+        state.update(&[Value::Utf8(identity.into())], 2.0).unwrap();
+        let state = SummaryState::WeightedFrequency(state);
+        let group = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            state.topk_items(&group(&[("job", "j")])).unwrap(),
+            vec![(r#"m{endpoint="a",job="j"}"#.to_string(), 2.0)]
+        );
+        assert_eq!(
+            state
+                .topk_items(&group(&[("job", ""), ("endpoint", "other")]))
+                .unwrap(),
+            vec![(r#"m{endpoint="a"}"#.to_string(), 2.0)]
+        );
     }
     use asap_sketchlib::HllVariant;
 

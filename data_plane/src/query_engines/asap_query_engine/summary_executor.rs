@@ -548,12 +548,14 @@ impl QueryExecutionContext<'_> {
         Ok(result)
     }
 
+    /// `group` is the state's stored group labels, as `read_bound_materialization` returns them.
     pub fn readout_bound(
         &self,
+        group: &BTreeMap<String, String>,
         state: &GroupState,
         query: &SketchQuery,
     ) -> Result<SummaryValue, SummaryExecutorError> {
-        self.readout(state, query)
+        self.readout(group, state, query)
     }
 
     pub fn merge_bound_states(
@@ -618,6 +620,7 @@ impl QueryExecutionContext<'_> {
 
     fn readout(
         &self,
+        group: &BTreeMap<String, String>,
         state: &GroupState,
         query: &SketchQuery,
     ) -> Result<SummaryValue, SummaryExecutorError> {
@@ -625,9 +628,9 @@ impl QueryExecutionContext<'_> {
             return Err(SummaryExecutorError::UnsupportedFamily);
         };
         if self.is_cumulative {
-            readout_cumulative(entries, *kind, query, self.t1_ms as i64)
+            readout_cumulative(entries, *kind, query, self.t1_ms as i64, group)
         } else {
-            readout_per_window(entries, *kind, query, self.t0_ms as i64)
+            readout_per_window(entries, *kind, query, self.t0_ms as i64, group)
         }
     }
 }
@@ -640,6 +643,7 @@ fn readout_cumulative(
     kind: DeltaSketchKind,
     query: &SketchQuery,
     t1_ms: i64,
+    group: &BTreeMap<String, String>,
 ) -> Result<SummaryValue, SummaryExecutorError> {
     let mut merged: Option<SummaryState> = None;
     let mut latest_window_end: Option<i64> = None;
@@ -675,7 +679,7 @@ fn readout_cumulative(
     let w_end = latest_window_end.unwrap_or(t1_ms);
     if let SketchQuery::TopK { k } = query {
         Ok(SummaryValue::TopK(
-            vec![(w_end, topk_ranked(&merged, *k)?)],
+            vec![(w_end, topk_ranked(&merged, *k, group)?)],
             coverage,
         ))
     } else {
@@ -697,6 +701,7 @@ fn readout_per_window(
     kind: DeltaSketchKind,
     query: &SketchQuery,
     t0_ms: i64,
+    group: &BTreeMap<String, String>,
 ) -> Result<SummaryValue, SummaryExecutorError> {
     let mut by_window: BTreeMap<i64, SummaryState> = BTreeMap::new();
     // Tracked from RAW window-ends, before the `w_end < t0_ms` carry-in
@@ -738,7 +743,7 @@ fn readout_per_window(
     if let SketchQuery::TopK { k } = query {
         let points = by_window
             .into_iter()
-            .map(|(w_end, rs)| topk_ranked(&rs, *k).map(|items| (w_end, items)))
+            .map(|(w_end, rs)| topk_ranked(&rs, *k, group).map(|items| (w_end, items)))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(SummaryValue::TopK(points, coverage))
     } else {
@@ -763,8 +768,12 @@ fn sketch_query_value(
         },
     )
 }
-fn topk_ranked(state: &SummaryState, k: usize) -> Result<Vec<(String, f64)>, SummaryExecutorError> {
-    asap_summary_state::stored_state::readout::topk_ranked(state, k).map_err(
+fn topk_ranked(
+    state: &SummaryState,
+    k: usize,
+    group: &BTreeMap<String, String>,
+) -> Result<Vec<(String, f64)>, SummaryExecutorError> {
+    asap_summary_state::stored_state::readout::topk_ranked(state, k, group).map_err(
         |asap_summary_state::stored_state::readout::Error::Unsupported(reason)| {
             SummaryExecutorError::Unsupported(reason)
         },
@@ -1187,7 +1196,11 @@ mod tests {
         };
         let states = context.read_bound_materialization(&binding).unwrap();
         let SummaryValue::Points(points, coverage) = context
-            .readout_bound(&states[0].1, &SketchQuery::Quantile { q: 0.5 })
+            .readout_bound(
+                &states[0].0,
+                &states[0].1,
+                &SketchQuery::Quantile { q: 0.5 },
+            )
             .unwrap()
         else {
             panic!("expected points");
@@ -1267,8 +1280,9 @@ mod tests {
             (SketchQuery::FrequencyL2, 6.0f64.sqrt()),
             (SketchQuery::FrequencyEntropy, 1.5),
         ] {
-            let SummaryValue::Points(points, _) =
-                context.readout_bound(&states[0].1, &query).unwrap()
+            let SummaryValue::Points(points, _) = context
+                .readout_bound(&states[0].0, &states[0].1, &query)
+                .unwrap()
             else {
                 panic!("expected scalar points")
             };

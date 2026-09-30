@@ -600,18 +600,50 @@ fn erp_collector_kll_export(plan: &Value, end_ms: u64, raw: &[f64], sequence: u6
 // an installed QueryPlan, retaining all three ranked identities and values.
 #[tokio::test]
 async fn registered_temporal_topk_cms_heap() {
-    registered_temporal_topk(planner_types::post_asap::SketchAlgorithm::CmsWithHeap).await;
+    registered_temporal_topk(
+        planner_types::post_asap::SketchAlgorithm::CmsWithHeap,
+        false,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn registered_temporal_topk_count_sketch_heap() {
-    registered_temporal_topk(planner_types::post_asap::SketchAlgorithm::CountSketchWithHeap).await;
+    registered_temporal_topk(
+        planner_types::post_asap::SketchAlgorithm::CountSketchWithHeap,
+        false,
+    )
+    .await;
 }
 
-async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlgorithm) {
+// A grouped CMS heap ranks each job's series separately and names each ranked
+// item by its whole series, including the job label the heap partitions by.
+#[tokio::test]
+async fn registered_temporal_topk_by_cms_heap() {
+    registered_temporal_topk(planner_types::post_asap::SketchAlgorithm::CmsWithHeap, true).await;
+}
+
+// A grouped CountSketch heap ranks each job's series under its whole series.
+#[tokio::test]
+async fn registered_temporal_topk_by_count_sketch_heap() {
+    registered_temporal_topk(
+        planner_types::post_asap::SketchAlgorithm::CountSketchWithHeap,
+        true,
+    )
+    .await;
+}
+
+async fn registered_temporal_topk(
+    algorithm: planner_types::post_asap::SketchAlgorithm,
+    grouped: bool,
+) {
     use control_plane::physical::compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler};
     use planner_types::post_asap::{CompositionOperator, SketchQuery, SummaryFamilyType};
-    const QUERY: &str = "topk(3, count_over_time(top_endpoint_qps[5s]))";
+    let query_text = if grouped {
+        "topk by (job) (2, count_over_time(top_endpoint_qps[5s]))"
+    } else {
+        "topk(3, count_over_time(top_endpoint_qps[5s]))"
+    };
     struct Evidence;
     impl asap_aware_mapping::AccuracyEvidenceProvider for Evidence {
         fn propagation_stats(
@@ -637,12 +669,12 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
     ))
     .unwrap();
     let mut entry = fixture["query_workload"]["repeating_queries"][5].clone();
-    entry["query"] = QUERY.into();
+    entry["query"] = query_text.into();
     entry["requirements"]["accuracy"] =
         serde_json::json!({"explicit": {"EpsilonDelta": {"epsilon": 0.05, "delta": 0.05}}});
     fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
     fixture["implementation"]["topk_evidence"] = serde_json::json!({
-        QUERY: {
+        query_text: {
             "selected_lower_bound": 95.0, "excluded_upper_bound": 80.0,
             "interval_failure_probability": 0.001, "observed_at_unix_ms": 9500,
             "source": "deterministic-count-ranking-fixture"
@@ -652,7 +684,7 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
     let (mut request, environment) = snapshot.into_physical_compilation_request().unwrap();
     let query = &mut request.queries[0];
     let expr = control_plane::query_parser::parse_query_expr_canonical(
-        QUERY,
+        query_text,
         query.accuracy_target.clone(),
     )
     .unwrap();
@@ -798,24 +830,28 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
         .as_millis() as i64;
     let base = now - now.rem_euclid(5000) - 20000;
     let counts = [
-        ("alpha", 100),
-        ("beta", 50),
-        ("gamma", 200),
-        ("delta", 75),
-        ("epsilon", 10),
-        ("zeta", 150),
+        ("alpha", "a", 100),
+        ("beta", "a", 50),
+        ("gamma", "a", 200),
+        ("delta", "b", 75),
+        ("epsilon", "b", 10),
+        ("zeta", "b", 150),
     ];
     let samples = WriteRequest {
         timeseries: counts
             .iter()
-            .map(|(item, count)| {
+            .map(|(item, job, count)| {
                 // Non-unit values distinguish count updates from accidental weighted sums.
                 let points = (0..2)
                     .flat_map(|window| {
                         (0..*count).map(move |i| (base + window * 5000 + 10 + i * 20, 17.0))
                     })
                     .collect::<Vec<_>>();
-                series_with_labels("top_endpoint_qps", &[("endpoint", item)], &points)
+                series_with_labels(
+                    "top_endpoint_qps",
+                    &[("endpoint", item), ("job", job)],
+                    &points,
+                )
             })
             .collect(),
     };
@@ -823,7 +859,7 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
     let watermark = WriteRequest {
         timeseries: vec![series_with_labels(
             "top_endpoint_qps",
-            &[("endpoint", "gamma")],
+            &[("endpoint", "gamma"), ("job", "a")],
             &[(base + 10500, 17.0)],
         )],
     };
@@ -836,7 +872,7 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
             let response: Value = client
                 .get(format!("{backend}/api/v1/query"))
                 .query(&[
-                    ("query", QUERY.to_string()),
+                    ("query", query_text.to_string()),
                     ("time", timestamp.to_string()),
                 ])
                 .send()
@@ -853,20 +889,34 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
     })
     .await
     .expect("registered TopK must become warm within 30s");
-    let expected = [("gamma", 200.0), ("zeta", 150.0), ("alpha", 100.0)];
+    let expected: &[(&str, &str, f64)] = if grouped {
+        &[
+            ("gamma", "a", 200.0),
+            ("alpha", "a", 100.0),
+            ("zeta", "b", 150.0),
+            ("delta", "b", 75.0),
+        ]
+    } else {
+        &[
+            ("gamma", "a", 200.0),
+            ("zeta", "b", 150.0),
+            ("alpha", "a", 100.0),
+        ]
+    };
     let assert_ranks = |response: &Value, range: bool| {
         assert_eq!(response["status"], "success", "{response}");
         assert!(is_warm(response), "{response}");
         let rows = response["data"]["result"].as_array().unwrap();
-        assert_eq!(rows.len(), 3, "{response}");
-        for (item, count) in expected {
+        assert_eq!(rows.len(), expected.len(), "{response}");
+        for &(item, job, count) in expected {
+            let series = format!("top_endpoint_qps{{endpoint=\"{item}\",job=\"{job}\"}}");
             let row = rows
                 .iter()
-                .find(|row| {
-                    row["metric"]["item"].as_str()
-                        == Some(format!("top_endpoint_qps{{endpoint=\"{item}\"}}").as_str())
-                })
-                .unwrap_or_else(|| panic!("missing {item}: {response}"));
+                .find(|row| row["metric"]["item"].as_str() == Some(series.as_str()))
+                .unwrap_or_else(|| panic!("missing {series}: {response}"));
+            if grouped {
+                assert_eq!(row["metric"]["job"], job, "{response}");
+            }
             let points = if range {
                 let points = row["values"].as_array().unwrap();
                 assert_eq!(points.len(), 2);
@@ -888,7 +938,7 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
     let range: Value = client
         .get(format!("{backend}/api/v1/query_range"))
         .query(&[
-            ("query", QUERY.to_string()),
+            ("query", query_text.to_string()),
             ("start", timestamp.to_string()),
             ("end", (timestamp + 5.0).to_string()),
             ("step", "5".into()),

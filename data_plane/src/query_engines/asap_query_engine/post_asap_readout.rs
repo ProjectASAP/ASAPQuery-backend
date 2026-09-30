@@ -212,7 +212,7 @@ impl PhysicalQueryRuntime<'_> {
                 for (key, state) in groups {
                     let value = self
                         .context
-                        .readout_bound(state, &query)
+                        .readout_bound(key, state, &query)
                         .map_err(PhysicalNodeError::Store)?;
                     let (mut rows, row_coverage) = expand_item_readout(key, value, item_labels)?;
                     if self.language == control_plane::query_plan::QueryLanguage::MetricsQl
