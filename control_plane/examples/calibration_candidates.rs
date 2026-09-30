@@ -126,7 +126,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enumerate()
     {
         let queries = candidate.queries.clone();
-        let enabled_materialization_keys = candidate.enabled_materialization_keys.clone();
         let planner_selected_queries = planner_forest(&queries);
         let compiled = if metricsql {
             DeploymentPlanCompiler.compile_metricsql(candidate, environment.clone())
@@ -137,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(plan) => plan,
             Err(error) => {
                 results.push(
-                    json!({"candidate_index": index, "materialization_policy": enabled_materialization_keys, "planner_selected_queries": planner_selected_queries, "unavailable_reason": error.to_string()}),
+                    json!({"candidate_index": index, "planner_selected_queries": planner_selected_queries, "unavailable_reason": error.to_string()}),
                 );
                 continue;
             }
@@ -146,14 +145,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(manifest) => manifest,
             Err(error) => {
                 results.push(
-                    json!({"candidate_index": index, "materialization_policy": enabled_materialization_keys, "planner_selected_queries": planner_selected_queries, "unavailable_reason": error.to_string()}),
+                    json!({"candidate_index": index, "planner_selected_queries": planner_selected_queries, "unavailable_reason": error.to_string()}),
                 );
                 continue;
             }
         };
         results.push(json!({
             "candidate_index": index,
-            "materialization_policy": enabled_materialization_keys,
             "planner_selected_queries": planner_selected_queries,
             "manifest": manifest,
             "lifecycle_estimates": plan.lifecycle_estimates,

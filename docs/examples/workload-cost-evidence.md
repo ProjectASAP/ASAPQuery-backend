@@ -84,8 +84,19 @@ measurements.
 
 ## Supported migration scope
 
-The default inventory compares the Planner-selected continuously maintained
-workload with its whole-workload exact fallback. `workload_cost::select` also
+The default inventory compares the Planner-selected workload with its
+whole-workload exact fallback. Within a candidate, whether each summary state
+is precomputed or rebuilt at query time is not a separate candidate: the
+compiler chooses a summary-maintenance lifecycle per unique state from
+`implementation.lifecycle_costs`, pricing shared state once. Continuously
+maintained state costs build, per-update maintenance over the ingestion rate,
+reads, retention and retirement; retention adds the state's estimated bytes
+times its retained panes times `store_per_byte_second` (default 0). An
+ephemeral state costs build, read and retirement per read, and is offered only
+when the deployment can read raw series from Prometheus at query time (not
+under `require_backend_local_execution`). A query rebuilds all of its states or
+none; with no state left it runs natively over raw series. The manifest of the
+resulting placement is quoted like any other. `workload_cost::select` also
 accepts additional Planner-authorized, already-bindable forests. This does not
 claim exhaustive search over every lifecycle, engine or Planner algorithm.
 An exact alternative without an accessible native backend is unavailable even
