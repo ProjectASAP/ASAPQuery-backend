@@ -834,14 +834,30 @@ fn enumerate_frontier_candidates(
             _ => unreachable!("native candidate retains canonical roots"),
         })
         .collect();
-    let strategy =
-        asap_aware_mapping::maintained_population::MaintainedPopulationStrategy::new(&roots);
-    let maintained_roots: Vec<_> = roots
+    // Populations are selected over roots typed with the complete series
+    // identity, so Planner can compile every readout over the snapshot rows.
+    let typed = roots
         .iter()
         .map(|root| {
-            strategy
-                .candidate(root)
-                .filter(|node| super::maintained_population::supported_node(node))
+            asap_physical_operators::physical_planner::promql_rows::with_series_identity(root)
+                .map(std::rc::Rc::new)
+                .ok()
+        })
+        .collect::<Vec<_>>();
+    let strategy = asap_aware_mapping::maintained_population::MaintainedPopulationStrategy::new(
+        &typed.iter().flatten().cloned().collect::<Vec<_>>(),
+    );
+    let maintained_roots: Vec<_> = typed
+        .iter()
+        .map(|root| {
+            root.as_ref()
+                .and_then(|root| strategy.candidate(root))
+                .filter(|node| {
+                    // Every readout must compile to the Planner program installed with it.
+                    super::maintained_population::supported_node(node)
+                        && asap_physical_operators::physical_planner::promql_rows::compile_current_series_readout(node)
+                            .is_ok()
+                })
         })
         .collect();
     if maintained_roots.iter().any(Option::is_some) {
@@ -1037,6 +1053,37 @@ mod tests {
             })));
     }
 
+    /// Planner cannot yet read out `without` groups, so such a population is
+    /// never selected, while the `by` form is.
+    #[test]
+    fn without_grouping_selects_no_population() {
+        for (query, supported) in [
+            ("quantile without (pod) (0.5, m)", false),
+            ("quantile by (job) (0.5, m)", true),
+        ] {
+            let root = std::rc::Rc::new(
+                asap_physical_operators::physical_planner::promql_rows::with_series_identity(
+                    &crate::query_parser::parse_query_expr_canonical(
+                        query,
+                        crate::types::AccuracyTarget::Exact,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            );
+            let strategy =
+                asap_aware_mapping::maintained_population::MaintainedPopulationStrategy::new(
+                    std::slice::from_ref(&root),
+                );
+            let candidate = strategy.candidate(&root).unwrap();
+            assert_eq!(
+                super::super::maintained_population::supported_node(&candidate),
+                supported,
+                "{query}"
+            );
+        }
+    }
+
     /// Instant counts select current membership, never accumulated observations.
     #[test]
     fn local_grouped_count_has_a_bindable_candidate() {
@@ -1050,20 +1097,21 @@ mod tests {
         queries.truncate(1);
         queries[0].query = planner_types::workload::Query("count by(job)(m)".into());
         let plan = with_unit_quotes(input).compile_promql().unwrap();
-        assert!(plan
-            .query_plan
-            .entries
-            .values()
-            .all(|entry| entry.nodes.values().any(|node| matches!(
-                node,
-                crate::query_plan::QueryPlanNode::Logical {
-                    operator: crate::query_plan::query_time::QueryTimeOperator::CurrentSeries {
-                        readout: asap_types::query_plan::current_series::SeriesReadout::Count,
-                        ..
-                    },
-                    ..
-                }
-            ))));
+        // The population supplies members; Planner counts them per job.
+        for entry in plan.query_plan.entries.values() {
+            assert!(entry.population_snapshot().is_some(), "{entry:?}");
+            let program = entry.recover_population_physical_dag().unwrap();
+            let output = program.output_contract(program.roots()[0]).unwrap();
+            assert_eq!(
+                output
+                    .schema
+                    .fields
+                    .iter()
+                    .map(|field| field.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["job", "count"]
+            );
+        }
     }
 
     fn fixture() -> BackendLocalPlanningInput {

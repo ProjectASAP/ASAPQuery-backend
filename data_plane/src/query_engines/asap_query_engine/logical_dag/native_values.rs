@@ -508,6 +508,43 @@ mod tests {
         );
     }
 
+    // A population count is an Int64 sample only when it is the sole numeric
+    // column; a Float64 value always wins over an Int64 helper column.
+    #[test]
+    fn selected_program_reads_counts_and_prefers_float_values() {
+        for (fields, row, expected) in [
+            (
+                vec![("job", DataType::Utf8), ("count", DataType::Int64)],
+                vec![Value::Utf8("api".into()), Value::Int64(3)],
+                3.,
+            ),
+            (
+                vec![("members", DataType::Int64), ("value", DataType::Float64)],
+                vec![Value::Int64(7), Value::Float64(2.5)],
+                2.5,
+            ),
+        ] {
+            let input = schema(&fields);
+            let plan = CompiledPhysicalDag::from_operators(
+                [(0, InputContract::bounded(input.clone()))].into(),
+                Default::default(),
+                vec![0],
+            )
+            .unwrap();
+            let (result, _) = execute_batches(&plan, 1 << 20, 1, 42, false, |_, contract| {
+                Ok(BoundInput::Rows(Batch::try_new(
+                    contract.schema.clone(),
+                    vec![row.clone()],
+                )?))
+            })
+            .unwrap();
+            let crate::query_engines::query_result::QueryResult::Vector(result) = result else {
+                panic!("vector expected")
+            };
+            assert_eq!(result.values[0].value, expected);
+        }
+    }
+
     // Count-like values are bound as integers only when the protocol sample is exact.
     #[test]
     fn integer_input_binding_preserves_type_and_rejects_rounding() {
@@ -867,15 +904,31 @@ fn execute_batches(
                 .fields
                 .iter()
                 .position(|field| field.name == SERIES_IDENTITY_COLUMN);
-            let value = batch
-                .schema()
-                .fields
-                .iter()
-                .position(|field| field.dtype == SummaryFamilyType::Plain(DataType::Float64))
-                .ok_or_else(|| miss("physical output loses sample value"))?;
+            let fields = &batch.schema().fields;
+            let typed = |dtype: DataType| {
+                fields
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, field)| field.dtype == SummaryFamilyType::Plain(dtype.clone()))
+                    .map(|(i, _)| i)
+                    .collect::<Vec<_>>()
+            };
+            // The sample is the Float64 column; an Int64 count is the sample
+            // only when it is the sole numeric column.
+            let value = match (
+                typed(DataType::Float64).as_slice(),
+                typed(DataType::Int64).as_slice(),
+            ) {
+                ([value, ..], _) => *value,
+                ([], [count]) => *count,
+                _ => return Err(miss("physical output loses sample value")),
+            };
             for row in batch.rows() {
-                let Value::Float64(sample) = &row[value] else {
-                    return Err(miss("invalid physical result value"));
+                let sample = &match row[value] {
+                    Value::Float64(sample) => sample,
+                    // A count is exact as a PromQL sample up to 2^53.
+                    Value::Int64(count) if count.unsigned_abs() <= 1 << 53 => count as f64,
+                    _ => return Err(miss("invalid physical result value")),
                 };
                 let labels = if let Some(identity) = identity {
                     let Value::Utf8(encoded) = &row[identity] else {

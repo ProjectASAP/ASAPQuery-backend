@@ -2436,7 +2436,7 @@ impl DeploymentPlanCompiler {
             if frontend == QueryFrontend::MetricsQl {
                 entry.language = crate::query_plan::QueryLanguage::MetricsQl;
             }
-            super::maintained_population::install_native_topk(
+            super::maintained_population::install_population_readout(
                 &mut entry,
                 query
                     .retained_physical()?
@@ -4867,6 +4867,11 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(populations.len(), 1);
+        // Storage returns the members; every readout is the entry's Planner program.
+        for entry in plan.query_plan.entries.values() {
+            assert!(entry.population_snapshot().is_some(), "{entry:?}");
+            entry.recover_population_physical_dag().unwrap();
+        }
         let installed = serde_json::to_string(&plan.precompute_plan.executable_dags).unwrap();
         assert!(
             !installed.contains("MaintainPopulation"),

@@ -1,7 +1,7 @@
 //! Bounded current-value state. Never pools a series' old samples into a quantile.
 use crate::drivers::ingest::prometheus_remote_write::CanonicalSample;
 use asap_types::query_plan::{
-    current_series::{SeriesPopulation, SeriesReadout},
+    current_series::SeriesPopulation,
     query_time::{LabelMatch, QueryTimeOperator},
     QueryPlan, QueryPlanNode,
 };
@@ -42,7 +42,6 @@ struct Member {
 #[derive(Default, Clone)]
 struct Group {
     ordered: BTreeSet<Ranked>,
-    cached: Option<(Vec<f64>, Vector, f64, f64)>,
 }
 #[derive(Clone)]
 struct Population {
@@ -54,7 +53,6 @@ struct Population {
     /// Input timestamp at which the budget blew, cleared once the lookback
     /// window has moved entirely past it. `None` means the population serves.
     unavailable: Option<i64>,
-    cache_builds: u64,
     last_read: i64,
     matchers: Vec<promql_parser::label::Matcher>,
 }
@@ -83,7 +81,6 @@ impl Population {
             groups: BTreeMap::new(),
             bytes: 0,
             unavailable: None,
-            cache_builds: 0,
             last_read: i64::MIN,
             matchers,
         })
@@ -98,7 +95,6 @@ impl Population {
                         value,
                         labels: labels.clone(),
                     });
-                    group.cached = None;
                     if group.ordered.is_empty() {
                         self.groups.remove(&old.group);
                     }
@@ -160,7 +156,7 @@ impl Population {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         self.remove(&labels);
-        // Bound the retained keys, tree nodes, and shared readout caches together.
+        // Bound the retained keys and tree nodes together.
         let bytes = 1024
             + labels
                 .iter()
@@ -190,94 +186,16 @@ impl Population {
         if let Some(value) = sample.value {
             let state = self.groups.entry(group).or_default();
             state.ordered.insert(Ranked { value, labels });
-            state.cached = None;
         }
     }
-    fn read(&mut self, readout: &SeriesReadout) -> Vector {
-        if matches!(readout, SeriesReadout::Snapshot) {
-            return self
-                .groups
-                .values()
-                .flat_map(|group| group.ordered.iter())
-                .map(|member| (member.labels.clone(), member.value))
-                .collect();
-        }
-        let mut result = vec![];
-        for (labels, group) in &mut self.groups {
-            if group.cached.is_none() {
-                let values = if self.definition.quantiles {
-                    group.ordered.iter().map(|r| r.value).collect()
-                } else {
-                    vec![]
-                };
-                let top = group
-                    .ordered
-                    .iter()
-                    .rev()
-                    .take(self.definition.max_k as usize)
-                    .map(|r| (r.labels.clone(), r.value))
-                    .collect();
-                let sum = compensated_sum(group.ordered.iter().map(|r| r.value));
-                let count = group.ordered.len() as f64;
-                let average = if sum.is_finite() {
-                    sum / count
-                } else {
-                    compensated_sum(group.ordered.iter().map(|r| r.value / count))
-                };
-                group.cached = Some((values, top, sum, average));
-                self.cache_builds += 1;
-            }
-            let (values, top, sum, average) = group.cached.as_ref().unwrap();
-            match readout {
-                SeriesReadout::Snapshot => unreachable!("snapshot returned above"),
-                SeriesReadout::Quantile { q } => {
-                    // `values` is only populated for a quantile-carrying population.
-                    // `QueryTimeOperator::validate` rejects the mismatched pairing at
-                    // install, so this is defensive: answer like Prometheus does for
-                    // an empty group rather than underflow `values.len() - 1` while
-                    // holding the lock every remote-write batch waits on.
-                    let value = if values.is_empty() {
-                        f64::NAN
-                    } else if *q < 0. {
-                        f64::NEG_INFINITY
-                    } else if *q > 1. {
-                        f64::INFINITY
-                    } else {
-                        let rank = q * (values.len() - 1) as f64;
-                        let lo = rank.floor() as usize;
-                        let hi = (lo + 1).min(values.len() - 1);
-                        let weight = rank - lo as f64;
-                        values[lo] * (1. - weight) + values[hi] * weight
-                    };
-                    result.push((labels.clone(), value));
-                }
-                SeriesReadout::TopK { k } => result.extend(top.iter().take(*k as usize).cloned()),
-                SeriesReadout::Sum => result.push((labels.clone(), *sum)),
-                SeriesReadout::Count => result.push((labels.clone(), group.ordered.len() as f64)),
-                SeriesReadout::Average => result.push((labels.clone(), *average)),
-            }
-        }
-        result
+    /// Every current member with a value, group by group.
+    fn snapshot(&self) -> Vector {
+        self.groups
+            .values()
+            .flat_map(|group| group.ordered.iter())
+            .map(|member| (member.labels.clone(), member.value))
+            .collect()
     }
-}
-
-// Rebuild shared statistics after replacement/expiry, avoiding subtraction drift.
-fn compensated_sum(values: impl Iterator<Item = f64>) -> f64 {
-    let (mut sum, mut correction) = (0.0_f64, 0.0);
-    for value in values {
-        let next = sum + value;
-        if next.is_finite() {
-            correction += if sum.abs() >= value.abs() {
-                (sum - next) + value
-            } else {
-                (value - next) + sum
-            };
-        } else {
-            correction = 0.0;
-        }
-        sum = next;
-    }
-    sum + correction
 }
 
 #[derive(Default)]
@@ -404,7 +322,6 @@ impl CurrentSeriesStore {
         &mut self,
         generation: (u64, u64),
         definition: &SeriesPopulation,
-        readout: &SeriesReadout,
         at: u64,
     ) -> Result<Vector, String> {
         if self.generation != Some(generation) {
@@ -436,7 +353,7 @@ impl CurrentSeriesStore {
             }
             let mut population = saved.clone();
             population.expire(at.saturating_sub(definition.lookback_ms as i64));
-            return Ok(population.read(readout));
+            return Ok(population.snapshot());
         }
         if at > watermark.saturating_add(definition.max_input_lag_ms as i64) {
             return Err("current-series input is behind evaluation time".into());
@@ -459,13 +376,10 @@ impl CurrentSeriesStore {
         }
         population.last_read = at;
         population.expire(at.saturating_sub(definition.lookback_ms as i64));
-        Ok(population.read(readout))
+        Ok(population.snapshot())
     }
-    pub fn stats(&self) -> (usize, u64) {
-        (
-            self.populations.len(),
-            self.populations.values().map(|p| p.cache_builds).sum(),
-        )
+    pub fn population_count(&self) -> usize {
+        self.populations.len()
     }
 }
 
@@ -508,14 +422,10 @@ mod tests {
         let mut store = CurrentSeriesStore::default();
         store.ingest(&plan, &[sample("old", "api", 0, Some(10.))]);
         store.ingest(&plan, &[sample("new", "api", 500, Some(3.))]);
-        let values = store
-            .read((7, 1), &population, &SeriesReadout::Sum, 1_000)
-            .unwrap();
+        let values = store.read((7, 1), &population, 1_000).unwrap();
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].1, 3.);
-        let values = store
-            .read((7, 1), &population, &SeriesReadout::Sum, 1_500)
-            .unwrap();
+        let values = store.read((7, 1), &population, 1_500).unwrap();
         assert!(values.is_empty());
     }
     // Historical reads use the state at that timestamp, never the latest values.
@@ -536,23 +446,9 @@ mod tests {
                 sample("one", "api", 3_000, Some(4.)),
             ],
         );
-        assert_eq!(
-            store
-                .read((7, 1), &population, &SeriesReadout::Sum, 1_000)
-                .unwrap()[0]
-                .1,
-            2.
-        );
-        assert_eq!(
-            store
-                .read((7, 1), &population, &SeriesReadout::Sum, 3_000)
-                .unwrap()[0]
-                .1,
-            4.
-        );
-        assert!(store
-            .read((7, 1), &population, &SeriesReadout::Sum, 999)
-            .is_err());
+        assert_eq!(store.read((7, 1), &population, 1_000).unwrap()[0].1, 2.);
+        assert_eq!(store.read((7, 1), &population, 3_000).unwrap()[0].1, 4.);
+        assert!(store.read((7, 1), &population, 999).is_err());
         assert!(
             store.history_bytes[&population.key()] + store.populations[&population.key()].bytes
                 <= population.max_bytes
@@ -577,9 +473,7 @@ mod tests {
             ],
         );
         store.ingest(&installed, &[sample("two", "api", 1_500, Some(20.))]);
-        assert!(store
-            .read((7, 1), &population, &SeriesReadout::Sum, 1_000)
-            .is_err());
+        assert!(store.read((7, 1), &population, 1_000).is_err());
         let mut bounded = population.clone();
         bounded.max_bytes = 2_500;
         let mut store = CurrentSeriesStore::default();
@@ -591,9 +485,7 @@ mod tests {
                 sample("one", "api", 2_000, Some(3.)),
             ],
         );
-        assert!(store
-            .read((7, 1), &bounded, &SeriesReadout::Sum, 1_000)
-            .is_err());
+        assert!(store.read((7, 1), &bounded, 1_000).is_err());
         assert!(
             store.history_bytes[&bounded.key()] + store.populations[&bounded.key()].bytes
                 <= bounded.max_bytes
@@ -618,7 +510,6 @@ mod tests {
                     QueryPlanNode::Logical {
                         operator: QueryTimeOperator::CurrentSeries {
                             population: p.clone(),
-                            readout: SeriesReadout::Quantile { q: 0.5 },
                         },
                         inputs: vec![],
                     },
@@ -670,99 +561,40 @@ mod tests {
             );
         }
     }
-    // Equal sample values still represent two series; replacements and stale markers retract them.
-    #[test]
-    fn sum_count_average_follow_current_series_membership() {
-        let p = definition();
-        let plan = plan(&p);
-        let mut store = CurrentSeriesStore::default();
-        warm(&mut store, &plan);
-        for (at, samples, expected) in [
-            (
-                301_000,
-                vec![sample("y", "api", 301_000, Some(1.))],
-                [7., 3., 7. / 3.],
-            ),
-            (
-                302_000,
-                vec![sample("z", "api", 302_000, None)],
-                [2., 2., 1.],
-            ),
-        ] {
-            store.ingest(&plan, &samples);
-            for (readout, truth) in [
-                SeriesReadout::Sum,
-                SeriesReadout::Count,
-                SeriesReadout::Average,
-            ]
+    fn members(values: Vector) -> Vec<(String, f64)> {
+        let mut members = values
             .into_iter()
-            .zip(expected)
-            {
-                let values = store.read((7, 1), &p, &readout, at).unwrap();
-                assert!(
-                    (values[0].1 - truth).abs() < 1e-12,
-                    "{readout:?}: {values:?}"
-                );
-            }
-        }
+            .map(|(labels, value)| (labels["pod"].clone(), value))
+            .collect::<Vec<_>>();
+        members.sort_by(|a, b| a.0.cmp(&b.0));
+        members
     }
 
-    /// Four quantiles reuse one distribution, and smaller k reads the shared maximum-k prefix.
+    // Equal sample values still represent two series; replacements and stale
+    // markers retract them, and out-of-order values cannot resurrect a series.
     #[test]
-    fn quantiles_and_topk_share_state_and_promote_after_updates_and_staleness() {
+    fn snapshot_follows_current_series_membership() {
         let p = definition();
         let plan = plan(&p);
         let mut store = CurrentSeriesStore::default();
         warm(&mut store, &plan);
-        for (q, expected) in [(0.5, 5.), (0.9, 8.2), (0.95, 8.6), (0.99, 8.92)] {
-            let result = store
-                .read((7, 1), &p, &SeriesReadout::Quantile { q }, 300_000)
-                .unwrap();
-            assert!((result[0].1 - expected).abs() < 1e-10);
-            assert_eq!(result[1].1, 50.);
-        }
-        for percentile in 1..100 {
-            let q = percentile as f64 / 100.;
-            let result = store
-                .read((7, 1), &p, &SeriesReadout::Quantile { q }, 300_000)
-                .unwrap();
-            assert!((result[0].1 - (1. + 8. * q)).abs() < 1e-10);
-        }
-        let small = store
-            .read((7, 1), &p, &SeriesReadout::TopK { k: 1 }, 300_000)
-            .unwrap();
-        let big = store
-            .read((7, 1), &p, &SeriesReadout::TopK { k: 3 }, 300_000)
-            .unwrap();
-        assert_eq!(small[0].0["pod"], "y");
-        assert_eq!(big[0], small[0]);
-        assert_eq!(store.stats(), (1, 2));
-        store.ingest(&plan, &[sample("y", "api", 301_000, Some(-5.))]);
+        store.ingest(&plan, &[sample("y", "api", 301_000, Some(1.))]);
         assert_eq!(
-            store
-                .read((7, 1), &p, &SeriesReadout::TopK { k: 1 }, 301_000)
-                .unwrap()[0]
-                .0["pod"],
-            "z"
+            members(store.read((7, 1), &p, 301_000).unwrap()),
+            [("w", 50.), ("x", 1.), ("y", 1.), ("z", 5.)].map(|(pod, value)| (pod.into(), value))
         );
         store.ingest(&plan, &[sample("z", "api", 302_000, None)]);
-        assert_eq!(
-            store
-                .read((7, 1), &p, &SeriesReadout::TopK { k: 1 }, 302_000)
-                .unwrap()[0]
-                .0["pod"],
-            "x"
-        );
-        // Out-of-order old values must not resurrect the stale series.
         store.ingest(&plan, &[sample("z", "api", 301_000, Some(100.))]);
         assert_eq!(
-            store
-                .read((7, 1), &p, &SeriesReadout::TopK { k: 1 }, 302_000)
-                .unwrap()[0]
-                .0["pod"],
-            "x"
+            members(store.read((7, 1), &p, 302_000).unwrap()),
+            [("w", 50.), ("x", 1.), ("y", 1.)].map(|(pod, value)| (pod.into(), value))
         );
+        let rows = store.read((7, 1), &p, 302_000).unwrap();
+        assert!(rows
+            .iter()
+            .all(|(labels, _)| labels["__name__"] == "a" && labels.contains_key("job")));
     }
+
     /// Cold state, gaps, old generations and historical timestamps cannot masquerade as complete populations.
     #[test]
     fn coverage_expiration_generation_and_capacity_fail_closed() {
@@ -770,59 +602,32 @@ mod tests {
         let plan = plan(&p);
         let mut store = CurrentSeriesStore::default();
         store.ingest(&plan, &[sample("x", "api", 0, Some(1.))]);
-        assert!(store
-            .read((7, 1), &p, &SeriesReadout::Quantile { q: 0.5 }, 0)
-            .is_err());
+        assert!(store.read((7, 1), &p, 0).is_err());
         warm(&mut store, &plan);
-        assert!(store
-            .read((7, 2), &p, &SeriesReadout::Quantile { q: 0.5 }, 300_000)
-            .is_err());
-        assert!(store
-            .read((7, 1), &p, &SeriesReadout::Quantile { q: 0.5 }, 299_000)
-            .is_err());
+        assert!(store.read((7, 2), &p, 300_000).is_err());
+        assert!(store.read((7, 1), &p, 299_000).is_err());
         for t in (360_000..=600_000).step_by(60_000) {
             store.ingest(&plan, &[sample("y", "api", t, Some(9.))]);
         }
-        assert_eq!(
-            store
-                .read((7, 1), &p, &SeriesReadout::Quantile { q: 0.5 }, 600_000)
-                .unwrap()
-                .len(),
-            1
-        ); // Prometheus 3.5 lookback is left-open
-        assert_eq!(
-            store
-                .read((7, 1), &p, &SeriesReadout::Quantile { q: 0.5 }, 600_001)
-                .unwrap()
-                .len(),
-            1
-        );
-        assert!(store
-            .read((7, 1), &p, &SeriesReadout::Quantile { q: 0.5 }, 600_000)
-            .is_err());
+        assert_eq!(store.read((7, 1), &p, 600_000).unwrap().len(), 1); // Prometheus 3.5 lookback is left-open
+        assert_eq!(store.read((7, 1), &p, 600_001).unwrap().len(), 1);
+        assert!(store.read((7, 1), &p, 600_000).is_err());
         store.ingest(&plan, &[sample("y", "api", 900_000, Some(9.))]);
-        assert!(store
-            .read((7, 1), &p, &SeriesReadout::Quantile { q: 0.5 }, 900_000)
-            .is_err());
+        assert!(store.read((7, 1), &p, 900_000).is_err());
         let mut bounded = p.clone();
         bounded.max_series = 3;
         let plan = super::tests::plan(&bounded);
         let mut store = CurrentSeriesStore::default();
         warm(&mut store, &plan);
         assert!(store
-            .read(
-                (7, 1),
-                &bounded,
-                &SeriesReadout::Quantile { q: 0.5 },
-                300_000
-            )
+            .read((7, 1), &bounded, 300_000)
             .unwrap_err()
             .contains("budget"));
     }
 
     // Prometheus 3.5 selectors exclude samples exactly at evaluation - lookback.
     #[test]
-    fn lookback_left_boundary_expires_members_for_all_shared_readouts() {
+    fn lookback_left_boundary_expires_members() {
         let p = definition();
         let plan = plan(&p);
         let mut store = CurrentSeriesStore::default();
@@ -830,22 +635,9 @@ mod tests {
         for t in (360_000..=600_000).step_by(60_000) {
             store.ingest(&plan, &[sample("y", "api", t, Some(9.))]);
         }
-        for (readout, expected) in [
-            (SeriesReadout::Count, 1.0),
-            (SeriesReadout::Sum, 9.0),
-            (SeriesReadout::Average, 9.0),
-            (SeriesReadout::Quantile { q: 0.5 }, 9.0),
-        ] {
-            let rows = store.read((7, 1), &p, &readout, 600_000).unwrap();
-            assert_eq!(
-                rows,
-                vec![(BTreeMap::from([("job".into(), "api".into())]), expected)]
-            );
-        }
-        let rows = store
-            .read((7, 1), &p, &SeriesReadout::TopK { k: 3 }, 600_000)
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0["pod"], "y");
+        assert_eq!(
+            members(store.read((7, 1), &p, 600_000).unwrap()),
+            vec![("y".to_string(), 9.)]
+        );
     }
 }
