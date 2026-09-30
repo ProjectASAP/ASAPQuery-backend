@@ -6,10 +6,21 @@ The shared physical operator library lives in ASAPPlanner, alongside post-ASAP
 IR and physical lowering. Its canonical architecture and acceptance contract are
 in [the Planner design](https://github.com/ProjectASAP/ASAPPlanner/blob/feat/shared-physical-operators/docs/design_docs/physical-planning-and-deployment.md).
 
-ASAPQuery-backend depends on `asap-physical-operators`, `asap_sketch_codec` and
-Planner IR at the same immutable revision. It does not own a second copy of the
-runtime or mathematical kernels. A new IR operation and its implementation can
-be changed and tested together in Planner.
+ASAPQuery-backend depends on `asap-physical-operators` and Planner IR at the
+same immutable revision. It does not own a second copy of the runtime or of the
+in-memory physical kernels. A new IR operation and its implementation can be
+changed and tested together in Planner.
+
+Planner does not own storage formats. The backend owns them:
+
+- `crates/asap_summary_state`: the summary kernels that ingest and the sketch
+  store keep, their stored byte encodings, delta reconstruction, native batch
+  frames, and conversion to Planner physical states where stored state enters
+  or leaves a physical DAG.
+- `crates/asap_sketch_codec`: the sketchlib `SketchEnvelope` codec.
+- `asap_types::physical_plan_codec`: the versioned envelope of persisted
+  physical plans and candidates.
+- `asap_types::semantic_fragment`: the stored-definition semantic identity.
 
 The query and precompute integration PRs both use the independent ASAP DAG runtime. Deployment code binds input
 sources, storage, ingestion windows, publication and protocol outputs. Execution
