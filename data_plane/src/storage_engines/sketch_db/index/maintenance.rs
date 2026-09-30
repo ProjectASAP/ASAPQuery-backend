@@ -751,7 +751,9 @@ impl SketchStore {
                     encoding_to_tag(SketchEncoding::NativeBatchV1)
                 } else {
                     match binding.metadata.agg_kind {
-                        AggKind::Sketch { .. } => encoding_to_tag(SketchEncoding::MsgpackFull),
+                        AggKind::Sketch { .. } => {
+                            encoding_to_tag(SketchEncoding::full_frame_for(state))
+                        }
                         AggKind::ExactAgg { .. } => 0,
                     }
                 },

@@ -23,6 +23,11 @@ pub fn sketch_query_value(rs: &SummaryState, query: &SketchQuery) -> Result<f64,
             .query_statistic(statistic, &None, &Default::default())
             .map_err(|_| Error::Unsupported("UnivMon readout failed"));
     }
+    if matches!(rs, SummaryState::WeightedFrequency(_)) {
+        return Err(Error::Unsupported(
+            "Planner weighted-frequency heaps support TopK readout only",
+        ));
+    }
     match query {
         SketchQuery::FrequencyL2 | SketchQuery::FrequencyEntropy => Err(Error::Unsupported(
             "frequency moment readout requires UnivMon",

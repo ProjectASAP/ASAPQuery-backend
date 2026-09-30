@@ -156,13 +156,6 @@ impl PhysicalQueryRuntime<'_> {
         context: &dag::RunContext,
     ) -> Result<PhysicalQueryOutput, PhysicalNodeError> {
         match node {
-            QueryPlanNode::Scalar { .. }
-            | QueryPlanNode::Binary { .. }
-            | QueryPlanNode::ReduceSum { .. } => {
-                Err(PhysicalNodeError::Physical(dag::Error::Invalid(
-                    "installed value computation requires a retained Planner physical graph".into(),
-                )))
-            }
             QueryPlanNode::PhysicalFragment {
                 dag,
                 row_input: None,
@@ -960,40 +953,6 @@ mod tests {
                 .unwrap(),
             row_input: None,
             pruning: None,
-        }
-    }
-
-    // Old computation nodes must fail explicitly rather than construct operators during a request.
-    #[test]
-    fn uncompiled_value_nodes_are_rejected() {
-        let store = SketchStore::new();
-        let runtime = PhysicalQueryRuntime {
-            counter_parameters: Default::default(),
-            language: asap_types::query_plan::QueryLanguage::PromQl,
-            catalog: None,
-            context: QueryExecutionContext {
-                index: &store,
-                t0_ms: 0,
-                t1_ms: 2000,
-                is_cumulative: true,
-                allowed_materializations: None,
-            },
-        };
-        for node in [
-            QueryPlanNode::Scalar { value: 1. },
-            QueryPlanNode::Binary {
-                inputs: [QueryNodeId(0), QueryNodeId(0)],
-                operator: ArithmeticOpKind::Add,
-            },
-            QueryPlanNode::ReduceSum {
-                input: QueryNodeId(0),
-                grouping: PhysicalGrouping::Reduce(vec![]),
-            },
-        ] {
-            assert!(
-                matches!(runtime.execute_node(QueryNodeId(1), &node, &[], &test_value_context()),
-                Err(PhysicalNodeError::Physical(dag::Error::Invalid(message))) if message.contains("retained Planner physical graph"))
-            );
         }
     }
 
@@ -1949,7 +1908,8 @@ mod tests {
         ))
         .unwrap();
         let entry = &mut snapshot["query_workload"]["repeating_queries"][0];
-        entry["query"] = serde_json::json!("sum_over_time(a[1m]) / sum_over_time(a[10m])");
+        entry["query"] =
+            serde_json::json!("sum(sum_over_time(a[1m])) / sum(sum_over_time(a[10m]))");
         entry["requirements"]["accuracy"]["explicit"] = serde_json::json!("Exact");
         entry["demand"]["fixed_interval_at"]["interval"] = serde_json::json!(60_000);
         let snapshot: BackendLocalPlanningInput = serde_json::from_value(snapshot).unwrap();

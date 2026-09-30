@@ -215,6 +215,10 @@ pub fn manifest(
                 .iter()
                 .find(|m| m.policy_fingerprint() == stored_output.fingerprint())
                 .ok_or_else(|| invalid("native maintenance config is absent"))?;
+            // Raw ingest programs are priced by their stored state components.
+            if config.derived_input.is_none() {
+                continue;
+            }
             add(
                 format!("maintenance:{}", stored_output.0),
                 json!({"physical_program":program,"stored_output":stored_output,"window_ms":config.stored_window_ms(),"interval_ms":config.slide_interval.saturating_mul(1000)}),
@@ -1356,7 +1360,7 @@ mod tests {
                 .store_per_byte_second = store;
             let q = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
             q.query = planner_types::workload::Query(
-                "max_over_time(a[1m]) + max_over_time(b[1m])".into(),
+                "sum(max_over_time(a[1m])) + sum(max_over_time(b[1m]))".into(),
             );
             q.requirements.accuracy = planner_types::workload::AccuracyRequirement::Explicit(
                 crate::types::AccuracyTarget::Exact,

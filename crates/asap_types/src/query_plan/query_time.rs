@@ -1,4 +1,5 @@
-//! Typed installed query-time operators; no Planner selection or AST lowering.
+//! Installed query-time leaves: raw selectors, exact subtrees and
+//! current-series readouts. Computation over them is Planner-compiled.
 use super::QueryPlanError;
 use promql_parser::parser::{self, Expr};
 use serde::{Deserialize, Serialize};
@@ -15,48 +16,14 @@ pub enum QueryTimeOperator {
         readout: super::current_series::SeriesReadout,
     },
     /// A maximal exact scalar/vector subtree evaluated by Prometheus.
-    ExactSubquery {
-        query: String,
-    },
+    ExactSubquery { query: String },
     /// Prometheus exact subtree whose selectors are restricted at runtime by
     /// the candidate vector produced by its single input.
-    CandidateExactSubquery {
-        query: String,
-        item_label: String,
-    },
+    CandidateExactSubquery { query: String, item_label: String },
     Scan {
         metric: Option<String>,
         matchers: Vec<LabelMatcher>,
         range_ms: Option<u64>,
-        offset_ms: i64,
-    },
-    UnaryNegate,
-    VectorToScalar,
-    Aggregate {
-        operation: Aggregation,
-        grouping: Grouping,
-    },
-    /// Select an ordered slice independently within each group.
-    Limit {
-        n: u64,
-        offset: u64,
-        grouping: Grouping,
-    },
-    Binary {
-        operation: BinaryOperation,
-        return_bool: bool,
-    },
-    Temporal {
-        operation: TemporalOperation,
-    },
-    Sort {
-        descending: bool,
-        grouping: Grouping,
-    },
-    HistogramQuantile,
-    Subquery {
-        range_ms: u64,
-        step_ms: u64,
         offset_ms: i64,
     },
 }
@@ -82,47 +49,6 @@ pub enum LabelMatch {
     Regex,
     NotRegex,
 }
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Aggregation {
-    Sum,
-    Max,
-    Min,
-    Avg,
-    Count,
-}
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum BinaryOperation {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    /// Division with the Planner relative-value certificate domain checks.
-    CheckedDiv,
-    /// Division for conditional exact rewrites: finite inputs and finite output.
-    FiniteDiv,
-    Mod,
-    Pow,
-    Equal,
-    NotEqual,
-    Less,
-    LessEqual,
-    Greater,
-    GreaterEqual,
-}
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TemporalOperation {
-    Rate,
-    Increase,
-    Avg,
-    Max,
-    Min,
-    Sum,
-    Count,
-}
-
 impl QueryTimeOperator {
     pub fn validate(&self, inputs: usize) -> Result<(), QueryPlanError> {
         if let Self::CurrentSeries {
@@ -148,8 +74,6 @@ impl QueryTimeOperator {
         let expected = match self {
             Self::Scan { .. } | Self::ExactSubquery { .. } | Self::CurrentSeries { .. } => 0,
             Self::CandidateExactSubquery { .. } => 1,
-            Self::Binary { .. } | Self::HistogramQuantile => 2,
-            _ => 1,
         };
         if inputs != expected {
             return Err(invalid("logical operator input arity mismatch"));
@@ -169,14 +93,6 @@ impl QueryTimeOperator {
                 return Err(invalid(
                     "exact subtree boundary must return scalar or instant vector",
                 ));
-            }
-        }
-        if let Self::Subquery {
-            range_ms, step_ms, ..
-        } = self
-        {
-            if *range_ms == 0 || *step_ms == 0 || range_ms / step_ms > 100_000 {
-                return Err(invalid("invalid or excessive subquery grid"));
             }
         }
         Ok(())

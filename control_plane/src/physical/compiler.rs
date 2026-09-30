@@ -1309,6 +1309,33 @@ fn preserve_invalid_exact_fallback_roots(
     Ok(())
 }
 
+/// Planner compiles query-time computation over stored readouts. A selected
+/// root whose computation it cannot compile keeps no summary state; the
+/// external exact engine evaluates the original query.
+fn preserve_uncompiled_computation_roots(
+    queries: &mut [QueryCompilationInput],
+    canonical_roots: &[Rc<QueryExpr>],
+) -> Result<(), CompileError> {
+    for (index, query) in queries.iter_mut().enumerate() {
+        let root = &query.selected_plan_root;
+        if super::maintained_population::supported_node(root)
+            || !crate::query_plan::is_query_computation(root)
+            || crate::query_plan::compile_query_computation(root).is_ok()
+        {
+            continue;
+        }
+        let parsed = original_root(query, index, canonical_roots)?;
+        query.selected_plan_root =
+            crate::planner_selection::keep_pre_asap(&parsed).map_err(|error| {
+                CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason: error.to_string(),
+                }
+            })?;
+    }
+    Ok(())
+}
+
 /// A MetricsQL query whose only selected states are Prometheus-specific
 /// counter readouts has no backend materialization to bind. Keep the original
 /// query as one native exact root. Mixed queries retain their other selected
@@ -1445,6 +1472,7 @@ impl DeploymentPlanCompiler {
             &request.canonical_roots,
             request.allow_mixed_summary_and_exact_execution,
         )?;
+        preserve_uncompiled_computation_roots(&mut request.queries, &request.canonical_roots)?;
 
         if environment.target == PhysicalDeploymentTarget::BackendLocalRemoteWrite
             && !request.allow_mixed_summary_and_exact_execution
@@ -1539,13 +1567,9 @@ impl DeploymentPlanCompiler {
                                 planner_types::post_asap::ExactKind::Max,
                                 _
                             )
-                        ) || crate::query_plan::query_time::selected_range_max_materialization(
-                            &query.query_string,
+                        ) || crate::query_plan::query_time::is_range_max_materialization(
                             &state.node,
-                        )
-                        .ok()
-                        .flatten()
-                        .is_some())
+                        ))
                         // An Ephemeral state is rebuilt at query time, not maintained.
                         && !placement.is_ephemeral(query_index, &state.node)
                 })
@@ -2180,23 +2204,10 @@ impl DeploymentPlanCompiler {
                 full_history: false,
                 cumulative_readout: true,
             };
-            // A whole-query native fallback need not be expressible in the local
-            // query-time algebra (for example an ERP-rejected entropy readout).
-            // Retain its native boundary without discarding other workload roots.
-            let native_root = request.allow_mixed_summary_and_exact_execution
-                && if let SummaryExpr::KeepPreAsap(expr) = &query.selected_plan_root.expr {
-                    let original = original_root(query, query_index, &request.canonical_roots)?;
-                    expr.as_ref() == &original
-                        && crate::query_plan::query_time::compile_logical(
-                            query.query_id.clone(),
-                            canonical.clone(),
-                            instant,
-                            FallbackPolicy::ExactBackend,
-                        )
-                        .is_err()
-                } else {
-                    false
-                };
+            // A query Planner keeps pre-ASAP has no stored input; Prometheus
+            // evaluates it whole.
+            let exact_root = request.allow_mixed_summary_and_exact_execution
+                && matches!(query.selected_plan_root.expr, SummaryExpr::KeepPreAsap(_));
             let native_rate = if population_operators[query_index].is_none()
                 && placement.raw_program(query_index).is_none()
             {
@@ -2233,7 +2244,12 @@ impl DeploymentPlanCompiler {
                 None
             };
             let mut entry = if let Some(raw) = placement.raw_program(query_index) {
-                Ok(raw_query_time_entry(query, canonical.clone(), raw)?)
+                Ok(raw_query_time_entry(
+                    query,
+                    canonical.clone(),
+                    &original_root(query, query_index, &request.canonical_roots)?,
+                    raw,
+                )?)
             } else if let Some((source, program)) = native_rate {
                 let native_state_binding = if let SummaryExpr::SummaryAgg {
                     family:
@@ -2272,7 +2288,7 @@ impl DeploymentPlanCompiler {
                         fallback: FallbackPolicy::ExactBackend,
                     }
                 } else {
-                    crate::query_plan::compile_bound_composable_mapped(
+                    crate::query_plan::compile_bound_mapped(
                         query.query_id.clone(),
                         canonical.clone(),
                         &source,
@@ -2309,6 +2325,9 @@ impl DeploymentPlanCompiler {
                         max_bytes: request
                             .retained_summary_memory_budget_bytes
                             .unwrap_or(64 * 1024 * 1024),
+                        drop_metric_name: !crate::query_plan::result_keeps_metric_name(
+                            &original_root(query, query_index, &request.canonical_roots)?,
+                        ),
                     },
                 );
                 entry.root = root;
@@ -2380,25 +2399,10 @@ impl DeploymentPlanCompiler {
                     instant,
                     fallback: FallbackPolicy::ExactBackend,
                 })
-            } else if request.allow_mixed_summary_and_exact_execution && !native_root {
-                crate::query_plan::compile_bound_composable_mapped(
-                    query.query_id.clone(),
-                    canonical.clone(),
-                    &query.selected_plan_root,
-                    instant,
-                    FallbackPolicy::ExactBackend,
-                    binding,
-                    |node, query_node| {
-                        if let Some(post_asap_node) = executable_dags[query_index]
-                            .as_ref()
-                            .and_then(|compiled| compiled.node_ids.node_id(node))
-                        {
-                            query_node_bindings.insert((query_index, post_asap_node), query_node);
-                        }
-                    },
-                )
+            } else if exact_root {
+                Ok(exact_query_entry(query, canonical.clone(), instant))
             } else {
-                crate::query_plan::compile_bound_mapped(
+                match crate::query_plan::compile_bound_mapped(
                     query.query_id.clone(),
                     canonical.clone(),
                     &query.selected_plan_root,
@@ -2413,16 +2417,22 @@ impl DeploymentPlanCompiler {
                             query_node_bindings.insert((query_index, post_asap_node), query_node);
                         }
                     },
-                )
+                ) {
+                    // A readout with no maintained state leaves no local plan;
+                    // the query is forwarded whole. A query that did compile
+                    // state must not maintain it unread, so it fails instead.
+                    Err(crate::query_plan::QueryPlanError::UnsupportedNode(_))
+                        if executable_dags[query_index].is_none() =>
+                    {
+                        query_node_bindings.retain(|(index, _), _| *index != query_index);
+                        Ok(exact_query_entry(query, canonical.clone(), instant))
+                    }
+                    other => other.map_err(|error| CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason: error.to_string(),
+                    }),
+                }
             }?;
-            if request.allow_mixed_summary_and_exact_execution
-                && placement.raw_program(query_index).is_none()
-            {
-                // Any Planner-selected leaf without a physical summary binding
-                // is an exact subtree boundary. Deployed plans never retain a
-                // backend-local range index leaf.
-                crate::query_plan::query_time::finalize_query_time_nodes(&mut entry)?;
-            }
             if frontend == QueryFrontend::MetricsQl {
                 entry.language = crate::query_plan::QueryLanguage::MetricsQl;
             }
@@ -2433,14 +2443,6 @@ impl DeploymentPlanCompiler {
                     .as_ref()
                     .map(|candidate| &candidate.query),
             )?;
-            let linked = crate::query_plan::physical_values::compile(&mut entry)?;
-            for ((index, _), node) in &mut query_node_bindings {
-                if *index == query_index {
-                    if let Some(root) = linked.get(node) {
-                        *node = *root;
-                    }
-                }
-            }
             let catalog_key = QueryPlan::catalog_key(entry.language, &canonical);
             if query_entries.insert(catalog_key, entry).is_some() {
                 return Err(CompileError::Query {
@@ -2717,9 +2719,35 @@ impl DeploymentPlanCompiler {
 
 /// Native query-time execution of a query that keeps no state: each raw input
 /// of the retained program is read by its range-selector `Scan`.
+/// The whole query forwarded unchanged to the external exact engine.
+fn exact_query_entry(
+    query: &QueryCompilationInput,
+    canonical: String,
+    instant: InstantExecution,
+) -> QueryPlanEntry {
+    let root = crate::query_plan::QueryNodeId(0);
+    QueryPlanEntry {
+        physical_dag: None,
+        language: crate::query_plan::QueryLanguage::PromQl,
+        query_id: query.query_id.clone(),
+        canonical_query: canonical,
+        fixed_evaluation: None,
+        root,
+        nodes: BTreeMap::from([(
+            root,
+            crate::query_plan::QueryPlanNode::ExactFallback {
+                reason: "no stored input covers this query".into(),
+            },
+        )]),
+        instant,
+        fallback: FallbackPolicy::ExactBackend,
+    }
+}
+
 fn raw_query_time_entry(
     query: &QueryCompilationInput,
     canonical: String,
+    root_expr: &QueryExpr,
     raw: &placement::RawQueryTimeProgram,
 ) -> Result<QueryPlanEntry, CompileError> {
     let mut nodes = BTreeMap::new();
@@ -2744,6 +2772,7 @@ fn raw_query_time_entry(
             inputs,
             source_nodes,
             max_bytes: 64 * 1024 * 1024,
+            drop_metric_name: !crate::query_plan::result_keeps_metric_name(root_expr),
         },
     );
     let entry = QueryPlanEntry {
@@ -4458,17 +4487,14 @@ fn collect_selected_materializations(
                     grouping.clone(),
                     selected,
                 )?;
-                // Explicit external authoritative values do not need duplicate local state.
-                if !composable {
-                    walk(
-                        values,
-                        readout,
-                        composable,
-                        native_maintenance,
-                        grouping.clone(),
-                        selected,
-                    )?;
-                }
+                walk(
+                    values,
+                    readout,
+                    composable,
+                    native_maintenance,
+                    grouping.clone(),
+                    selected,
+                )?;
             }
             SummaryExpr::ValueOperation { child, .. } => {
                 walk(
@@ -4919,30 +4945,6 @@ pub(crate) mod tests {
         assert!(error.to_string().contains("row-update executor"), "{error}");
     }
 
-    // Compiler preserves the Planner's conditional-average execution guard.
-    #[test]
-    fn temporal_average_lowers_with_finite_division_guard() {
-        let mut environment = environment(10_000);
-        environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
-        environment.target_collector_ids.clear();
-        let request = request("average", "avg_over_time(a[1m])");
-        let plan = DeploymentPlanCompiler
-            .compile_promql(request, environment)
-            .unwrap();
-        assert!(plan
-            .query_plan
-            .entries
-            .values()
-            .flat_map(|entry| entry.nodes.values())
-            .flat_map(
-                |node| crate::query_plan::physical_values::operator_parameters(
-                    node,
-                    "VectorBinary"
-                )
-            )
-            .any(|parameters| parameters["operator"]["checked_finite_division"] == true));
-    }
-
     // The Planner's minimum state lowers without reconstructing direction from text.
     #[test]
     fn minimum_retains_its_typed_direction() {
@@ -5012,7 +5014,7 @@ pub(crate) mod tests {
     fn complete_cost_selection_preserves_shared_sum_panes() {
         let mut snapshot = planning_snapshot();
         let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
-        entry.query = Query("sum_over_time(a[1m]) / sum_over_time(a[10m])".into());
+        entry.query = Query("sum(sum_over_time(a[1m])) / sum(sum_over_time(a[10m]))".into());
         entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
         let plan = quoted_snapshot(snapshot, crate::physical::compiler::QueryFrontend::PromQl)
             .compile_promql()
@@ -5088,7 +5090,6 @@ pub(crate) mod tests {
     #[test]
     fn issue_701_702_temporal_workloads_have_warm_candidates() {
         for text in [
-            "avg_over_time(data[5m])",
             "min_over_time(data[5m])",
             "quantile_over_time(0.9,data[5m])",
         ] {
@@ -5125,6 +5126,52 @@ pub(crate) mod tests {
         }
     }
 
+    // Without mixed execution, a computation Planner can compile over readouts
+    // whose states the deployment does not select forwards whole instead of
+    // failing the deployment.
+    #[test]
+    fn unselected_states_under_compilable_computation_forward_whole() {
+        let query = "sum by (job) (rate(a[5m])) / sum by (job) (rate(b[5m]))";
+        let workload = request("ratio", query);
+        assert!(!workload.allow_mixed_summary_and_exact_execution);
+        let plan = DeploymentPlanCompiler
+            .compile_promql(workload, environment(10_000))
+            .unwrap();
+        let entry = plan.query_plan.lookup(query).unwrap();
+        assert!(matches!(
+            &entry.nodes[&entry.root],
+            crate::query_plan::QueryPlanNode::ExactFallback { .. }
+        ));
+        assert!(plan.precompute_plan.materializations.is_empty());
+    }
+
+    // avg_over_time divides two per-series readouts. Planner does not yet
+    // match per-series rows in a Binary, so no candidate keeps local state and
+    // the exact engine evaluates the query.
+    #[test]
+    fn per_series_average_has_no_warm_candidate_until_planner_matches_series() {
+        let mut snapshot = planning_snapshot();
+        let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+        entry.query = Query("avg_over_time(data[5m])".into());
+        entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+        let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
+        for candidate in
+            super::super::workload_cost::enumerate_exact_and_materialized_candidates(request)
+                .unwrap()
+        {
+            let Ok(plan) = DeploymentPlanCompiler.compile_promql(candidate, environment.clone())
+            else {
+                continue;
+            };
+            assert!(plan.precompute_plan.materializations.is_empty());
+            assert!(plan
+                .query_plan
+                .entries
+                .values()
+                .all(|entry| entry.materialization_bindings().is_empty()));
+        }
+    }
+
     // Quantile rank error does not certify relative error of a quotient.
     #[test]
     fn uncertified_quantile_ratios_retain_exact_execution() {
@@ -5141,13 +5188,13 @@ pub(crate) mod tests {
                 .unwrap();
             assert!(plan.precompute_plan.materializations.is_empty(), "{text}");
             assert!(
-                plan.query_plan
-                    .entries
-                    .values()
-                    .all(|entry| entry.nodes.values().any(|node| matches!(
-                        node,
-                        crate::query_plan::QueryPlanNode::ExactFallback { .. }
-                    ))),
+                plan.query_plan.entries.values().all(|entry| {
+                    entry.nodes.len() == 1
+                        && matches!(
+                            &entry.nodes[&entry.root],
+                            crate::query_plan::QueryPlanNode::ExactFallback { .. }
+                        )
+                }),
                 "{text}"
             );
         }
@@ -5443,9 +5490,10 @@ pub(crate) mod tests {
         assert!(plan.precompute_plan.materializations.is_empty());
     }
 
-    // Native exact values remain explicit; unsupported heaps publish no stored state.
+    // A ranking over an exact PromQL subtree has no stored input: Prometheus
+    // evaluates the whole query and the backend computes nothing.
     #[test]
-    fn hybrid_rate_topk_preserves_the_original_exact_subquery() {
+    fn hybrid_rate_topk_forwards_the_whole_exact_query() {
         let query = "topk(2, sum by (job) (rate(m[1m])))";
         let evidence = TopKMembershipEvidence {
             selected_lower_bound: 101.0,
@@ -5464,23 +5512,12 @@ pub(crate) mod tests {
             .compile_promql(request, environment)
             .unwrap();
         let entry = plan.query_plan.lookup(query).unwrap();
-        use crate::query_plan::{query_time::QueryTimeOperator, QueryPlanNode};
-        let limits = crate::query_plan::physical_values::operator_parameters(
+        use crate::query_plan::QueryPlanNode;
+        assert_eq!(entry.nodes.len(), 1);
+        assert!(matches!(
             &entry.nodes[&entry.root],
-            "Limit",
-        );
-        assert_eq!(limits.len(), 1);
-        assert_eq!(limits[0]["n"], 2);
-        assert_eq!(
-            entry
-                .nodes
-                .values()
-                .filter(|node| matches!(node, QueryPlanNode::Logical {
-            operator: QueryTimeOperator::ExactSubquery { query }, ..
-        } if query == "sum by (job) (rate(m[1m]))"))
-                .count(),
-            1
-        );
+            QueryPlanNode::ExactFallback { .. }
+        ));
         assert!(entry.materialization_bindings().is_empty());
         assert!(plan.precompute_plan.materializations.is_empty());
         let artifact = plan.to_publication_artifact().unwrap();
@@ -6167,19 +6204,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn metricsql_counter_gate_rejects_mixed_input_snapshots() {
-        let mut workload = request("mixed", "max_over_time(m[1m]) + rate(m[1m])");
+    fn metricsql_counter_gate_forwards_mixed_operands_whole() {
+        // A counter branch that MetricsQL cannot read from stored state leaves
+        // no local operand; the exact engine evaluates the original query.
+        let query = "max_over_time(m[1m]) + rate(m[1m])";
+        let mut workload = request("mixed", query);
         workload.allow_mixed_summary_and_exact_execution = true;
         let mut deployment = environment(10_000);
         deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         deployment.target_collector_ids.clear();
-        let Err(error) = DeploymentPlanCompiler.compile_metricsql(workload, deployment) else {
-            panic!("mixed local/external snapshots must fail deployment binding");
-        };
-        assert!(
-            error.to_string().contains("common snapshot proof"),
-            "{error}"
-        );
+        let plan = DeploymentPlanCompiler
+            .compile_metricsql(workload, deployment)
+            .unwrap();
+        let entry = plan.query_plan.entries.values().next().unwrap();
+        assert_eq!(entry.language, crate::query_plan::QueryLanguage::MetricsQl);
+        assert!(matches!(
+            &entry.nodes[&entry.root],
+            crate::query_plan::QueryPlanNode::ExactFallback { .. }
+        ));
+        assert_eq!(entry.canonical_query, query);
+        assert!(entry.materialization_bindings().is_empty());
+        assert!(plan.precompute_plan.materializations.is_empty());
     }
 
     #[test]
@@ -6787,18 +6832,13 @@ pub(crate) mod tests {
             );
             assert!(!entry.materialization_bindings().is_empty());
         }
+        // The grouped division is a Planner join over the two readouts.
         assert!(bundle
             .query_plan
             .entries
             .values()
             .flat_map(|entry| entry.nodes.values())
-            .any(
-                |node| !crate::query_plan::physical_values::operator_parameters(
-                    node,
-                    "VectorBinary"
-                )
-                .is_empty()
-            ));
+            .any(|node| !crate::query_plan::operator_parameters(node, "Join").is_empty()));
     }
 
     #[test]
@@ -7233,7 +7273,7 @@ pub(crate) mod tests {
         for interval in [10_000, 60_000] {
             for (rhs, expected_states) in [("a", 1), ("b", 2), ("a{job=\"x\"}", 2)] {
                 let mut snapshot = planning_snapshot();
-                let query = format!("sum_over_time(a[1m]) / sum_over_time({rhs}[10m])");
+                let query = format!("sum(sum_over_time(a[1m])) / sum(sum_over_time({rhs}[10m]))");
                 let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
                 entry.query = Query(query);
                 entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
@@ -7319,7 +7359,7 @@ pub(crate) mod tests {
     #[test]
     fn explicit_window_quotes_are_not_repriced_for_sharing() {
         let mut snapshot = planning_snapshot();
-        let query = "sum_over_time(a[1m]) / sum_over_time(a[10m])";
+        let query = "sum(sum_over_time(a[1m])) / sum(sum_over_time(a[10m]))";
         let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
         entry.query = Query(query.into());
         entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);

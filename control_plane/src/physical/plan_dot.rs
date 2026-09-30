@@ -71,7 +71,11 @@ pub fn render(plan: &CompiledPhysicalPlan) -> String {
             render_native(
                 &mut dot,
                 &format!("maintenance_{dag_index}_{}", sink.0),
-                "Planner maintenance operators",
+                if installed.reads_raw_samples(*sink) {
+                    "Planner raw precompute operators"
+                } else {
+                    "Planner maintenance operators"
+                },
                 program,
             );
         }
@@ -201,9 +205,6 @@ fn query_node_label(node: &QueryPlanNode) -> String {
         QueryPlanNode::Logical { operator, .. } => {
             format!("Logical\n{}", query_time_label(operator))
         }
-        QueryPlanNode::Scalar { value } => format!("Scalar\n{value}"),
-        QueryPlanNode::Binary { operator, .. } => format!("Binary\n{operator:?}"),
-        QueryPlanNode::ReduceSum { .. } => "ReduceSum".into(),
         QueryPlanNode::ReadMaterialization { binding } => format!(
             "ReadMaterialization\n{}\nwindow={}ms\nlookback={:?}",
             binding.materialization.fingerprint(),
@@ -224,15 +225,6 @@ fn query_time_label(operator: &QueryTimeOperator) -> &'static str {
         QueryTimeOperator::ExactSubquery { .. } => "ExactSubquery",
         QueryTimeOperator::CandidateExactSubquery { .. } => "CandidateExactSubquery",
         QueryTimeOperator::Scan { .. } => "Scan",
-        QueryTimeOperator::UnaryNegate => "UnaryNegate",
-        QueryTimeOperator::VectorToScalar => "VectorToScalar",
-        QueryTimeOperator::Aggregate { .. } => "Aggregate",
-        QueryTimeOperator::Limit { .. } => "Limit",
-        QueryTimeOperator::Binary { .. } => "Binary",
-        QueryTimeOperator::Temporal { .. } => "Temporal",
-        QueryTimeOperator::Sort { .. } => "Sort",
-        QueryTimeOperator::HistogramQuantile => "HistogramQuantile",
-        QueryTimeOperator::Subquery { .. } => "Subquery",
     }
 }
 

@@ -164,17 +164,6 @@ impl QueryPlan {
                 }
             }
             for node in entry.nodes.values() {
-                if matches!(
-                    node,
-                    QueryPlanNode::Scalar { .. }
-                        | QueryPlanNode::Binary { .. }
-                        | QueryPlanNode::ReduceSum { .. }
-                ) {
-                    return Err(QueryPlanError::Invalid(
-                        "installed value computation requires a retained Planner physical graph"
-                            .into(),
-                    ));
-                }
                 let QueryPlanNode::ExactReadout { input, readout } = node else {
                     continue;
                 };
@@ -651,9 +640,6 @@ impl QueryPlanEntry {
             if let QueryPlanNode::Logical { operator, inputs } = node {
                 operator.validate(inputs.len())?;
             }
-            if matches!(node, QueryPlanNode::Scalar { value } if !value.is_finite()) {
-                return Err(QueryPlanError::Invalid("non-finite scalar constant".into()));
-            }
             if let QueryPlanNode::ExternalExact { request, inputs } = node {
                 if request.expression.trim().is_empty() {
                     return Err(QueryPlanError::Invalid(
@@ -836,6 +822,10 @@ pub enum QueryPlanNode {
         inputs: Vec<QueryNodeId>,
         source_nodes: Vec<u64>,
         max_bytes: u64,
+        /// PromQL removes `__name__` from the series identity of this result;
+        /// Planner keeps it in the identity it computes.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        drop_metric_name: bool,
     },
     /// Complete Planner-compiled relation computation; inputs follow its typed slots.
     PhysicalRelation {
@@ -853,17 +843,6 @@ pub enum QueryPlanNode {
     Logical {
         operator: query_time::QueryTimeOperator,
         inputs: Vec<QueryNodeId>,
-    },
-    Scalar {
-        value: f64,
-    },
-    Binary {
-        inputs: [QueryNodeId; 2],
-        operator: planner_types::pre_asap::ArithmeticOpKind,
-    },
-    ReduceSum {
-        input: QueryNodeId,
-        grouping: PhysicalGrouping,
     },
     ReadMaterialization {
         binding: MaterializationBinding,
@@ -893,13 +872,10 @@ pub enum QueryPlanNode {
 impl QueryPlanNode {
     pub fn inputs(&self) -> &[QueryNodeId] {
         match self {
-            Self::Scalar { .. } | Self::ReadMaterialization { .. } | Self::ExactFallback { .. } => {
-                &[]
+            Self::ReadMaterialization { .. } | Self::ExactFallback { .. } => &[],
+            Self::SummaryEstimate { input, .. } | Self::ExactReadout { input, .. } => {
+                std::slice::from_ref(input)
             }
-            Self::Binary { inputs, .. } => inputs,
-            Self::ReduceSum { input, .. }
-            | Self::SummaryEstimate { input, .. }
-            | Self::ExactReadout { input, .. } => std::slice::from_ref(input),
             Self::Physical { inputs, .. }
             | Self::PhysicalRelation { inputs, .. }
             | Self::PhysicalFragment { inputs, .. }
@@ -1014,52 +990,29 @@ mod contract_tests {
 
 #[cfg(test)]
 mod retired_plan_tests {
-    // Recovery cannot reactivate the removed request-time scalar compiler.
+    // Recovery cannot reactivate the removed backend value operators.
     #[test]
-    fn catalog_rejects_uncompiled_value_computation() {
-        use super::*;
-        let catalog =
-            crate::summary_catalog::SummaryCatalog::from_materializations(1, 1, &[]).unwrap();
-        let entry = QueryPlanEntry {
-            physical_dag: None,
-            language: QueryLanguage::PromQl,
-            query_id: "scalar".into(),
-            canonical_query: "1".into(),
-            fixed_evaluation: None,
-            root: QueryNodeId(0),
-            nodes: BTreeMap::from([(QueryNodeId(0), QueryPlanNode::Scalar { value: 1. })]),
-            instant: InstantExecution {
-                lookback_ms: 0,
-                full_history: false,
-                cumulative_readout: false,
-            },
-            fallback: FallbackPolicy::Reject,
-        };
-        let mut plan = QueryPlan {
-            plan_id: 1,
-            plan_version: 1,
-            clickhouse_context: None,
-            selected_dags: BTreeMap::new(),
-            entries: BTreeMap::from([("1".into(), entry)]),
-        };
-        assert!(plan
-            .validate_against_catalog(&catalog)
-            .unwrap_err()
-            .to_string()
-            .contains("retained Planner physical graph"));
-        plan.entries.get_mut("1").unwrap().nodes.insert(
-            QueryNodeId(0),
-            QueryPlanNode::PhysicalFragment {
-                inputs: vec![],
-                dag: asap_physical_operators::physical_planner::promql_values::compile_scalar(1.)
-                    .unwrap()
-                    .encode()
-                    .unwrap(),
-                row_input: None,
-                pruning: None,
-            },
-        );
-        plan.validate_against_catalog(&catalog).unwrap();
+    fn retired_value_operators_are_not_accepted() {
+        for kind in ["scalar", "binary", "reduce_sum"] {
+            let error =
+                serde_json::from_value::<super::QueryPlanNode>(serde_json::json!({"op":kind}))
+                    .unwrap_err();
+            assert!(error.to_string().contains("unknown variant"), "{error}");
+        }
+        for kind in [
+            "binary",
+            "aggregate",
+            "temporal",
+            "subquery",
+            "sort",
+            "limit",
+        ] {
+            let error = serde_json::from_value::<super::query_time::QueryTimeOperator>(
+                serde_json::json!({"kind":kind}),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("unknown variant"), "{error}");
+        }
     }
 
     // Row-preserving operators cannot opt out of the original vector identity.

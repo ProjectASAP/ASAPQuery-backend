@@ -290,7 +290,12 @@ impl WindowProcessor for BackfillWindowProcessor {
         for (sid, bucket) in by_bucket {
             let SidBucket { group_key, samples } = bucket;
             let accumulator = if let Some(program) = &program {
-                super::window_builder::build_dag_accumulator(program, &samples)?
+                let Some(accumulator) =
+                    super::window_builder::build_dag_accumulator(program, &samples, window_range)?
+                else {
+                    continue;
+                };
+                accumulator
             } else {
                 #[cfg(test)]
                 {

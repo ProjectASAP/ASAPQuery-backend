@@ -1,6 +1,15 @@
 //! Bind raw ingestion to a selected Planner producer and its raw dependency edge.
-use crate::storage_engines::types::KeyByLabelValues;
-use asap_summary_state::factory::{create_planner_accumulator, AccumulatorUpdater};
+//! The backend supplies one typed sample batch per pane; the Planner-compiled
+//! precompute graph owns every update, grouping and item computation.
+use crate::storage_engines::types::AggregateCore;
+use asap_physical_operators::{
+    operators::Operator,
+    physical_planner::{precompute, CompiledPhysicalDag, Source as PhysicalSource},
+    runtime::{Limits, RunContext, Scope},
+    values::{Batch, Value},
+};
+use asap_summary_state::factory::create_planner_accumulator;
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 use asap_types::{executable_plan::BackendNodeBinding, PrecomputeMaterialization};
 use planner_types::post_asap::{
     EdgeRole, GroupingStrategy, PostAsapNodeId, PostAsapOperatorPayload, SummaryFamilyType,
@@ -8,6 +17,10 @@ use planner_types::post_asap::{
 };
 use planner_types::pre_asap::{ColumnRef, QueryExpr, Source};
 use std::collections::HashMap;
+
+/// Planner execution errors keep their type (e.g. `MemoryLimit`); setup and
+/// binding failures are messages.
+pub type BuildError = Box<dyn std::error::Error + Send + Sync>;
 
 /// A validated executable projection; semantics come from the installed node.
 /// The retained node ID makes failures attributable to the selected DAG.
@@ -18,7 +31,10 @@ pub struct RawDagProgram {
     pub input: SummaryUpdate,
     pub grouping: GroupingStrategy,
     pub reduction: planner_types::pre_asap::Reduction,
-    projected_column: Option<String>,
+    /// Planner's encoded precompute graph from the raw sample boundary to this
+    /// output; decoded graphs are not `Send` (see `decoded`).
+    program: std::sync::Arc<[u8]>,
+    source: u64,
 }
 
 impl RawDagProgram {
@@ -164,18 +180,43 @@ impl RawDagProgram {
                 if !update_matches {
                     return Err("DAG update differs from stored summary identity".into());
                 }
+                let compiled = installed
+                    .native_program(node.id)?
+                    .ok_or("raw materialization lacks its Planner precompute graph")?;
+                let [(source, contract)] = compiled.input_contracts().collect::<Vec<_>>()[..]
+                else {
+                    return Err("raw precompute graph must read one raw sample input".into());
+                };
+                if contract.schema != precompute::raw_sample_schema()
+                    || source != u64::from(edge.producer.0)
+                {
+                    return Err("raw precompute graph does not read the bound raw source".into());
+                }
+                // Stored heap readout renders identity items as whole series
+                // keys; one that omits labels would not name its series.
+                fn partial_identity(expr: &SummaryInputExpr) -> bool {
+                    match expr {
+                        SummaryInputExpr::EntityIdentity(
+                            planner_types::post_asap::EntityIdentity::PromqlLabelSet { excluding },
+                        ) => !excluding.is_empty(),
+                        SummaryInputExpr::Tuple(items) => items.iter().any(partial_identity),
+                        _ => false,
+                    }
+                }
+                if input.item.as_ref().is_some_and(partial_identity) {
+                    return Err(
+                        "raw heap items that exclude identity labels are not readable".into(),
+                    );
+                }
                 let program = Self {
+                    source,
+                    program: compiled.encode().map_err(|e| e.to_string())?.into(),
                     node: node.id,
                     family: family.clone(),
                     input: input.clone(),
                     grouping: grouping.clone(),
                     reduction: reduction.clone(),
-                    projected_column: config
-                        .effective_value_projection()
-                        .column()
-                        .map(str::to_owned),
                 };
-                program.validate()?;
                 if let Some(old) = &selected {
                     if old.family != program.family
                         || old.input != program.input
@@ -195,97 +236,222 @@ impl RawDagProgram {
         selected.ok_or_else(|| "raw materialization has no selected post-ASAP DAG producer".into())
     }
 
-    pub fn updater(&self) -> Result<Box<dyn AccumulatorUpdater>, String> {
-        create_planner_accumulator(&self.family, &self.input, &self.grouping)
-    }
-
-    fn validate(&self) -> Result<(), String> {
-        match &self.input.weight {
-            SummaryInputExpr::Column(ColumnRef::SampleValue) | SummaryInputExpr::Constant(_) => {}
-            SummaryInputExpr::Column(
-                ColumnRef::Named(name) | ColumnRef::Qualified { name, .. },
-            ) if self.projected_column.as_ref() == Some(name) => {}
-            _ => return Err("raw DAG weight expression is unsupported".into()),
-        }
-        fn item(expr: &SummaryInputExpr) -> bool {
-            match expr {
-                SummaryInputExpr::Column(ColumnRef::Named(_) | ColumnRef::SampleValue) => true,
-                SummaryInputExpr::Tuple(items) => items.iter().all(item),
-                SummaryInputExpr::EntityIdentity(
-                    planner_types::post_asap::EntityIdentity::PromqlLabelSet { excluding },
-                ) => excluding.is_empty(),
-                _ => false,
-            }
-        }
-        if self.input.item.as_ref().is_some_and(|e| !item(e)) {
-            return Err("raw DAG item expression is unsupported".into());
-        }
-        self.updater().map(|_| ())
-    }
-
-    /// Validate admission with the same weight semantics used during execution,
-    /// without mutating an accumulator or accepting part of a request.
-    pub fn validate_sample(
+    /// Execute the Planner graph over one pane's samples as one typed batch.
+    /// Returns `None` when the graph admits no population from them.
+    pub fn build<'a>(
         &self,
-        updater: &dyn AccumulatorUpdater,
-        value: f64,
-    ) -> Result<f64, String> {
-        let weight = match &self.input.weight {
-            SummaryInputExpr::Constant(c) => *c,
-            // The worker retains one previous value per series across pane rotation.
-            SummaryInputExpr::Column(_) => value,
-            _ => return Err("unsupported raw weight expression".into()),
+        samples: impl IntoIterator<Item = (&'a str, i64, f64)>,
+        pane: (i64, i64),
+        max_bytes: usize,
+    ) -> Result<Option<Box<dyn AggregateCore>>, BuildError> {
+        let samples = pane_batch(samples);
+        // The router assigns one population per group, so one pane yields
+        // at most one state.
+        match self.execute(samples, pane, max_bytes)?.as_slice() {
+            [] => Ok(None),
+            [row] => match row.as_slice() {
+                [_, _, Value::Summary { state, .. }] => Ok(Some(
+                    asap_summary_state::physical::from_physical(state.as_ref())?,
+                )),
+                _ => Err("raw precompute output is not a population state".into()),
+            },
+            _ => Err("one routed group produced several populations".into()),
+        }
+    }
+
+    /// Check that the Planner graph admits every sample, without storing a result.
+    pub fn validate<'a>(
+        &self,
+        samples: impl IntoIterator<Item = (&'a str, i64, f64)>,
+        max_bytes: usize,
+    ) -> Result<(), BuildError> {
+        let samples = pane_batch(samples);
+        if samples.is_empty() {
+            return Ok(());
+        }
+        let bounds = samples
+            .iter()
+            .fold((i64::MAX, i64::MIN), |(lo, hi), (_, time, _)| {
+                (lo.min(*time), hi.max(time.saturating_add(1)))
+            });
+        self.execute(samples, bounds, max_bytes).map(|_| ())
+    }
+
+    /// The family's empty state, for a pane known to have no samples. Heaps
+    /// are Planner weighted-frequency states, as `build` produces.
+    pub fn empty_state(&self) -> Result<Box<dyn AggregateCore>, String> {
+        use asap_summary_state::summary_kernels::weighted_frequency::{
+            FrequencyAlgorithm, PhysicalWeightedFrequency, WeightedFrequency,
         };
-        let scalar_frequency = asap_types::accumulator_spec::is_unit_sample_frequency(&self.input)
-            && !updater.is_keyed();
-        let weight = if scalar_frequency { value } else { weight };
-        updater.validate_single_input(weight)?;
-        Ok(weight)
+        use planner_types::post_asap::SketchParams;
+        if let SummaryFamilyType::Sketch(kind, _) = &self.family {
+            let heap = match kind.params() {
+                SketchParams::CmsWithHeap {
+                    width,
+                    depth,
+                    heap_size,
+                } => Some((FrequencyAlgorithm::Cms, width, depth, heap_size)),
+                SketchParams::CountSketchWithHeap {
+                    width,
+                    depth,
+                    heap_size,
+                } => Some((FrequencyAlgorithm::CountSketch, width, depth, heap_size)),
+                _ => None,
+            };
+            if let Some((algorithm, width, depth, heap_size)) = heap {
+                let state = PhysicalWeightedFrequency::new(
+                    algorithm,
+                    *width as usize,
+                    *depth as usize,
+                    *heap_size as usize,
+                )
+                .map_err(|e| e.to_string())?;
+                return Ok(Box::new(WeightedFrequency(state)));
+            }
+        }
+        Ok(
+            create_planner_accumulator(&self.family, &self.input, &self.grouping)?
+                .take_accumulator(),
+        )
     }
 
-    pub fn apply(
+    fn execute<'a>(
         &self,
-        updater: &mut dyn AccumulatorUpdater,
-        series: &str,
-        value: f64,
-        timestamp: i64,
-    ) -> Result<(), String> {
-        let weight = self.validate_sample(updater, value)?;
-        if updater.is_keyed() {
-            let labels = super::worker::parse_labels_from_series_key(series);
-            fn eval(
-                expr: &SummaryInputExpr,
-                series: &str,
-                value: f64,
-                labels: &HashMap<&str, &str>,
-            ) -> Result<Vec<String>, String> {
-                Ok(match expr {
-                    SummaryInputExpr::EntityIdentity(_) => vec![series.to_owned()],
-                    SummaryInputExpr::Column(ColumnRef::SampleValue) => vec![value.to_string()],
-                    SummaryInputExpr::Column(ColumnRef::Named(name)) => vec![labels
-                        .get(name.as_str())
-                        .map(|s| super::worker::decode_label_value(s).into_owned())
-                        .ok_or_else(|| format!("missing DAG item column {name}"))?],
-                    SummaryInputExpr::Tuple(items) => items
-                        .iter()
-                        .map(|i| eval(i, series, value, labels))
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_iter()
-                        .flatten()
-                        .collect(),
-                    _ => return Err("unsupported raw item expression".into()),
-                })
+        samples: impl IntoIterator<Item = (&'a str, i64, f64)>,
+        pane: (i64, i64),
+        max_bytes: usize,
+    ) -> Result<Vec<Vec<Value>>, BuildError> {
+        use futures::StreamExt;
+        let schema = precompute::raw_sample_schema();
+        let rows = samples
+            .into_iter()
+            .map(|(series, time, value)| {
+                precompute::raw_sample_row(&series_labels(series), time, value)
+            })
+            .collect();
+        let batch = Batch::try_new(schema.clone(), rows).map_err(|e| e.to_string())?;
+        let sources = std::collections::BTreeMap::from([(
+            self.source,
+            Box::new(Operator::source(schema, vec![batch]).map_err(|e| e.to_string())?)
+                as PhysicalSource<'_>,
+        )]);
+        let program = decoded(&self.program)?;
+        let graph = program.instantiate(sources).map_err(|e| e.to_string())?;
+        let context = RunContext::new(
+            Scope::Ingestion {
+                window_start_ms: pane.0,
+                window_end_ms: pane.1,
+                revision: 0,
+            },
+            Limits {
+                max_bytes,
+                ..Limits::default()
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(futures::executor::block_on(async {
+            let mut stream = graph.execute(program.roots(), context)?.pop().ok_or(
+                asap_physical_operators::Error::Invalid("missing output".into()),
+            )?;
+            let mut rows = Vec::new();
+            while let Some(batch) = stream.next().await {
+                rows.extend(batch?.rows().iter().cloned());
             }
-            let item = self
-                .input
-                .item
-                .as_ref()
-                .ok_or("keyed DAG kernel requires an explicit item")?;
-            let key = KeyByLabelValues::new_with_labels(eval(item, series, value, &labels)?);
-            updater.update_keyed(&key, weight, timestamp);
-        } else {
-            updater.update_single(weight, timestamp);
+            Ok::<_, asap_physical_operators::Error>(rows)
+        })?)
+    }
+}
+
+/// The complete label set of a canonical series key, including `__name__`.
+pub(crate) fn series_labels(series: &str) -> std::collections::BTreeMap<String, String> {
+    let mut labels: std::collections::BTreeMap<_, _> =
+        super::worker::parse_labels_from_series_key(series)
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k.to_owned(),
+                    super::worker::decode_label_value(v).into_owned(),
+                )
+            })
+            .collect();
+    let metric = series.split('{').next().unwrap_or_default();
+    if !metric.is_empty() {
+        labels.insert("__name__".into(), metric.to_owned());
+    }
+    labels
+}
+
+/// A pane's samples as ingestion delivers them to Planner: in timestamp
+/// order (stable for equal times), with one sample per series and timestamp;
+/// a repeated `(series, timestamp)` is the same sample, so the first is kept.
+fn pane_batch<'a>(
+    samples: impl IntoIterator<Item = (&'a str, i64, f64)>,
+) -> Vec<(&'a str, i64, f64)> {
+    let mut samples = samples.into_iter().collect::<Vec<_>>();
+    samples.sort_by_key(|(_, time, _)| *time);
+    let mut seen = std::collections::HashSet::new();
+    samples.retain(|(series, time, _)| seen.insert((*series, *time)));
+    samples
+}
+
+/// Decoded graphs are not `Send`, so each thread decodes an installed graph
+/// once. Holding the encoded bytes keeps their address from being reused.
+fn decoded(encoded: &std::sync::Arc<[u8]>) -> Result<std::rc::Rc<CompiledPhysicalDag>, String> {
+    type Cache =
+        std::collections::HashMap<usize, (std::sync::Arc<[u8]>, std::rc::Rc<CompiledPhysicalDag>)>;
+    thread_local! {
+        static DECODED: std::cell::RefCell<Cache> = Default::default();
+    }
+    DECODED.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let key = encoded.as_ptr() as usize;
+        if let Some((_, program)) = cache.get(&key) {
+            return Ok(program.clone());
         }
-        Ok(())
+        if cache.len() >= 1024 {
+            cache.clear();
+        }
+        let program =
+            std::rc::Rc::new(CompiledPhysicalDag::decode(encoded).map_err(|e| e.to_string())?);
+        cache.insert(key, (encoded.clone(), program.clone()));
+        Ok(program)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A heap output's empty state is the Planner heap state that `build`
+    // produces, so it binds as a physical input and stores as a heap frame.
+    #[test]
+    fn heap_empty_state_is_a_planner_heap_frame() {
+        use planner_types::post_asap::{SketchAlgorithm, SketchKind, SketchParams};
+        let family = SummaryFamilyType::Sketch(
+            SketchKind::new(
+                SketchAlgorithm::CmsWithHeap,
+                SketchParams::CmsWithHeap {
+                    width: 64,
+                    depth: 3,
+                    heap_size: 8,
+                },
+            ),
+            GroupingStrategy::PerSubpopulationInstance,
+        );
+        let program = RawDagProgram {
+            node: PostAsapNodeId(1),
+            family,
+            input: SummaryUpdate::column(ColumnRef::SampleValue),
+            grouping: GroupingStrategy::PerSubpopulationInstance,
+            reduction: planner_types::pre_asap::Reduction::PerEntity,
+            program: std::sync::Arc::from(Vec::new()),
+            source: 0,
+        };
+        let empty = program.empty_state().unwrap();
+        assert!(asap_summary_state::physical::to_physical(empty.as_ref()).is_ok());
+        assert_eq!(
+            asap_summary_state::stored_state::SketchEncoding::full_frame_for(empty.as_ref()),
+            asap_summary_state::stored_state::SketchEncoding::WeightedFrequencyV1
+        );
     }
 }

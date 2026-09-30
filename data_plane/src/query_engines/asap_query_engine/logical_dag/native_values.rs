@@ -330,102 +330,9 @@ mod tests {
         Error,
     };
 
-    // An installed computation binds complete label maps; ranking and division are native.
-    #[test]
-    fn compiled_vector_composition_preserves_grouping_and_runs_independently() {
-        use super::super::{
-            execute_installed, PreparedLeaf, PreparedLeaves, Value as ProtocolValue,
-        };
-        use asap_types::query_plan::{
-            query_time::QueryTimeOperator, FallbackPolicy, InstantExecution, QueryPlanNode,
-        };
-        let query = "topk by (job) (1, sum without(instance) (left_metric) / sum without(instance) (right_metric))";
-        let mut entry = control_plane::query_plan::query_time::compile_logical(
-            "compiled-values".into(),
-            query.into(),
-            InstantExecution {
-                lookback_ms: 300_000,
-                full_history: false,
-                cumulative_readout: false,
-            },
-            FallbackPolicy::Reject,
-        )
-        .unwrap();
-        control_plane::query_plan::physical_values::compile(&mut entry).unwrap();
-        entry.validate(&Default::default()).unwrap();
-        assert!(entry.nodes.values().all(|node| matches!(
-            node,
-            QueryPlanNode::PhysicalFragment { .. }
-                | QueryPlanNode::Logical {
-                    operator: QueryTimeOperator::Scan { .. },
-                    ..
-                }
-        )));
-        for scale in [1., 2.] {
-            let mut leaves = PreparedLeaves::new();
-            for (id, node) in &entry.nodes {
-                if let QueryPlanNode::Logical {
-                    operator: QueryTimeOperator::Scan { metric, .. },
-                    ..
-                } = node
-                {
-                    let left = metric.as_deref() == Some("left_metric");
-                    let values = [
-                        ("api", "a", if left { 4. * scale } else { 2. }),
-                        ("api", "b", if left { 2. * scale } else { 1. }),
-                        ("worker", "c", if left { 8. * scale } else { 2. }),
-                    ];
-                    leaves.insert(
-                        (*id, 1000),
-                        PreparedLeaf {
-                            value: ProtocolValue::Vector(
-                                values
-                                    .into_iter()
-                                    .map(|(job, instance, value)| {
-                                        (
-                                            Labels::from([
-                                                ("__name__".into(), metric.clone().unwrap()),
-                                                ("job".into(), job.into()),
-                                                ("instance".into(), instance.into()),
-                                            ]),
-                                            value,
-                                        )
-                                    })
-                                    .collect(),
-                            ),
-                            remote: true,
-                            remote_evaluations: 1,
-                            remote_rpcs: 1,
-                        },
-                    );
-                }
-            }
-            let (result, _) = execute_installed(&entry, &leaves, 1000, |_, _| {
-                panic!("all inputs were bound")
-            })
-            .unwrap();
-            let crate::query_engines::query_result::QueryResult::Vector(result) = result else {
-                panic!("expected vector")
-            };
-            let actual = result
-                .values
-                .into_iter()
-                .map(|point| (point.labels.labels[0].clone(), point.value))
-                .collect::<std::collections::BTreeMap<_, _>>();
-            assert_eq!(
-                actual,
-                std::collections::BTreeMap::from([
-                    ("api".into(), 2. * scale),
-                    ("worker".into(), 4. * scale)
-                ])
-            );
-        }
-    }
-
     // An available label is bound by Backend; Planner evaluates its predicate.
     #[test]
     fn planner_filter_compiles_and_executes_bound_labels() {
-        use asap_types::query_plan::{FallbackPolicy, InstantExecution, QueryPlanNode};
         use planner_types::{
             post_asap::{
                 execution_data_state::lift_plain, ExecutionTiming, SummaryExpr, SummaryNode,
@@ -470,24 +377,24 @@ mod tests {
                 timing: ExecutionTiming::QueryTime,
             },
         });
-        let entry = control_plane::query_plan::compile_bound_mapped(
-            "filter".into(),
-            query.into(),
-            &root,
-            InstantExecution {
-                lookback_ms: 0,
-                full_history: false,
-                cumulative_readout: false,
-            },
-            FallbackPolicy::Reject,
-            |_, _| panic!("filter requires no materialization"),
-            |_, _| {},
+        // The pre-ASAP selector is the fragment's bound input, as an exact
+        // engine result would be.
+        let dag = planner_types::post_asap::compile_post_asap_dag(&root).unwrap();
+        let source = dag.nodes.iter().find(|node| node.id != dag.root).unwrap();
+        let program = asap_physical_operators::physical_planner::compile(
+            &dag,
+            [(
+                u64::from(source.id.0),
+                InputContract::bounded(std::sync::Arc::new(source.output_schema.clone())),
+            )]
+            .into(),
+            &[u64::from(dag.root.0)],
         )
         .unwrap();
-        let QueryPlanNode::PhysicalFragment { dag, row_input, .. } = &entry.nodes[&entry.root]
-        else {
-            panic!("filter was rejected: {:?}", entry.nodes)
-        };
+        let row_input = program
+            .row_source(program.roots()[0])
+            .and_then(|id| program.input_contracts().position(|(input, _)| input == id));
+        let dag = program.encode().unwrap();
         let values = vec![
             (
                 [
@@ -501,7 +408,7 @@ mod tests {
         ];
         let expected = values[0].clone();
         assert_eq!(
-            physical(dag, vec![values], *row_input, 42, context(1 << 20)).unwrap(),
+            physical(&dag, vec![values], row_input, 42, context(1 << 20)).unwrap(),
             vec![expected]
         );
     }
@@ -588,7 +495,7 @@ mod tests {
     #[test]
     fn selected_candidate_input_budget_is_a_terminal_error() {
         let plan = CompiledPhysicalDag::decode(&sorted()).unwrap();
-        let error = execute_batches(&plan, 1, 1, 42, |_, contract| {
+        let error = execute_batches(&plan, 1, 1, 42, false, |_, contract| {
             Ok(BoundInput::Rows(Batch::try_new(
                 contract.schema.clone(),
                 vec![vec![Value::Float64(1.)]],
@@ -768,6 +675,7 @@ where
         max_bytes,
         bindings.len(),
         at,
+        entry.drops_metric_name(),
         |input_id, contract| {
             let schema = &contract.schema;
             let values = super::vector(super::from_result(callback(bindings[&input_id], at)?)?)?;
@@ -810,59 +718,67 @@ pub(in crate::query_engines::asap_query_engine) fn execute_stored(
     let program = entry
         .recover_vector_physical_dag()
         .map_err(|e| miss(e.to_string()))?;
-    execute_batches(&program, max_bytes, inputs.len(), at, |id, contract| {
-        let schema = &contract.schema;
-        let index = sources
-            .iter()
-            .position(|source| *source == id)
-            .ok_or_else(|| miss("native source is unbound"))?;
-        let node = entry.nodes.get(&inputs[index]);
-        if let Some(asap_types::query_plan::QueryPlanNode::Logical { operator, .. }) = node {
-            let (client, endpoint) = raw_endpoint
-                .ok_or_else(|| miss("query-time raw input has no Prometheus endpoint"))?;
-            let at = i64::try_from(at).map_err(|_| miss("native timestamp overflow"))?;
-            return Ok(BoundInput::Lazy(super::super::raw_source::bind(
-                contract, operator, at, client, endpoint,
-            )?));
-        }
-        let Some(asap_types::query_plan::QueryPlanNode::ReadMaterialization { binding }) = node
-        else {
-            return Err(miss("native stored source has no deployed summary binding"));
-        };
-        let store = store.ok_or_else(|| {
-            EngineError::capability_miss("native_stored", "summary store unavailable")
-        })?;
-        let end = i64::try_from(at).map_err(|_| miss("native timestamp overflow"))?;
-        let start = at
-            .checked_sub(binding.window_ms)
-            .ok_or_else(|| miss("native window underflow"))?;
-        let address = asap_types::sds::StoredSummaryKey {
-            plan_id,
-            plan_version,
-            stored_output_id: binding.stored_output_reference.stored_output_id,
-            population: std::collections::BTreeMap::new(),
-            window: asap_types::sds::HalfOpenTimeRange {
-                start_ms: start as i64,
-                end_ms: end,
-            },
-        };
-        store
-            .read_bound_native_summary(
-                &address,
-                &binding.stored_output_reference,
-                schema.clone(),
-                max_bytes as usize,
-            )
-            .map(BoundInput::Rows)
-            .map_err(|error| match error {
-                crate::storage_engines::sketch_db::index::NativeReadError::Unavailable(message) => {
-                    miss(message)
-                }
-                crate::storage_engines::sketch_db::index::NativeReadError::Physical(error) => {
-                    EngineError::from(error)
-                }
-            })
-    })
+    let drop_metric_name = entry.drops_metric_name();
+    execute_batches(
+        &program,
+        max_bytes,
+        inputs.len(),
+        at,
+        drop_metric_name,
+        |id, contract| {
+            let schema = &contract.schema;
+            let index = sources
+                .iter()
+                .position(|source| *source == id)
+                .ok_or_else(|| miss("native source is unbound"))?;
+            let node = entry.nodes.get(&inputs[index]);
+            if let Some(asap_types::query_plan::QueryPlanNode::Logical { operator, .. }) = node {
+                let (client, endpoint) = raw_endpoint
+                    .ok_or_else(|| miss("query-time raw input has no Prometheus endpoint"))?;
+                let at = i64::try_from(at).map_err(|_| miss("native timestamp overflow"))?;
+                return Ok(BoundInput::Lazy(super::super::raw_source::bind(
+                    contract, operator, at, client, endpoint,
+                )?));
+            }
+            let Some(asap_types::query_plan::QueryPlanNode::ReadMaterialization { binding }) = node
+            else {
+                return Err(miss("native stored source has no deployed summary binding"));
+            };
+            let store = store.ok_or_else(|| {
+                EngineError::capability_miss("native_stored", "summary store unavailable")
+            })?;
+            let end = i64::try_from(at).map_err(|_| miss("native timestamp overflow"))?;
+            let start = at
+                .checked_sub(binding.window_ms)
+                .ok_or_else(|| miss("native window underflow"))?;
+            let address = asap_types::sds::StoredSummaryKey {
+                plan_id,
+                plan_version,
+                stored_output_id: binding.stored_output_reference.stored_output_id,
+                population: std::collections::BTreeMap::new(),
+                window: asap_types::sds::HalfOpenTimeRange {
+                    start_ms: start as i64,
+                    end_ms: end,
+                },
+            };
+            store
+                .read_bound_native_summary(
+                    &address,
+                    &binding.stored_output_reference,
+                    schema.clone(),
+                    max_bytes as usize,
+                )
+                .map(BoundInput::Rows)
+                .map_err(|error| match error {
+                    crate::storage_engines::sketch_db::index::NativeReadError::Unavailable(
+                        message,
+                    ) => miss(message),
+                    crate::storage_engines::sketch_db::index::NativeReadError::Physical(error) => {
+                        EngineError::from(error)
+                    }
+                })
+        },
+    )
 }
 
 /// Stored and protocol inputs are read before execution; query-time raw
@@ -877,6 +793,7 @@ fn execute_batches(
     max_bytes: u64,
     input_count: usize,
     at: u64,
+    drop_metric_name: bool,
     mut input_batch: impl FnMut(
         u64,
         &asap_physical_operators::physical_planner::InputContract,
@@ -942,6 +859,7 @@ fn execute_batches(
         .remove(0);
     let values = crate::query_engines::request::drive(async {
         let mut values = Vec::new();
+        let mut renamed = std::collections::BTreeSet::new();
         while let Some(batch) = stream.next().await {
             let batch = batch.map_err(EngineError::from)?;
             let identity = batch
@@ -963,7 +881,18 @@ fn execute_batches(
                     let Value::Utf8(encoded) = &row[identity] else {
                         return Err(miss("invalid physical series identity"));
                     };
-                    decode_series_identity(encoded).map_err(EngineError::from)?
+                    let mut labels = decode_series_identity(encoded).map_err(EngineError::from)?;
+                    if drop_metric_name {
+                        labels.remove("__name__");
+                        // PromQL rejects a result whose series collide once
+                        // the name is dropped; the exact engine reports it.
+                        if !renamed.insert(labels.clone()) {
+                            return Err(miss(
+                                "vector cannot contain metrics with the same labelset",
+                            ));
+                        }
+                    }
+                    labels
                 } else {
                     batch
                         .schema()
@@ -1028,7 +957,7 @@ mod request_contract_tests {
                         Default::default(),
                         vec![0],
                     )?;
-                execute_batches(&program, 64 * 1024, 1, 0, |_, _| {
+                execute_batches(&program, 64 * 1024, 1, 0, false, |_, _| {
                     Batch::try_new(schema.clone(), vec![vec![Value::Float64(1.0)]])
                         .map(BoundInput::Rows)
                         .map_err(EngineError::from)

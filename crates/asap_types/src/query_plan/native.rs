@@ -92,9 +92,21 @@ impl QueryPlanEntry {
                 inputs,
                 source_nodes,
                 max_bytes,
+                ..
             }) => Some((inputs, source_nodes, *max_bytes)),
             _ => None,
         }
+    }
+
+    /// Whether the root physical result drops `__name__` from series identities.
+    pub fn drops_metric_name(&self) -> bool {
+        matches!(
+            self.nodes.get(&self.root),
+            Some(QueryPlanNode::Physical {
+                drop_metric_name: true,
+                ..
+            })
+        )
     }
 
     /// Validate bound counter vectors or stored aggregate batches against the

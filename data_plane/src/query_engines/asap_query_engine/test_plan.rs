@@ -192,3 +192,49 @@ pub(super) fn bound_reference(
     }
     catalog.output_reference(output).unwrap()
 }
+
+/// An exact PromQL query lowered by the control plane: backend readouts over
+/// fixture bindings, with Planner-compiled computation above them.
+pub(super) fn planner_computed_entry(query: &str) -> QueryPlanEntry {
+    let canonical = canonical_promql(query).unwrap();
+    let expr = control_plane::query_parser::parse_query_expr_canonical(
+        &canonical,
+        planner_types::types::AccuracyTarget::Exact,
+    )
+    .unwrap();
+    let selected = control_plane::planner_selection::select_query(
+        &expr,
+        &control_plane::physical::post_asap::cost_model::ControlPlaneCostModel::new(
+            planner_types::types::AccuracyTarget::Exact,
+        ),
+    )
+    .unwrap();
+    let mut next = 0;
+    control_plane::query_plan::compile_bound_mapped(
+        canonical.clone(),
+        canonical,
+        &selected,
+        InstantExecution {
+            lookback_ms: 300_000,
+            full_history: false,
+            cumulative_readout: false,
+        },
+        FallbackPolicy::ExactBackend,
+        |_, _| {
+            next += 1;
+            let output = asap_types::sds::StoredOutputId(next);
+            Ok(MaterializationBinding {
+                stored_output_reference: asap_types::sds::StoredOutputReference::for_output(output),
+                materialization: output,
+                output_grouping: PhysicalGrouping::PerEntity,
+                item_labels: vec![],
+                window_ms: 300_000,
+                pane_origin_ms: Some(0),
+                readout_lookback_ms: Some(300_000),
+                full_window_slide_ms: None,
+            })
+        },
+        |_, _| {},
+    )
+    .unwrap()
+}

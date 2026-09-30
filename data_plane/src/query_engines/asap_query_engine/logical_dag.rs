@@ -9,10 +9,6 @@ use crate::query_engines::{
 use crate::storage_engines::types::KeyByLabelValues;
 use asap_physical_operators::dag as physical;
 use asap_types::query_plan::query_time::QueryTimeOperator;
-#[cfg(test)]
-use asap_types::query_plan::query_time::{
-    Aggregation, BinaryOperation, Grouping, TemporalOperation,
-};
 use asap_types::query_plan::{CandidateCompleteness, QueryNodeId, QueryPlanEntry, QueryPlanNode};
 use futures::{FutureExt, StreamExt};
 use std::cell::RefCell;
@@ -64,11 +60,6 @@ pub struct ExecutionStats {
 }
 fn miss(detail: impl Into<String>) -> EngineError {
     EngineError::capability_miss("installed_logical_dag", detail)
-}
-#[cfg(test)]
-fn no_name(mut labels: Labels) -> Labels {
-    labels.remove("__name__");
-    labels
 }
 fn vector(value: Value) -> Result<Vector, EngineError> {
     let Value::Vector(values) = value else {
@@ -285,7 +276,6 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
         at: i64,
         node: &QueryPlanNode,
         inputs: &[&Value],
-        dependencies: &[(QueryNodeId, i64)],
         context: &physical::RunContext,
     ) -> Result<Value, EngineError> {
         if let Some(leaf) = self.leaves.get(&(id, at)) {
@@ -300,14 +290,6 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
             return Ok(value);
         }
         let value = match node.clone() {
-            QueryPlanNode::Scalar { .. }
-            | QueryPlanNode::Binary { .. }
-            | QueryPlanNode::ReduceSum { .. } => {
-                return Err(physical::Error::Invalid(
-                    "installed computation requires a retained Planner physical graph".into(),
-                )
-                .into());
-            }
             QueryPlanNode::Logical {
                 operator: QueryTimeOperator::CurrentSeries { .. },
                 ..
@@ -318,18 +300,10 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
                     u64::try_from(at).map_err(|_| miss("negative current-series timestamp"))?,
                 )?)?
             }
-            QueryPlanNode::Logical { operator, .. } => {
-                if matches!(
-                    operator,
-                    QueryTimeOperator::Scan { .. }
-                        | QueryTimeOperator::ExactSubquery { .. }
-                        | QueryTimeOperator::CandidateExactSubquery { .. }
-                ) {
-                    return Err(miss(
-                        "installed Prometheus leaf was not prepared; backend raw execution is forbidden",
-                    ));
-                }
-                self.logical(operator, inputs, dependencies, at, context)?
+            QueryPlanNode::Logical { .. } => {
+                return Err(miss(
+                    "installed Prometheus leaf was not prepared; backend raw execution is forbidden",
+                ));
             }
             QueryPlanNode::PhysicalFragment {
                 dag,
@@ -369,88 +343,8 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> ValueRuntim
         };
         Ok(value)
     }
-    fn logical(
-        &mut self,
-        operator: QueryTimeOperator,
-        inputs: &[&Value],
-        dependencies: &[(QueryNodeId, i64)],
-        at: i64,
-        context: &physical::RunContext,
-    ) -> Result<Value, EngineError> {
-        match operator {
-            QueryTimeOperator::ExactSubquery { .. }
-            | QueryTimeOperator::CandidateExactSubquery { .. } => {
-                Err(miss("Prometheus exact leaf was not prepared"))
-            }
-            QueryTimeOperator::CurrentSeries { .. } => Err(miss(
-                "current-series leaf must use its installed node identity",
-            )),
-            QueryTimeOperator::Scan { .. } => {
-                Err(miss("local raw Scan is forbidden in deployed plans"))
-            }
-            QueryTimeOperator::UnaryNegate
-            | QueryTimeOperator::VectorToScalar
-            | QueryTimeOperator::Aggregate { .. }
-            | QueryTimeOperator::Limit { .. }
-            | QueryTimeOperator::Binary { .. }
-            | QueryTimeOperator::Temporal { .. }
-            | QueryTimeOperator::Sort { .. }
-            | QueryTimeOperator::HistogramQuantile => Err(physical::Error::Invalid(
-                "installed computation must contain Planner physical operators".into(),
-            )
-            .into()),
-            QueryTimeOperator::Subquery {
-                range_ms,
-                step_ms,
-                offset_ms,
-            } => {
-                let (start, end, _) = subquery_grid(at, range_ms, step_ms, offset_ms)?;
-                let mut values: BTreeMap<Labels, Vec<(i64, f64)>> = BTreeMap::new();
-                if inputs.len() != dependencies.len() {
-                    return Err(miss("subquery grid input mismatch"));
-                }
-                for (value, (_, time)) in inputs.iter().zip(dependencies) {
-                    for (labels, value) in vector((**value).clone())? {
-                        values.entry(labels).or_default().push((*time, value));
-                    }
-                }
-                Ok(Value::Matrix(values.into_iter().collect(), start, end))
-            }
-        }
-    }
 }
 
-fn subquery_grid(
-    at: i64,
-    range_ms: u64,
-    step_ms: u64,
-    offset_ms: i64,
-) -> Result<(i64, i64, Vec<i64>), EngineError> {
-    let end = at
-        .checked_sub(offset_ms)
-        .ok_or_else(|| miss("offset overflow"))?;
-    let range = i64::try_from(range_ms).map_err(|_| miss("range overflow"))?;
-    let step = i64::try_from(step_ms).map_err(|_| miss("step overflow"))?;
-    if step <= 0 || range / step > 100_000 {
-        return Err(miss("invalid or excessive subquery steps"));
-    }
-    let start = end
-        .checked_sub(range)
-        .ok_or_else(|| miss("range overflow"))?;
-    let mut time = start
-        .div_euclid(step)
-        .checked_add(1)
-        .and_then(|n| n.checked_mul(step))
-        .ok_or_else(|| miss("subquery grid overflow"))?;
-    let mut times = Vec::new();
-    while time <= end {
-        times.push(time);
-        time = time
-            .checked_add(step)
-            .ok_or_else(|| miss("subquery time overflow"))?;
-    }
-    Ok((start, end, times))
-}
 fn expanded_inputs(node: &QueryPlanNode, at: i64) -> Result<Vec<(QueryNodeId, i64)>, EngineError> {
     match node {
         QueryPlanNode::Logical {
@@ -463,25 +357,10 @@ fn expanded_inputs(node: &QueryPlanNode, at: i64) -> Result<Vec<(QueryNodeId, i6
             "installed leaf was not prepared; local raw execution is forbidden",
         )),
         QueryPlanNode::Logical {
-            operator:
-                QueryTimeOperator::Subquery {
-                    range_ms,
-                    step_ms,
-                    offset_ms,
-                },
-            inputs,
-        } => {
-            let [input] = inputs.as_slice() else {
-                return Err(miss("subquery requires one input"));
-            };
-            let (_, _, times) = subquery_grid(at, *range_ms, *step_ms, *offset_ms)?;
-            Ok(times.into_iter().map(|time| (*input, time)).collect())
-        }
-        QueryPlanNode::Logical {
             operator: QueryTimeOperator::CurrentSeries { .. },
             ..
         } => Ok(vec![]),
-        QueryPlanNode::PhysicalFragment { inputs, .. } | QueryPlanNode::Logical { inputs, .. } => {
+        QueryPlanNode::PhysicalFragment { inputs, .. } => {
             Ok(inputs.iter().map(|&id| (id, at)).collect())
         }
 
@@ -535,14 +414,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>>
             let values = values.iter().map(|v| v.value()).collect::<Vec<_>>();
             self.runtime
                 .borrow_mut()
-                .execute_node(
-                    self.id,
-                    self.time,
-                    self.node,
-                    &values,
-                    &self.dependencies,
-                    &context,
-                )
+                .execute_node(self.id, self.time, self.node, &values, &context)
                 .map_err(|error| {
                     *self.error.borrow_mut() = Some(error);
                     physical::Error::Operator(format!(
@@ -640,63 +512,6 @@ fn native_labels(labels: &Labels) -> physical::values::Value {
             .into(),
     )
 }
-#[cfg(test)]
-fn native_vector_batch(
-    values: Vector,
-    grouping: &Grouping,
-) -> Result<physical::values::Batch, EngineError> {
-    use physical::values::{Batch, Value as Cell};
-    use planner_types::{
-        post_asap::{SummaryFamilyType, SummaryField, SummarySchema},
-        pre_asap::DataType,
-    };
-    let label_type = DataType::Map {
-        key: Box::new(DataType::Utf8),
-        value: Box::new(DataType::Utf8),
-        value_nullable: false,
-    };
-    let schema = std::sync::Arc::new(SummarySchema {
-        fields: vec![
-            ("labels", label_type.clone()),
-            ("group", label_type),
-            ("value", DataType::Float64),
-        ]
-        .into_iter()
-        .map(|(name, dtype)| SummaryField {
-            name: name.into(),
-            dtype: SummaryFamilyType::Plain(dtype),
-            nullable: false,
-        })
-        .collect(),
-        time_index: None,
-    });
-    let rows = values
-        .into_iter()
-        .map(|(labels, value)| {
-            vec![
-                native_labels(&labels),
-                native_labels(&grouping_key(&labels, grouping)),
-                Cell::Float64(value),
-            ]
-        })
-        .collect();
-    Batch::try_new(schema, rows).map_err(EngineError::from)
-}
-#[cfg(test)]
-fn native_batch_rows(
-    batch: physical::values::Batch,
-    ops: Vec<physical::operators::Operator>,
-    context: &physical::RunContext,
-) -> Result<Vec<Vec<physical::values::Value>>, EngineError> {
-    physical::batch_execution::evaluate_batch(batch, ops, context.clone())
-        .map(|batches| {
-            batches
-                .into_iter()
-                .flat_map(|batch| batch.rows().to_vec())
-                .collect()
-        })
-        .map_err(EngineError::from)
-}
 fn native_vector_output(
     rows: Vec<Vec<physical::values::Value>>,
     label_column: usize,
@@ -729,296 +544,6 @@ fn native_vector_output(
         .collect()
 }
 #[cfg(test)]
-fn aggregate(
-    operation: Aggregation,
-    grouping: &Grouping,
-    values: Vector,
-    context: &physical::RunContext,
-) -> Result<Vector, EngineError> {
-    use physical::operators::{Operator, Reduction};
-    let batch = native_vector_batch(values, grouping)?;
-    let reduction = match operation {
-        Aggregation::Sum => Reduction::Sum(2),
-        Aggregation::Avg => Reduction::Avg(2),
-        Aggregation::Count => Reduction::Count,
-        Aggregation::Max => Reduction::Max(2),
-        Aggregation::Min => Reduction::Min(2),
-    };
-    let operator = Operator::aggregate(
-        batch.schema().clone(),
-        vec![1],
-        vec![("value".into(), reduction)],
-    )
-    .map_err(EngineError::from)?;
-    native_vector_output(native_batch_rows(batch, vec![operator], context)?, 0, 1)
-}
-
-#[cfg(test)]
-fn negate(value: Value, context: &physical::RunContext) -> Result<Value, EngineError> {
-    use physical::operators::{Expression, Operator};
-    let scalar = matches!(value, Value::Scalar(_));
-    let values = match value {
-        Value::Scalar(v) => vec![(Labels::new(), v)],
-        Value::Vector(v) => v,
-        _ => return Err(miss("cannot negate range vector")),
-    };
-    let batch = native_vector_batch(
-        values,
-        &Grouping {
-            labels: vec![],
-            without: false,
-        },
-    )?;
-    let operator = Operator::project(
-        batch.schema().clone(),
-        vec![
-            ("labels".into(), Expression::Column(0)),
-            (
-                "value".into(),
-                Expression::Negate(Box::new(Expression::Column(2))),
-            ),
-        ],
-    )
-    .map_err(EngineError::from)?;
-    let result = native_vector_output(native_batch_rows(batch, vec![operator], context)?, 0, 1)?;
-    Ok(if scalar {
-        Value::Scalar(result[0].1)
-    } else {
-        Value::Vector(result)
-    })
-}
-#[cfg(test)]
-fn grouping_key(labels: &Labels, grouping: &Grouping) -> Labels {
-    labels
-        .iter()
-        .filter(|(key, _)| {
-            if grouping.without {
-                key.as_str() != "__name__" && !grouping.labels.contains(key)
-            } else {
-                grouping.labels.contains(key)
-            }
-        })
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
-}
-
-/// Select by the child sample value while retaining every selected series'
-/// labels. NaN ranks below every numeric value, matching Prometheus' TOPK heap.
-/// Stable sorting also leaves equal-valued series in the child's order.
-#[cfg(test)]
-fn topk_selection(
-    k: u64,
-    grouping: &Grouping,
-    values: Vector,
-    context: &physical::RunContext,
-) -> Result<Vector, EngineError> {
-    use physical::operators::{Operator, SortKey};
-    let batch = native_vector_batch(values, grouping)?;
-    let sort = Operator::sort(
-        batch.schema().clone(),
-        vec![SortKey {
-            column: 2,
-            descending: true,
-            nulls_first: false,
-        }],
-        vec![1],
-    )
-    .map_err(EngineError::from)?;
-    let limit = Operator::limit(sort.schema(), k, 0, vec![1]).map_err(EngineError::from)?;
-    let mut output =
-        native_vector_output(native_batch_rows(batch, vec![sort, limit], context)?, 0, 2)?;
-    // The HTTP adapter preserves canonical label-group presentation; native Sort
-    // already determined score order within each group.
-    output.sort_by_key(|(labels, _)| grouping_key(labels, grouping));
-    Ok(output)
-}
-
-#[cfg(test)]
-fn binary(
-    operation: BinaryOperation,
-    boolean: bool,
-    left: Value,
-    right: Value,
-) -> Result<Value, EngineError> {
-    binary_in_context(operation, boolean, left, right, &test_native_context())
-}
-#[cfg(test)]
-fn binary_in_context(
-    operation: BinaryOperation,
-    boolean: bool,
-    left: Value,
-    right: Value,
-    context: &physical::RunContext,
-) -> Result<Value, EngineError> {
-    use physical::{
-        operators::{Expression, Operator},
-        values::{Batch, Value as Cell},
-    };
-    use planner_types::{
-        post_asap::{BinaryOperator, SummaryFamilyType, SummaryField, SummarySchema},
-        pre_asap::{ArithmeticOpKind as A, BinaryOpKind, CompareOpKind as C, DataType},
-    };
-    let kind = match operation {
-        BinaryOperation::Add => BinaryOpKind::Arithmetic(A::Add),
-        BinaryOperation::Sub => BinaryOpKind::Arithmetic(A::Sub),
-        BinaryOperation::Mul => BinaryOpKind::Arithmetic(A::Mul),
-        BinaryOperation::Div | BinaryOperation::CheckedDiv | BinaryOperation::FiniteDiv => {
-            BinaryOpKind::Arithmetic(A::Div)
-        }
-        BinaryOperation::Mod => BinaryOpKind::Arithmetic(A::Mod),
-        BinaryOperation::Pow => BinaryOpKind::Arithmetic(A::Pow),
-        BinaryOperation::Equal => BinaryOpKind::Compare(C::Eq),
-        BinaryOperation::NotEqual => BinaryOpKind::Compare(C::Ne),
-        BinaryOperation::Less => BinaryOpKind::Compare(C::Lt),
-        BinaryOperation::LessEqual => BinaryOpKind::Compare(C::Le),
-        BinaryOperation::Greater => BinaryOpKind::Compare(C::Gt),
-        BinaryOperation::GreaterEqual => BinaryOpKind::Compare(C::Ge),
-    };
-    let arithmetic = matches!(kind, BinaryOpKind::Arithmetic(_));
-    let scalar_output = matches!((&left, &right), (Value::Scalar(_), Value::Scalar(_)));
-    if scalar_output && !arithmetic && !boolean {
-        return Err(miss("scalar comparison requires bool"));
-    }
-    if boolean
-        && matches!(
-            operation,
-            BinaryOperation::CheckedDiv | BinaryOperation::FiniteDiv
-        )
-    {
-        return Err(miss("checked division cannot return bool"));
-    }
-    // Matching and metric-name presentation are protocol bindings; all numeric
-    // computation and checked arithmetic execute in the shared operator.
-    let mut pairs = Vec::new();
-    let scalar_left = matches!(left, Value::Scalar(_));
-    match (left, right) {
-        (Value::Scalar(a), Value::Scalar(b)) => pairs.push((Labels::new(), a, b)),
-        (Value::Vector(values), Value::Scalar(b)) => {
-            for (labels, a) in vector(Value::Vector(values))? {
-                pairs.push((labels, a, b));
-            }
-        }
-        (Value::Scalar(a), Value::Vector(values)) => {
-            for (labels, b) in vector(Value::Vector(values))? {
-                pairs.push((labels, a, b));
-            }
-        }
-        (Value::Vector(left), Value::Vector(right)) => {
-            let mut rhs = BTreeMap::new();
-            for (labels, value) in right {
-                if rhs.insert(no_name(labels), value).is_some() {
-                    return Err(miss("duplicate vector matching labels"));
-                }
-            }
-            let mut seen = BTreeSet::new();
-            for (labels, value) in left {
-                let key = no_name(labels.clone());
-                if !seen.insert(key.clone()) {
-                    return Err(miss("duplicate vector matching labels"));
-                }
-                if let Some(right) = rhs.get(&key) {
-                    pairs.push((labels, value, *right));
-                }
-            }
-        }
-        _ => return Err(miss("binary matrix unsupported")),
-    }
-    let schema = std::sync::Arc::new(SummarySchema {
-        fields: ["left", "right"]
-            .into_iter()
-            .map(|name| SummaryField {
-                name: name.into(),
-                dtype: SummaryFamilyType::Plain(DataType::Float64),
-                nullable: false,
-            })
-            .collect(),
-        time_index: None,
-    });
-    let batch = Batch::try_new(
-        schema.clone(),
-        pairs
-            .iter()
-            .map(|(_, a, b)| vec![Cell::Float64(*a), Cell::Float64(*b)])
-            .collect(),
-    )
-    .map_err(EngineError::from)?;
-    let operator = Operator::project(
-        schema,
-        vec![(
-            "value".into(),
-            Expression::Binary {
-                operator: BinaryOperator {
-                    kind,
-                    vector_match: None,
-                    checked_relative_division: operation == BinaryOperation::CheckedDiv,
-                    checked_finite_division: operation == BinaryOperation::FiniteDiv,
-                },
-                left: Box::new(Expression::Column(0)),
-                right: Box::new(Expression::Column(1)),
-            },
-        )],
-    )
-    .map_err(EngineError::from)?;
-    let rows = native_batch_rows(batch, vec![operator], context)?;
-    let mut output = Vec::new();
-    for ((labels, a, b), row) in pairs.into_iter().zip(rows) {
-        let value = match row.first() {
-            Some(Cell::Float64(value)) => *value,
-            Some(Cell::Bool(value)) if boolean => {
-                if *value {
-                    1.
-                } else {
-                    0.
-                }
-            }
-            Some(Cell::Bool(true)) => {
-                if scalar_left {
-                    b
-                } else {
-                    a
-                }
-            }
-            Some(Cell::Bool(false)) => continue,
-            _ => return Err(miss("native binary result schema mismatch")),
-        };
-        output.push((
-            if arithmetic || boolean {
-                no_name(labels)
-            } else {
-                labels
-            },
-            value,
-        ));
-    }
-    if scalar_output {
-        return Ok(Value::Scalar(
-            output
-                .first()
-                .ok_or_else(|| miss("missing scalar result"))?
-                .1,
-        ));
-    }
-    Ok(Value::Vector(vector(Value::Vector(output))?))
-}
-
-#[cfg(test)]
-fn test_state_binding() -> QueryPlanNode {
-    let output = asap_types::sds::StoredOutputId(99);
-    QueryPlanNode::ReadMaterialization {
-        binding: asap_types::query_plan::MaterializationBinding {
-            stored_output_reference: asap_types::sds::StoredOutputReference::for_output(output),
-            materialization: output,
-            output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
-            item_labels: vec![],
-            window_ms: 1000,
-            pane_origin_ms: Some(0),
-            readout_lookback_ms: Some(300_000),
-            full_window_slide_ms: None,
-        },
-    }
-}
-
-#[cfg(test)]
 fn test_native_context() -> physical::RunContext {
     physical::RunContext::new(
         physical::Scope::Query {
@@ -1031,7 +556,7 @@ fn test_native_context() -> physical::RunContext {
 }
 
 #[cfg(test)]
-mod topk_tests {
+mod join_tests {
     use super::*;
     use asap_types::query_plan::{FallbackPolicy, InstantExecution};
 
@@ -1040,412 +565,6 @@ mod topk_tests {
             .iter()
             .map(|(key, value)| ((*key).into(), (*value).into()))
             .collect()
-    }
-
-    // An overflowing sum cannot implement average, but zero/subnormal averages remain valid.
-    #[test]
-    fn finite_division_guards_temporal_average_without_rejecting_zero() {
-        let mut sum = asap_summary_state::summary_kernels::sum::SumAccumulator::new();
-        sum.update(1e308);
-        sum.update(1e308);
-        assert!(binary(
-            BinaryOperation::FiniteDiv,
-            false,
-            Value::Scalar(sum.sum),
-            Value::Scalar(2.0)
-        )
-        .is_err());
-        for (a, b, expected) in [
-            (0.0, 2.0, 0.0),
-            (10.0, 2.0, 5.0),
-            (f64::MIN_POSITIVE, 2.0, f64::MIN_POSITIVE / 2.0),
-        ] {
-            let Value::Scalar(value) = binary(
-                BinaryOperation::FiniteDiv,
-                false,
-                Value::Scalar(a),
-                Value::Scalar(b),
-            )
-            .unwrap() else {
-                panic!("scalar")
-            };
-            assert_eq!(value, expected);
-        }
-        assert!(binary(
-            BinaryOperation::FiniteDiv,
-            false,
-            Value::Scalar(1.0),
-            Value::Scalar(0.0)
-        )
-        .is_err());
-    }
-
-    // A conditional accuracy certificate must fall back rather than return an unbounded ratio.
-    #[test]
-    fn checked_relative_division_enforces_its_execution_domain() {
-        for (a, b) in [
-            (1., 0.),
-            (0., 0.),
-            (1., f64::INFINITY),
-            (f64::NAN, 2.),
-            (f64::MAX, f64::MIN_POSITIVE),
-            (f64::MIN_POSITIVE, f64::MAX),
-        ] {
-            assert!(binary(
-                BinaryOperation::CheckedDiv,
-                false,
-                Value::Scalar(a),
-                Value::Scalar(b)
-            )
-            .is_err());
-        }
-        let Value::Scalar(value) = binary(
-            BinaryOperation::CheckedDiv,
-            false,
-            Value::Scalar(5.),
-            Value::Scalar(10.),
-        )
-        .unwrap() else {
-            panic!("scalar");
-        };
-        assert_eq!(value, 0.5);
-    }
-
-    #[test]
-    fn topk_selects_by_sample_value_and_preserves_series_labels() {
-        let values = vec![
-            (
-                labels(&[("__name__", "cpu"), ("job", "api"), ("pod", "a")]),
-                4.0,
-            ),
-            (
-                labels(&[("__name__", "cpu"), ("job", "api"), ("pod", "b")]),
-                9.0,
-            ),
-            (
-                labels(&[("__name__", "cpu"), ("job", "db"), ("pod", "c")]),
-                7.0,
-            ),
-            (
-                labels(&[("__name__", "cpu"), ("job", "db"), ("pod", "d")]),
-                2.0,
-            ),
-        ];
-        let selected = topk_selection(
-            1,
-            &Grouping {
-                labels: vec!["job".into()],
-                without: false,
-            },
-            values,
-            &test_native_context(),
-        )
-        .unwrap();
-        assert_eq!(selected.len(), 2);
-        assert_eq!(selected[0].0["pod"], "b");
-        assert_eq!(selected[0].1, 9.0);
-        assert_eq!(selected[1].0["pod"], "c");
-        assert_eq!(selected[1].1, 7.0);
-        assert!(selected
-            .iter()
-            .all(|(labels, _)| labels.contains_key("__name__")));
-    }
-
-    #[test]
-    fn topk_ranks_nan_below_numbers_and_keeps_exact_child_values() {
-        let selected = topk_selection(
-            2,
-            &Grouping {
-                labels: vec![],
-                without: false,
-            },
-            vec![
-                (labels(&[("series", "nan")]), f64::NAN),
-                (labels(&[("series", "low")]), -1.0),
-                (labels(&[("series", "high")]), 3.0),
-            ],
-            &test_native_context(),
-        )
-        .unwrap();
-        let selected = topk_selection(
-            2,
-            &Grouping {
-                labels: vec![],
-                without: false,
-            },
-            selected,
-            &test_native_context(),
-        )
-        .unwrap();
-        assert_eq!(
-            selected
-                .iter()
-                .map(|row| row.0["series"].as_str())
-                .collect::<Vec<_>>(),
-            vec!["high", "low"]
-        );
-        assert_eq!(
-            selected.iter().map(|row| row.1).collect::<Vec<_>>(),
-            vec![3.0, -1.0]
-        );
-    }
-
-    #[test]
-    fn installed_topk_combines_with_prometheus_exact_child() {
-        let mut entry = control_plane::query_plan::query_time::compile_logical(
-            "hybrid-topk".into(),
-            "topk(2, m)".into(),
-            InstantExecution {
-                lookback_ms: 300_000,
-                full_history: false,
-                cumulative_readout: false,
-            },
-            FallbackPolicy::ExactBackend,
-        )
-        .unwrap();
-        control_plane::query_plan::query_time::finalize_query_time_nodes(&mut entry).unwrap();
-        let leaf = entry
-            .nodes
-            .iter()
-            .find_map(|(id, node)| {
-                matches!(
-                    node,
-                    QueryPlanNode::Logical {
-                        operator: QueryTimeOperator::ExactSubquery { .. },
-                        ..
-                    }
-                )
-                .then_some(*id)
-            })
-            .unwrap();
-        let at = 1_000_u64;
-        let leaves = [(
-            (leaf, at as i64),
-            PreparedLeaf {
-                value: Value::Vector(vec![
-                    (labels(&[("pod", "a")]), 1.0),
-                    (labels(&[("pod", "b")]), 8.0),
-                    (labels(&[("pod", "c")]), 5.0),
-                ]),
-                remote: true,
-                remote_evaluations: 1,
-                remote_rpcs: 1,
-            },
-        )]
-        .into_iter()
-        .collect();
-        let mut entry = entry.clone();
-        control_plane::query_plan::physical_values::compile(&mut entry).unwrap();
-        let (result, stats) = execute_installed(&entry, &leaves, at, |_, _| {
-            panic!("summary callback must not run for an exact-child topk")
-        })
-        .unwrap();
-        let QueryResult::Vector(result) = result else {
-            panic!("instant vector expected")
-        };
-        assert_eq!(
-            result
-                .values
-                .iter()
-                .map(|point| point.value)
-                .collect::<Vec<_>>(),
-            vec![8.0, 5.0]
-        );
-        assert_eq!(stats.remote_branch_evaluations, 1);
-        assert_eq!(stats.remote_rpcs, 1);
-        assert_eq!(stats.raw_scan_evaluations, 0);
-    }
-
-    // A temporal operator over an external subquery follows the same language
-    // policy as a summary readout; changing execution placement cannot drop names.
-    #[test]
-    fn metricsql_temporal_subdag_preserves_names_only_for_value_rollups() {
-        use control_plane::query_plan::QueryLanguage;
-        for language in [QueryLanguage::PromQl, QueryLanguage::MetricsQl] {
-            for operation in [
-                TemporalOperation::Max,
-                TemporalOperation::Min,
-                TemporalOperation::Avg,
-                TemporalOperation::Sum,
-                TemporalOperation::Count,
-                TemporalOperation::Rate,
-            ] {
-                let entry = QueryPlanEntry {
-                    physical_dag: None,
-                    language,
-                    query_id: "labels".into(),
-                    canonical_query: "test".into(),
-                    fixed_evaluation: None,
-                    root: QueryNodeId(1),
-                    nodes: BTreeMap::from([
-                        (
-                            QueryNodeId(0),
-                            QueryPlanNode::Logical {
-                                operator: QueryTimeOperator::ExactSubquery {
-                                    query: "m[1s]".into(),
-                                },
-                                inputs: vec![],
-                            },
-                        ),
-                        (
-                            QueryNodeId(1),
-                            QueryPlanNode::Logical {
-                                operator: QueryTimeOperator::Temporal { operation },
-                                inputs: vec![QueryNodeId(0)],
-                            },
-                        ),
-                    ]),
-                    instant: InstantExecution {
-                        lookback_ms: 1000,
-                        full_history: false,
-                        cumulative_readout: true,
-                    },
-                    fallback: FallbackPolicy::ExactBackend,
-                };
-                let leaves = BTreeMap::from([(
-                    (QueryNodeId(0), 1000),
-                    PreparedLeaf {
-                        value: Value::Matrix(
-                            vec![(
-                                labels(&[("__name__", "m"), ("job", "api")]),
-                                vec![(100, 1.), (900, 3.)],
-                            )],
-                            0,
-                            1000,
-                        ),
-                        remote: true,
-                        remote_evaluations: 1,
-                        remote_rpcs: 1,
-                    },
-                )]);
-                let mut entry = entry.clone();
-                control_plane::query_plan::physical_values::compile(&mut entry).unwrap();
-                let (result, _) = execute_installed(&entry, &leaves, 1000, |_, _| {
-                    panic!("external child supplied")
-                })
-                .unwrap();
-                let QueryResult::Vector(result) = result else {
-                    panic!("vector required")
-                };
-                let expected = language == QueryLanguage::MetricsQl
-                    && matches!(
-                        operation,
-                        TemporalOperation::Max | TemporalOperation::Min | TemporalOperation::Avg
-                    );
-                assert_eq!(
-                    result.values[0]
-                        .label_keys_override
-                        .as_ref()
-                        .unwrap()
-                        .iter()
-                        .any(|name| name == "__name__"),
-                    expected,
-                    "{language:?} {operation:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn installed_topk_ranks_exact_rate_summary_values() {
-        let summary = QueryNodeId(0);
-        let root = QueryNodeId(1);
-        let entry = QueryPlanEntry {
-            physical_dag: None,
-            language: asap_types::query_plan::QueryLanguage::PromQl,
-            query_id: "summary-rate-topk".into(),
-            canonical_query: "topk(2, rate(requests_total[5m]))".into(),
-            fixed_evaluation: None,
-            root,
-            nodes: BTreeMap::from([
-                (QueryNodeId(99), test_state_binding()),
-                (
-                    summary,
-                    QueryPlanNode::ExactReadout {
-                        input: QueryNodeId(99),
-                        readout: asap_types::query_plan::ExactReadout::Rate,
-                    },
-                ),
-                (
-                    root,
-                    QueryPlanNode::Logical {
-                        operator: QueryTimeOperator::Limit {
-                            offset: 0,
-                            n: 2,
-                            grouping: Grouping {
-                                labels: vec![],
-                                without: false,
-                            },
-                        },
-                        inputs: vec![QueryNodeId(98)],
-                    },
-                ),
-                (
-                    QueryNodeId(98),
-                    QueryPlanNode::Logical {
-                        operator: QueryTimeOperator::Sort {
-                            descending: true,
-                            grouping: Grouping {
-                                labels: vec![],
-                                without: false,
-                            },
-                        },
-                        inputs: vec![summary],
-                    },
-                ),
-            ]),
-            instant: InstantExecution {
-                lookback_ms: 300_000,
-                full_history: false,
-                cumulative_readout: false,
-            },
-            fallback: FallbackPolicy::ExactBackend,
-        };
-        let mut entry = entry.clone();
-        control_plane::query_plan::physical_values::compile(&mut entry).unwrap();
-        let (result, stats) = execute_installed(&entry, &BTreeMap::new(), 300_000, |id, at| {
-            assert_eq!(id, summary);
-            assert_eq!(at, 300_000);
-            Ok(QueryResult::Vector(
-                crate::query_engines::query_result::InstantVector {
-                    values: vec![
-                        InstantVectorElement::new(
-                            KeyByLabelValues::new_with_labels(vec!["a".into()]),
-                            0.4,
-                        )
-                        .with_label_keys_override(vec!["pod".into()]),
-                        InstantVectorElement::new(
-                            KeyByLabelValues::new_with_labels(vec!["b".into()]),
-                            1.2,
-                        )
-                        .with_label_keys_override(vec!["pod".into()]),
-                        InstantVectorElement::new(
-                            KeyByLabelValues::new_with_labels(vec!["c".into()]),
-                            0.8,
-                        )
-                        .with_label_keys_override(vec!["pod".into()]),
-                    ],
-                    timestamp: at,
-                    warnings: vec![],
-                    accuracy: None,
-                    window_used: Some((0, at)),
-                },
-            ))
-        })
-        .unwrap();
-        let QueryResult::Vector(result) = result else {
-            panic!("instant vector expected")
-        };
-        assert_eq!(
-            result
-                .values
-                .iter()
-                .map(|point| point.value)
-                .collect::<Vec<_>>(),
-            vec![1.2, 0.8]
-        );
-        assert_eq!(stats.summary_readout_evaluations, 1);
-        assert_eq!(stats.remote_branch_evaluations, 0);
     }
 
     fn topk_membership_guarantee() -> planner_types::post_asap::ResultGuarantee {
@@ -1507,53 +626,12 @@ mod topk_tests {
         }
     }
 
-    #[test]
-    fn candidate_sidecar_intersects_then_reranks_exact_values() {
-        let candidates = vec![
-            (labels(&[("pod", "b")]), 99.0),
-            (labels(&[("pod", "c")]), 50.0),
-        ];
-        let exact = vec![
-            (labels(&[("pod", "a")]), 10.0),
-            (labels(&[("pod", "b")]), 8.0),
-            (labels(&[("pod", "c")]), 9.0),
-        ];
-        let (selected, warning) = semi_join(
-            candidates,
-            exact,
-            &[("pod".into(), "pod".into())],
-            Some(&CandidateCompleteness::Certified {
-                guarantee: topk_membership_guarantee(),
-            }),
-            &test_native_context(),
-        )
-        .unwrap();
-        let selected = topk_selection(
-            2,
-            &Grouping {
-                labels: vec![],
-                without: false,
-            },
-            selected,
-            &test_native_context(),
-        )
-        .unwrap();
-        assert_eq!(
-            selected
-                .iter()
-                .map(|row| row.0["pod"].as_str())
-                .collect::<Vec<_>>(),
-            vec!["c", "b"]
-        );
-        assert!(warning.is_none());
-    }
-
+    // The pruning join reads both the candidate and the exact readout.
     #[test]
     fn installed_candidate_sidecar_reads_both_summary_inputs() {
         let candidate_id = QueryNodeId(0);
         let value_id = QueryNodeId(1);
-        let filter = QueryNodeId(2);
-        let root = QueryNodeId(3);
+        let root = QueryNodeId(2);
         let entry = QueryPlanEntry {
             physical_dag: None,
             language: asap_types::query_plan::QueryLanguage::PromQl,
@@ -1574,7 +652,7 @@ mod topk_tests {
                         reason: "prepared exact counter readout".into(),
                     },
                 ),
-                (filter, {
+                (root, {
                     let schema = planner_types::post_asap::SummarySchema {
                         fields: vec![planner_types::post_asap::SummaryField {
                             name: "pod".into(),
@@ -1647,33 +725,6 @@ mod topk_tests {
                         }
                     }
                 }),
-                (
-                    root,
-                    QueryPlanNode::Logical {
-                        operator: QueryTimeOperator::Limit {
-                            offset: 0,
-                            n: 1,
-                            grouping: Grouping {
-                                labels: vec![],
-                                without: false,
-                            },
-                        },
-                        inputs: vec![QueryNodeId(98)],
-                    },
-                ),
-                (
-                    QueryNodeId(98),
-                    QueryPlanNode::Logical {
-                        operator: QueryTimeOperator::Sort {
-                            descending: true,
-                            grouping: Grouping {
-                                labels: vec![],
-                                without: false,
-                            },
-                        },
-                        inputs: vec![filter],
-                    },
-                ),
             ]),
             instant: InstantExecution {
                 lookback_ms: 300_000,
@@ -1710,8 +761,6 @@ mod topk_tests {
                 },
             ),
         ]);
-        let mut entry = entry.clone();
-        control_plane::query_plan::physical_values::compile(&mut entry).unwrap();
         let (result, stats) = execute_installed(&entry, &leaves, at as u64, |_, _| {
             panic!("both inputs are prepared")
         })
@@ -1719,9 +768,15 @@ mod topk_tests {
         let QueryResult::Vector(result) = result else {
             panic!("vector expected")
         };
-        assert_eq!(result.values.len(), 1);
-        assert_eq!(result.values[0].value, 3.0, "exact value is authoritative");
-        assert_eq!(result.values[0].labels.labels, vec!["c"]);
+        // The candidates keep only b and c; their exact values are authoritative.
+        assert_eq!(
+            result
+                .values
+                .iter()
+                .map(|point| (point.labels.labels.clone(), point.value))
+                .collect::<Vec<_>>(),
+            vec![(vec!["b".to_string()], 1.0), (vec!["c".to_string()], 3.0)]
+        );
         assert_eq!(stats.summary_readout_evaluations, 2);
         assert!(result.warnings.is_empty());
     }
@@ -1757,117 +812,127 @@ mod topk_tests {
 }
 
 #[cfg(test)]
-mod shared_runtime_tests {
+mod planner_computation_tests {
     use super::*;
-    use asap_types::query_plan::{FallbackPolicy, InstantExecution, QueryLanguage};
+    use crate::query_engines::asap_query_engine::test_plan::planner_computed_entry;
 
-    fn entry() -> QueryPlanEntry {
-        QueryPlanEntry {
-            physical_dag: None,
-            language: QueryLanguage::PromQl,
-            query_id: "shared-grid".into(),
-            canonical_query: "shared-grid".into(),
-            fixed_evaluation: None,
-            root: QueryNodeId(3),
-            // The callback binds a readout boundary backed by the declared stored source.
-            nodes: BTreeMap::from([
-                (QueryNodeId(99), test_state_binding()),
-                (
-                    QueryNodeId(0),
-                    QueryPlanNode::ExactReadout {
-                        input: QueryNodeId(99),
-                        readout: asap_types::query_plan::ExactReadout::Sum,
-                    },
-                ),
-                (
-                    QueryNodeId(1),
-                    QueryPlanNode::Logical {
-                        operator: QueryTimeOperator::Subquery {
-                            range_ms: 2000,
-                            step_ms: 1000,
-                            offset_ms: 0,
-                        },
-                        inputs: vec![QueryNodeId(0)],
-                    },
-                ),
-                (
-                    QueryNodeId(2),
-                    QueryPlanNode::Logical {
-                        operator: QueryTimeOperator::Temporal {
-                            operation: TemporalOperation::Sum,
-                        },
-                        inputs: vec![QueryNodeId(1)],
-                    },
-                ),
-                (
-                    QueryNodeId(3),
-                    QueryPlanNode::Logical {
-                        operator: QueryTimeOperator::Binary {
-                            operation: BinaryOperation::Add,
-                            return_bool: false,
-                        },
-                        inputs: vec![QueryNodeId(2), QueryNodeId(2)],
-                    },
-                ),
-            ]),
-            instant: InstantExecution {
-                lookback_ms: 2000,
-                full_history: false,
-                cumulative_readout: false,
-            },
-            fallback: FallbackPolicy::ExactBackend,
-        }
-    }
-
-    // A shared time-grid node runs once per query; distinct times and runs stay isolated.
-    #[test]
-    fn shared_subquery_scopes_do_not_duplicate_or_leak_values() {
-        let mut entry = entry();
-        control_plane::query_plan::physical_values::compile(&mut entry).unwrap();
-        let QueryPlanNode::PhysicalFragment { dag, .. } = &entry.nodes[&entry.root] else {
-            panic!("compiled root required")
-        };
-        let graph: serde_json::Value = serde_json::from_slice(dag).unwrap();
-        let shared = graph["nodes"]
-            .as_object()
-            .unwrap()
-            .values()
-            .find_map(|node| {
-                let operator = node.get("Operator")?;
-                operator["operator"]["kind"]
-                    .get("VectorBinary")
-                    .map(|_| operator["inputs"].as_array().unwrap())
-            })
-            .unwrap();
-        assert_eq!(shared.len(), 2);
-        assert_eq!(shared[0], shared[1]);
-        let mut calls = Vec::new();
-        for (at, expected) in [(3000, 10.), (4000, 14.)] {
-            let (result, stats) = execute_installed(&entry, &BTreeMap::new(), at, |id, time| {
-                assert_eq!(id, QueryNodeId(0));
-                calls.push(time);
-                Ok(QueryResult::vector(
-                    vec![InstantVectorElement::new(
-                        KeyByLabelValues::new_with_labels(vec!["a".into()]),
-                        time as f64 / 1000.,
+    fn readout(values: &[(&str, f64)], at: u64) -> QueryResult {
+        QueryResult::vector(
+            values
+                .iter()
+                .map(|(job, value)| {
+                    InstantVectorElement::new(
+                        KeyByLabelValues::new_with_labels(vec![(*job).into()]),
+                        *value,
                     )
-                    .with_label_keys_override(vec!["pod".into()])],
-                    time,
-                ))
-            })
-            .unwrap();
-            let QueryResult::Vector(result) = result else {
-                panic!("vector required");
-            };
-            assert_eq!(result.values[0].value, expected);
-            assert_eq!(stats.summary_readout_evaluations, 2);
-        }
-        assert_eq!(calls, vec![2000, 3000, 3000, 4000]);
+                    .with_label_keys_override(vec!["job".into()])
+                })
+                .collect(),
+            at,
+        )
     }
 
-    // Query adapters use native computation and its parent execution budget.
+    fn readouts(entry: &QueryPlanEntry) -> Vec<QueryNodeId> {
+        entry
+            .nodes
+            .iter()
+            .filter(|(_, node)| matches!(node, QueryPlanNode::ExactReadout { .. }))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    // A ratio of grouped readouts, formerly a backend Binary operator, runs as
+    // one Planner physical fragment over the two readouts.
     #[test]
-    fn native_scalar_and_aggregation_share_parent_resource_control() {
+    fn grouped_ratio_executes_as_one_planner_fragment() {
+        let entry = planner_computed_entry(
+            "sum by (job) (rate(errors_total[5m])) / sum by (job) (rate(requests_total[5m]))",
+        );
+        assert!(matches!(
+            entry.nodes[&entry.root],
+            QueryPlanNode::PhysicalFragment { .. }
+        ));
+        assert!(!entry
+            .nodes
+            .values()
+            .any(|node| matches!(node, QueryPlanNode::Logical { .. })));
+        let [errors, requests] = readouts(&entry).try_into().unwrap();
+        let (result, stats) = execute_installed(&entry, &BTreeMap::new(), 300_000, |id, at| {
+            Ok(if id == errors {
+                readout(&[("api", 1.0), ("db", 3.0)], at)
+            } else {
+                assert_eq!(id, requests);
+                readout(&[("api", 4.0), ("db", 6.0), ("web", 1.0)], at)
+            })
+        })
+        .unwrap();
+        let QueryResult::Vector(result) = result else {
+            panic!("instant vector expected")
+        };
+        let mut values = result
+            .values
+            .iter()
+            .map(|point| (point.labels.labels.clone(), point.value))
+            .collect::<Vec<_>>();
+        values.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            values,
+            vec![
+                (vec!["api".to_string()], 0.25),
+                (vec!["db".to_string()], 0.5)
+            ]
+        );
+        assert_eq!(stats.summary_readout_evaluations, 2);
+    }
+
+    // topk over an exact readout, formerly backend Sort and Limit operators,
+    // ranks in a Planner fragment and keeps the readout's series labels.
+    #[test]
+    fn topk_over_readout_executes_as_a_planner_fragment() {
+        let entry = planner_computed_entry("topk(2, rate(requests_total[5m]))");
+        let QueryPlanNode::PhysicalFragment {
+            row_input: Some(0), ..
+        } = entry.nodes[&entry.root]
+        else {
+            panic!(
+                "expected a row-preserving Planner fragment: {:?}",
+                entry.nodes
+            )
+        };
+        let [summary] = readouts(&entry).try_into().unwrap();
+        let (result, stats) = execute_installed(&entry, &BTreeMap::new(), 300_000, |id, at| {
+            assert_eq!(id, summary);
+            Ok(readout(&[("a", 0.4), ("b", 1.2), ("c", 0.8)], at))
+        })
+        .unwrap();
+        let QueryResult::Vector(result) = result else {
+            panic!("instant vector expected")
+        };
+        assert_eq!(
+            result
+                .values
+                .iter()
+                .map(|point| (point.labels.labels[0].as_str(), point.value))
+                .collect::<Vec<_>>(),
+            vec![("b", 1.2), ("c", 0.8)]
+        );
+        assert_eq!(stats.summary_readout_evaluations, 1);
+    }
+
+    // Source failures keep their routing classification across the shared runtime.
+    #[test]
+    fn source_error_classification_survives_execution() {
+        let entry = planner_computed_entry("sum(rate(requests_total[5m])) * 2");
+        let error = execute_installed(&entry, &BTreeMap::new(), 300_000, |_, _| {
+            Err(EngineError::capability_miss("source", "failed"))
+        })
+        .unwrap_err();
+        assert!(matches!(error,EngineError::CapabilityMiss{engine_id,..} if engine_id=="source"));
+    }
+
+    // Planner scalar programs run under the parent request budget and cancellation.
+    #[test]
+    fn native_scalar_shares_parent_resource_control() {
         let context = test_native_context();
         let graph = asap_physical_operators::physical_planner::promql_values::compile_scalar(7.)
             .unwrap()
@@ -1877,32 +942,7 @@ mod shared_runtime_tests {
             native_values::complete_values(&graph, &[], context.clone()).unwrap(),
             Some(Value::Scalar(7.))
         ));
-        let output = aggregate(
-            Aggregation::Sum,
-            &Grouping {
-                labels: vec![],
-                without: false,
-            },
-            vec![(Labels::new(), 2.), (Labels::new(), 5.)],
-            &context,
-        )
-        .unwrap();
-        assert_eq!(output, vec![(Labels::new(), 7.)]);
-        assert!(context.peak_bytes() > 0);
         context.cancel();
         assert!(native_values::complete_values(&graph, &[], context.clone()).is_err());
-        assert!(negate(Value::Scalar(1.), &context).is_err());
-    }
-
-    // Source failures keep their routing classification across the shared runtime.
-    #[test]
-    fn source_error_classification_survives_execution() {
-        let mut entry = entry();
-        control_plane::query_plan::physical_values::compile(&mut entry).unwrap();
-        let error = execute_installed(&entry, &BTreeMap::new(), 3000, |_, _| {
-            Err(EngineError::capability_miss("source", "failed"))
-        })
-        .unwrap_err();
-        assert!(matches!(error,EngineError::CapabilityMiss{engine_id,..} if engine_id=="source"));
     }
 }
