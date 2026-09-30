@@ -1303,7 +1303,8 @@ fn preserve_native_unsafe_raw_roots(
 /// Canonicalize Planner candidates that have no backend-maintained state at
 /// the physical compiler boundary. Their selected post-ASAP shape may be
 /// intentionally unsupported (and therefore invalid as an executable
-/// maintenance DAG), but the original query remains a valid exact plan.
+/// maintenance DAG), or a valid native program can lack any bindable stored
+/// input (for example, an offset selector). Preserve the original exact query.
 fn preserve_invalid_exact_fallback_roots(
     queries: &mut [QueryCompilationInput],
     canonical_roots: &[Rc<QueryExpr>],
@@ -1315,9 +1316,11 @@ fn preserve_invalid_exact_fallback_roots(
                 query_id: query.query_id.clone(),
                 reason,
             })?;
-        let invalid_executable =
-            selected.is_empty() && validate_executable_subdag(&query.selected_plan_root).is_err();
-        if invalid_executable
+        let unbound_candidate = selected.is_empty()
+            && (validate_executable_subdag(&query.selected_plan_root).is_err()
+                || (query.physical_candidate.is_some()
+                    && !super::maintained_population::supported_node(&query.selected_plan_root)));
+        if unbound_candidate
             && !matches!(query.selected_plan_root.expr, SummaryExpr::KeepPreAsap(_))
         {
             let parsed = original_root(query, index, canonical_roots)?;
@@ -1499,6 +1502,14 @@ impl DeploymentPlanCompiler {
             && !request.allow_mixed_summary_and_exact_execution
         {
             preserve_native_unsafe_raw_roots(&mut request.queries, &request.canonical_roots)?;
+        }
+
+        // Native exact roots cannot retain a physical program whose stored inputs
+        // belonged to the candidate replaced by the frontend/source guards.
+        for query in &mut request.queries {
+            if matches!(query.selected_plan_root.expr, SummaryExpr::KeepPreAsap(_)) {
+                query.physical_candidate = None;
+            }
         }
 
         let roots = request

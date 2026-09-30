@@ -1165,7 +1165,9 @@ mod tests {
         for entry in plan.query_plan.entries.values() {
             for node in entry.nodes.values() {
                 match node {
-                    QueryPlanNode::PhysicalFragment { .. } => fragments += 1,
+                    QueryPlanNode::PhysicalFragment { .. } | QueryPlanNode::Physical { .. } => {
+                        fragments += 1
+                    }
                     QueryPlanNode::ReadMaterialization { .. }
                     | QueryPlanNode::ExactReadout { .. }
                     | QueryPlanNode::SummaryEstimate { .. }
