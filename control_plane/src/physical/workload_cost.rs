@@ -959,7 +959,7 @@ mod tests {
     use super::super::compiler::BackendLocalPlanningInput;
     use super::*;
 
-    /// PlanSpace decides the computation: every quantile family it can
+    /// CandidatePostASAPDAGs decides the computation: every quantile family it can
     /// realize is ranked in the selection trace, and one is committed.
     #[test]
     fn planner_ranks_quantile_families_before_committing_one() {
