@@ -4658,8 +4658,17 @@ mod dag_execution_tests {
         plans
     }
 
-    // Live raw ingest builds each pane with the installed Planner graph, and
-    // every stored state equals feeding the selected kernel sample by sample.
+    /// The pre-Planner interpreter's unkeyed update: a constant weight or the
+    /// sample value; unit-frequency summaries observe the sample value.
+    fn reference_weight(input: &planner_types::post_asap::SummaryUpdate, value: f64) -> f64 {
+        match (&input.item, &input.weight) {
+            (None, planner_types::post_asap::SummaryInputExpr::Constant(weight)) => *weight,
+            _ => value,
+        }
+    }
+
+    // Live raw ingest and backfill build each pane with the installed Planner
+    // graph, and every stored state equals feeding the kernel sample by sample.
     #[test]
     fn live_panes_execute_planner_dag_with_identical_states() {
         let mut outputs = 0;
@@ -4747,6 +4756,7 @@ mod dag_execution_tests {
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
                 let mut expected = BTreeMap::new();
+                let mut backfill = BTreeMap::new();
                 for (key, samples) in &groups {
                     let group_key = Arc::new(GroupKey::new(
                         key.iter().map(|(k, v)| (k.as_str(), v.as_str())),
@@ -4761,10 +4771,27 @@ mod dag_execution_tests {
                                     start as u64,
                                     end as u64,
                                 ))
-                                .or_insert_with(|| program.updater().unwrap());
-                            program
-                                .apply(&mut **updater, series, *value, *time)
-                                .unwrap();
+                                .or_insert_with(|| {
+                                    asap_summary_state::factory::create_planner_accumulator(
+                                        &program.family,
+                                        &program.input,
+                                        &program.grouping,
+                                    )
+                                    .unwrap()
+                                });
+                            updater.update_single(reference_weight(&program.input, *value), *time);
+                            backfill
+                                .entry((
+                                    group_key.values().labels.join(";"),
+                                    start as u64,
+                                    end as u64,
+                                ))
+                                .or_insert_with(Vec::new)
+                                .push(crate::storage_engines::sketch_db::backfill::RawSample {
+                                    labels: series.clone(),
+                                    timestamp_ms: *time,
+                                    value: *value,
+                                });
                         }
                     }
                 }
@@ -4810,6 +4837,25 @@ mod dag_execution_tests {
                     config.metric
                 );
                 assert_eq!(actual, expected, "{:?}", config.aggregation_type);
+                // Backfill builds each window with the same installed graph.
+                let backfilled = backfill
+                    .into_iter()
+                    .map(|((key, start, end), samples)| {
+                        let state = crate::storage_engines::sketch_db::build_dag_accumulator(
+                            &program,
+                            &samples,
+                            (start, end),
+                        )
+                        .unwrap()
+                        .unwrap();
+                        ((key, start, end), state.serialize_to_bytes())
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                assert_eq!(
+                    backfilled, expected,
+                    "backfill {:?}",
+                    config.aggregation_type
+                );
                 outputs += 1;
                 families.insert(
                     format!("{:?}", config.accumulator_spec().unwrap().family)
@@ -4984,6 +5030,24 @@ mod dag_execution_tests {
                 7.0
             );
         }
+    }
+
+    // Revision admission checks samples with the installed Planner graph.
+    #[test]
+    fn admission_validates_with_the_planner_graph() {
+        let plan = plan("sum_over_time(asap_demo_gauge[5s])");
+        let config = plan.precompute_plan.materializations[0].clone();
+        let program = InstalledPrecomputePlan::from_precompute_plan(plan.precompute_plan)
+            .unwrap()
+            .raw_programs[&config.policy_fp_u64()]
+            .clone();
+        let series = config.metric.as_str();
+        assert!(program
+            .validate([(series, 1000, 1.0), (series, 2000, 2.0)], 1 << 20)
+            .is_ok());
+        assert!(program
+            .validate([(series, 1000, f64::INFINITY)], 1 << 20)
+            .is_err());
     }
 
     // A raw output installs only with its Planner-compiled precompute graph.

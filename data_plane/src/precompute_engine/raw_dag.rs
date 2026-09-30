@@ -27,7 +27,6 @@ pub struct RawDagProgram {
     pub input: SummaryUpdate,
     pub grouping: GroupingStrategy,
     pub reduction: planner_types::pre_asap::Reduction,
-    projected_column: Option<String>,
     /// Planner's encoded precompute graph from the raw sample boundary to this
     /// output. Decoded graphs are not `Send`, so each execution decodes it.
     program: std::sync::Arc<[u8]>,
@@ -197,12 +196,7 @@ impl RawDagProgram {
                     input: input.clone(),
                     grouping: grouping.clone(),
                     reduction: reduction.clone(),
-                    projected_column: config
-                        .effective_value_projection()
-                        .column()
-                        .map(str::to_owned),
                 };
-                program.validate()?;
                 if let Some(old) = &selected {
                     if old.family != program.family
                         || old.input != program.input
@@ -222,6 +216,16 @@ impl RawDagProgram {
         selected.ok_or_else(|| "raw materialization has no selected post-ASAP DAG producer".into())
     }
 
+    /// Heap readout decodes only the backend heap kernel, not Planner's weighted
+    /// frequency state, so heaps stay on that kernel until it does.
+    fn heap(&self) -> bool {
+        matches!(&self.family, SummaryFamilyType::Sketch(kind, _) if matches!(
+            kind.algorithm(),
+            planner_types::post_asap::SketchAlgorithm::CmsWithHeap
+                | planner_types::post_asap::SketchAlgorithm::CountSketchWithHeap
+        ))
+    }
+
     /// Execute the Planner graph over one pane's samples as one typed batch.
     /// Returns `None` when the graph admits no population from them.
     pub fn build<'a>(
@@ -230,21 +234,67 @@ impl RawDagProgram {
         pane: (i64, i64),
         max_bytes: usize,
     ) -> Result<Option<Box<dyn AggregateCore>>, String> {
-        use futures::StreamExt;
         let samples = pane_batch(samples);
-        // Stored heap readout decodes only the backend heap kernel, not
-        // Planner's weighted frequency state, so heaps stay on that kernel.
-        if matches!(&self.family, SummaryFamilyType::Sketch(kind, _) if matches!(
-            kind.algorithm(),
-            planner_types::post_asap::SketchAlgorithm::CmsWithHeap
-                | planner_types::post_asap::SketchAlgorithm::CountSketchWithHeap
-        )) {
-            let mut updater = self.updater()?;
+        if self.heap() {
+            let mut updater = self.heap_updater()?;
             for (series, time, value) in samples {
                 self.apply(&mut *updater, series, value, time)?;
             }
             return Ok(Some(updater.take_accumulator()));
         }
+        // The router assigns one population per group, so one pane yields
+        // at most one state.
+        match self.execute(samples, pane, max_bytes)?.as_slice() {
+            [] => Ok(None),
+            [row] => match row.as_slice() {
+                [_, _, Value::Summary { state, .. }] => {
+                    asap_summary_state::physical::from_physical(state.as_ref())
+                        .map(Some)
+                        .map_err(|e| e.to_string())
+                }
+                _ => Err("raw precompute output is not a population state".into()),
+            },
+            _ => Err("one routed group produced several populations".into()),
+        }
+    }
+
+    /// Check that the Planner graph admits every sample, without storing a result.
+    pub fn validate<'a>(
+        &self,
+        samples: impl IntoIterator<Item = (&'a str, i64, f64)>,
+        max_bytes: usize,
+    ) -> Result<(), String> {
+        let samples = pane_batch(samples);
+        if self.heap() {
+            let updater = self.heap_updater()?;
+            for (_, _, value) in samples {
+                self.validate_sample(updater.as_ref(), value)?;
+            }
+            return Ok(());
+        }
+        if samples.is_empty() {
+            return Ok(());
+        }
+        let bounds = samples
+            .iter()
+            .fold((i64::MAX, i64::MIN), |(lo, hi), (_, time, _)| {
+                (lo.min(*time), hi.max(time.saturating_add(1)))
+            });
+        self.execute(samples, bounds, max_bytes).map(|_| ())
+    }
+
+    /// The family's empty state, for a pane known to have no samples.
+    pub fn empty_state(&self) -> Result<Box<dyn AggregateCore>, String> {
+        Ok(self.heap_updater()?.take_accumulator())
+    }
+
+    fn execute<'a>(
+        &self,
+        samples: impl IntoIterator<Item = (&'a str, i64, f64)>,
+        pane: (i64, i64),
+        max_bytes: usize,
+    ) -> Result<Vec<Vec<Value>>, String> {
+        use futures::StreamExt;
         let schema = precompute::raw_sample_schema();
         let rows = samples
             .into_iter()
@@ -272,7 +322,7 @@ impl RawDagProgram {
             },
         )
         .map_err(|e| e.to_string())?;
-        let rows = futures::executor::block_on(async {
+        futures::executor::block_on(async {
             let mut stream = graph.execute(program.roots(), context)?.pop().ok_or(
                 asap_physical_operators::Error::Invalid("missing output".into()),
             )?;
@@ -282,58 +332,14 @@ impl RawDagProgram {
             }
             Ok::<_, asap_physical_operators::Error>(rows)
         })
-        .map_err(|e| e.to_string())?;
-        // The router assigns one population per group, so one pane yields
-        // at most one state.
-        match rows.as_slice() {
-            [] => Ok(None),
-            [row] => match row.as_slice() {
-                [_, _, Value::Summary { state, .. }] => {
-                    asap_summary_state::physical::from_physical(state.as_ref())
-                        .map(Some)
-                        .map_err(|e| e.to_string())
-                }
-                _ => Err("raw precompute output is not a population state".into()),
-            },
-            _ => Err("one routed group produced several populations".into()),
-        }
+        .map_err(|e| e.to_string())
     }
 
-    pub fn updater(&self) -> Result<Box<dyn AccumulatorUpdater>, String> {
+    fn heap_updater(&self) -> Result<Box<dyn AccumulatorUpdater>, String> {
         create_planner_accumulator(&self.family, &self.input, &self.grouping)
     }
 
-    fn validate(&self) -> Result<(), String> {
-        match &self.input.weight {
-            SummaryInputExpr::Column(ColumnRef::SampleValue) | SummaryInputExpr::Constant(_) => {}
-            SummaryInputExpr::Column(
-                ColumnRef::Named(name) | ColumnRef::Qualified { name, .. },
-            ) if self.projected_column.as_ref() == Some(name) => {}
-            _ => return Err("raw DAG weight expression is unsupported".into()),
-        }
-        fn item(expr: &SummaryInputExpr) -> bool {
-            match expr {
-                SummaryInputExpr::Column(ColumnRef::Named(_) | ColumnRef::SampleValue) => true,
-                SummaryInputExpr::Tuple(items) => items.iter().all(item),
-                SummaryInputExpr::EntityIdentity(
-                    planner_types::post_asap::EntityIdentity::PromqlLabelSet { excluding },
-                ) => excluding.is_empty(),
-                _ => false,
-            }
-        }
-        if self.input.item.as_ref().is_some_and(|e| !item(e)) {
-            return Err("raw DAG item expression is unsupported".into());
-        }
-        self.updater().map(|_| ())
-    }
-
-    /// Validate admission with the same weight semantics used during execution,
-    /// without mutating an accumulator or accepting part of a request.
-    pub fn validate_sample(
-        &self,
-        updater: &dyn AccumulatorUpdater,
-        value: f64,
-    ) -> Result<f64, String> {
+    fn validate_sample(&self, updater: &dyn AccumulatorUpdater, value: f64) -> Result<f64, String> {
         let weight = match &self.input.weight {
             SummaryInputExpr::Constant(c) => *c,
             // The worker retains one previous value per series across pane rotation.
@@ -347,7 +353,7 @@ impl RawDagProgram {
         Ok(weight)
     }
 
-    pub fn apply(
+    fn apply(
         &self,
         updater: &mut dyn AccumulatorUpdater,
         series: &str,
