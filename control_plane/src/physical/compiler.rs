@@ -1043,7 +1043,7 @@ impl BackendLocalPlanningInput {
                 exact_costs_by_id.insert(format!("compat-query-{index}"), rows.clone());
             }
         }
-        // PromQL rows carry their complete identity before PlanSpace chooses
+        // PromQL rows carry their complete identity before CandidatePostASAPDAGs chooses
         // shared states, so arithmetic never needs a second logical selection.
         let logical_roots = canonical_roots
             .iter()
@@ -1089,7 +1089,7 @@ impl BackendLocalPlanningInput {
         }
         let mut planner_candidate_forests = Vec::new();
         // Native physical realizations need the complete series identity in
-        // their rows. Planner's PlanSpace proposes them for the identity-typed
+        // their rows. Planner's CandidatePostASAPDAGs proposes them for the identity-typed
         // root; each is a logical alternative whose readout-built states are
         // placed by lifecycle, then substituted into the preferred workload.
         for (index, root) in canonical_roots.iter().enumerate() {
@@ -5394,7 +5394,7 @@ pub(crate) mod tests {
         snapshot
     }
 
-    // Per-series arithmetic compiles on the first selection, without retrying PlanSpace.
+    // Per-series arithmetic compiles on the first selection, without retrying CandidatePostASAPDAGs.
     #[test]
     fn logical_candidates_have_series_identity_before_selection() {
         let (request, _) = exact_workload_snapshot(&["avg_over_time(data[5m])"])

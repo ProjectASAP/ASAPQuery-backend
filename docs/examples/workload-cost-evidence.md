@@ -86,7 +86,7 @@ measurements.
 
 The default inventory compares the Planner-selected workload with its
 whole-workload exact fallback, maintained-population variants, and one
-substitution per native physical realization that Planner's PlanSpace proposes
+substitution per native physical realization that Planner's CandidatePostASAPDAGs proposes
 for a query (for example a heap over per-series Rate readouts). Planner's
 global selection, not a quote per alternative, decides every other summary
 choice such as the sketch family. Within a candidate, whether each summary state
