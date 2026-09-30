@@ -1043,14 +1043,31 @@ impl BackendLocalPlanningInput {
             self.physical_inputs.erp.as_ref(),
             self.environment.observed_at_unix_ms,
         )?;
-        for query in &mut queries {
+        for (index, query) in queries.iter_mut().enumerate() {
+            // The preferred typed root can itself have a native realization;
+            // apply the same lifecycle pricing as the alternative forests.
+            if let Some(timed) = placement::time_native_candidate(
+                &query.selected_plan_root,
+                query,
+                &workload,
+                &data_workload,
+                index,
+                &self.environment,
+                &self.physical_inputs,
+            ) {
+                query.selected_plan_root = timed.root;
+                query.retain(Some(timed.physical))?;
+                planner_selection_trace.extend(timed.trace);
+            }
             prepare_window_implementations(
                 query,
                 &self.physical_inputs.window_cost_model,
                 self.environment.target,
                 self.physical_inputs.query_retention_margin_ms,
             )?;
-            query.retain_physical_candidate()?;
+            if query.physical_candidate.is_none() {
+                query.retain_physical_candidate()?;
+            }
         }
         let mut planner_candidate_forests = Vec::new();
         // Native physical realizations need the complete series identity in
