@@ -1,5 +1,6 @@
 //! Retained physical programs for SQL relations and PromQL vectors.
 use super::*;
+use crate::physical_plan_codec::PhysicalPlanCodec;
 use asap_physical_operators::physical_planner::CompiledPhysicalDag;
 use planner_types::post_asap::SummarySchema;
 

@@ -1858,7 +1858,7 @@ impl PrometheusRemoteWriteReceiver {
                 if committed.contains_key(&policy_fp.0) { continue; }
                 let program = RawDagProgram::from_plan(&plan.precompute_plan, config)?;
                 let manager = WindowManager::with_layout(config.window_size, config.slide_interval, config.pane_origin_ms, &config.window_layout);
-                let mut windows: BTreeMap<(u64,u64), Box<dyn asap_physical_operators::summary_kernels::factory::AccumulatorUpdater>> = BTreeMap::new();
+                let mut windows: BTreeMap<(u64,u64), Box<dyn asap_summary_state::summary_kernels::factory::AccumulatorUpdater>> = BTreeMap::new();
                 samples.sort_by(|a,b| (&a.0,a.1).cmp(&(&b.0,b.1)));
                 for (series,time,value) in samples {
                     for start in manager.stored_bucket_starts(time) {

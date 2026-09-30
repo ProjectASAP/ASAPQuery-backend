@@ -1,6 +1,6 @@
 //! Config fixtures for backend integration tests; production binds Planner payloads.
-use asap_physical_operators::factory::*;
-use asap_physical_operators::{AggregateCore, AggregationType};
+use asap_summary_state::factory::*;
+use asap_summary_state::{AggregateCore, AggregationType};
 use asap_types::{accumulator_spec::cms_params, PrecomputeMaterialization};
 use planner_types::post_asap::{ExactKind, SketchAlgorithm, SketchParams, SummaryFamilyType};
 #[cfg(test)]
@@ -232,7 +232,7 @@ pub fn create_fixture_accumulator(
             else {
                 unreachable!("validated UnivMon family parameters")
             };
-            asap_physical_operators::factory::create_planner_accumulator(
+            asap_summary_state::factory::create_planner_accumulator(
                 &spec.family,
                 &planner_types::post_asap::SummaryUpdate::column(
                     planner_types::pre_asap::ColumnRef::SampleValue,
@@ -248,7 +248,7 @@ pub fn create_fixture_accumulator(
             let SketchParams::Hll { precision } = kind.params() else {
                 unreachable!("validated HLL family parameters")
             };
-            asap_physical_operators::factory::create_planner_accumulator(
+            asap_summary_state::factory::create_planner_accumulator(
                 &spec.family,
                 &planner_types::post_asap::SummaryUpdate::column(
                     planner_types::pre_asap::ColumnRef::SampleValue,

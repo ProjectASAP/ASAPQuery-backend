@@ -1,6 +1,8 @@
 //! Fetch installed exact cuts from Prometheus before composing them with ASAP state.
 use super::logical_dag::{PreparedLeaf, PreparedLeaves, Value};
 use crate::query_engines::EngineError;
+#[cfg(test)]
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 use asap_types::query_plan::{
     query_time::QueryTimeOperator, ExternalExactInput, ExternalExactRequest, QueryLanguage,
     QueryNodeId, QueryPlanEntry, QueryPlanNode,
@@ -967,7 +969,7 @@ mod tests {
             index::{Capability, SummarySeriesMetadata},
         };
         use crate::storage_engines::types::Measurement;
-        use asap_physical_operators::summary_kernels::IncreaseAccumulator;
+        use asap_summary_state::summary_kernels::IncreaseAccumulator;
         use asap_types::query_plan::{
             query_time::BinaryOperation, ExactReadout, MaterializationBinding, PhysicalGrouping,
         };

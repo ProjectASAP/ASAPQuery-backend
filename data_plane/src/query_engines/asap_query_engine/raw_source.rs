@@ -12,6 +12,8 @@ use asap_physical_operators::{
     values::{Batch, Schema},
     Error,
 };
+#[cfg(test)]
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 use asap_types::query_plan::query_time::{LabelMatch, QueryTimeOperator};
 use futures::{stream, StreamExt, TryStreamExt};
 use planner_types::{

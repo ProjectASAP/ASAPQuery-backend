@@ -202,7 +202,7 @@ async fn installed_local_range_accounts_for_accumulated_results() {
             1,
             BTreeMap::new(),
             (pane * 1000, (pane + 1) * 1000),
-            Box::new(asap_physical_operators::summary_kernels::SumAccumulator::with_sum(2.0)),
+            Box::new(asap_summary_state::summary_kernels::SumAccumulator::with_sum(2.0)),
         );
     }
     engine

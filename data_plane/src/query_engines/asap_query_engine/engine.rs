@@ -1548,7 +1548,7 @@ mod sketch_query_tests {
 mod aux_pushdown_tests {
     use super::*;
     use crate::storage_engines::types::AggregationType;
-    use asap_physical_operators::summary_kernels::{
+    use asap_summary_state::summary_kernels::{
         max::MaxAccumulator, min::MinAccumulator, sum::SumAccumulator,
     };
     use asap_types::Statistic;
@@ -1767,7 +1767,7 @@ mod asap_tier_classify_tests {
     async fn execute_sum_by_zone_dispatches_to_exact_agg_reducer() {
         use crate::query_engines::query_result::QueryResult;
         use crate::storage_engines::sketch_db::data::AggregationType;
-        use asap_physical_operators::summary_kernels::sum::SumAccumulator;
+        use asap_summary_state::summary_kernels::sum::SumAccumulator;
 
         let idx = Arc::new(SketchStore::new());
         // Mirror the acceptance-test setup: four ExactAgg(Sum) sids, one
@@ -2421,7 +2421,7 @@ mod asap_tier_classify_tests {
     async fn execute_instant_sum_accumulates_all_windows_not_last() {
         use crate::query_engines::query_result::QueryResult;
         use crate::storage_engines::sketch_db::data::AggregationType;
-        use asap_physical_operators::summary_kernels::sum::SumAccumulator;
+        use asap_summary_state::summary_kernels::sum::SumAccumulator;
 
         let idx = Arc::new(SketchStore::new());
         let now_ms = 600_000_u64;

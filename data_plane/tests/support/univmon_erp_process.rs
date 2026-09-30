@@ -1,5 +1,5 @@
 use super::*;
-use asap_physical_operators::summary_kernels::univmon::UnivMonAccumulator;
+use asap_summary_state::summary_kernels::univmon::UnivMonAccumulator;
 use control_plane::physical::erp::ErpShapeObserver;
 use data_plane::storage_engines::types::{AggregateCore, SerializableToSink};
 

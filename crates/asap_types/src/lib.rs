@@ -9,6 +9,7 @@ pub mod executable_plan;
 pub mod grouping_projection;
 pub mod key_by_label_names;
 pub mod monitor_spec;
+pub mod physical_plan_codec;
 pub mod plan_publication;
 pub mod policy_fingerprint;
 pub mod policy_registry;

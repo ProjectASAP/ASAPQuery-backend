@@ -139,7 +139,7 @@ pub enum TimestampUnit {
 #[serde(deny_unknown_fields)]
 pub struct IngestContract {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dataset_identity: Option<planner_types::post_asap::LogicalDatasetIdentity>,
+    pub dataset_identity: Option<crate::semantic_fragment::LogicalDatasetIdentity>,
     pub protocol: IngestProtocol,
     pub endpoint_path: String,
     pub timestamp_unit: TimestampUnit,

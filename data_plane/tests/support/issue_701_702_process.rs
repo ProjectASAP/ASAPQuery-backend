@@ -1,5 +1,6 @@
 //! Issue workloads execute their selected Planner DAG on the production HTTP path.
 use super::*;
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 use control_plane::physical::{
     compiler::{
         BackendLocalPlanningInput, DeploymentPlanCompiler, BACKEND_REVISION, PLANNER_REVISION,

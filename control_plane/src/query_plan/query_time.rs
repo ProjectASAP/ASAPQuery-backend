@@ -6,6 +6,8 @@
 use super::{
     FallbackPolicy, InstantExecution, QueryNodeId, QueryPlanEntry, QueryPlanError, QueryPlanNode,
 };
+#[cfg(test)]
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 use promql_parser::{
     label::MatchOp,
     parser::{self, Expr, LabelModifier, Offset, VectorSelector},

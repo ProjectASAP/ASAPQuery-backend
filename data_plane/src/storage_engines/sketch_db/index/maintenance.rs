@@ -795,7 +795,7 @@ impl SketchStore {
 mod tests {
     use super::*;
     use crate::storage_engines::types::PrecomputedOutput;
-    use asap_physical_operators::summary_kernels::SumAccumulator;
+    use asap_summary_state::summary_kernels::SumAccumulator;
     use asap_types::traits::SerializableToSink;
 
     #[test]
@@ -1303,7 +1303,7 @@ mod tests {
         );
         let assert_complete_output = |store: &SketchStore| {
             use crate::storage_engines::sketch_db::data::SketchEncoding;
-            use asap_physical_operators::summary_kernels::DDSketchAccumulator;
+            use asap_summary_state::summary_kernels::DDSketchAccumulator;
             let rows = store.query_range(target_sid, 0, 60_000);
             assert_eq!(rows.len(), 1);
             assert!(rows[0].series_label_values.is_empty());

@@ -9,6 +9,7 @@ use crate::{
     },
     storage_engines::sketch_db::index::SketchStore,
 };
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 use asap_types::query_plan::{QueryNodeId, QueryPlanEntry, QueryPlanNode};
 use asap_types::summary_catalog::SummaryCatalog;
 use std::collections::{BTreeMap, BTreeSet};

@@ -9,8 +9,9 @@ use crate::storage_engines::types::{
 };
 #[cfg(test)]
 use crate::tests::accumulator_fixture::create_fixture_accumulator;
-use asap_physical_operators::factory::AccumulatorUpdater;
-use asap_physical_operators::summary_kernels::sum::SumAccumulator;
+use asap_summary_state::codec::KeyCodec;
+use asap_summary_state::factory::AccumulatorUpdater;
+use asap_summary_state::summary_kernels::sum::SumAccumulator;
 use asap_types::aggregation_config::PrecomputeMaterialization;
 use asap_types::PolicyFingerprint;
 use asap_types::SampleUpdateRule;
@@ -1971,10 +1972,10 @@ mod tests {
     use crate::precompute_engine::config::LateDataPolicy;
     use crate::precompute_engine::output_sink::CapturingOutputSink;
     use crate::storage_engines::types::InstalledPrecomputePlan;
-    use asap_physical_operators::summary_kernels::datasketches_kll::DatasketchesKLLAccumulator;
-    use asap_physical_operators::summary_kernels::keyed_sum_count::KeyedSumCountAccumulator;
-    use asap_physical_operators::summary_kernels::sum::SumAccumulator;
     use asap_sketchlib::KllSketch;
+    use asap_summary_state::summary_kernels::datasketches_kll::DatasketchesKLLAccumulator;
+    use asap_summary_state::summary_kernels::keyed_sum_count::KeyedSumCountAccumulator;
+    use asap_summary_state::summary_kernels::sum::SumAccumulator;
     use asap_types::enums::WindowKind;
     use asap_types::sds::StoredOutputId;
     use asap_types::AggregationType;
@@ -3268,8 +3269,8 @@ mod tests {
     // OTLP ingest dispatch builds via `decode_modified_otlp_sketch_bytes`.
     // -----------------------------------------------------------------------
 
-    use asap_physical_operators::summary_kernels::DDSketchAccumulator;
     use asap_sketchlib::DdSketch;
+    use asap_summary_state::summary_kernels::DDSketchAccumulator;
 
     /// Build a fresh DDSketch holding `vals` so each test has a real,
     /// non-empty sketch to push through `process_accumulator_input`.
@@ -4033,7 +4034,7 @@ mod tests {
     // A pooled Sum is correct only for an explicit cross-entity reduction.
     #[test]
     fn pooled_sum_does_not_preserve_per_entity_output_rows() {
-        use asap_physical_operators::summary_kernels::SumAccumulator;
+        use asap_summary_state::summary_kernels::SumAccumulator;
         let config = make_agg_config(
             1,
             "gauge",
@@ -4087,7 +4088,7 @@ mod tests {
     // The physical compiler rejects raw counter producers until series state is preserved.
     #[test]
     fn pooled_counter_samples_lose_independent_same_timestamp_reset() {
-        use asap_physical_operators::summary_kernels::IncreaseAccumulator;
+        use asap_summary_state::summary_kernels::IncreaseAccumulator;
         let config = make_agg_config(
             1,
             "requests_total",
@@ -4451,7 +4452,7 @@ mod dag_execution_tests {
     use super::*;
     use crate::precompute_engine::output_sink::CapturingOutputSink;
     use crate::storage_engines::types::InstalledPrecomputePlan;
-    use asap_physical_operators::summary_kernels::exact::ExactAccumulator;
+    use asap_summary_state::summary_kernels::exact::ExactAccumulator;
     use asap_types::query_plan::ExactReadout;
 
     fn plan(query: &str) -> control_plane::physical::compiler::CompiledPhysicalPlan {

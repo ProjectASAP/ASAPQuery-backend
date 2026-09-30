@@ -4,6 +4,7 @@
 //! maintained-summary leaf to one materialization and lowers edges to stable
 //! node IDs. Serving executes this graph without reconstructing Planner IR or
 //! searching for compatible materializations.
+use crate::physical_plan_codec::PhysicalPlanCodec;
 
 pub mod current_series;
 mod native;

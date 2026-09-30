@@ -1,6 +1,7 @@
 //! Retain Planner-compiled scalar/vector fragments before publishing an installed plan.
 use super::*;
 use asap_physical_operators::physical_planner::{promql_values as physical, CompiledPhysicalDag};
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 use planner_types::{
     post_asap::BinaryOperator,
     pre_asap::{AggIntent, ArithmeticOpKind, BinaryOpKind, ColumnRef, CompareOpKind, GroupKeys},

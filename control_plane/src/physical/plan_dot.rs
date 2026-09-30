@@ -2,6 +2,7 @@
 //!
 //! This is intentionally a developer-facing view: JSON remains the complete
 //! representation, while DOT keeps labels compact enough to follow execution.
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 
 use super::compiler::CompiledPhysicalPlan;
 use crate::query_plan::QueryPlanNode;

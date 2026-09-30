@@ -62,6 +62,7 @@
 //! 8-byte alignment) and skips a bunch of the micro-optimizations in
 //! the design doc. v1 priorities are correctness, round-trip, and
 //! passing tests — not beating Prometheus TSDB.
+use asap_summary_state::codec::KeyCodec;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Write};

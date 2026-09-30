@@ -1,5 +1,6 @@
 //! Control-plane lowering from Planner IR to the shared installed query DAG.
 //! Serving consumes asap_types::query_plan; compilation stays in this component.
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 
 mod clickhouse_exact;
 pub mod physical_values;

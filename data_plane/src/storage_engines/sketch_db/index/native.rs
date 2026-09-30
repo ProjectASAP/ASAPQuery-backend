@@ -2,11 +2,13 @@
 //! recovery path. Window snapshots are not additive hot-state updates.
 use super::*;
 use crate::drivers::ingest::series_resolver::SeriesIdResolver;
-use asap_physical_operators::{
+use asap_physical_operators::values::{Batch, Schema, Value};
+use asap_summary_state::{
     stored_state::native::{decode_batch, encode_batch},
-    values::{Batch, Schema, Value},
     AggregateCore, SerializableToSink,
 };
+#[cfg(test)]
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 
 const NATIVE_OUTPUT_TYPE: &str = "NativePhysicalOutputV1";
 const NATIVE_OUTPUT_TAG: u8 = persistence::part::encoding_tag::NATIVE_BATCH_V1;
@@ -78,7 +80,8 @@ impl NativeSummaryOutput {
             let [state] = states.as_slice() else {
                 return Err("native stored row requires one summary state".into());
             };
-            let row_kind = state.get_accumulator_type();
+            let row_kind = asap_summary_state::physical::aggregation_type(state.as_ref())
+                .map_err(|error| error.to_string())?;
             if kind.is_some_and(|kind| kind != row_kind) {
                 return Err("native stored rows have different summary families".into());
             }
@@ -393,7 +396,7 @@ mod tests {
     use asap_physical_operators::{
         dag::{operators::Operator, Limits, RunContext, Scope},
         physical_planner::{CompiledPhysicalDag, InputContract, Source},
-        summary_kernels::SumAccumulator,
+        summary_kernels::exact::ExactAccumulator,
     };
     use futures::{executor::block_on, StreamExt};
     use planner_types::{
@@ -457,8 +460,8 @@ mod tests {
             vec![vec![
                 Value::Utf8("api".into()),
                 Value::Summary {
-                    family,
-                    state: Arc::new(SumAccumulator::new()),
+                    family: family.clone(),
+                    state: Arc::new(ExactAccumulator::new(family, false).unwrap()),
                 },
             ]],
         )
@@ -538,7 +541,7 @@ mod tests {
             let mut output = PrecomputedOutput::new(0, 60_000, None, source.policy_fingerprint());
             output.population_labels = Some(group);
             output.catalog_generation = Some(generation.clone());
-            let mut state = SumAccumulator::new();
+            let mut state = asap_summary_state::summary_kernels::SumAccumulator::new();
             state.update(value);
             store
                 .publish_admitted_summary_update(
@@ -671,8 +674,9 @@ mod tests {
             let readout = Operator::readout(
                 batch.schema().clone(),
                 0,
-                asap_types::Statistic::Quantile,
-                HashMap::from([("quantile".into(), "1.0".into())]),
+                asap_physical_operators::operators::ReadoutQuery::Sketch(
+                    planner_types::post_asap::SketchQuery::Quantile { q: 1.0 },
+                ),
             )
             .unwrap();
             let values = run(batch, readout);

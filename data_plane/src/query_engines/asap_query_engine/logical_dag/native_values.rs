@@ -5,6 +5,7 @@ use asap_physical_operators::dag::{
     operators::Operator,
     values::{Batch, Schema, Value},
 };
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 #[cfg(test)]
 use planner_types::post_asap::{SummaryField, SummarySchema};
 use planner_types::{post_asap::SummaryFamilyType, pre_asap::DataType};

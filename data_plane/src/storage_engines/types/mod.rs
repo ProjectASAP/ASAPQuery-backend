@@ -30,4 +30,4 @@ pub use crate::query_engines::routing::{
     QueryOperatorShape, RoutingTarget,
 };
 
-pub use asap_physical_operators::{traits::*, KeyByLabelValues, Measurement};
+pub use asap_summary_state::{traits::*, KeyByLabelValues, Measurement};

@@ -1,0 +1,25 @@
+[package]
+name = "asap_summary_state"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+asap-physical-operators.workspace = true
+planner-types.workspace = true
+asap_sketch_codec.workspace = true
+asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", rev = "5f03ccbd798ed5fec62bdd839bcb331123cab369" }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json.workspace = true
+tracing.workspace = true
+base64 = "0.21"
+bincode = "1.3"
+rmp-serde = "1.3"
+prost = "0.13"
+thiserror = "2"
+
+[dev-dependencies]
+hex = "0.4"
+
+[features]
+default = []
+extra_debugging = []

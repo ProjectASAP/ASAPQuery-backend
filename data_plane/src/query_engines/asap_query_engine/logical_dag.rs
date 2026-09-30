@@ -1,4 +1,6 @@
 //! Executes the installed typed logical DAG. No serving-time PromQL parsing.
+#[cfg(test)]
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 pub(super) mod native_values;
 use crate::query_engines::{
     query_result::{InstantVectorElement, QueryResult},
@@ -1043,7 +1045,7 @@ mod topk_tests {
     // An overflowing sum cannot implement average, but zero/subnormal averages remain valid.
     #[test]
     fn finite_division_guards_temporal_average_without_rejecting_zero() {
-        let mut sum = asap_physical_operators::summary_kernels::sum::SumAccumulator::new();
+        let mut sum = asap_summary_state::summary_kernels::sum::SumAccumulator::new();
         sum.update(1e308);
         sum.update(1e308);
         assert!(binary(

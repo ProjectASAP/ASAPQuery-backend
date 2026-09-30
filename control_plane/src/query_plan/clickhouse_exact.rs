@@ -1,5 +1,7 @@
 //! Render a supported canonical relational cut without changing its row population.
 //! Unsupported operators remain admission errors, never guessed SQL semantics.
+#[cfg(test)]
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 use planner_types::pre_asap::{
     AggIntent, ArithmeticOpKind, CompareOpKind, QueryExpr, Reduction, ScalarValue, Schema, Source,
 };

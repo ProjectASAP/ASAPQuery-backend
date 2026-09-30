@@ -1,1 +1,1 @@
-pub use asap_physical_operators::SerializableToSink;
+pub use asap_summary_state::SerializableToSink;

@@ -5,6 +5,7 @@
 //! Planner payloads contain process-local `Rc` values, so they are decoded only
 //! when executing or validating a DAG. Compilation and QueryPlan cross-checks
 //! remain control-plane responsibilities.
+use crate::physical_plan_codec::PhysicalPlanCodec;
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -1,4 +1,5 @@
 //! Planner owns Rate ranking; Backend binds durable state and prices candidates.
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 use control_plane::physical::{
     compiler::{BackendLocalPlanningInput, DeploymentPlanCompiler},
     workload_cost::enumerate_exact_and_materialized_candidates,

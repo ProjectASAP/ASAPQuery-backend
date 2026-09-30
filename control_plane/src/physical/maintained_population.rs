@@ -2,6 +2,7 @@
 #[cfg(test)]
 use super::compiler::QueryCompilationInput;
 use super::compiler::{CompileError, PhysicalCompilationRequest};
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 use asap_types::query_plan::{
     current_series::{SeriesPopulation, SeriesReadout},
     query_time::{Grouping, LabelMatch, LabelMatcher, QueryTimeOperator},
