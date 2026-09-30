@@ -192,22 +192,6 @@ impl RawDagProgram {
                 {
                     return Err("raw precompute graph does not read the bound raw source".into());
                 }
-                // Stored heap readout renders identity items as whole series
-                // keys; one that omits labels would not name its series.
-                fn partial_identity(expr: &SummaryInputExpr) -> bool {
-                    match expr {
-                        SummaryInputExpr::EntityIdentity(
-                            planner_types::post_asap::EntityIdentity::PromqlLabelSet { excluding },
-                        ) => !excluding.is_empty(),
-                        SummaryInputExpr::Tuple(items) => items.iter().any(partial_identity),
-                        _ => false,
-                    }
-                }
-                if input.item.as_ref().is_some_and(partial_identity) {
-                    return Err(
-                        "raw heap items that exclude identity labels are not readable".into(),
-                    );
-                }
                 let program = Self {
                     source,
                     program: compiled.encode().map_err(|e| e.to_string())?.into(),

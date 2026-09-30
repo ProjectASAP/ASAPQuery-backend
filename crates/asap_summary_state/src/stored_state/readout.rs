@@ -82,8 +82,12 @@ pub fn sketch_query_value(rs: &SummaryState, query: &SketchQuery) -> Result<f64,
 /// heap-less family (`Dd`/`Hll`/`Kll`/`Cms`/`CountSketch` -- no item
 /// universe to rank), not for an empty heap (a heap-bearing family that
 /// simply never received any updates yields `Ok(vec![])`, not an error).
-pub fn topk_ranked(rs: &SummaryState, k: usize) -> Result<Vec<(String, f64)>, Error> {
-    let mut items = rs.topk_items().ok_or(Error::Unsupported(
+pub fn topk_ranked(
+    rs: &SummaryState,
+    k: usize,
+    group: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<(String, f64)>, Error> {
+    let mut items = rs.topk_items(group).ok_or(Error::Unsupported(
         "TopK requires a heap-bearing family (CmsWithHeap/CountSketchWithHeap) -- \
          this state's family carries no item universe to rank",
     ))?;
