@@ -108,6 +108,8 @@ pub mod encoding_tag {
     pub const MSGPACK_DELTA: u8 = 4;
     pub const NATIVE_BATCH_V1: u8 = 5;
     pub const WEIGHTED_FREQUENCY_V1: u8 = 6;
+    /// Planner sketch bytes with sampling probability.
+    pub const SAMPLED_KERNEL_V2: u8 = 7;
 }
 
 /// One entry inside a decoded part. The `start_ts`/`end_ts`/`label`

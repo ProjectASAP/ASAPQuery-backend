@@ -113,6 +113,29 @@ fn decode_full(
     encoding: SketchEncoding,
 ) -> Result<SummaryState, String> {
     use SketchEncoding::{MsgpackFull, ProtoFull, WeightedFrequencyV1};
+    if encoding == SketchEncoding::SampledKernelV2 {
+        let (sample_p, sketch): (f64, Vec<u8>) =
+            rmp_serde::from_slice(bytes).map_err(|e| e.to_string())?;
+        return Ok(match kind {
+            DeltaSketchKind::DDSketch { .. } => SummaryState::Dd(
+                k::DDSketchAccumulator::from_sketch(d::ddsketch_from_msgpack(&sketch)?, sample_p)
+                    .map_err(|e| e.to_string())?,
+            ),
+            DeltaSketchKind::Hll { .. } => SummaryState::Hll(
+                k::HllSketchAccumulator::from_sketch(d::hll_from_msgpack(&sketch)?, sample_p)
+                    .map_err(|e| e.to_string())?,
+            ),
+            DeltaSketchKind::Cms { .. } => SummaryState::Cms(
+                k::CountMinSketchAccumulator::from_sketch(d::cms_from_msgpack(&sketch)?, sample_p)
+                    .map_err(|e| e.to_string())?,
+            ),
+            DeltaSketchKind::CountSketch { .. } => SummaryState::CountSketch(
+                k::CountSketchAccumulator::from_sketch(d::cs_from_msgpack(&sketch)?, sample_p)
+                    .map_err(|e| e.to_string())?,
+            ),
+            _ => return Err("sampled kernel frame has an unsupported sketch family".into()),
+        });
+    }
     Ok(match (kind, encoding) {
         (
             DeltaSketchKind::UnivMon {
@@ -683,7 +706,8 @@ fn visit_window_summary_states(
             }
             SketchEncoding::ProtoFull
             | SketchEncoding::MsgpackFull
-            | SketchEncoding::WeightedFrequencyV1 => {
+            | SketchEncoding::WeightedFrequencyV1
+            | SketchEncoding::SampledKernelV2 => {
                 // A Full (re)sets this window's base.
                 rolling = Some(decode_full(&kind, &state.bytes, state.encoding)?);
             }
@@ -719,6 +743,62 @@ mod tests {
     //! notably the SPARSE-register HLL handling the deleted dead decoder
     //! got wrong — fails the build.
     use super::*;
+
+    // Local full-frame tags route sampled state through the versioned decoder.
+    #[test]
+    fn local_sampled_frames_keep_probability() {
+        use crate::StoredState;
+        let states: Vec<(DeltaSketchKind, Box<dyn AggregateCore>)> = vec![
+            (
+                DeltaSketchKind::DDSketch { alpha: 0.01 },
+                Box::new(k::DDSketchAccumulator::from_sketch(DdSketch::new(0.01), 0.25).unwrap()),
+            ),
+            (
+                DeltaSketchKind::Hll { precision: 4 },
+                Box::new(
+                    k::HllSketchAccumulator::from_sketch(
+                        HllSketch::new(HllVariant::Regular, 4),
+                        0.25,
+                    )
+                    .unwrap(),
+                ),
+            ),
+            (
+                DeltaSketchKind::Cms { rows: 2, cols: 16 },
+                Box::new(
+                    k::CountMinSketchAccumulator::from_sketch(CountMinSketch::new(2, 16), 0.25)
+                        .unwrap(),
+                ),
+            ),
+            (
+                DeltaSketchKind::CountSketch { rows: 3, cols: 16 },
+                Box::new(
+                    k::CountSketchAccumulator::from_sketch(CountSketch::new(3, 16), 0.25).unwrap(),
+                ),
+            ),
+        ];
+        for (kind, state) in states {
+            let encoding = SketchEncoding::full_frame_for(state.as_ref());
+            assert_eq!(encoding, SketchEncoding::SampledKernelV2);
+            assert!(encoding.is_full());
+            let frame = SketchSampleState {
+                bytes: state.encode().unwrap(),
+                encoding,
+            };
+            let restored = cumulative_summary_state(&[(1000, &frame)], kind)
+                .unwrap()
+                .unwrap();
+            let probability = match restored {
+                SummaryState::Dd(s) => s.sample_p(),
+                SummaryState::Hll(s) => s.sample_p(),
+                SummaryState::Cms(s) => s.sample_p(),
+                SummaryState::CountSketch(s) => s.sample_p(),
+                _ => panic!("wrong restored family"),
+            };
+            assert_eq!(probability, 0.25);
+            assert!(decode_full(&kind, &frame.bytes, SketchEncoding::MsgpackFull).is_err());
+        }
+    }
 
     // A stored Planner heap window decodes only for its catalog family and shape, merges
     // with another window, and ranks items under their series keys.
