@@ -852,7 +852,12 @@ fn enumerate_frontier_candidates(
         .map(|root| {
             root.as_ref()
                 .and_then(|root| strategy.candidate(root))
-                .filter(|node| super::maintained_population::supported_node(node))
+                .filter(|node| {
+                    // Every readout must compile to the Planner program installed with it.
+                    super::maintained_population::supported_node(node)
+                        && asap_physical_operators::physical_planner::promql_rows::compile_current_series_readout(node)
+                            .is_ok()
+                })
         })
         .collect();
     if maintained_roots.iter().any(Option::is_some) {
@@ -1046,6 +1051,37 @@ mod tests {
             .any(|candidate| candidate.queries.iter().all(|query| {
                 super::super::maintained_population::supported_node(&query.selected_plan_root)
             })));
+    }
+
+    /// Planner cannot yet read out `without` groups, so such a population is
+    /// never selected, while the `by` form is.
+    #[test]
+    fn without_grouping_selects_no_population() {
+        for (query, supported) in [
+            ("quantile without (pod) (0.5, m)", false),
+            ("quantile by (job) (0.5, m)", true),
+        ] {
+            let root = std::rc::Rc::new(
+                asap_physical_operators::physical_planner::promql_rows::with_series_identity(
+                    &crate::query_parser::parse_query_expr_canonical(
+                        query,
+                        crate::types::AccuracyTarget::Exact,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            );
+            let strategy =
+                asap_aware_mapping::maintained_population::MaintainedPopulationStrategy::new(
+                    std::slice::from_ref(&root),
+                );
+            let candidate = strategy.candidate(&root).unwrap();
+            assert_eq!(
+                super::super::maintained_population::supported_node(&candidate),
+                supported,
+                "{query}"
+            );
+        }
     }
 
     /// Instant counts select current membership, never accumulated observations.

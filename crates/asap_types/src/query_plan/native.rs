@@ -54,12 +54,19 @@ impl QueryPlanEntry {
                 SummaryFamilyType::Plain(DataType::Float64 | DataType::Int64)
             )
         };
+        let labels = output
+            .schema
+            .fields
+            .iter()
+            .filter(|field| !numeric(field))
+            .map(|field| {
+                (field.dtype == SummaryFamilyType::Plain(DataType::Utf8)).then_some(&field.name)
+            })
+            .collect::<Option<BTreeSet<_>>>();
         let grouped_value = output.schema.time_index.is_none()
             && output.schema.fields.iter().filter(|f| numeric(f)).count() == 1
-            && output.schema.fields.iter().all(|field| {
-                numeric(field)
-                    || (field.dtype == SummaryFamilyType::Plain(DataType::Utf8)
-                        && population.grouping.labels.contains(&field.name))
+            && labels.is_some_and(|labels| {
+                labels == population.grouping.labels.iter().collect::<BTreeSet<_>>()
             });
         if input.schema != output.schema && !grouped_value {
             return Err(invalid(

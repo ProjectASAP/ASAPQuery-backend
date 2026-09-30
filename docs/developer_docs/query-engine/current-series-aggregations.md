@@ -1,4 +1,4 @@
-# Shared current-series quantiles and TopK
+# Shared current-series aggregations
 
 Backend-local PromQL workload compilation can export a maintained current-value
 alternative for `quantile(q, metric)`, `topk(k, metric)`, `sum`, `count` and
@@ -50,6 +50,9 @@ A native exact alternative remains available for cost selection and execution fa
   unobserved generation or exceeded resource bounds cause native fallback.
 - State is in memory. Restart and generation replacement require warmup again;
   historical range queries continue to use native execution.
+- Sum and average use Planner's aggregate operator, which adds values in order
+  without Prometheus' compensated summation; results can differ in the last
+  bits, and an average whose sum overflows is infinite.
 - Populations divide the configured retained-summary memory budget and cap series
   cardinality. Bounds include conservative space for labels and trees.
   The existing Remote Write adapter accepts finite sample values and stale markers.

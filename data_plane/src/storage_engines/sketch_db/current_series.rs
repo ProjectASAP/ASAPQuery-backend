@@ -156,7 +156,7 @@ impl Population {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         self.remove(&labels);
-        // Bound the retained keys, tree nodes, and shared readout caches together.
+        // Bound the retained keys and tree nodes together.
         let bytes = 1024
             + labels
                 .iter()
