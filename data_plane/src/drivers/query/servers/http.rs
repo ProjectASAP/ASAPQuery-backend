@@ -1488,6 +1488,23 @@ async fn process_via_router(
     }
 }
 
+/// Remove the engine's stored-input lag note from the client warnings.
+fn extract_stored_input_lag(value: &mut serde_json::Value) -> Option<u64> {
+    let warnings = value.get_mut("warnings")?.as_array_mut()?;
+    let mut lag = None;
+    warnings.retain(|warning| {
+        let Some(text) = warning
+            .as_str()
+            .and_then(|text| text.strip_prefix("asap_stored_input_lag_ms:"))
+        else {
+            return true;
+        };
+        lag = text.parse().ok();
+        false
+    });
+    lag
+}
+
 fn extract_logical_provenance(
     value: &mut serde_json::Value,
 ) -> Option<Result<(u64, u64, u64, u64, u64, u64, u64), ()>> {
@@ -1622,6 +1639,12 @@ async fn annotate_data_source(response: Response, data_source_id: &'static str) 
         return Response::from_parts(parts, axum::body::Body::from(bytes));
     }
     if data_source_id == "asap_query" {
+        if let Some(lag) = extract_stored_input_lag(&mut value) {
+            parts.headers.insert(
+                "x-asap-stored-input-lag-ms",
+                axum::http::HeaderValue::from(lag),
+            );
+        }
         if let Some(provenance) = extract_logical_provenance(&mut value) {
             let (route, detail) = match provenance {
                 Ok((raw, summary, memo, remote, _legacy_indexes, rpcs, branches)) => {
@@ -6475,6 +6498,22 @@ mod logical_provenance_tests {
             Some(Ok((0, 0, 0, 1, 0, 1, 1)))
         );
         assert_eq!(value["warnings"], serde_json::json!(["partial data"]));
+    }
+
+    // The stored-input lag of a mixed program becomes response metadata, not a client warning.
+    #[tokio::test]
+    async fn stored_input_lag_is_a_response_header() {
+        let response = Json(serde_json::json!({"status":"success", "warnings":[
+            "asap_stored_input_lag_ms:40000", "asap_logical_stats:raw=0,summary=2,memo_hits=0,remote=0,remote_rpcs=0,remote_branches=0"
+        ], "data":{"resultType":"vector", "result":[]}})).into_response();
+        let response = annotate_data_source(response, "asap_query").await;
+        assert_eq!(response.headers()["x-asap-stored-input-lag-ms"], "40000");
+        assert_eq!(response.headers()["x-asap-execution"], "warm");
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value["warnings"].as_array().unwrap().is_empty());
     }
 
     #[test]
