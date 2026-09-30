@@ -6980,7 +6980,7 @@ impl SketchStore {
             output.catalog_generation = Some(Arc::clone(&generation));
             output.stored_output_reference = Some(record.reference.clone());
             let family = plan
-                .precompute_plan
+                .installed_precompute_plan
                 .state_family(definition)
                 .ok_or("revision view lacks output state schema")?;
             let kind = plan

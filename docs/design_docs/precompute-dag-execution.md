@@ -97,7 +97,10 @@ version; population and window selection identify the records to read.
 
 The backend derives an immutable `InstalledPrecomputePlan` from the supplied
 PrecomputePlan. This runtime representation avoids validating the graph and
-binding operators again for every input batch.
+binding operators again for every input batch. A temporary lookup decodes each
+Planner DAG once per validation or installation pass and indexes state families
+by stored output. The installed router retains only the derived deployment
+indexes; it does not deserialize a DAG for each incoming sample.
 
 Installation performs four steps:
 

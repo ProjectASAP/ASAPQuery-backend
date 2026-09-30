@@ -1893,7 +1893,7 @@ impl PrometheusRemoteWriteReceiver {
                 if let Some(previous) = committed.get(&output.0) {
                     let config = plan.precompute_plan.materializations.iter().find(|c| c.policy_fp_u64() == output.0).ok_or("committed raw output missing")?;
                     let mut groups: BTreeMap<BTreeMap<String,String>, BTreeMap<(u64,u64),Arc<dyn crate::storage_engines::types::AggregateCore>>> = BTreeMap::new();
-                    for record in previous { groups.entry(record.group.clone()).or_default().insert((record.start_ms,record.end_ms),crate::precompute_engine::revisions::decode_state(record, plan.precompute_plan.state_family(config.stored_output_id).ok_or("committed raw output has no state schema")?)?); }
+                    for record in previous { groups.entry(record.group.clone()).or_default().insert((record.start_ms,record.end_ms),crate::precompute_engine::revisions::decode_state(record, plan.installed_precompute_plan.state_family(config.stored_output_id).ok_or("committed raw output has no state schema")?)?); }
                     for (group,windows) in groups {
                         frozen.push(crate::storage_engines::sketch_db::index::FrozenExactWindows {
                             stored_output_reference: plan.installed_precompute_plan.stored_output_reference(output).ok_or("committed raw binding missing")?, storage_handle: output.0, definition: output, generation:Arc::new(generation.clone()), group, windows, singleton_population_complete:true,

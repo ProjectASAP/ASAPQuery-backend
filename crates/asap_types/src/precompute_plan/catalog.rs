@@ -50,12 +50,7 @@ impl PrecomputePlan {
                 "stored output semantics differ from installed writer computation",
             ));
         }
-        // Decode each DAG at most once; errors still surface only where used.
-        let dags = self
-            .executable_dags
-            .values()
-            .map(|installed| (installed, std::cell::OnceCell::new()))
-            .collect::<Vec<_>>();
+        let lookup = self.lookup().map_err(invalid)?;
         for config in &self.materializations {
             if config.derived_input.is_some() && config.semantic_fragment.is_none() {
                 return Err(invalid(
@@ -64,11 +59,7 @@ impl PrecomputePlan {
             }
             if let Some(expected) = &config.semantic_fragment {
                 let mut found = false;
-                for (installed, dag) in &dags {
-                    let dag = dag
-                        .get_or_init(|| installed.document.decode())
-                        .as_ref()
-                        .map_err(|error| invalid(error.clone()))?;
+                for (installed, dag) in &lookup.dags {
                     for (id, binding) in &installed.binding.nodes {
                         if matches!(binding, crate::executable_plan::BackendNodeBinding::Materialization { stored_output }
                             if stored_output.fingerprint() == config.policy_fingerprint())
@@ -113,7 +104,7 @@ impl PrecomputePlan {
         for config in &self.materializations {
             let id = StoredOutputId::from(config.policy_fingerprint());
             let binding = &catalog.outputs[&id];
-            let family = self
+            let family = lookup
                 .state_family(id)
                 .ok_or(PrecomputePlanError::SchemaSetMismatch)?;
             let expected =
@@ -147,7 +138,7 @@ impl PrecomputePlan {
                 || data.source != expected_source
                 || &data.value_projection != expected_projection
                 || data.population_filter_canonical
-                    != self.population_filter(config).map_err(invalid)?
+                    != lookup.population_filter(config).map_err(invalid)?
                 || data.group_by_keys != config.grouping_labels
             {
                 return Err(invalid("source/population/grouping differs from catalog"));

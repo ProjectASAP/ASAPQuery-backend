@@ -25,7 +25,14 @@ Planner does not own storage formats. The backend owns them:
 The query and precompute integration PRs both use the independent ASAP DAG runtime. Deployment code binds input
 sources, storage, ingestion windows, publication and protocol outputs. Execution
 phase belongs to the physical node's data state, not the operator payload.
-Computation has the same semantics during precomputation and query execution.
+The Planner maintenance lifecycle is the only source of node timing. Computation
+has the same semantics during precomputation and query execution.
+
+`PrecomputeMaterialization` contains deployment fields: output identity, source
+binding, partitioning, windows, retention and runtime policy. Families come from
+state-schema contracts; updates, item labels and input predicates come from the
+bound Planner DAG. Removed computation fields are rejected by the v2 backend
+compatibility contract. JSON and YAML transports preserve the same typed plan.
 
 Candidate pruning uses a general semi-join with explicit matching keys, followed
 by grouped Sort and grouped Limit. The completeness certificate belongs to the
@@ -42,9 +49,10 @@ Planner tests cover shared producers, phase assignment, typed batches and
 composed candidate pruning. Backend tests cover source binding, installed plan
 validation, storage compatibility and query responses.
 
-The migration does not supply a local raw Scan. That deployment capability
-remains deferred. Library tests supplied with raw batches are not evidence that
-the backend can execute arbitrary raw-only installed plans.
+Ephemeral plans bind raw-series inputs to the configured Prometheus source at
+query evaluation time. Mixed plans bind those raw inputs beside complete stored
+revisions within the configured lag bound; unavailable inputs follow the installed
+exact fallback.
 
 ## Stack integration
 
@@ -56,9 +64,9 @@ structure, #742 checks selection with synthetic costs, and #775 checks installed
 plans against data-plane results. Production evidence and performance validation
 remain separate from these correctness tests.
 
-The library also owns stored-summary decoding, delta reconstruction and
-family-specific readout kernels. Deployment adapters select compatible panes
-and translate inputs and outputs; they do not copy those computations.
+Planner owns pane-state merge and family-specific readout kernels. Backend owns
+stored-summary decoding, delta reconstruction and pane selection, then binds the
+decoded state to those kernels.
 
 The shared `physical_planner::compile` API validates concrete operators and typed
 input contracts before opening sources. Deployment resolves those inputs and

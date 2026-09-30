@@ -103,14 +103,15 @@ impl SummaryCatalog {
     pub fn from_plan(
         plan: &crate::precompute_plan::PrecomputePlan,
     ) -> Result<Self, SummaryCatalogError> {
+        let lookup = plan.lookup().map_err(SummaryCatalogError::Descriptor)?;
         let outputs = plan
             .materializations
             .iter()
             .map(|config| {
-                let family = plan.state_family(config.stored_output_id).ok_or(
+                let family = lookup.state_family(config.stored_output_id).ok_or(
                     SummaryCatalogError::MissingDescriptor(config.stored_output_id.as_u64()),
                 )?;
-                let filter = plan
+                let filter = lookup
                     .population_filter(config)
                     .map_err(SummaryCatalogError::Descriptor)?;
                 Ok((config, family, filter))
