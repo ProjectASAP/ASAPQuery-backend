@@ -2418,10 +2418,11 @@ impl DeploymentPlanCompiler {
                         }
                     },
                 ) {
-                    // A selected state without a binding, or computation Planner
-                    // cannot compile over readouts, leaves no local plan.
+                    // A readout with no maintained state leaves no local plan;
+                    // the query is forwarded whole. A query that did compile
+                    // state must not maintain it unread, so it fails instead.
                     Err(crate::query_plan::QueryPlanError::UnsupportedNode(_))
-                        if request.allow_mixed_summary_and_exact_execution =>
+                        if executable_dags[query_index].is_none() =>
                     {
                         query_node_bindings.retain(|(index, _), _| *index != query_index);
                         Ok(exact_query_entry(query, canonical.clone(), instant))
@@ -4483,17 +4484,14 @@ fn collect_selected_materializations(
                     grouping.clone(),
                     selected,
                 )?;
-                // Explicit external authoritative values do not need duplicate local state.
-                if !composable {
-                    walk(
-                        values,
-                        readout,
-                        composable,
-                        native_maintenance,
-                        grouping.clone(),
-                        selected,
-                    )?;
-                }
+                walk(
+                    values,
+                    readout,
+                    composable,
+                    native_maintenance,
+                    grouping.clone(),
+                    selected,
+                )?;
             }
             SummaryExpr::ValueOperation { child, .. } => {
                 walk(
@@ -5122,6 +5120,32 @@ pub(crate) mod tests {
                 }),
                 "no warm candidate for {text}: {reasons:?}"
             );
+        }
+    }
+
+    // Without mixed execution, a computation Planner can compile over readouts
+    // whose states the deployment does not select forwards whole instead of
+    // failing the deployment.
+    #[test]
+    fn unselected_states_under_compilable_computation_forward_whole() {
+        let query = "sum by (job) (rate(a[5m])) / sum by (job) (rate(b[5m]))";
+        let workload = request("ratio", query);
+        assert!(!workload.allow_mixed_summary_and_exact_execution);
+        let plan = DeploymentPlanCompiler
+            .compile_promql(workload, environment(10_000))
+            .unwrap();
+        let entry = plan.query_plan.lookup(query).unwrap();
+        if entry.materialization_bindings().is_empty() {
+            assert!(matches!(
+                &entry.nodes[&entry.root],
+                crate::query_plan::QueryPlanNode::ExactFallback { .. }
+            ));
+            assert!(plan.precompute_plan.materializations.is_empty());
+        } else {
+            assert!(matches!(
+                &entry.nodes[&entry.root],
+                crate::query_plan::QueryPlanNode::PhysicalFragment { .. }
+            ));
         }
     }
 
@@ -6204,6 +6228,7 @@ pub(crate) mod tests {
         ));
         assert_eq!(entry.canonical_query, query);
         assert!(entry.materialization_bindings().is_empty());
+        assert!(plan.precompute_plan.materializations.is_empty());
     }
 
     #[test]

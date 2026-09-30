@@ -208,16 +208,27 @@ pub(crate) fn compile_query_computation(
             continue;
         }
         let semantic = semantic.expect("readout has a semantic node");
+        let source = exact_accumulator_value_source(semantic).unwrap_or(semantic);
         if matches!(
             semantic.expr,
             SummaryExpr::SummaryJoin { .. }
                 | SummaryExpr::SummarySubtract { .. }
                 | SummaryExpr::SummaryDelete { .. }
-        ) || node
-            .output_schema
-            .fields
-            .iter()
-            .any(|field| !matches!(field.dtype, SummaryFamilyType::Plain(_)))
+        ) || (matches!(
+            source.expr,
+            SummaryExpr::SummaryAgg {
+                family: SummaryFamilyType::ExactAggregate(
+                    planner_types::post_asap::ExactKind::Count,
+                    _
+                ),
+                ..
+            }
+        ) && !exact_value_executable(source))
+            || node
+                .output_schema
+                .fields
+                .iter()
+                .any(|field| !matches!(field.dtype, SummaryFamilyType::Plain(_)))
         {
             return Err(unsupported(
                 "query-time computation consumes state that has no decoded readout".into(),
@@ -228,6 +239,21 @@ pub(crate) fn compile_query_computation(
             InputContract::bounded(std::sync::Arc::new(node.output_schema.clone())),
         );
         frontier.insert(u64::from(id.0), Rc::clone(semantic));
+    }
+    // A pruning contract is bound only at the fragment root.
+    if dag.nodes.iter().any(|node| {
+        node.id != dag.root
+            && matches!(
+                node.payload,
+                Payload::RelationalJoin {
+                    pruning: Some(_),
+                    ..
+                }
+            )
+    }) {
+        return Err(unsupported(
+            "a pruned join must be the root of its query-time region".into(),
+        ));
     }
     let physical = compile(dag, contracts, &[u64::from(dag.root.0)])
         .map_err(|error| unsupported(error.to_string()))?;
@@ -653,8 +679,9 @@ where
 }
 
 /// Does PromQL keep `__name__` on this query's result series? Only a series
-/// selector keeps it, through ordering, selection, subqueries and
-/// `last_over_time`; functions, aggregations and arithmetic drop it.
+/// selector keeps it, through ordering, selection, filtering, relabeling,
+/// subqueries and `first_`/`last_over_time`; other functions, aggregations and
+/// arithmetic drop it.
 pub fn result_keeps_metric_name(expr: &planner_types::pre_asap::QueryExpr) -> bool {
     use planner_types::pre_asap::{AggIntent, QueryExpr};
     match expr {
@@ -663,10 +690,17 @@ pub fn result_keeps_metric_name(expr: &planner_types::pre_asap::QueryExpr) -> bo
         | QueryExpr::TimeShift { child, .. }
         | QueryExpr::Sort { child, .. }
         | QueryExpr::Limit { child, .. }
+        | QueryExpr::Filter { child, .. }
+        | QueryExpr::PromqlSeriesSample { child, .. }
+        | QueryExpr::PromqlRelabel { child, .. }
         | QueryExpr::PromqlSubquery { child, .. } => result_keeps_metric_name(child),
         QueryExpr::Aggregate {
             child, measures, ..
-        } if matches!(measures.as_slice(), [AggIntent::LastOverTime]) => {
+        } if matches!(
+            measures.as_slice(),
+            [AggIntent::LastOverTime | AggIntent::FirstOverTime]
+        ) =>
+        {
             result_keeps_metric_name(child)
         }
         _ => false,
@@ -1154,6 +1188,29 @@ mod tests {
             }
         }
         assert!(fragments > 0);
+    }
+
+    // Instant counts have no local exact readout, so a computation over one
+    // is not compiled locally; count_over_time keeps its readout.
+    #[test]
+    fn computation_over_instant_count_is_not_local() {
+        let selected = |query: &str| {
+            let canonical = crate::query_parser::parse_query_expr_canonical(
+                query,
+                planner_types::types::AccuracyTarget::Exact,
+            )
+            .unwrap();
+            crate::planner_selection::plan_test_query(&canonical).unwrap()
+        };
+        let instant = selected("count(m) * 2");
+        assert!(is_query_computation(&instant));
+        let Err(error) = compile_query_computation(&instant) else {
+            panic!("instant count computation compiled locally");
+        };
+        assert!(error.to_string().contains("no decoded readout"), "{error}");
+        let temporal = selected("sum(count_over_time(m[5m])) * 2");
+        assert!(is_query_computation(&temporal));
+        compile_query_computation(&temporal).unwrap();
     }
 
     #[test]

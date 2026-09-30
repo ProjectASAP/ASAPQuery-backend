@@ -859,6 +859,7 @@ fn execute_batches(
         .remove(0);
     let values = crate::query_engines::request::drive(async {
         let mut values = Vec::new();
+        let mut renamed = std::collections::BTreeSet::new();
         while let Some(batch) = stream.next().await {
             let batch = batch.map_err(EngineError::from)?;
             let identity = batch
@@ -883,6 +884,13 @@ fn execute_batches(
                     let mut labels = decode_series_identity(encoded).map_err(EngineError::from)?;
                     if drop_metric_name {
                         labels.remove("__name__");
+                        // PromQL rejects a result whose series collide once
+                        // the name is dropped; the exact engine reports it.
+                        if !renamed.insert(labels.clone()) {
+                            return Err(miss(
+                                "vector cannot contain metrics with the same labelset",
+                            ));
+                        }
                     }
                     labels
                 } else {

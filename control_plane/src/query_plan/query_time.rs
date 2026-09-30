@@ -3,7 +3,7 @@
 pub use asap_types::query_plan::query_time::*;
 
 use planner_types::post_asap::{ExactKind, SummaryExpr, SummaryFamilyType, SummaryNode};
-use planner_types::pre_asap::{QueryExpr, Reduction};
+use planner_types::pre_asap::{QueryExpr, Reduction, Source};
 
 /// A per-series `max_over_time` over one plain range selector, the only
 /// maximum state the backend maintains. Planner distinguishes Max from Min
@@ -30,7 +30,10 @@ pub(crate) fn is_range_max_materialization(node: &SummaryNode) -> bool {
         &child.expr,
         SummaryExpr::KeepPreAsap(expr) if matches!(
             expr.as_ref(),
-            QueryExpr::TimeRange { child, .. } if matches!(child.as_ref(), QueryExpr::Scan { .. })
+            QueryExpr::TimeRange { child, .. } if matches!(
+                child.as_ref(),
+                QueryExpr::Scan { source: Source::TimeSeries { metric }, .. } if !metric.is_empty()
+            )
         )
     )
 }

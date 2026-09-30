@@ -680,6 +680,23 @@ mod tests {
         server.abort();
     }
 
+    // Series that collide once the name is dropped are a PromQL error, not two
+    // results with one label set.
+    #[tokio::test]
+    async fn raw_program_rejects_series_that_collide_without_the_metric_name() {
+        let body = serde_json::json!({"status": "success", "data": {"resultType": "matrix", "result": [
+            {"metric": {"__name__": "m", "job": "api", "instance": "a"}, "values": [[900, "1"]]},
+            {"metric": {"__name__": "n", "job": "api", "instance": "a"}, "values": [[900, "2"]]}
+        ]}});
+        let (endpoint, _, server) = prometheus(200, body, std::time::Duration::ZERO).await;
+        let error = engine(endpoint)
+            .execute_at(QUERY, AT as u64)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("same labelset"), "{error}");
+        server.abort();
+    }
+
     // An installed raw input fails the query when its endpoint fails or is not
     // configured; it is never answered as an empty vector.
     #[tokio::test]
