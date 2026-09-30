@@ -983,7 +983,8 @@ mod planner_computation_tests {
         );
     }
 
-    // A literal operand scales every per-series readout value.
+    // A literal operand scales every per-series readout value and drops the
+    // metric name the readouts carry.
     #[test]
     fn per_series_scalar_arithmetic_scales_each_series() {
         let entry = planner_series_entry("rate(a[5m]) * 2");
@@ -991,7 +992,10 @@ mod planner_computation_tests {
         let (result, _) = execute_installed(&entry, &BTreeMap::new(), 300_000, |id, at| {
             assert_eq!(id, a);
             Ok(series_readout(
-                &[(&[("job", "api")], 1.5), (&[("job", "db")], 4.0)],
+                &[
+                    (&[("__name__", "a"), ("job", "api")], 1.5),
+                    (&[("__name__", "a"), ("job", "db")], 4.0),
+                ],
                 at,
             ))
         })
