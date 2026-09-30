@@ -680,10 +680,12 @@ where
 
 /// Does PromQL keep `__name__` on this query's result series? Only a series
 /// selector keeps it, through ordering, selection, filtering, relabeling,
-/// subqueries and `first_`/`last_over_time`; other functions, aggregations and
-/// arithmetic drop it.
+/// subqueries, `first_`/`last_over_time` and the left side of `and`/`unless`;
+/// other functions, aggregations and arithmetic drop it. A comparison keeps it
+/// unless it has `bool`, which the IR does not record; Planner compiles no
+/// comparison, so the rule treats them as dropping it.
 pub fn result_keeps_metric_name(expr: &planner_types::pre_asap::QueryExpr) -> bool {
-    use planner_types::pre_asap::{AggIntent, QueryExpr};
+    use planner_types::pre_asap::{AggIntent, BinaryOpKind, PromQLVectorSetOpKind, QueryExpr};
     match expr {
         QueryExpr::Scan { .. } => true,
         QueryExpr::TimeRange { child, .. }
@@ -694,6 +696,11 @@ pub fn result_keeps_metric_name(expr: &planner_types::pre_asap::QueryExpr) -> bo
         | QueryExpr::PromqlSeriesSample { child, .. }
         | QueryExpr::PromqlRelabel { child, .. }
         | QueryExpr::PromqlSubquery { child, .. } => result_keeps_metric_name(child),
+        QueryExpr::BinaryOp {
+            op: BinaryOpKind::Set(PromQLVectorSetOpKind::And | PromQLVectorSetOpKind::Unless),
+            lhs,
+            ..
+        } => result_keeps_metric_name(lhs),
         QueryExpr::Aggregate {
             child, measures, ..
         } if matches!(
@@ -1211,6 +1218,32 @@ mod tests {
         let temporal = selected("sum(count_over_time(m[5m])) * 2");
         assert!(is_query_computation(&temporal));
         compile_query_computation(&temporal).unwrap();
+    }
+
+    // PromQL keeps `__name__` only on selections of a series selector.
+    #[test]
+    fn metric_name_follows_promql_result_rules() {
+        for (query, keeps) in [
+            ("m", true),
+            ("m offset 5m", true),
+            ("sort(m)", true),
+            ("topk(2, m)", true),
+            ("last_over_time(m[5m])", true),
+            ("m and n", true),
+            ("rate(m[5m])", false),
+            ("quantile_over_time(0.5, m[5m])", false),
+            ("m * 2", false),
+            ("sum by (job) (m)", false),
+            ("topk(2, rate(m[5m]))", false),
+            ("max_over_time(rate(m[1m])[5m:1m])", false),
+        ] {
+            let expr = crate::query_parser::parse_query_expr_canonical(
+                query,
+                planner_types::types::AccuracyTarget::Exact,
+            )
+            .unwrap();
+            assert_eq!(result_keeps_metric_name(&expr), keeps, "{query}");
+        }
     }
 
     #[test]

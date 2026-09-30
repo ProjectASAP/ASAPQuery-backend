@@ -2427,7 +2427,10 @@ impl DeploymentPlanCompiler {
                         query_node_bindings.retain(|(index, _), _| *index != query_index);
                         Ok(exact_query_entry(query, canonical.clone(), instant))
                     }
-                    other => other,
+                    other => other.map_err(|error| CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason: error.to_string(),
+                    }),
                 }
             }?;
             if frontend == QueryFrontend::MetricsQl {
@@ -5135,18 +5138,11 @@ pub(crate) mod tests {
             .compile_promql(workload, environment(10_000))
             .unwrap();
         let entry = plan.query_plan.lookup(query).unwrap();
-        if entry.materialization_bindings().is_empty() {
-            assert!(matches!(
-                &entry.nodes[&entry.root],
-                crate::query_plan::QueryPlanNode::ExactFallback { .. }
-            ));
-            assert!(plan.precompute_plan.materializations.is_empty());
-        } else {
-            assert!(matches!(
-                &entry.nodes[&entry.root],
-                crate::query_plan::QueryPlanNode::PhysicalFragment { .. }
-            ));
-        }
+        assert!(matches!(
+            &entry.nodes[&entry.root],
+            crate::query_plan::QueryPlanNode::ExactFallback { .. }
+        ));
+        assert!(plan.precompute_plan.materializations.is_empty());
     }
 
     // avg_over_time divides two per-series readouts. Planner does not yet
