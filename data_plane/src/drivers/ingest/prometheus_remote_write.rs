@@ -1826,15 +1826,14 @@ impl PrometheusRemoteWriteReceiver {
             for config in plan.precompute_plan.materializations.iter().filter(|c| c.derived_input.is_none()) {
                 let filter = compile_spatial_filter(&config.spatial_filter_normalized)?;
                 let program = RawDagProgram::from_plan(&plan.precompute_plan, config)?;
-                let updater = program.updater()?;
-                for sample in samples {
+                let mut matching = samples.iter().filter_map(|sample| {
                     let labels = sample.labels.iter().map(|(k,v)|(k.clone(),v.clone())).collect();
-                    if sample.metric == config.metric && filter.matches(&labels) {
-                        if let Some(value) = sample.value {
-                            program.validate_sample(updater.as_ref(), value).map_err(|_| crate::precompute_engine::revisions::AdmissionRejected("sample is outside the bound summary kernel's input domain"))?;
-                        }
-                    }
-                }
+                    (sample.metric == config.metric && filter.matches(&labels)).then_some(())?;
+                    Some((sample.series.as_str(), sample.timestamp_ms, sample.value?))
+                }).collect::<Vec<_>>();
+                matching.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+                // Reject the whole request when the Planner graph cannot admit it.
+                program.validate(matching, runtime.policy.max_checkpoint_bytes).map_err(|_| crate::precompute_engine::revisions::AdmissionRejected("sample is outside the bound summary kernel's input domain"))?;
             }
             Ok(())
         }, |inputs, revision, captured_at_ms, admitted, publish| {
@@ -1858,17 +1857,17 @@ impl PrometheusRemoteWriteReceiver {
                 if committed.contains_key(&policy_fp.0) { continue; }
                 let program = RawDagProgram::from_plan(&plan.precompute_plan, config)?;
                 let manager = WindowManager::with_layout(config.window_size, config.slide_interval, config.pane_origin_ms, &config.window_layout);
-                let mut windows: BTreeMap<(u64,u64), Box<dyn asap_summary_state::summary_kernels::factory::AccumulatorUpdater>> = BTreeMap::new();
+                // Each stored window's admitted samples, built by the Planner graph below.
+                let mut windows: BTreeMap<(u64,u64), Vec<(String,i64,f64)>> = BTreeMap::new();
+                let mut buffered = 0usize;
                 samples.sort_by(|a,b| (&a.0,a.1).cmp(&(&b.0,b.1)));
                 for (series,time,value) in samples {
                     for start in manager.stored_bucket_starts(time) {
                         let (start,end) = manager.stored_bucket_bounds(start);
                         if start < 0 || end < 0 || end as u64 > captured_at_ms || (start as u64) < captured_at_ms.saturating_sub(retain.saturating_sub(max_window)) { continue; }
-                        let key = (start as u64,end as u64);
-                        if let std::collections::btree_map::Entry::Vacant(entry) = windows.entry(key) { entry.insert(program.updater()?); }
-                        program.apply(windows.get_mut(&key).unwrap().as_mut(), &series, value, time)?;
-                        let bytes = windows.values().map(|u|u.memory_usage_bytes()).sum::<usize>();
-                        if bytes > runtime.policy.max_checkpoint_bytes { return Err(Box::new(asap_physical_operators::Error::MemoryLimit)); }
+                        buffered = buffered.saturating_add(series.len() + std::mem::size_of::<(String,i64,f64)>());
+                        if buffered > runtime.policy.max_checkpoint_bytes { return Err(Box::new(asap_physical_operators::Error::MemoryLimit)); }
+                        windows.entry((start as u64,end as u64)).or_default().push((series.clone(), time, value));
                     }
                 }
                 // This captured revision contains every accepted local input.
@@ -1886,19 +1885,26 @@ impl PrometheusRemoteWriteReceiver {
                         if width == 0 { return Err("counter pane width is zero".into()); }
                         while start < last {
                             let end = start.checked_add(width).ok_or("counter pane timestamp overflow")?;
-                            if let std::collections::btree_map::Entry::Vacant(entry) = windows.entry((start, end)) {
-                                entry.insert(program.updater()?);
-                                if windows.values().map(|u| u.memory_usage_bytes()).sum::<usize>() > runtime.policy.max_checkpoint_bytes {
-                                    return Err(Box::new(asap_physical_operators::Error::MemoryLimit));
-                                }
-                            }
+                            windows.entry((start, end)).or_default();
                             start = end;
                         }
                     }
                 }
                 let reference = plan.installed_precompute_plan.stored_output_reference(policy_fp.into()).ok_or("revision raw binding missing")?;
                 let group = group_key.as_population_labels();
-                let states: BTreeMap<_, Arc<dyn crate::storage_engines::types::AggregateCore>> = windows.into_iter().map(|(w,updater)|(w,Arc::from(updater.into_accumulator()))).collect();
+                let mut states: BTreeMap<_, Arc<dyn crate::storage_engines::types::AggregateCore>> = BTreeMap::new();
+                for (window, samples) in windows {
+                    let state = if samples.is_empty() {
+                        // A known-empty counter pane of this captured revision.
+                        Some(program.empty_state()?)
+                    } else {
+                        let bounds = (i64::try_from(window.0)?, i64::try_from(window.1)?);
+                        program.build(samples.iter().map(|(s,t,v)|(s.as_str(),*t,*v)), bounds, runtime.policy.max_checkpoint_bytes)?
+                    };
+                    if let Some(state) = state {
+                        states.insert(window, Arc::from(state));
+                    }
+                }
                 for ((start,end),state) in &states {
                     records.get_mut(&policy_fp.into()).unwrap().push(RevisionRecord { reference: reference.clone(), group: group.clone(), start_ms:*start, end_ms:*end, payload:encode_state(Arc::clone(state),program.family.clone())? });
                 }

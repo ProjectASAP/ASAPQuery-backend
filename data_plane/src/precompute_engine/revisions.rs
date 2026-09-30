@@ -593,10 +593,7 @@ impl RevisionRuntime {
             .filter(|c| c.derived_input.is_none())
         {
             let program = super::raw_dag::RawDagProgram::from_plan(&plan.precompute_plan, config)?;
-            let bytes = encode_state(
-                Arc::from(program.updater()?.into_accumulator()),
-                program.family,
-            )?;
+            let bytes = encode_state(Arc::from(program.empty_state()?), program.family)?;
             if bytes.len() > self.policy.max_checkpoint_bytes {
                 return Err(Box::new(asap_physical_operators::Error::MemoryLimit));
             }
