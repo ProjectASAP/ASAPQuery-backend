@@ -61,6 +61,7 @@ fn encoding_to_tag(enc: SketchEncoding) -> u8 {
         SketchEncoding::MsgpackFull => t::MSGPACK_FULL,
         SketchEncoding::MsgpackDelta => t::MSGPACK_DELTA,
         SketchEncoding::NativeBatchV1 => t::NATIVE_BATCH_V1,
+        SketchEncoding::WeightedFrequencyV1 => t::WEIGHTED_FREQUENCY_V1,
     }
 }
 
@@ -75,6 +76,7 @@ fn tag_to_encoding(tag: u8) -> SketchEncoding {
         t::MSGPACK_FULL => SketchEncoding::MsgpackFull,
         t::MSGPACK_DELTA => SketchEncoding::MsgpackDelta,
         t::NATIVE_BATCH_V1 => SketchEncoding::NativeBatchV1,
+        t::WEIGHTED_FREQUENCY_V1 => SketchEncoding::WeightedFrequencyV1,
         // t::PROTO_FULL and t::UNKNOWN (legacy) both → Full.
         _ => SketchEncoding::ProtoFull,
     }
@@ -1913,10 +1915,7 @@ impl SketchStore {
                             let Some(s) = payload.as_sketch() else {
                                 continue;
                             };
-                            if !matches!(
-                                s.encoding,
-                                SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull
-                            ) {
+                            if !s.encoding.is_full() {
                                 continue;
                             }
                             let w_end = win.1 as i64;
@@ -2126,13 +2125,7 @@ impl SketchStore {
                     })
                     .unwrap_or(false);
                 let has_base_before = samples.iter().any(|(w_end, frames)| {
-                    *w_end < start_unix_ms as i64
-                        && frames.iter().any(|s| {
-                            matches!(
-                                s.encoding,
-                                SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull
-                            )
-                        })
+                    *w_end < start_unix_ms as i64 && frames.iter().any(|s| s.encoding.is_full())
                 });
                 earliest_is_delta && !has_base_before
             })
@@ -2159,10 +2152,7 @@ impl SketchStore {
                     continue;
                 };
                 let encoding = tag_to_encoding(entry.encoding_tag);
-                if !matches!(
-                    encoding,
-                    SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull
-                ) {
+                if !encoding.is_full() {
                     continue;
                 }
                 let label_map = Self::rebuild_label_map(&keys, &entry.label);
@@ -3409,7 +3399,7 @@ impl SketchStore {
                 window,
                 SketchSampleState {
                     bytes: accumulator.serialize_to_bytes(),
-                    encoding: SketchEncoding::MsgpackFull,
+                    encoding: SketchEncoding::full_frame_for(accumulator),
                 },
             ),
             AggKind::ExactAgg { .. } => self.append_precompute_with_binding(
@@ -6927,7 +6917,7 @@ impl SketchStore {
                         (record.start_ms, record.end_ms),
                         SketchSampleState {
                             bytes: state.serialize_to_bytes(),
-                            encoding: SketchEncoding::MsgpackFull,
+                            encoding: SketchEncoding::full_frame_for(state.as_ref()),
                         },
                     ),
                     AggKind::ExactAgg { .. } => view.append_precompute_with_binding(
