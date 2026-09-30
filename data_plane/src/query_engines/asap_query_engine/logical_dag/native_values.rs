@@ -871,11 +871,19 @@ fn execute_batches(
                 .schema()
                 .fields
                 .iter()
-                .position(|field| field.dtype == SummaryFamilyType::Plain(DataType::Float64))
+                .position(|field| {
+                    matches!(
+                        field.dtype,
+                        SummaryFamilyType::Plain(DataType::Float64 | DataType::Int64)
+                    )
+                })
                 .ok_or_else(|| miss("physical output loses sample value"))?;
             for row in batch.rows() {
-                let Value::Float64(sample) = &row[value] else {
-                    return Err(miss("invalid physical result value"));
+                let sample = &match row[value] {
+                    Value::Float64(sample) => sample,
+                    // A count is exact as a PromQL sample up to 2^53.
+                    Value::Int64(count) if count.unsigned_abs() <= 1 << 53 => count as f64,
+                    _ => return Err(miss("invalid physical result value")),
                 };
                 let labels = if let Some(identity) = identity {
                     let Value::Utf8(encoded) = &row[identity] else {

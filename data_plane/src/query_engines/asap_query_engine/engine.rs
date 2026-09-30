@@ -549,7 +549,6 @@ impl ASAPQueryEngine {
                     operator:
                         asap_types::query_plan::query_time::QueryTimeOperator::CurrentSeries {
                             population,
-                            readout,
                         },
                     ..
                 }) = entry.nodes.get(&root)
@@ -567,7 +566,6 @@ impl ASAPQueryEngine {
                                 physical.query_plan.plan_version,
                             ),
                             population,
-                            readout,
                             evaluation_ms,
                         )
                         .map_err(|error| EngineError::capability_miss("current_series", error))?;

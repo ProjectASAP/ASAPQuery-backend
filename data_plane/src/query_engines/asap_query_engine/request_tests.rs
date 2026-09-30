@@ -127,7 +127,6 @@ fn mixed_bound_outputs_rejected_before_any_source_is_read() {
                     max_k: 3,
                     quantiles: false,
                 },
-                readout: current_series::SeriesReadout::Sum,
             },
             inputs: vec![],
         },

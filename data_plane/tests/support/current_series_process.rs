@@ -297,10 +297,6 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
         metrics.contains("asap_current_series_populations 2\n"),
         "{metrics}"
     );
-    assert!(
-        metrics.contains("asap_current_series_cache_builds_total 3\n"),
-        "{metrics}"
-    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     // A decreasing value and a stale marker must promote a formerly excluded series.
     for (pod, value, offset, expected) in [

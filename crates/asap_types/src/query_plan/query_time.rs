@@ -10,10 +10,10 @@ fn invalid(message: impl Into<String>) -> QueryPlanError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryTimeOperator {
-    /// Readout over a bounded current-value population maintained at ingest.
+    /// Every member of a bounded current-value population maintained at
+    /// ingest; the entry's Planner program computes the readout.
     CurrentSeries {
         population: super::current_series::SeriesPopulation,
-        readout: super::current_series::SeriesReadout,
     },
     /// A maximal exact scalar/vector subtree evaluated by Prometheus.
     ExactSubquery { query: String },
@@ -51,25 +51,8 @@ pub enum LabelMatch {
 }
 impl QueryTimeOperator {
     pub fn validate(&self, inputs: usize) -> Result<(), QueryPlanError> {
-        if let Self::CurrentSeries {
-            population,
-            readout,
-        } = self
-        {
+        if let Self::CurrentSeries { population } = self {
             population.validate()?;
-            match readout {
-                super::current_series::SeriesReadout::Quantile { q }
-                    if !q.is_finite() || !population.quantiles =>
-                {
-                    return Err(invalid(
-                        "quantile readout requires finite q and a quantile population",
-                    ))
-                }
-                super::current_series::SeriesReadout::TopK { k } if *k > population.max_k => {
-                    return Err(invalid("TopK readout exceeds shared population capacity"))
-                }
-                _ => {}
-            }
         }
         let expected = match self {
             Self::Scan { .. } | Self::ExactSubquery { .. } | Self::CurrentSeries { .. } => 0,

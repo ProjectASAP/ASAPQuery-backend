@@ -1,13 +1,15 @@
 # Shared current-series quantiles and TopK
 
 Backend-local PromQL workload compilation can export a maintained current-value
-alternative for `quantile(q, metric)` and `topk(k, metric)`, including `by` and
-`without` grouping and selector label matchers. Parameters must be finite scalar
+alternative for `quantile(q, metric)`, `topk(k, metric)`, `sum`, `count` and
+`avg`, with `by` grouping and selector label matchers. `without` grouping is
+forwarded to the exact engine until Planner can project it from the series
+identity. Parameters must be finite scalar
 literals. Selector offsets, `@`, nested input expressions and MetricsQL use the
 existing alternatives; they are not admitted by this implementation.
 
 ASAPPlanner owns this transformation through the opt-in `MaintainedPopulationStrategy`
-over canonical IR. It emits `MaintainPopulation` at maintenance time and
+over canonical IR typed with the complete series identity. It emits `MaintainPopulation` at maintenance time and
 `ReadPopulation` at read time, with source/filter/group identity, quantile
 consumers and the maximum requested k in its typed contract. Compatible producers
 are shared by Planner CSE. The backend consumes these nodes, binds resource and
@@ -18,7 +20,10 @@ opt in only when they can implement and price this maintenance contract.
 For example, put p50, p90, p95, p99 and Top1/Top5 in one workload. Matching source,
 selector and grouping contracts produce one `CurrentSeries` population with
 `quantiles: true` and `max_k: 5`. Each registered query keeps its own readout.
-Different sources, filters and groupings remain distinct. This state is exact:
+Different sources, filters and groupings remain distinct. The backend stores
+only the population and returns its current members; each readout (ranking,
+quantile, sum, count, average) is the query's Planner-compiled physical program
+over those members. This state is exact:
 it retains each series' current value in a shared ordered population, rather than
 inserting all historical observations into a quantile sketch. Its memory grows
 with series cardinality, even when only Top1 is requested. Those excluded series
@@ -26,9 +31,7 @@ are required to promote the correct replacement when a winner decreases or expir
 
 Accepted Remote Write batches update the state atomically under its lock. A newer
 sample replaces the old value; stale markers remove the value. Older updates do
-not resurrect a newer stale marker. Per-group readout arrays are shared until that
-group changes. TopK-only populations cache just the largest registered k results;
-quantile consumers also share an ordered value array.
+not resurrect a newer stale marker.
 
 Deployment uses complete workload quotes. The manifest deduplicates population
 build, update, residency and retirement components across consumers and prices
@@ -48,12 +51,12 @@ A native exact alternative remains available for cost selection and execution fa
 - State is in memory. Restart and generation replacement require warmup again;
   historical range queries continue to use native execution.
 - Populations divide the configured retained-summary memory budget and cap series
-  cardinality. Bounds include conservative space for labels, trees and caches.
+  cardinality. Bounds include conservative space for labels and trees.
   The existing Remote Write adapter accepts finite sample values and stale markers.
 
-`/metrics` exposes `asap_current_series_populations` and
-`asap_current_series_cache_builds_total` to verify reuse. These describe the active
-in-memory population generation; they are not window-sketch materialization counts.
+`/metrics` exposes `asap_current_series_populations` to verify sharing. It
+describes the active in-memory population generation; it is not a window-sketch
+materialization count.
 
 ## Validation
 

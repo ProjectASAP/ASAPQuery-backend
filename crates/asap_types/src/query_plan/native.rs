@@ -11,11 +11,7 @@ impl QueryPlanEntry {
         }
         match self.nodes.get(&self.root) {
             Some(QueryPlanNode::Logical {
-                operator:
-                    query_time::QueryTimeOperator::CurrentSeries {
-                        population,
-                        readout: current_series::SeriesReadout::Snapshot,
-                    },
+                operator: query_time::QueryTimeOperator::CurrentSeries { population },
                 inputs,
             }) if inputs.is_empty() => Some(population),
             _ => None,
@@ -49,12 +45,27 @@ impl QueryPlanEntry {
         let output = dag
             .output_contract(*root)
             .map_err(|error| QueryPlanError::Invalid(error.to_string()))?;
-        if input.schema != output.schema {
+        use planner_types::{post_asap::SummaryFamilyType, pre_asap::DataType};
+        // A ranking returns complete source rows; an aggregate returns one
+        // value per group of the population's grouping labels.
+        let numeric = |field: &planner_types::post_asap::SummaryField| {
+            matches!(
+                field.dtype,
+                SummaryFamilyType::Plain(DataType::Float64 | DataType::Int64)
+            )
+        };
+        let grouped_value = output.schema.time_index.is_none()
+            && output.schema.fields.iter().filter(|f| numeric(f)).count() == 1
+            && output.schema.fields.iter().all(|field| {
+                numeric(field)
+                    || (field.dtype == SummaryFamilyType::Plain(DataType::Utf8)
+                        && population.grouping.labels.contains(&field.name))
+            });
+        if input.schema != output.schema && !grouped_value {
             return Err(invalid(
-                "population ranking must preserve complete source rows",
+                "population readout must return source rows or one value per group",
             ));
         }
-        use planner_types::{post_asap::SummaryFamilyType, pre_asap::DataType};
         let fields = &input.schema.fields;
         let column = |name: &str, dtype: DataType| {
             fields.iter().any(|field| {

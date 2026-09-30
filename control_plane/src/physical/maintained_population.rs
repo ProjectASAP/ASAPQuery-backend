@@ -4,17 +4,17 @@ use super::compiler::QueryCompilationInput;
 use super::compiler::{CompileError, PhysicalCompilationRequest};
 use asap_types::physical_plan_codec::PhysicalPlanCodec;
 use asap_types::query_plan::{
-    current_series::{SeriesPopulation, SeriesReadout},
+    current_series::SeriesPopulation,
     query_time::{Grouping, LabelMatch, LabelMatcher, QueryTimeOperator},
 };
 use planner_types::post_asap::{
     maintained_population::*, SummaryExpr, SummaryNode, ValueOperation,
 };
 
-fn selected(node: &SummaryNode) -> Option<(MaintainedPopulation, PopulationReadout)> {
+fn selected(node: &SummaryNode) -> Option<MaintainedPopulation> {
     if let SummaryExpr::ValueOperation {
         child,
-        operation: ValueOperation::ReadPopulation { readout },
+        operation: ValueOperation::ReadPopulation { .. },
         ..
     } = &node.expr
     {
@@ -23,13 +23,13 @@ fn selected(node: &SummaryNode) -> Option<(MaintainedPopulation, PopulationReado
             ..
         } = &child.expr
         {
-            return Some((population.clone(), readout.clone()));
+            return Some(population.clone());
         }
     }
     // The source remains a maintained population when Planner places a heap,
     // projection and ranking above it. Backend binds that source only.
     let SummaryExpr::ValueOperation {
-        operation: ValueOperation::Limit { n, offset: 0, .. },
+        operation: ValueOperation::Limit { offset: 0, .. },
         ..
     } = &node.expr
     else {
@@ -54,12 +54,14 @@ fn selected(node: &SummaryNode) -> Option<(MaintainedPopulation, PopulationReado
         &std::rc::Rc::new(node.clone()),
     )
     .ok()?;
-    Some(((*population).clone(), PopulationReadout::TopK { k: *n }))
+    Some((*population).clone())
 }
 
+/// A current-series population Planner can read out. Planner cannot yet
+/// project `without` groups from the series identity.
 pub(super) fn supported_node(node: &SummaryNode) -> bool {
-    selected(node).is_some_and(|(population, _)| {
-        matches!(population.input, PopulationInput::CurrentSeries(_))
+    selected(node).is_some_and(|population| {
+        matches!(&population.input, PopulationInput::CurrentSeries(spec) if !spec.without)
     })
 }
 
@@ -83,9 +85,7 @@ pub(super) fn operators(
     let populations: std::collections::BTreeSet<_> = selected
         .iter()
         .flatten()
-        .map(|(population, _)| {
-            serde_json::to_string(population).expect("typed population serializes")
-        })
+        .map(|population| serde_json::to_string(population).expect("typed population serializes"))
         .collect();
     let max_bytes = request
         .retained_summary_memory_budget_bytes
@@ -93,7 +93,7 @@ pub(super) fn operators(
         .min(1_073_741_824)
         / populations.len().max(1) as u64;
     selected.into_iter().zip(&request.queries).map(|(selected, query)| {
-        let Some((spec, readout)) = selected else { return Ok(None); };
+        let Some(spec) = selected else { return Ok(None); };
     let PopulationInput::CurrentSeries(input) = &spec.input else {
         return Err(CompileError::Query { query_id: query.query_id.clone(), reason: "maintained table-row populations require a row-update executor; remote-write current-series state is incompatible".into() });
     };
@@ -131,17 +131,7 @@ pub(super) fn operators(
             .min(input.lookback_ms),
     };
     population.validate()?;
-    let readout = match &readout {
-        PopulationReadout::Quantile { q } => SeriesReadout::Quantile { q: *q },
-        PopulationReadout::TopK { k } => SeriesReadout::TopK { k: *k as u64 },
-        PopulationReadout::Sum => SeriesReadout::Sum,
-        PopulationReadout::Count => SeriesReadout::Count,
-        PopulationReadout::Average => SeriesReadout::Average,
-    };
-    Ok(Some(QueryTimeOperator::CurrentSeries {
-        population,
-        readout,
-    }))
+    Ok(Some(QueryTimeOperator::CurrentSeries { population }))
     }).collect()
 }
 
@@ -158,30 +148,25 @@ pub(super) fn operator(
     Ok(operators(request)?.remove(index))
 }
 
-/// The maintained population is a deployment source; ranking is compiled by
-/// Planner before this candidate is priced or installed.
-pub(super) fn install_native_topk(
+/// The maintained population is a deployment source; its readout is the
+/// Planner program compiled before this candidate is priced or installed.
+pub(super) fn install_population_readout(
     entry: &mut asap_types::query_plan::QueryPlanEntry,
     compiled: Option<&asap_physical_operators::physical_planner::CompiledPhysicalDag>,
 ) -> Result<(), CompileError> {
     use asap_types::query_plan::QueryPlanNode;
-    let Some(QueryPlanNode::Logical {
-        operator:
-            QueryTimeOperator::CurrentSeries {
-                population,
-                readout: SeriesReadout::TopK { .. },
-            },
-        ..
-    }) = entry.nodes.get(&entry.root)
-    else {
-        return Ok(());
-    };
-    if population.grouping.without {
+    if !matches!(
+        entry.nodes.get(&entry.root),
+        Some(QueryPlanNode::Logical {
+            operator: QueryTimeOperator::CurrentSeries { .. },
+            ..
+        })
+    ) {
         return Ok(());
     }
     let compiled = compiled.ok_or_else(|| CompileError::Query {
         query_id: entry.query_id.clone(),
-        reason: "selected TopK candidate has no retained physical DAG".into(),
+        reason: "selected population readout has no retained physical DAG".into(),
     })?;
     let encoded = compiled.encode().map_err(|error| CompileError::Query {
         query_id: entry.query_id.clone(),
@@ -191,14 +176,6 @@ pub(super) fn install_native_topk(
         serde_json::from_slice(&encoded)
             .map_err(|error| CompileError::Snapshot(error.to_string()))?,
     );
-    let Some(QueryPlanNode::Logical {
-        operator: QueryTimeOperator::CurrentSeries { readout, .. },
-        ..
-    }) = entry.nodes.get_mut(&entry.root)
-    else {
-        unreachable!()
-    };
-    *readout = SeriesReadout::Snapshot;
     entry.recover_population_physical_dag()?;
     Ok(())
 }
