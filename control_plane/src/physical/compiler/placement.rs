@@ -1155,6 +1155,41 @@ fn retime(
     Some(Rc::new(next))
 }
 
+/// Price the hypothetical retained native realization with the same window
+/// preparation and selection used when that realization is installed.
+fn native_retained_states(
+    root: &Rc<SummaryNode>,
+    state: &Rc<SummaryNode>,
+    query: &QueryCompilationInput,
+    environment: &PhysicalDeploymentContext,
+    inputs: &BackendLocalPhysicalInputs,
+) -> Option<u64> {
+    let timing = planner_types::post_asap::ExecutionTiming::IngestionTime;
+    let retained_state = retime(state, state, timing)?;
+    let mut retained = query.clone();
+    retained.selected_plan_root = retime(root, state, timing)?;
+    let physical = root_fixed_window_candidate(&retained.selected_plan_root).ok()?;
+    retained.retain(Some(physical)).ok()?;
+    prepare_window_implementations(
+        &mut retained,
+        &inputs.window_cost_model,
+        environment.target,
+        inputs.query_retention_margin_ms,
+    )
+    .ok()?;
+    let states = collect_selected_materializations(&retained.selected_plan_root, true).ok()?;
+    let state = states.iter().find(|state| state.node == retained_state)?;
+    installed_window(
+        &retained,
+        state,
+        &states,
+        environment,
+        inputs.query_retention_margin_ms,
+        false,
+    )
+    .map(|(_, count)| count)
+}
+
 /// A Planner candidate with a native physical realization after its
 /// readout-built states are placed by lifecycle.
 pub(super) struct TimedCandidate {
@@ -1175,6 +1210,7 @@ pub(super) fn time_native_candidate(
     data: &DataWorkload,
     index: usize,
     environment: &PhysicalDeploymentContext,
+    inputs: &BackendLocalPhysicalInputs,
 ) -> Option<TimedCandidate> {
     use planner_types::post_asap::ExecutionTiming;
     let untimed = || {
@@ -1185,8 +1221,8 @@ pub(super) fn time_native_candidate(
         })
     };
     let lifecycle = &query.summary_lifecycle_inputs;
-    // Windows are prepared from the timed root, so the installed layout is not
-    // known while its timing is being chosen.
+    // Enumerate lifecycle choices first; each retained native alternative is
+    // repriced below using its hypothetical installed window layout.
     let model = LifecycleCosts {
         costs: lifecycle.costs.clone(),
         retained_states: None,
@@ -1219,11 +1255,32 @@ pub(super) fn time_native_candidate(
     let mut trace = Vec::new();
     let mut maintained_over_readouts = false;
     for deployment in candidates.deployments() {
-        let retained = alternative_cost(
-            deployment,
-            &SummaryMaintenanceLifecycle::ContinuouslyMaintained,
-        );
         let lifecycle = if over_readouts(&deployment.summary) {
+            let retained_states =
+                native_retained_states(root, &deployment.summary, query, environment, inputs);
+            let mut retained_model = model.clone();
+            retained_model.retained_states = retained_states;
+            let retained = retained_states.and_then(|_| {
+                let priced = enumerate_summary_maintenance_lifecycles(
+                    Rc::clone(root),
+                    WorkloadDemand::new_with_data(workload, data, std::slice::from_ref(&index)),
+                    environment.observed_at_unix_ms,
+                    Some(Horizon(lifecycle.horizon_seconds)),
+                    SummaryMaintenanceLifecycleCapabilities {
+                        supports_ephemeral: true,
+                        supports_prepared: false,
+                        supports_shared: false,
+                        supports_continuously_maintained: true,
+                    },
+                    &retained_model,
+                )
+                .ok()?;
+                let priced = priced
+                    .deployments()
+                    .iter()
+                    .find(|priced| priced.summary == deployment.summary)?;
+                alternative_cost(priced, &SummaryMaintenanceLifecycle::ContinuouslyMaintained)
+            });
             let rebuilt = alternative_cost(deployment, &SummaryMaintenanceLifecycle::Ephemeral);
             let ephemeral = rebuild_is_cheaper(retained, rebuilt);
             maintained_over_readouts |= !ephemeral;
@@ -1237,6 +1294,7 @@ pub(super) fn time_native_candidate(
             // placement of the states it installs as `lifecycle_placement`.
             trace.push(json!({
                 "stage": "deployment.native_candidate_placement",
+                "retained_states": retained_states,
                 "query_ids": [&query.query_id],
                 "candidate_root_id": crate::planner_selection::explained_root_id(root, &query.accuracy_target),
                 "logical_root_id": crate::planner_selection::explained_root_id(&deployment.summary, &query.accuracy_target),

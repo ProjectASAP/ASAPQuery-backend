@@ -1106,6 +1106,7 @@ impl BackendLocalPlanningInput {
                     &data_workload,
                     index,
                     &self.environment,
+                    &self.physical_inputs,
                 ) else {
                     if typed_search {
                         planner_selection_trace.push(serde_json::json!({
