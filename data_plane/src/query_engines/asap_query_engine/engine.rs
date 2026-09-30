@@ -250,6 +250,7 @@ impl ASAPQueryEngine {
             entry,
             times,
             physical.precompute_plan.summary_catalog.as_ref(),
+            self.max_stored_input_lag_ms,
         )?
         else {
             return Ok(None);
@@ -542,6 +543,7 @@ impl ASAPQueryEngine {
                     entry,
                     &[at],
                     physical.precompute_plan.summary_catalog.as_ref(),
+                    self.max_stored_input_lag_ms,
                 )
             })
             .transpose()?

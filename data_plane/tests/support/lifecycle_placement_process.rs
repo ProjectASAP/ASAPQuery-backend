@@ -209,9 +209,20 @@ async fn expensive_summary_store_rebuilds_state_from_raw_series() {
 // the default bound of one 10 s slide.
 #[tokio::test]
 async fn mixed_placement_combines_raw_series_with_stored_state_within_the_lag_bound() {
+    mixed_placement_at_offset(0).await;
+}
+
+// Revision pinning admits the latest complete stored window for an off-grid
+// evaluation, while raw data is still fetched at the requested timestamp.
+#[tokio::test]
+async fn mixed_placement_pins_stored_revision_between_window_boundaries() {
+    mixed_placement_at_offset(3_000).await;
+}
+
+async fn mixed_placement_at_offset(offset_ms: i64) {
     const MIXED: &str = "sum(rate(a[1m])) + sum(rate(b[10m]))";
     let origin = origin_ms();
-    let at_ms = origin + 650_000;
+    let at_ms = origin + 650_000 + offset_ms;
     // Raw `a` rises 1/s. Stored `b` rises 2/s, then 4/s over the last 5 s
     // before t_q, so its rate tells which stored window was read. Its samples
     // sit mid-second, off every window boundary.
@@ -260,11 +271,15 @@ async fn mixed_placement_combines_raw_series_with_stored_state_within_the_lag_bo
         panic!("no mixed answer: {last}\nbackend log:\n{log}")
     });
     assert!(lag <= 10_000, "lag {lag} beyond one slide");
-    assert_eq!(lag % 10_000, 0, "stored windows end on the 10 s grid");
+    assert_eq!(
+        lag % 10_000,
+        offset_ms as u64,
+        "stored windows end on the 10 s grid"
+    );
     // Exact reference: rate(a) over (t_q - 1m, t_q] plus rate(b) over the
     // stored window (t_s - 10m, t_s], t_s = t_q - lag. Its samples span 599 s
     // and extrapolate half a second to each window edge.
-    let end = 650 - lag as i64 / 1000;
+    let end = 650 + offset_ms / 1000 - lag as i64 / 1000;
     let expected = 1.0 + (counter(end - 1) - counter(end - 600)) / 599.0;
     let value = first_value(&last, "value").unwrap();
     assert!(
