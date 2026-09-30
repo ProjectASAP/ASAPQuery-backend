@@ -300,6 +300,10 @@ struct ReductionRollupSeries {
     base_width_ms: Option<u64>,
     next_start_ms: Option<u64>,
     valid: bool,
+    /// A pane that does not extend the series contiguously (a late correction,
+    /// a replacement or a gap) is not folded in, so the rollup can no longer
+    /// answer and stays invalid; readers fall back to the exact panes.
+    broken: bool,
     levels: Vec<BTreeMap<u64, ReductionRollupNode>>,
 }
 
@@ -311,6 +315,7 @@ impl ReductionRollupSeries {
             base_width_ms: None,
             next_start_ms: None,
             valid: false,
+            broken: false,
             levels: Vec::new(),
         }
     }
@@ -318,9 +323,13 @@ impl ReductionRollupSeries {
 
 impl ReductionRollupSeries {
     fn append(&mut self, window: TimestampRange, value: f64, retention_horizon_ms: Option<u64>) {
+        if self.broken {
+            return;
+        }
         let width = window.1.saturating_sub(window.0);
         if width == 0 || self.next_start_ms.is_some_and(|next| next != window.0) {
             self.valid = false;
+            self.broken = true;
             return;
         }
         let anchor = *self.anchor_start_ms.get_or_insert(window.0);
@@ -330,6 +339,7 @@ impl ReductionRollupSeries {
             || !(window.0 - anchor).is_multiple_of(base_width)
         {
             self.valid = false;
+            self.broken = true;
             return;
         }
         self.valid = true;
@@ -3879,6 +3889,19 @@ pub use crate::storage_engines::sketch_db::persistence;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A late correction to a closed pane makes the rollup stop answering
+    // instead of serving the uncorrected extremum.
+    #[test]
+    fn min_rollup_stops_answering_after_a_late_correction() {
+        let mut rollup = ReductionRollupSeries::new(RollupReduction::Min);
+        rollup.append((0, 1000), 7.0, None);
+        rollup.append((1000, 2000), 3.0, None);
+        assert_eq!(rollup.query(0, 2000), Some(3.0));
+        rollup.append((0, 1000), 1.0, None);
+        rollup.append((2000, 3000), 5.0, None);
+        assert_eq!(rollup.query(0, 3000), None);
+    }
 
     #[test]
     fn max_rollup_answers_aligned_and_partial_ranges_and_prunes_history() {
