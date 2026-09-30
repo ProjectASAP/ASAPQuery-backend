@@ -1627,6 +1627,11 @@ impl DeploymentPlanCompiler {
             request.queries[id].selected_plan_root = root;
         }
         let placement = placement::place(&request, &environment, frontend);
+        for (index, query) in request.queries.iter_mut().enumerate() {
+            if let Some(root) = placement.root(index) {
+                query.selected_plan_root = Rc::clone(root);
+            }
+        }
         let population_operators = super::maintained_population::operators(&request)?;
         let mut compiled_materializations = Vec::with_capacity(request.queries.len());
         let mut collector_materializations = Vec::with_capacity(request.queries.len());
@@ -1646,6 +1651,7 @@ impl DeploymentPlanCompiler {
             &request.queries,
             environment.target,
             request.allow_mixed_summary_and_exact_execution,
+            |index| placement.native_branches(index),
         )?;
         let mut lifecycle_estimates =
             BTreeMap::<asap_types::PolicyFingerprint, MaterializationLifecycleEstimate>::new();
@@ -1668,9 +1674,10 @@ impl DeploymentPlanCompiler {
             let selected = if super::maintained_population::supported_node(&node) {
                 Vec::new()
             } else {
-                collect_selected_materializations(
+                collect_selected_materializations_with(
                     &node,
                     request.allow_mixed_summary_and_exact_execution,
+                    placement.native_branches(query_index),
                 )
                 .map_err(|reason| CompileError::Query {
                     query_id: query.query_id.clone(),
@@ -1780,7 +1787,13 @@ impl DeploymentPlanCompiler {
                 .retained_physical()?
                 .is_some_and(|candidate| candidate.precompute.is_some());
             for (ordinal, selected) in selected.into_iter().enumerate() {
-                let branch_query = state_query(query, &selected, &cohort_nodes, native_cohort);
+                let branch_query = state_query(
+                    query,
+                    &selected,
+                    &cohort_nodes,
+                    native_cohort,
+                    placement.beside_raw(query_index, &selected.node),
+                );
                 let query = &branch_query;
                 let lifecycle_costs = SummaryMaintenanceLifecycleCostInputs {
                     build_cost: Some(Cost(query.summary_lifecycle_inputs.costs.build)),
@@ -1993,6 +2006,7 @@ impl DeploymentPlanCompiler {
                         reason: error.to_string(),
                     })?;
                     if !native_cohort
+                        && !placement.beside_raw(query_index, &selected.node)
                         && runtime_materialization.window_size
                             != runtime_materialization.slide_interval
                     {
@@ -2352,11 +2366,24 @@ impl DeploymentPlanCompiler {
                 None
             };
             let mut entry = if let Some(raw) = placement.raw_program(query_index) {
+                let stored = raw
+                    .stored
+                    .iter()
+                    .map(|(slot, node)| {
+                        let SummaryExpr::SummaryAgg { family, .. } = &node.expr else {
+                            return Err(CompileError::Snapshot(
+                                "stored input beside raw series is not a summary state".into(),
+                            ));
+                        };
+                        Ok((*slot, binding(node, family)?))
+                    })
+                    .collect::<Result<Vec<_>, CompileError>>()?;
                 Ok(raw_query_time_entry(
                     query,
                     canonical.clone(),
                     &original_root(query, query_index, &request.canonical_roots)?,
                     raw,
+                    stored,
                 )?)
             } else if let Some((source, program)) = native_rate {
                 let native_state_binding = if let SummaryExpr::SummaryAgg {
@@ -2592,6 +2619,20 @@ impl DeploymentPlanCompiler {
                 query_id: query_id.clone(),
                 reason,
             })?;
+            for (branch, program) in placement.branch_programs(query_index) {
+                let sink = compiled.node_ids.node_id(branch).ok_or_else(|| {
+                    CompileError::Snapshot("stored branch is absent from its DAG".into())
+                })?;
+                installed.native_programs.insert(
+                    sink,
+                    serde_json::from_slice(
+                        &program
+                            .encode()
+                            .map_err(|e| CompileError::Snapshot(e.to_string()))?,
+                    )
+                    .map_err(|e| CompileError::Snapshot(e.to_string()))?,
+                );
+            }
             if let Some(program) = request.queries[query_index]
                 .retained_physical()?
                 .and_then(|physical| physical.precompute)
@@ -2857,23 +2898,36 @@ fn raw_query_time_entry(
     canonical: String,
     root_expr: &QueryExpr,
     raw: &placement::RawQueryTimeProgram,
+    stored: Vec<(u64, MaterializationBinding)>,
 ) -> Result<QueryPlanEntry, CompileError> {
     let mut nodes = BTreeMap::new();
     let mut inputs = Vec::new();
     let mut source_nodes = Vec::new();
-    for (ordinal, (slot, scan)) in raw.scans.iter().enumerate() {
+    let leaves = raw
+        .scans
+        .iter()
+        .map(|(slot, scan)| {
+            (
+                *slot,
+                crate::query_plan::QueryPlanNode::Logical {
+                    operator: scan.clone(),
+                    inputs: vec![],
+                },
+            )
+        })
+        .chain(stored.into_iter().map(|(slot, binding)| {
+            (
+                slot,
+                crate::query_plan::QueryPlanNode::ReadMaterialization { binding },
+            )
+        }));
+    for (ordinal, (slot, node)) in leaves.enumerate() {
         let id = crate::query_plan::QueryNodeId(ordinal as u64);
-        nodes.insert(
-            id,
-            crate::query_plan::QueryPlanNode::Logical {
-                operator: scan.clone(),
-                inputs: vec![],
-            },
-        );
+        nodes.insert(id, node);
         inputs.push(id);
-        source_nodes.push(*slot);
+        source_nodes.push(slot);
     }
-    let root = crate::query_plan::QueryNodeId(raw.scans.len() as u64);
+    let root = crate::query_plan::QueryNodeId(inputs.len() as u64);
     nodes.insert(
         root,
         crate::query_plan::QueryPlanNode::Physical {
@@ -3858,11 +3912,15 @@ struct PlannerPhysicalSelection {
 
 /// `query` as the consumer of `state` alone: its window, grouping, and the
 /// window implementations that can install it.
+/// A state read beside query-time raw inputs, like a native cohort state, is
+/// installed as one complete window sliding at the evaluation interval: the
+/// executor reads it as a stored native batch within one slide of t_q.
 fn state_query(
     query: &QueryCompilationInput,
     state: &SelectedMaterialization,
     cohort_nodes: &BTreeSet<usize>,
     native_cohort: bool,
+    beside_raw: bool,
 ) -> QueryCompilationInput {
     let mut branch = query.clone();
     branch.query_lookback_ms = state
@@ -3877,14 +3935,12 @@ fn state_query(
     let cohort = cohort_nodes.contains(&(Rc::as_ptr(&state.node) as usize));
     branch.window_realization_candidates.retain(|candidate| {
         candidate.window_secs.saturating_mul(1_000) == lookback_ms
-            && if cohort {
-                if native_cohort {
-                    windows::is_complete_window(candidate)
-                        && candidate.slide_secs.saturating_mul(1000)
-                            == u64::from(query.summary_lifecycle_inputs.evaluation_interval_ms)
-                } else {
-                    windows::is_full_cohort(candidate)
-                }
+            && if beside_raw || (cohort && native_cohort) {
+                windows::is_complete_window(candidate)
+                    && candidate.slide_secs.saturating_mul(1000)
+                        == u64::from(query.summary_lifecycle_inputs.evaluation_interval_ms)
+            } else if cohort {
+                windows::is_full_cohort(candidate)
             } else {
                 !candidate.cohort_only
             }
@@ -4444,10 +4500,11 @@ pub(crate) fn aggregation_config_for_materialization(
     .context("build materialization from physical aggregation")
 }
 
-fn materialization_consumers(
+fn materialization_consumers<'a>(
     queries: &[QueryCompilationInput],
     target: PhysicalDeploymentTarget,
     composable: bool,
+    native_branches: impl Fn(usize) -> &'a [Rc<SummaryNode>],
 ) -> Result<BTreeMap<asap_types::PolicyFingerprint, BTreeSet<usize>>, CompileError> {
     let mut consumers = BTreeMap::<_, BTreeSet<_>>::new();
     // Until logical lifecycle costing carries a derived-program identity,
@@ -4455,11 +4512,15 @@ fn materialization_consumers(
     let mut cohort_programs =
         BTreeMap::<asap_types::PolicyFingerprint, Option<*const SummaryNode>>::new();
     for (index, query) in queries.iter().enumerate() {
-        let states = collect_selected_materializations(&query.selected_plan_root, composable)
-            .map_err(|reason| CompileError::Query {
-                query_id: query.query_id.clone(),
-                reason,
-            })?;
+        let states = collect_selected_materializations_with(
+            &query.selected_plan_root,
+            composable,
+            native_branches(index),
+        )
+        .map_err(|reason| CompileError::Query {
+            query_id: query.query_id.clone(),
+            reason,
+        })?;
         for state in states {
             if composable
                 && state.window_secs.is_some_and(|window| {
@@ -4555,14 +4616,29 @@ fn collect_selected_materializations(
     node: &Rc<SummaryNode>,
     composable: bool,
 ) -> Result<Vec<SelectedMaterialization>, String> {
+    collect_selected_materializations_with(node, composable, &[])
+}
+
+/// [`collect_selected_materializations`] where each of `native_branches` is
+/// maintained by its own complete native graph, as a whole root with a
+/// fixed-window realization is: its Sum over readouts is a stored state.
+fn collect_selected_materializations_with(
+    node: &Rc<SummaryNode>,
+    composable: bool,
+    native_branches: &[Rc<SummaryNode>],
+) -> Result<Vec<SelectedMaterialization>, String> {
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         node: &Rc<SummaryNode>,
         readout: Option<&SketchQuery>,
         composable: bool,
         native_maintenance: bool,
+        branches: &[Rc<SummaryNode>],
         inherited_grouping: Option<Vec<String>>,
         selected: &mut Vec<SelectedMaterialization>,
     ) -> Result<(), String> {
+        let native_maintenance =
+            native_maintenance || branches.iter().any(|branch| Rc::ptr_eq(branch, node));
         let grouping = if composable {
             if let SummaryExpr::SummaryAgg {
                 reduction, child, ..
@@ -4612,7 +4688,15 @@ fn collect_selected_materializations(
         };
         if let Some(source) = &immutable_sources {
             for source in source {
-                walk(source, None, composable, native_maintenance, None, selected)?;
+                walk(
+                    source,
+                    None,
+                    composable,
+                    native_maintenance,
+                    branches,
+                    None,
+                    selected,
+                )?;
             }
         }
         match &node.expr {
@@ -4628,6 +4712,7 @@ fn collect_selected_materializations(
                     readout,
                     composable,
                     native_maintenance,
+                    branches,
                     grouping.clone(),
                     selected,
                 )?;
@@ -4636,6 +4721,7 @@ fn collect_selected_materializations(
                     readout,
                     composable,
                     native_maintenance,
+                    branches,
                     grouping.clone(),
                     selected,
                 )?;
@@ -4646,6 +4732,7 @@ fn collect_selected_materializations(
                     readout,
                     composable,
                     native_maintenance,
+                    branches,
                     grouping.clone(),
                     selected,
                 )?;
@@ -4656,6 +4743,7 @@ fn collect_selected_materializations(
                     readout,
                     composable,
                     native_maintenance,
+                    branches,
                     grouping.clone(),
                     selected,
                 )?;
@@ -4664,6 +4752,7 @@ fn collect_selected_materializations(
                     readout,
                     composable,
                     native_maintenance,
+                    branches,
                     grouping.clone(),
                     selected,
                 )?;
@@ -4676,6 +4765,7 @@ fn collect_selected_materializations(
                     readout,
                     composable,
                     native_maintenance,
+                    branches,
                     grouping.clone(),
                     selected,
                 )?;
@@ -4684,6 +4774,7 @@ fn collect_selected_materializations(
                     readout,
                     composable,
                     native_maintenance,
+                    branches,
                     grouping.clone(),
                     selected,
                 )?;
@@ -4704,6 +4795,7 @@ fn collect_selected_materializations(
                     readout,
                     composable,
                     native_maintenance,
+                    branches,
                     grouping.clone(),
                     selected,
                 )?;
@@ -4724,6 +4816,7 @@ fn collect_selected_materializations(
                 Some(query),
                 composable,
                 native_maintenance,
+                branches,
                 grouping.clone(),
                 selected,
             )?,
@@ -4734,6 +4827,7 @@ fn collect_selected_materializations(
                         readout,
                         composable,
                         native_maintenance,
+                        branches,
                         grouping.clone(),
                         selected,
                     )?;
@@ -4842,6 +4936,7 @@ fn collect_selected_materializations(
         None,
         composable,
         placement::root_fixed_window_candidate(node).is_ok(),
+        native_branches,
         None,
         &mut selected,
     )?;
@@ -6060,6 +6155,7 @@ pub(crate) mod tests {
             &queries,
             PhysicalDeploymentTarget::BackendLocalRemoteWrite,
             true,
+            |_| &[],
         )
         .unwrap_err();
         assert!(
