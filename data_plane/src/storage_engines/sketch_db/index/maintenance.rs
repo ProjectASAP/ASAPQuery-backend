@@ -1385,18 +1385,34 @@ mod tests {
             let frames = &rows[0].samples[&60_000];
             assert_eq!(frames.len(), 1);
             let sketch = match frames[0].encoding {
-                SketchEncoding::MsgpackFull => DDSketchAccumulator {
-                    inner: asap_summary_state::stored_state::decoders::ddsketch_from_msgpack(
+                SketchEncoding::SampledKernelV2 => {
+                    let state = asap_summary_state::stored_state::codec::decode(
+                        "DDSketchAccumulatorV2",
+                        &frames[0].bytes,
+                    )
+                    .unwrap();
+                    state
+                        .as_any()
+                        .downcast_ref::<DDSketchAccumulator>()
+                        .unwrap()
+                        .clone()
+                }
+                SketchEncoding::MsgpackFull => DDSketchAccumulator::from_sketch(
+                    asap_summary_state::stored_state::decoders::ddsketch_from_msgpack(
                         &frames[0].bytes,
                     )
                     .unwrap(),
-                },
-                SketchEncoding::ProtoFull => DDSketchAccumulator {
-                    inner: asap_summary_state::stored_state::decoders::ddsketch_from_proto(
+                    1.0,
+                )
+                .expect("validated sampling probability"),
+                SketchEncoding::ProtoFull => DDSketchAccumulator::from_sketch(
+                    asap_summary_state::stored_state::decoders::ddsketch_from_proto(
                         &frames[0].bytes,
                     )
                     .unwrap(),
-                },
+                    1.0,
+                )
+                .expect("validated sampling probability"),
                 other => panic!("unexpected derived encoding: {other:?}"),
             };
             assert_eq!(sketch.inner.total_count(), 2);

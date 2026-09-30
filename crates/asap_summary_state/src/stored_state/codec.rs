@@ -4,9 +4,9 @@
 //! only place that names their persisted type tags and byte encodings; Planner
 //! owns their update, merge and estimate.
 use super::native::NativeSummaryOutput;
-use crate::univmon::UnivMonAccumulator;
-use crate::{AggregationType, KeyByLabelValues};
+use crate::AggregationType;
 use asap_physical_operators::summary_kernels as k;
+use asap_physical_operators::summary_kernels::univmon::UnivMonAccumulator;
 use asap_physical_operators::summary_kernels::weighted_frequency::{
     FrequencyAlgorithm, WeightedFrequency,
 };
@@ -18,11 +18,12 @@ use std::collections::HashMap;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// Persisted type tag of Planner's exact state (its named msgpack form).
-pub const EXACT_V1: &str = "PlannerExactAccumulatorV1";
+pub const EXACT_V2: &str = "PlannerExactAccumulatorV2";
 
 /// Exact-state tags written before the store kept Planner kernels. Their byte
 /// layouts are no longer decoded.
 const RETIRED_EXACT_TAGS: &[&str] = &[
+    "PlannerExactAccumulatorV1",
     "SumAccumulator",
     "IncreaseAccumulator",
     "MinAccumulator",
@@ -80,20 +81,8 @@ fn view(state: &dyn AggregateCore) -> Option<View<'_>> {
     None
 }
 
-/// Planner's weighted frequency state is serde-transparent over the sketchlib
-/// kernel, which owns the persisted `WeightedFrequencyV1` bytes.
-// Planner keeps the kernel and its algorithm private; this round trip is the
-// only public access until it exposes them.
-pub(crate) fn frequency_kernel(
-    state: &WeightedFrequency,
-) -> Result<asap_sketchlib::WeightedFrequency, Error> {
-    Ok(rmp_serde::from_slice(&rmp_serde::to_vec(state)?)?)
-}
-
 pub(crate) fn frequency_state(bytes: &[u8]) -> Result<WeightedFrequency, Error> {
-    let kernel = asap_sketchlib::WeightedFrequency::from_bytes(bytes)
-        .map_err(|e| format!("deserialize weighted frequency: {e:?}"))?;
-    Ok(rmp_serde::from_slice(&rmp_serde::to_vec(&kernel)?)?)
+    Ok(WeightedFrequency::from_bytes(bytes)?)
 }
 
 fn exact_aggregation_type(state: &k::exact::ExactAccumulator) -> AggregationType {
@@ -126,12 +115,12 @@ pub trait StoredState {
 impl<'a> StoredState for dyn AggregateCore + 'a {
     fn type_name(&self) -> &'static str {
         match view(self) {
-            Some(View::Exact(_)) => EXACT_V1,
-            Some(View::Dd(_)) => "DDSketchAccumulator",
-            Some(View::Hll(_)) => "HllSketchAccumulator",
+            Some(View::Exact(_)) => EXACT_V2,
+            Some(View::Dd(_)) => "DDSketchAccumulatorV2",
+            Some(View::Hll(_)) => "HllSketchAccumulatorV2",
             Some(View::Kll(_)) => "DatasketchesKLLAccumulator",
-            Some(View::Cms(_)) => "CountMinSketchAccumulator",
-            Some(View::Cs(_)) => "CountSketchAccumulator",
+            Some(View::Cms(_)) => "CountMinSketchAccumulatorV2",
+            Some(View::Cs(_)) => "CountSketchAccumulatorV2",
             Some(View::CmsHeap(_)) => "CountMinSketchWithHeapAccumulator",
             Some(View::CsHeap(_)) => "CountSketchWithHeapAccumulator",
             Some(View::Hydra(_)) => "HydraKllSketchAccumulator",
@@ -154,8 +143,8 @@ impl<'a> StoredState for dyn AggregateCore + 'a {
             Some(View::CmsHeap(_)) => T::CountMinSketchWithHeap,
             Some(View::CsHeap(_)) => T::CountSketchWithHeap,
             Some(View::Hydra(_)) => T::HydraKLL,
-            Some(View::Frequency(state)) => match frequency_kernel(state).map(|k| k.algorithm()) {
-                Ok(FrequencyAlgorithm::CountSketch) => T::CountSketchWithHeap,
+            Some(View::Frequency(state)) => match state.algorithm() {
+                FrequencyAlgorithm::CountSketch => T::CountSketchWithHeap,
                 _ => T::CountMinSketchWithHeap,
             },
             Some(View::UnivMon(_)) => T::UnivMon,
@@ -168,16 +157,24 @@ impl<'a> StoredState for dyn AggregateCore + 'a {
         Ok(
             match view(self).ok_or("Planner state has no stored codec")? {
                 View::Exact(state) => rmp_serde::to_vec_named(state)?,
-                View::Dd(state) => state.inner.to_msgpack()?,
-                View::Hll(state) => state.inner.to_msgpack()?,
+                View::Dd(state) => {
+                    rmp_serde::to_vec(&(state.sample_p(), state.inner.to_msgpack()?))?
+                }
+                View::Hll(state) => {
+                    rmp_serde::to_vec(&(state.sample_p(), state.inner.to_msgpack()?))?
+                }
                 View::Kll(state) => state.inner.to_msgpack()?,
-                View::Cms(state) => state.inner.to_msgpack()?,
-                View::Cs(state) => state.inner.to_msgpack()?,
+                View::Cms(state) => {
+                    rmp_serde::to_vec(&(state.sample_p(), state.inner.to_msgpack()?))?
+                }
+                View::Cs(state) => {
+                    rmp_serde::to_vec(&(state.sample_p(), state.inner.to_msgpack()?))?
+                }
                 View::CmsHeap(state) => state.inner.to_msgpack()?,
                 View::CsHeap(state) => state.inner.to_msgpack()?,
                 View::Hydra(state) => state.inner.to_msgpack()?,
-                View::Frequency(state) => frequency_kernel(state)?.to_bytes(),
-                View::UnivMon(state) => state.to_bytes()?,
+                View::Frequency(state) => state.to_bytes(),
+                View::UnivMon(state) => state.sketch().serialize_to_bytes()?,
                 View::Native(state) => state.bytes().to_vec(),
             },
         )
@@ -214,7 +211,7 @@ pub fn range_ms(parameters: &HashMap<String, String>) -> Result<Option<(i64, i64
 }
 
 /// Reject a Planner state before it enters the store when it has no stored
-/// codec (for example Planner's UnivMon, whose sketch is private).
+/// codec.
 pub fn check_storable(state: &dyn AggregateCore) -> Result<(), Error> {
     view(state)
         .map(|_| ())
@@ -226,22 +223,38 @@ pub fn check_storable(state: &dyn AggregateCore) -> Result<(), Error> {
 pub fn decode(type_name: &str, bytes: &[u8]) -> Result<Box<dyn AggregateCore>, Error> {
     use super::decoders as d;
     Ok(match type_name {
-        EXACT_V1 => Box::new(decode_exact(bytes)?),
-        "DDSketchAccumulator" => Box::new(k::DDSketchAccumulator {
-            inner: d::ddsketch_from_msgpack(bytes)?,
-        }),
-        "HllSketchAccumulator" => Box::new(k::HllSketchAccumulator {
-            inner: d::hll_from_msgpack(bytes)?,
-        }),
+        EXACT_V2 => Box::new(decode_exact(bytes)?),
+        "DDSketchAccumulatorV2" => {
+            let (sample_p, sketch): (f64, Vec<u8>) = rmp_serde::from_slice(bytes)?;
+            Box::new(k::DDSketchAccumulator::from_sketch(
+                d::ddsketch_from_msgpack(&sketch)?,
+                sample_p,
+            )?)
+        }
+        "HllSketchAccumulatorV2" => {
+            let (sample_p, sketch): (f64, Vec<u8>) = rmp_serde::from_slice(bytes)?;
+            Box::new(k::HllSketchAccumulator::from_sketch(
+                d::hll_from_msgpack(&sketch)?,
+                sample_p,
+            )?)
+        }
         "DatasketchesKLLAccumulator" => Box::new(k::DatasketchesKLLAccumulator {
             inner: d::kll_from_msgpack(bytes)?,
         }),
-        "CountMinSketchAccumulator" => Box::new(k::CountMinSketchAccumulator {
-            inner: d::cms_from_msgpack(bytes)?,
-        }),
-        "CountSketchAccumulator" => Box::new(k::CountSketchAccumulator {
-            inner: d::cs_from_msgpack(bytes)?,
-        }),
+        "CountMinSketchAccumulatorV2" => {
+            let (sample_p, sketch): (f64, Vec<u8>) = rmp_serde::from_slice(bytes)?;
+            Box::new(k::CountMinSketchAccumulator::from_sketch(
+                d::cms_from_msgpack(&sketch)?,
+                sample_p,
+            )?)
+        }
+        "CountSketchAccumulatorV2" => {
+            let (sample_p, sketch): (f64, Vec<u8>) = rmp_serde::from_slice(bytes)?;
+            Box::new(k::CountSketchAccumulator::from_sketch(
+                d::cs_from_msgpack(&sketch)?,
+                sample_p,
+            )?)
+        }
         "CountMinSketchWithHeapAccumulator" => Box::new(k::CountMinSketchWithHeapAccumulator {
             inner: d::cms_with_heap_from_msgpack(bytes)?,
         }),
@@ -252,11 +265,22 @@ pub fn decode(type_name: &str, bytes: &[u8]) -> Result<Box<dyn AggregateCore>, E
             inner: asap_sketchlib::HydraKllSketch::from_msgpack(bytes)?,
         }),
         "WeightedFrequency" => Box::new(frequency_state(bytes)?),
-        "UnivMonAccumulator" => Box::new(UnivMonAccumulator::from_bytes(bytes)?),
+        "UnivMonAccumulator" => Box::new(UnivMonAccumulator::from_sketch(
+            asap_sketchlib::UnivMon::deserialize_from_bytes(bytes)?,
+        )?),
+        "DDSketchAccumulator"
+        | "HllSketchAccumulator"
+        | "CountMinSketchAccumulator"
+        | "CountSketchAccumulator" => {
+            return Err(format!(
+                "stored format {type_name} is retired; sampled sketch storage requires V2"
+            )
+            .into());
+        }
         retired if is_retired_exact(retired) => {
             return Err(format!(
                 "stored format {retired} is retired and no longer decoded; \
-                 exact state is stored as {EXACT_V1}"
+                 exact state is stored as {EXACT_V2}"
             )
             .into())
         }
@@ -276,18 +300,34 @@ pub fn decode_envelope(bytes: &[u8]) -> Result<Box<dyn AggregateCore>, Error> {
         Some(SketchState::Kll(_)) => Box::new(k::DatasketchesKLLAccumulator {
             inner: d::kll_from_proto(bytes)?,
         }),
-        Some(SketchState::Ddsketch(_)) => Box::new(k::DDSketchAccumulator {
-            inner: d::ddsketch_from_proto(bytes)?,
-        }),
-        Some(SketchState::Hll(_)) => Box::new(k::HllSketchAccumulator {
-            inner: d::hll_from_proto(bytes)?,
-        }),
-        Some(SketchState::CountMin(_)) => Box::new(k::CountMinSketchAccumulator {
-            inner: d::cms_from_proto(bytes)?,
-        }),
-        Some(SketchState::CountSketch(_)) => Box::new(k::CountSketchAccumulator {
-            inner: d::cs_from_proto(bytes)?,
-        }),
+        Some(SketchState::Ddsketch(_)) => Box::new(
+            k::DDSketchAccumulator::from_sketch(
+                d::ddsketch_from_proto(bytes)?,
+                d::sample_probability(bytes)?,
+            )
+            .expect("validated sampling probability"),
+        ),
+        Some(SketchState::Hll(_)) => Box::new(
+            k::HllSketchAccumulator::from_sketch(
+                d::hll_from_proto(bytes)?,
+                d::sample_probability(bytes)?,
+            )
+            .expect("validated sampling probability"),
+        ),
+        Some(SketchState::CountMin(_)) => Box::new(
+            k::CountMinSketchAccumulator::from_sketch(
+                d::cms_from_proto(bytes)?,
+                d::sample_probability(bytes)?,
+            )
+            .expect("validated sampling probability"),
+        ),
+        Some(SketchState::CountSketch(_)) => Box::new(
+            k::CountSketchAccumulator::from_sketch(
+                d::cs_from_proto(bytes)?,
+                d::sample_probability(bytes)?,
+            )
+            .expect("validated sampling probability"),
+        ),
         Some(other) => {
             let family = match other {
                 SketchState::Univmon(_) => "UnivMon",
@@ -305,44 +345,6 @@ pub fn decode_envelope(bytes: &[u8]) -> Result<Box<dyn AggregateCore>, Error> {
 /// Decode Planner's exact state, rejecting a payload whose population states
 /// differ from its declared family.
 pub fn decode_exact(bytes: &[u8]) -> Result<k::exact::ExactAccumulator, Error> {
-    // Planner's exact state is serde-derived without validation; this mirror
-    // of its persisted shape checks each population against the family.
-    #[derive(serde::Deserialize)]
-    struct Shape {
-        family: SummaryFamilyType,
-        scalar: Scalar,
-        keyed: Option<HashMap<KeyByLabelValues, Scalar>>,
-    }
-    #[derive(serde::Deserialize)]
-    enum Scalar {
-        Sum(serde::de::IgnoredAny),
-        Count(serde::de::IgnoredAny),
-        Min(serde::de::IgnoredAny),
-        Max(serde::de::IgnoredAny),
-        Counter(serde::de::IgnoredAny),
-    }
-    let shape: Shape = rmp_serde::from_slice(bytes)?;
-    // Planner accepts only matching (kind, params) exact families.
-    k::exact::ExactAccumulator::new(shape.family.clone(), shape.keyed.is_some())?;
-    let SummaryFamilyType::ExactAggregate(expected, _) = &shape.family else {
-        return Err(format!("{:?} is not an exact family", shape.family).into());
-    };
-    let matches = |scalar: &Scalar| match scalar {
-        Scalar::Sum(_) => *expected == ExactKind::Sum,
-        Scalar::Count(_) => *expected == ExactKind::Count,
-        Scalar::Min(_) => *expected == ExactKind::Min,
-        Scalar::Max(_) => *expected == ExactKind::Max,
-        Scalar::Counter(_) => matches!(expected, ExactKind::Rate | ExactKind::Increase),
-    };
-    if !matches(&shape.scalar)
-        || shape
-            .keyed
-            .iter()
-            .flat_map(HashMap::values)
-            .any(|s| !matches(s))
-    {
-        return Err("exact payload differs from declared Planner family".into());
-    }
     Ok(rmp_serde::from_slice(bytes)?)
 }
 
@@ -355,18 +357,31 @@ pub fn empty_like(state: &dyn AggregateCore) -> Result<Box<dyn AggregateCore>, E
     };
     Ok(
         match view(state).ok_or("Planner state has no stored codec")? {
-            View::Dd(s) => Box::new(k::DDSketchAccumulator {
-                inner: DdSketch::new(s.inner.alpha),
-            }),
-            View::Hll(s) => Box::new(k::HllSketchAccumulator {
-                inner: HllSketch::new(s.inner.variant, s.inner.precision),
-            }),
-            View::Cms(s) => Box::new(k::CountMinSketchAccumulator {
-                inner: CountMinSketch::new(s.inner.rows(), s.inner.cols()),
-            }),
-            View::Cs(s) => Box::new(k::CountSketchAccumulator {
-                inner: CountSketch::new(s.inner.rows, s.inner.cols),
-            }),
+            View::Dd(s) => Box::new(
+                k::DDSketchAccumulator::from_sketch(DdSketch::new(s.inner.alpha), s.sample_p())
+                    .expect("validated sampling probability"),
+            ),
+            View::Hll(s) => Box::new(
+                k::HllSketchAccumulator::from_sketch(
+                    HllSketch::new(s.inner.variant, s.inner.precision),
+                    s.sample_p(),
+                )
+                .expect("validated sampling probability"),
+            ),
+            View::Cms(s) => Box::new(
+                k::CountMinSketchAccumulator::from_sketch(
+                    CountMinSketch::new(s.inner.rows(), s.inner.cols()),
+                    s.sample_p(),
+                )
+                .expect("validated sampling probability"),
+            ),
+            View::Cs(s) => Box::new(
+                k::CountSketchAccumulator::from_sketch(
+                    CountSketch::new(s.inner.rows, s.inner.cols),
+                    s.sample_p(),
+                )
+                .expect("validated sampling probability"),
+            ),
             View::CmsHeap(s) => Box::new(k::CountMinSketchWithHeapAccumulator {
                 inner: CountMinSketchWithHeap::new(
                     s.inner.rows(),
@@ -378,9 +393,8 @@ pub fn empty_like(state: &dyn AggregateCore) -> Result<Box<dyn AggregateCore>, E
                 inner: CountSketchWithHeap::new(s.inner.rows(), s.inner.cols(), s.inner.heap_size),
             }),
             View::UnivMon(s) => {
-                let mut empty = s.clone();
-                empty.clear();
-                Box::new(empty)
+                let (heap, rows, cols, layers) = s.dimensions();
+                Box::new(UnivMonAccumulator::new(heap, rows, cols, layers)?)
             }
             _ => return Err("only delta-capable sketch families reset to empty".into()),
         },
@@ -390,28 +404,31 @@ pub fn empty_like(state: &dyn AggregateCore) -> Result<Box<dyn AggregateCore>, E
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Statistic;
+    use crate::{KeyByLabelValues, Statistic};
     use asap_physical_operators::values::Value;
     use planner_types::{post_asap::SketchQuery, pre_asap::ColumnRef};
 
-    /// Stored bytes written by the pre-Planner-kernel backend, one per family.
+    /// Golden payloads for each supported stored family; sampled codecs wrap sketch bytes.
     const GOLDEN: &[(&str, &str)] = &[
-        ("DDSketchAccumulator", "93cb3f847ae147ae147bdc01040000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001d0c0"),
-        ("HllSketchAccumulator", "415341507631010201010000013a0000001388b06d657461646174615f76657273696f6e01af686173685f70726f66696c655f6964bc70726f6a656374617361702e787868332e736565646c6973742e7631ae686173685f616c676f726974686dab787868335f36345f313238af736565645f64657269766174696f6eb4736565645f6c6973745f696e6465785f77726170ae696e7075745f656e636f64696e67b470726f6a656374617361702e696e7075742e7631a9736565645f6c697374dc0014cecafe3553cf000000ade3415118ce8cc70208ce2f024b2bce451a3df5ce6a09e667cebb67ae85ce3c6ef372cea54ff53ace510e527fce9b05688cce1f83d9abce5be0cd19cecbbb9d5dce629a292ace9159015ace152fecd8ce67332667ce8eb44a87cedb0c2e0db463616e6f6e6963616c5f736565645f696e64657805a9707265636973696f6e0491c41000000300010101000000010000000000"),
+        ("DDSketchAccumulatorV2", "93cb3f847ae147ae147bdc01040000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001d0c0"),
+        ("HllSketchAccumulatorV2", "415341507631010201010000013a0000001388b06d657461646174615f76657273696f6e01af686173685f70726f66696c655f6964bc70726f6a656374617361702e787868332e736565646c6973742e7631ae686173685f616c676f726974686dab787868335f36345f313238af736565645f64657269766174696f6eb4736565645f6c6973745f696e6465785f77726170ae696e7075745f656e636f64696e67b470726f6a656374617361702e696e7075742e7631a9736565645f6c697374dc0014cecafe3553cf000000ade3415118ce8cc70208ce2f024b2bce451a3df5ce6a09e667cebb67ae85ce3c6ef372cea54ff53ace510e527fce9b05688cce1f83d9abce5be0cd19cecbbb9d5dce629a292ace9159015ace152fecd8ce67332667ce8eb44a87cedb0c2e0db463616e6f6e6963616c5f736565645f696e64657805a9707265636973696f6e0491c41000000300010101000000010000000000"),
         ("DatasketchesKLLAccumulator", "92ccc8dc006641534150763101020600000000280000002ccc84ccb06d657461646174615f76657273696f6e01cca16bccccccc8cca16d08cca96974656d5f74797065cca3663634cc93cc920003cc93cccb4008000000000000cccb3fccf0000000000000cccb4000000000000000cc93cccf560f2acc9b7e7e3ccca80000"),
-        ("CountMinSketchAccumulator", "939298cb0000000000000000cb4000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb000000000000000098cb0000000000000000cb4000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb00000000000000000208"),
-        ("CountSketchAccumulator", "9403089398cb0000000000000000cb4000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb000000000000000098cb0000000000000000cbc000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb000000000000000098cb0000000000000000cb4000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb000000000000000090"),
+        ("CountMinSketchAccumulatorV2", "939298cb0000000000000000cb4000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb000000000000000098cb0000000000000000cb4000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb00000000000000000208"),
+        ("CountSketchAccumulatorV2", "9403089398cb0000000000000000cb4000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb000000000000000098cb0000000000000000cbc000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb000000000000000098cb0000000000000000cb4000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb000000000000000090"),
         ("CountMinSketchWithHeapAccumulator", "93939298cb0000000000000000cb4008000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb000000000000000098cb4008000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb000000000000000002089192a161cb400800000000000002"),
         ("CountSketchWithHeapAccumulator", "93939398cb0000000000000000cb4008000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb000000000000000098cbc008000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb000000000000000098cb0000000000000000cb0000000000000000cbc008000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb0000000000000000cb000000000000000003089192a161cb400800000000000002"),
-        (EXACT_V1, "83a666616d696c7981ae457861637441676772656761746592a353756da353756da67363616c617281a353756dcb4012000000000000a56b65796564c0"),
-        (EXACT_V1, "83a666616d696c7981ae457861637441676772656761746592a5436f756e74a5436f756e74a67363616c617281a5436f756e7400a56b657965648181a66c6162656c7391a16181a5436f756e7402"),
-        (EXACT_V1, "83a666616d696c7981ae457861637441676772656761746592a452617465a452617465a67363616c617281a7436f756e74657286b47374617274696e675f6d6561737572656d656e7481a576616c7565cb4024000000000000b27374617274696e675f74696d657374616d70cd03e8b56c6173745f7365656e5f6d6561737572656d656e7481a576616c7565cb4039000000000000b36c6173745f7365656e5f74696d657374616d70cd07d0ae746f74616c5f696e637265617365cb402e000000000000ac73616d706c655f636f756e7402a56b65796564c0"),
+        (EXACT_V2, "83a666616d696c7981ae457861637441676772656761746592a353756da353756da67363616c617281a553756d563282a373756dcb4012000000000000ac636f6d70656e736174696f6ecb0000000000000000a56b65796564c0"),
+        (EXACT_V2, "83a666616d696c7981ae457861637441676772656761746592a5436f756e74a5436f756e74a67363616c617281a5436f756e7400a56b657965648181a66c6162656c7391a16181a5436f756e7402"),
+        (EXACT_V2, "83a666616d696c7981ae457861637441676772656761746592a452617465a452617465a67363616c617281a7436f756e74657286b47374617274696e675f6d6561737572656d656e7481a576616c7565cb4024000000000000b27374617274696e675f74696d657374616d70cd03e8b56c6173745f7365656e5f6d6561737572656d656e7481a576616c7565cb4039000000000000b36c6173745f7365656e5f74696d657374616d70cd07d0ae746f74616c5f696e637265617365cb402e000000000000ac73616d706c655f636f756e7402a56b65796564c0"),
         ("UnivMonAccumulator", "4153415076310102100000000155000000898bb06d657461646174615f76657273696f6e01af686173685f70726f66696c655f6964bc70726f6a656374617361702e787868332e736565646c6973742e7631ae686173685f616c676f726974686dab787868335f36345f313238af736565645f64657269766174696f6eb4736565645f6c6973745f696e6465785f77726170ae696e7075745f656e636f64696e67b470726f6a656374617361702e696e7075742e7631a9736565645f6c697374dc0014cecafe3553cf000000ade3415118ce8cc70208ce2f024b2bce451a3df5ce6a09e667cebb67ae85ce3c6ef372cea54ff53ace510e527fce9b05688cce1f83d9abce5be0cd19cecbbb9d5dce629a292ace9159015ace152fecd8ce67332667ce8eb44a87cedb0c2e0daa6c617965725f73697a6502aa736b657463685f726f7703aa736b657463685f636f6c10a9686561705f73697a6504a86b65795f74797065a375363498dc0060000000000000ff00000000000000010000000000000001000000000000ff00000000000000000000000000000001ff000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000009602020200000092020092cf3ff0000000000000cf400000000000000092010192c3c30201"),
         ("WeightedFrequency", "415341502d57465245512d31000000000008000000000000000200000000000000020000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e03f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e03f01000000000000000100000000000000040000000100000000000000611500000000000000010000000000000004000000010000000000000061000000000000e03f"),
     ];
 
     fn golden(tag: &str, hex_bytes: &str) -> (Box<dyn AggregateCore>, Vec<u8>) {
-        let bytes = hex::decode(hex_bytes).unwrap();
+        let mut bytes = hex::decode(hex_bytes).unwrap();
+        if tag.ends_with("V2") && tag != EXACT_V2 {
+            bytes = rmp_serde::to_vec(&(1.0_f64, bytes)).unwrap();
+        }
         (decode(tag, &bytes).unwrap(), bytes)
     }
     fn item() -> Option<KeyByLabelValues> {
@@ -519,13 +536,100 @@ mod tests {
         assert!(decode_exact(&bytes).is_err());
     }
 
-    // A state without a stored codec cannot enter the store.
+    // Sampled edge counts retain their probability through durable storage.
     #[test]
-    fn planner_univmon_has_no_stored_codec() {
-        let planner = k::univmon::UnivMonAccumulator::new(4, 3, 16, 2).unwrap();
-        assert!(check_storable(&planner).is_err());
-        assert!((&planner as &dyn AggregateCore).encode().is_err());
-        assert!(check_storable(&UnivMonAccumulator::new(4, 3, 16, 2).unwrap()).is_ok());
+    fn sampled_envelope_storage_preserves_scaled_count() {
+        use asap_sketchlib::proto::sketchlib::SketchEnvelope;
+        use prost::Message;
+        let mut sketch = asap_sketchlib::DdSketch::new(0.01);
+        sketch.update(3.0);
+        let mut envelope =
+            SketchEnvelope::decode(asap_sketch_codec::encode_ddsketch(&sketch).as_slice()).unwrap();
+        for (p, expected) in [(0.0, 1.0), (1.0, 1.0), (0.25, 4.0)] {
+            envelope.sample_p = p;
+            let state = decode_envelope(&envelope.encode_to_vec()).unwrap();
+            let restored = decode(state.type_name(), &state.encode().unwrap()).unwrap();
+            assert_eq!(read(restored.as_ref(), Statistic::Count, None), expected);
+        }
+        for p in [-1.0, 1.1, f64::NAN, f64::INFINITY] {
+            envelope.sample_p = p;
+            assert!(decode_envelope(&envelope.encode_to_vec()).is_err());
+        }
+        assert!(decode("DDSketchAccumulator", &sketch.to_msgpack().unwrap())
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("retired"));
+    }
+
+    // Every sampled frequency/cardinality family retains scaled readouts in storage.
+    #[test]
+    fn sampled_frequency_and_hll_storage_keep_probability() {
+        let key = KeyByLabelValues::new_with_labels(vec!["a".into()]);
+        let mut cms = asap_sketchlib::CountMinSketch::new(2, 16);
+        cms.update("a", 3.0);
+        let mut cs = asap_sketchlib::CountSketch::new(3, 16);
+        cs.update("a", 3.0);
+        let states: Vec<Box<dyn AggregateCore>> = vec![
+            Box::new(k::CountMinSketchAccumulator::from_sketch(cms, 0.25).unwrap()),
+            Box::new(k::CountSketchAccumulator::from_sketch(cs, 0.25).unwrap()),
+        ];
+        for state in states {
+            let restored = decode(state.type_name(), &state.encode().unwrap()).unwrap();
+            assert_eq!(
+                read(restored.as_ref(), Statistic::Count, Some(key.clone())),
+                12.0
+            );
+        }
+        let state = k::HllSketchAccumulator::from_sketch(
+            asap_sketchlib::HllSketch::new(asap_sketchlib::HllVariant::Regular, 4),
+            0.25,
+        )
+        .unwrap();
+        let state = &state as &dyn AggregateCore;
+        let restored = decode(state.type_name(), &state.encode().unwrap()).unwrap();
+        assert_eq!(
+            restored
+                .as_any()
+                .downcast_ref::<k::HllSketchAccumulator>()
+                .unwrap()
+                .sample_p(),
+            0.25
+        );
+    }
+
+    // Window resets discard counts while retaining a series' sampling probability.
+    #[test]
+    fn sampled_reset_keeps_probability() {
+        let state =
+            k::DDSketchAccumulator::from_sketch(asap_sketchlib::DdSketch::new(0.01), 0.25).unwrap();
+        let empty = empty_like(&state).unwrap();
+        assert_eq!(
+            empty
+                .as_any()
+                .downcast_ref::<k::DDSketchAccumulator>()
+                .unwrap()
+                .sample_p(),
+            0.25
+        );
+    }
+
+    // Persisted terminal-mode UnivMon sketches cannot enter the standard-update kernel.
+    #[test]
+    fn terminal_univmon_storage_is_rejected() {
+        let mut sketch = asap_sketchlib::UnivMon::init_univmon(4, 3, 16, 2);
+        sketch.fast_insert(&asap_sketchlib::DataInput::U64(1), 1);
+        assert!(decode("UnivMonAccumulator", &sketch.serialize_to_bytes().unwrap()).is_err());
+    }
+
+    // Planner UnivMon states persist directly without a backend kernel shim.
+    #[test]
+    fn planner_univmon_round_trips_through_storage() {
+        let state = k::univmon::UnivMonAccumulator::new(4, 3, 16, 2).unwrap();
+        check_storable(&state).unwrap();
+        let bytes = (&state as &dyn AggregateCore).encode().unwrap();
+        let restored = decode("UnivMonAccumulator", &bytes).unwrap();
+        assert!(restored.as_any().is::<k::univmon::UnivMonAccumulator>());
     }
 
     // An OTLP envelope attribute decodes into its family's Planner kernel;

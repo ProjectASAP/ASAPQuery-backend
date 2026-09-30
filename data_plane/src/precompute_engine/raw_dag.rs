@@ -277,24 +277,6 @@ impl RawDagProgram {
                 .map_err(|e| e.to_string())?;
                 return Ok(Box::new(state));
             }
-            // Planner's UnivMon has no stored codec; the store keeps the
-            // backend UnivMon shim.
-            if let SketchParams::UnivMon {
-                heap_size,
-                sketch_rows,
-                sketch_cols,
-                layers,
-            } = kind.params()
-            {
-                return asap_summary_state::univmon::UnivMonAccumulator::new(
-                    *heap_size as usize,
-                    *sketch_rows as usize,
-                    *sketch_cols as usize,
-                    *layers as usize,
-                )
-                .map(|state| Box::new(state) as Box<dyn AggregateCore>)
-                .map_err(|e| e.to_string());
-            }
         }
         Ok(
             create_planner_accumulator(&self.family, &self.input, &self.grouping)?

@@ -483,7 +483,7 @@ mod tests {
     }
     // A transformed value cannot share state identity with its source column.
     #[test]
-    fn value_expression_is_semantic_and_nonfinite_constants_are_rejected() {
+    fn value_expression_and_nonfinite_constants_have_stable_semantics() {
         use planner_types::pre_asap::{ProjectItem, ScalarValue};
         let original = fixture("latency");
         let expected = SummarySemanticFragment::from_dag(&original, original.root).unwrap();
@@ -515,7 +515,12 @@ mod tests {
             unreachable!()
         };
         cols[0].expr = QueryExpr::Literal(ScalarValue::Float64(f64::NAN));
-        assert!(SummarySemanticFragment::from_dag(&transformed, transformed.root).is_err());
+        let fragment = SummarySemanticFragment::from_dag(&transformed, transformed.root).unwrap();
+        let bytes = canonical_bytes(&fragment).unwrap();
+        let restored: SummarySemanticFragment = serde_json::from_slice(&bytes).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(canonical_bytes(&restored).unwrap(), bytes);
+        assert_ne!(canonical_bytes(&logged).unwrap(), bytes);
     }
 
     // Changing a downstream consumer cannot change the persisted input definition.

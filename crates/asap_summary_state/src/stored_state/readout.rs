@@ -51,7 +51,9 @@ pub fn sketch_query_value(rs: &SummaryState, query: &SketchQuery) -> Result<f64,
         SketchQuery::PointCount {
             key: ColumnRef::SampleValue,
             value: None,
-        } => Ok(rs.total()),
+        } => rs.total().ok_or(Error::Unsupported(
+            "sketch does not preserve total update mass",
+        )),
         SketchQuery::PointCount {
             key: ColumnRef::Named(_) | ColumnRef::Qualified { .. },
             value: Some(v),
@@ -226,5 +228,25 @@ mod counter_tests {
         let none = Parameters::new();
         assert!(exact_readout_optional(states(), Statistic::Min, &None, &none).is_err());
         assert!(exact_readout(states(), Statistic::Min, &None, &none).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Signed CountSketch counters must not be misreported as population mass.
+    #[test]
+    fn signed_sketch_bare_count_is_unsupported() {
+        let state = SummaryState::CountSketch(
+            asap_physical_operators::summary_kernels::CountSketchAccumulator::new(3, 16),
+        );
+        assert!(sketch_query_value(
+            &state,
+            &SketchQuery::PointCount {
+                key: ColumnRef::SampleValue,
+                value: None
+            }
+        )
+        .is_err());
     }
 }

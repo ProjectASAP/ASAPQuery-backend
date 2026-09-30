@@ -1077,11 +1077,9 @@ mod catalog_binding_tests {
 mod tests {
     use super::*;
 
-    // Planner's guarded average divides two per-series readouts; until
-    // Planner matches per-series rows, lowering refuses it instead of
-    // computing it in the backend.
+    // Planner compiles guarded per-series average division into a physical fragment.
     #[test]
-    fn per_series_guarded_division_is_not_lowered_locally() {
+    fn per_series_guarded_division_uses_planner_fragment() {
         let query = "avg_over_time(m[5m])";
         let canonical = crate::query_parser::parse_query_expr_canonical(
             query,
@@ -1093,7 +1091,7 @@ mod tests {
             panic!("expected the Planner's average rewrite");
         };
         assert!(operator.checked_finite_division);
-        let error = compile_bound_mapped(
+        let entry = compile_bound_mapped(
             "guarded".into(),
             query.into(),
             &root,
@@ -1119,11 +1117,14 @@ mod tests {
             },
             |_, _| {},
         )
-        .unwrap_err();
-        assert!(
-            matches!(error, QueryPlanError::UnsupportedNode(_)),
-            "{error}"
-        );
+        .unwrap();
+        let QueryPlanNode::PhysicalFragment { dag, .. } = &entry.nodes[&entry.root] else {
+            panic!("expected compiled Planner fragment")
+        };
+        let document: serde_json::Value = serde_json::from_slice(dag).unwrap();
+        assert!(document
+            .to_string()
+            .contains("\"checked_finite_division\":true"));
     }
 
     // Every o11y corpus query compiles as backend readouts under Planner
@@ -1164,7 +1165,9 @@ mod tests {
         for entry in plan.query_plan.entries.values() {
             for node in entry.nodes.values() {
                 match node {
-                    QueryPlanNode::PhysicalFragment { .. } => fragments += 1,
+                    QueryPlanNode::PhysicalFragment { .. } | QueryPlanNode::Physical { .. } => {
+                        fragments += 1
+                    }
                     QueryPlanNode::ReadMaterialization { .. }
                     | QueryPlanNode::ExactReadout { .. }
                     | QueryPlanNode::SummaryEstimate { .. }

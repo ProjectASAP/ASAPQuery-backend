@@ -61,11 +61,6 @@ impl Placement {
             .is_some_and(|mixed| mixed.retained.iter().any(|s| Rc::ptr_eq(s, state)))
     }
 
-    /// The root a mixed query compiles instead of Planner's selected root.
-    pub(super) fn root(&self, query: usize) -> Option<&Rc<SummaryNode>> {
-        self.mixed(query).map(|mixed| &mixed.root)
-    }
-
     /// Native branches a mixed query maintains and reads as stored batches.
     pub(super) fn native_branches(&self, query: usize) -> &[Rc<SummaryNode>] {
         self.mixed(query).map_or(&[], |mixed| &mixed.branches)
@@ -86,6 +81,7 @@ impl Placement {
 /// state's estimated bytes for every retained pane and partition at the
 /// summary-store price; an unknown size under a positive price leaves
 /// retention unpriced.
+#[derive(Clone)]
 struct LifecycleCosts {
     costs: LifecycleUnitCosts,
     /// States the installed window layout retains. Without one, panes are
@@ -763,11 +759,8 @@ fn raw_query_time_program(root: &QueryExpr) -> Result<RawQueryTimeProgram, Strin
     })
 }
 
-/// A mixed query's plan: its identity-typed root, rebuilt states, native
-/// branches read as batches with the precompute program building each, every
-/// retained state, and the query-time program.
+/// A mixed query's rebuilt states, retained native branches and their programs.
 struct MixedPlacement {
-    root: Rc<SummaryNode>,
     rebuilt: Vec<Rc<SummaryNode>>,
     branches: Vec<Rc<SummaryNode>>,
     precompute: Vec<CompiledPhysicalDag>,
@@ -884,134 +877,40 @@ fn leaf_selector(state: &SummaryNode) -> Option<(Rc<QueryExpr>, QueryTimeOperato
     Some((Rc::clone(selector), scan))
 }
 
-/// A leaf state of an identity-typed root: its original and retyped nodes,
-/// its raw leaf, and the `Scan` that reads that leaf at query time.
+/// A state whose raw source already carries Planner's complete series identity.
 struct TypedState {
-    original: Rc<SummaryNode>,
     state: Rc<SummaryNode>,
     leaf: Rc<SummaryNode>,
     scan: QueryTimeOperator,
 }
 
-/// `root` with each of `states`' raw selectors typed with the complete series
-/// identity: raw rows read at query time carry it, and Planner's native
-/// realization of a branch needs it. A per-series node keeps its input's
-/// columns, so it gains the identity too; every other node is unchanged.
-fn identity_typed(
-    root: &Rc<SummaryNode>,
-    states: &[Rc<SummaryNode>],
-) -> Result<(Rc<SummaryNode>, Vec<TypedState>), String> {
-    use asap_physical_operators::physical_planner::promql_rows::SERIES_IDENTITY_COLUMN;
-    fn names(schema: &planner_types::post_asap::SummarySchema) -> Vec<&str> {
-        schema
-            .fields
-            .iter()
-            .map(|field| field.name.as_str())
-            .collect()
-    }
-    // A readout or per-series state that passed its old input's columns
-    // through passes the identity on; any other node keeps its schema.
-    fn follow(
-        next: &mut SummaryNode,
-        old: &planner_types::post_asap::SummarySchema,
-        new: &planner_types::post_asap::SummarySchema,
-    ) {
-        let per_series = match &next.expr {
-            SummaryExpr::ValueOperation { .. } => true,
-            SummaryExpr::SummaryAgg { reduction, .. } => {
-                matches!(reduction, planner_types::pre_asap::Reduction::PerEntity)
-            }
-            _ => false,
-        };
-        if per_series && names(&next.schema) == names(old) {
-            if let Some(identity) = new
-                .fields
-                .iter()
-                .find(|field| field.name == SERIES_IDENTITY_COLUMN)
+/// Logical selection types all supported PromQL sources before placement.
+/// Mixed placement only binds those typed leaves; it never rewrites their schemas.
+fn typed_states(states: &[Rc<SummaryNode>]) -> Result<Vec<TypedState>, String> {
+    states
+        .iter()
+        .map(|state| {
+            let (selector, scan) = leaf_selector(state).ok_or("state has no raw selector")?;
+            if !selector
+                .output_schema()
+                .map_err(|error| error.to_string())?
+                .has_promql_series_identity()
             {
-                next.schema.fields.push(identity.clone());
+                return Err("mixed input requires a logically typed series identity".into());
             }
-        }
-    }
-    fn retype(
-        node: &Rc<SummaryNode>,
-        states: &[Rc<SummaryNode>],
-        typed: &mut Vec<TypedState>,
-    ) -> Result<Rc<SummaryNode>, String> {
-        let mut next = node.as_ref().clone();
-        if states.iter().any(|state| Rc::ptr_eq(state, node)) {
-            let (selector, scan) = leaf_selector(node).ok_or("state has no raw selector")?;
-            let selector =
-                asap_physical_operators::physical_planner::promql_rows::with_series_identity(
-                    &selector,
-                )
-                .map_err(|e| e.to_string())?;
-            let SummaryExpr::SummaryAgg { child, .. } = &mut next.expr else {
+            let SummaryExpr::SummaryAgg { child, .. } = &state.expr else {
                 unreachable!("leaf_selector matched a SummaryAgg")
             };
-            let mut leaf = crate::planner_selection::keep_pre_asap(&selector)
-                .map_err(|e| e.to_string())?
-                .as_ref()
-                .clone();
-            leaf.guarantee = child.guarantee.clone();
-            let (old, leaf) = (Rc::clone(child), Rc::new(leaf));
-            *child = Rc::clone(&leaf);
-            follow(&mut next, &old.schema, &leaf.schema);
-            let state = Rc::new(next);
-            typed.push(TypedState {
-                original: Rc::clone(node),
-                state: Rc::clone(&state),
-                leaf,
+            Ok(TypedState {
+                state: Rc::clone(state),
+                leaf: Rc::clone(child),
                 scan,
-            });
-            return Ok(state);
-        }
-        let unchanged = match &mut next.expr {
-            SummaryExpr::KeepPreAsap(_) => true,
-            SummaryExpr::ValueOperation { child, .. } | SummaryExpr::SummaryAgg { child, .. } => {
-                let old = Rc::clone(child);
-                *child = retype(child, states, typed)?;
-                let unchanged = Rc::ptr_eq(&old, child);
-                let new = Rc::clone(child);
-                follow(&mut next, &old.schema, &new.schema);
-                unchanged
-            }
-            // These nodes' schemas do not follow their inputs, so an input
-            // that gained the identity has no typed form here.
-            SummaryExpr::SummaryEstimate { summary_input, .. } => {
-                let old = Rc::clone(summary_input);
-                *summary_input = retype(summary_input, states, typed)?;
-                if old.schema != summary_input.schema {
-                    return Err("an estimate over a per-series input cannot be retyped".into());
-                }
-                Rc::ptr_eq(&old, summary_input)
-            }
-            SummaryExpr::BinaryOp { lhs, rhs, .. } => {
-                let (left, right) = (Rc::clone(lhs), Rc::clone(rhs));
-                *lhs = retype(lhs, states, typed)?;
-                *rhs = retype(rhs, states, typed)?;
-                if left.schema != lhs.schema || right.schema != rhs.schema {
-                    return Err("a per-series binary input cannot be retyped".into());
-                }
-                Rc::ptr_eq(&left, lhs) && Rc::ptr_eq(&right, rhs)
-            }
-            _ => return Err("mixed placement supports no such operator".into()),
-        };
-        Ok(if unchanged {
-            Rc::clone(node)
-        } else {
-            Rc::new(next)
+            })
         })
-    }
-    let mut typed = Vec::new();
-    let root = retype(root, states, &mut typed)?;
-    if typed.len() != states.len() {
-        return Err("a state is not reachable as a leaf of the root".into());
-    }
-    Ok((root, typed))
+        .collect()
 }
 
-/// Type `root` for a mixed plan that rebuilds `rebuilt` from raw rows and
+/// Bind `root` for a mixed plan that rebuilds `rebuilt` from raw rows and
 /// reads each of `branches` as its stored native batch. Raw rows and Planner's
 /// native precompute of a branch both carry the complete series identity.
 fn mixed_placement(
@@ -1023,12 +922,12 @@ fn mixed_placement(
     for branch in branches {
         leaves.extend(immutable_materialization_sources(branch).ok_or("branch has no sources")?);
     }
-    let (root, typed) = identity_typed(root, &leaves)?;
+    let typed = typed_states(&leaves)?;
     let (rebuilt, sources): (Vec<_>, Vec<_>) = typed
         .into_iter()
-        .partition(|state| rebuilt.iter().any(|s| Rc::ptr_eq(s, &state.original)));
+        .partition(|state| rebuilt.iter().any(|s| Rc::ptr_eq(s, &state.state)));
     // A branch is the Sum or sketch over readouts of its typed sources.
-    let typed_branches: Vec<_> = batch_branches(&root)
+    let typed_branches: Vec<_> = batch_branches(root)
         .into_iter()
         .filter(|branch| {
             immutable_materialization_sources(branch).is_some_and(|inputs| {
@@ -1044,7 +943,7 @@ fn mixed_placement(
     }
     // Compilation numbers the same root identically when it installs the
     // plan, so these slots and precompute roots name its installed nodes.
-    let compiled = planner_types::post_asap::compile_post_asap_dag_with_node_ids(&root)
+    let compiled = planner_types::post_asap::compile_post_asap_dag_with_node_ids(root)
         .map_err(|e| e.to_string())?;
     let id = |node: &Rc<SummaryNode>| {
         compiled
@@ -1075,7 +974,6 @@ fn mixed_placement(
     let mut retained = typed_branches.clone();
     retained.extend(sources.into_iter().map(|state| state.state));
     Ok(MixedPlacement {
-        root,
         rebuilt: rebuilt.into_iter().map(|state| state.state).collect(),
         branches: typed_branches,
         precompute,
@@ -1258,6 +1156,41 @@ fn retime(
     Some(Rc::new(next))
 }
 
+/// Price the hypothetical retained native realization with the same window
+/// preparation and selection used when that realization is installed.
+fn native_retained_states(
+    root: &Rc<SummaryNode>,
+    state: &Rc<SummaryNode>,
+    query: &QueryCompilationInput,
+    environment: &PhysicalDeploymentContext,
+    inputs: &BackendLocalPhysicalInputs,
+) -> Option<u64> {
+    let timing = planner_types::post_asap::ExecutionTiming::IngestionTime;
+    let retained_state = retime(state, state, timing)?;
+    let mut retained = query.clone();
+    retained.selected_plan_root = retime(root, state, timing)?;
+    let physical = root_fixed_window_candidate(&retained.selected_plan_root).ok()?;
+    retained.retain(Some(physical)).ok()?;
+    prepare_window_implementations(
+        &mut retained,
+        &inputs.window_cost_model,
+        environment.target,
+        inputs.query_retention_margin_ms,
+    )
+    .ok()?;
+    let states = collect_selected_materializations(&retained.selected_plan_root, true).ok()?;
+    let state = states.iter().find(|state| state.node == retained_state)?;
+    installed_window(
+        &retained,
+        state,
+        &states,
+        environment,
+        inputs.query_retention_margin_ms,
+        false,
+    )
+    .map(|(_, count)| count)
+}
+
 /// A Planner candidate with a native physical realization after its
 /// readout-built states are placed by lifecycle.
 pub(super) struct TimedCandidate {
@@ -1278,6 +1211,7 @@ pub(super) fn time_native_candidate(
     data: &DataWorkload,
     index: usize,
     environment: &PhysicalDeploymentContext,
+    inputs: &BackendLocalPhysicalInputs,
 ) -> Option<TimedCandidate> {
     use planner_types::post_asap::ExecutionTiming;
     let untimed = || {
@@ -1288,8 +1222,8 @@ pub(super) fn time_native_candidate(
         })
     };
     let lifecycle = &query.summary_lifecycle_inputs;
-    // Windows are prepared from the timed root, so the installed layout is not
-    // known while its timing is being chosen.
+    // Enumerate lifecycle choices first; each retained native alternative is
+    // repriced below using its hypothetical installed window layout.
     let model = LifecycleCosts {
         costs: lifecycle.costs.clone(),
         retained_states: None,
@@ -1322,11 +1256,32 @@ pub(super) fn time_native_candidate(
     let mut trace = Vec::new();
     let mut maintained_over_readouts = false;
     for deployment in candidates.deployments() {
-        let retained = alternative_cost(
-            deployment,
-            &SummaryMaintenanceLifecycle::ContinuouslyMaintained,
-        );
         let lifecycle = if over_readouts(&deployment.summary) {
+            let retained_states =
+                native_retained_states(root, &deployment.summary, query, environment, inputs);
+            let mut retained_model = model.clone();
+            retained_model.retained_states = retained_states;
+            let retained = retained_states.and_then(|_| {
+                let priced = enumerate_summary_maintenance_lifecycles(
+                    Rc::clone(root),
+                    WorkloadDemand::new_with_data(workload, data, std::slice::from_ref(&index)),
+                    environment.observed_at_unix_ms,
+                    Some(Horizon(lifecycle.horizon_seconds)),
+                    SummaryMaintenanceLifecycleCapabilities {
+                        supports_ephemeral: true,
+                        supports_prepared: false,
+                        supports_shared: false,
+                        supports_continuously_maintained: true,
+                    },
+                    &retained_model,
+                )
+                .ok()?;
+                let priced = priced
+                    .deployments()
+                    .iter()
+                    .find(|priced| priced.summary == deployment.summary)?;
+                alternative_cost(priced, &SummaryMaintenanceLifecycle::ContinuouslyMaintained)
+            });
             let rebuilt = alternative_cost(deployment, &SummaryMaintenanceLifecycle::Ephemeral);
             let ephemeral = rebuild_is_cheaper(retained, rebuilt);
             maintained_over_readouts |= !ephemeral;
@@ -1340,6 +1295,7 @@ pub(super) fn time_native_candidate(
             // placement of the states it installs as `lifecycle_placement`.
             trace.push(json!({
                 "stage": "deployment.native_candidate_placement",
+                "retained_states": retained_states,
                 "query_ids": [&query.query_id],
                 "candidate_root_id": crate::planner_selection::explained_root_id(root, &query.accuracy_target),
                 "logical_root_id": crate::planner_selection::explained_root_id(&deployment.summary, &query.accuracy_target),

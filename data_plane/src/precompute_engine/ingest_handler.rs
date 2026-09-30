@@ -377,9 +377,9 @@ mod tests {
         // first PROTO-encoded frame had landed. Use a distinct key
         // so we're not racing any earlier tests.
         let series_key = "__name__=latency_ms,inst=a";
-        let base = DDSketchAccumulator {
-            inner: DdSketch::from_raw(0.01, vec![1, 2, 3], 0),
-        };
+        let base =
+            DDSketchAccumulator::from_sketch(DdSketch::from_raw(0.01, vec![1, 2, 3], 0), 1.0)
+                .expect("validated sampling probability");
         state.sketch_snapshots.insert(
             series_key.to_string(),
             SnapshotCacheEntry {

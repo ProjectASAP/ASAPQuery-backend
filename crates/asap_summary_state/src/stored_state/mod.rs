@@ -23,6 +23,8 @@ pub enum SketchEncoding {
     /// A complete Planner weighted-frequency heap state (sketchlib
     /// `WeightedFrequency` bytes); never a legacy integer heap frame.
     WeightedFrequencyV1,
+    /// Planner sketch bytes paired with their sampling probability.
+    SampledKernelV2,
 }
 
 impl SketchEncoding {
@@ -30,7 +32,7 @@ impl SketchEncoding {
     pub fn is_full(self) -> bool {
         matches!(
             self,
-            Self::ProtoFull | Self::MsgpackFull | Self::WeightedFrequencyV1
+            Self::ProtoFull | Self::MsgpackFull | Self::WeightedFrequencyV1 | Self::SampledKernelV2
         )
     }
 
@@ -39,6 +41,20 @@ impl SketchEncoding {
         use asap_physical_operators::summary_kernels::weighted_frequency::WeightedFrequency;
         if state.as_any().is::<WeightedFrequency>() {
             Self::WeightedFrequencyV1
+        } else if state
+            .as_any()
+            .is::<asap_physical_operators::summary_kernels::DDSketchAccumulator>()
+            || state
+                .as_any()
+                .is::<asap_physical_operators::summary_kernels::HllSketchAccumulator>()
+            || state
+                .as_any()
+                .is::<asap_physical_operators::summary_kernels::CountMinSketchAccumulator>()
+            || state
+                .as_any()
+                .is::<asap_physical_operators::summary_kernels::CountSketchAccumulator>()
+        {
+            Self::SampledKernelV2
         } else {
             Self::MsgpackFull
         }

@@ -1223,7 +1223,7 @@ mod tests {
     #[test]
     fn bound_univmon_merges_panes_for_four_readouts() {
         use crate::storage_engines::sketch_db::index::SketchEncoding;
-        use asap_summary_state::univmon::UnivMonAccumulator;
+        use asap_physical_operators::summary_kernels::univmon::UnivMonAccumulator;
         use asap_types::query_plan::{MaterializationBinding, PhysicalGrouping};
         let index = SketchStore::new();
         let fp = asap_types::PolicyFingerprint(701);
@@ -1252,7 +1252,7 @@ mod tests {
                 BTreeMap::from([("job".into(), "a".into())]),
                 (start, start + 1000),
                 SketchSampleState {
-                    bytes: state.to_bytes().unwrap(),
+                    bytes: state.sketch().serialize_to_bytes().unwrap(),
                     encoding: SketchEncoding::MsgpackFull,
                 },
             );
@@ -1312,18 +1312,20 @@ mod tests {
         use asap_physical_operators::summary_kernels::DDSketchAccumulator;
         let mut sketch = asap_sketchlib::DdSketch::new(0.01);
         assert!(sketch_query_value(
-            &SummaryState::Dd(DDSketchAccumulator {
-                inner: sketch.clone(),
-            }),
+            &SummaryState::Dd(
+                DDSketchAccumulator::from_sketch(sketch.clone(), 1.0)
+                    .expect("validated sampling probability")
+            ),
             &SketchQuery::Quantile { q: 0.9 }
         )
         .is_err());
         sketch.update(20.0);
         for q in [0.0, 0.5, 0.9, 1.0] {
             let value = sketch_query_value(
-                &SummaryState::Dd(DDSketchAccumulator {
-                    inner: sketch.clone(),
-                }),
+                &SummaryState::Dd(
+                    DDSketchAccumulator::from_sketch(sketch.clone(), 1.0)
+                        .expect("validated sampling probability"),
+                ),
                 &SketchQuery::Quantile { q },
             )
             .unwrap();
@@ -1333,16 +1335,20 @@ mod tests {
         assert!(sketch.quantile(0.9).unwrap() < 21.0);
         for (q, expected) in [(0.0, 20.0), (0.5, 30.0), (0.9, 38.0), (1.0, 40.0)] {
             let value = sketch_query_value(
-                &SummaryState::Dd(DDSketchAccumulator {
-                    inner: sketch.clone(),
-                }),
+                &SummaryState::Dd(
+                    DDSketchAccumulator::from_sketch(sketch.clone(), 1.0)
+                        .expect("validated sampling probability"),
+                ),
                 &SketchQuery::Quantile { q },
             )
             .unwrap();
             assert!((value - expected).abs() <= expected * 0.01);
         }
         assert!(sketch_query_value(
-            &SummaryState::Dd(DDSketchAccumulator { inner: sketch }),
+            &SummaryState::Dd(
+                DDSketchAccumulator::from_sketch(sketch, 1.0)
+                    .expect("validated sampling probability")
+            ),
             &SketchQuery::Quantile { q: f64::NAN }
         )
         .is_err());

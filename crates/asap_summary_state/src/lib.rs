@@ -10,7 +10,6 @@ pub use aggregation_type::AggregationType;
 
 pub mod codec;
 pub mod stored_state;
-pub mod univmon;
 
 pub use asap_physical_operators::{AggregateCore, KeyByLabelValues, Measurement, Statistic};
 pub use stored_state::codec::StoredState;

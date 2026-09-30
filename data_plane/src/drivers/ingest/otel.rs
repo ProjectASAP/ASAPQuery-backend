@@ -2474,24 +2474,41 @@ fn decode_modified_otlp_sketch_bytes(
     //   3  — ENCODING_MSGPACK        (full sketch-core msgpack state)
     //   4  — ENCODING_MSGPACK_DELTA  (MSGPACK diff; not yet wired)
     Ok(match (encoding, algorithm) {
-        (ENCODING_PROTO, SketchAlgorithm::DDSketch) => Box::new(k::DDSketchAccumulator {
-            inner: d::ddsketch_from_proto(bytes)?,
-        }),
+        (ENCODING_PROTO, SketchAlgorithm::DDSketch) => Box::new(
+            k::DDSketchAccumulator::from_sketch(
+                d::ddsketch_from_proto(bytes)?,
+                d::sample_probability(bytes)?,
+            )
+            .expect("validated sampling probability"),
+        ),
         (ENCODING_PROTO, SketchAlgorithm::Kll) => Box::new(k::DatasketchesKLLAccumulator {
             inner: d::kll_from_proto(bytes)?,
         }),
-        (ENCODING_PROTO, SketchAlgorithm::Cms) => Box::new(k::CountMinSketchAccumulator {
-            inner: d::cms_from_proto(bytes)?,
-        }),
-        (ENCODING_PROTO, SketchAlgorithm::CountSketch) => Box::new(k::CountSketchAccumulator {
-            inner: d::cs_from_proto(bytes)?,
-        }),
-        (ENCODING_PROTO, SketchAlgorithm::Hll) => Box::new(k::HllSketchAccumulator {
-            inner: d::hll_from_proto(bytes)?,
-        }),
-        (ENCODING_MSGPACK, SketchAlgorithm::Cms) => Box::new(k::CountMinSketchAccumulator {
-            inner: d::cms_from_msgpack(bytes)?,
-        }),
+        (ENCODING_PROTO, SketchAlgorithm::Cms) => Box::new(
+            k::CountMinSketchAccumulator::from_sketch(
+                d::cms_from_proto(bytes)?,
+                d::sample_probability(bytes)?,
+            )
+            .expect("validated sampling probability"),
+        ),
+        (ENCODING_PROTO, SketchAlgorithm::CountSketch) => Box::new(
+            k::CountSketchAccumulator::from_sketch(
+                d::cs_from_proto(bytes)?,
+                d::sample_probability(bytes)?,
+            )
+            .expect("validated sampling probability"),
+        ),
+        (ENCODING_PROTO, SketchAlgorithm::Hll) => Box::new(
+            k::HllSketchAccumulator::from_sketch(
+                d::hll_from_proto(bytes)?,
+                d::sample_probability(bytes)?,
+            )
+            .expect("validated sampling probability"),
+        ),
+        (ENCODING_MSGPACK, SketchAlgorithm::Cms) => Box::new(
+            k::CountMinSketchAccumulator::from_sketch(d::cms_from_msgpack(bytes)?, 1.0)
+                .expect("validated sampling probability"),
+        ),
         (ENCODING_MSGPACK, SketchAlgorithm::CountSketch) => {
             // A heap-bearing CountSketch full frame is the
             // `{sketch,topk_heap,heap_size}` envelope, which the plain
@@ -2502,20 +2519,23 @@ fn decode_modified_otlp_sketch_bytes(
                 Ok(heap) if !heap.topk_heap_items().is_empty() => {
                     Box::new(k::CountSketchWithHeapAccumulator { inner: heap })
                 }
-                _ => Box::new(k::CountSketchAccumulator {
-                    inner: d::cs_from_msgpack(bytes)?,
-                }),
+                _ => Box::new(
+                    k::CountSketchAccumulator::from_sketch(d::cs_from_msgpack(bytes)?, 1.0)
+                        .expect("validated sampling probability"),
+                ),
             }
         }
         (ENCODING_MSGPACK, SketchAlgorithm::Kll) => Box::new(k::DatasketchesKLLAccumulator {
             inner: d::kll_from_msgpack(bytes)?,
         }),
-        (ENCODING_MSGPACK, SketchAlgorithm::DDSketch) => Box::new(k::DDSketchAccumulator {
-            inner: d::ddsketch_from_msgpack(bytes)?,
-        }),
-        (ENCODING_MSGPACK, SketchAlgorithm::Hll) => Box::new(k::HllSketchAccumulator {
-            inner: d::hll_from_msgpack(bytes)?,
-        }),
+        (ENCODING_MSGPACK, SketchAlgorithm::DDSketch) => Box::new(
+            k::DDSketchAccumulator::from_sketch(d::ddsketch_from_msgpack(bytes)?, 1.0)
+                .expect("validated sampling probability"),
+        ),
+        (ENCODING_MSGPACK, SketchAlgorithm::Hll) => Box::new(
+            k::HllSketchAccumulator::from_sketch(d::hll_from_msgpack(bytes)?, 1.0)
+                .expect("validated sampling probability"),
+        ),
         (ENCODING_PROTO, other) => {
             return Err(
                 format!("modified-OTLP PROTO decoding is not implemented for {other:?}").into(),
@@ -2647,22 +2667,38 @@ pub(crate) fn apply_modified_otlp_delta_bytes(
         (ENCODING_PROTO_DELTA, SketchAlgorithm::DDSketch) => edit(
             existing,
             "DDSketchAccumulator",
-            |s: &mut k::DDSketchAccumulator| d::apply_ddsketch_proto_delta(&mut s.inner, bytes),
+            |s: &mut k::DDSketchAccumulator| {
+                // Bare deltas inherit the series' probability from its full frame.
+                s.merge_sample_p(1.0).map_err(|e| e.to_string())?;
+                d::apply_ddsketch_proto_delta(&mut s.inner, bytes)
+            },
         ),
         (ENCODING_PROTO_DELTA, SketchAlgorithm::Hll) => edit(
             existing,
             "HllSketchAccumulator",
-            |s: &mut k::HllSketchAccumulator| d::apply_hll_proto_delta(&mut s.inner, bytes),
+            |s: &mut k::HllSketchAccumulator| {
+                // Bare deltas inherit the series' probability from its full frame.
+                s.merge_sample_p(1.0).map_err(|e| e.to_string())?;
+                d::apply_hll_proto_delta(&mut s.inner, bytes)
+            },
         ),
         (ENCODING_PROTO_DELTA, SketchAlgorithm::CountSketch) => edit(
             existing,
             "CountSketchAccumulator",
-            |s: &mut k::CountSketchAccumulator| d::apply_cs_proto_delta(&mut s.inner, bytes),
+            |s: &mut k::CountSketchAccumulator| {
+                // Bare deltas inherit the series' probability from its full frame.
+                s.merge_sample_p(1.0).map_err(|e| e.to_string())?;
+                d::apply_cs_proto_delta(&mut s.inner, bytes)
+            },
         ),
         (ENCODING_PROTO_DELTA, SketchAlgorithm::Cms) => edit(
             existing,
             "CountMinSketchAccumulator",
-            |s: &mut k::CountMinSketchAccumulator| d::apply_cms_proto_delta(&mut s.inner, bytes),
+            |s: &mut k::CountMinSketchAccumulator| {
+                // Bare deltas inherit the series' probability from its full frame.
+                s.merge_sample_p(1.0).map_err(|e| e.to_string())?;
+                d::apply_cms_proto_delta(&mut s.inner, bytes)
+            },
         ),
         (ENCODING_PROTO_DELTA, other) => Err(format!(
             "PROTO_DELTA for sketch kind {other:?} is not yet supported; \
@@ -2694,21 +2730,16 @@ pub(crate) fn apply_modified_otlp_delta_bytes(
 }
 
 /// Apply `update` to the cached base of kernel type `T`. Planner kernels
-/// expose no mutable downcast, so the base is copied, updated and replaced.
-fn edit<T: AggregateCore + Clone + 'static>(
+/// expose mutable downcasting so updates do not copy the cached sketch.
+fn edit<T: AggregateCore + 'static>(
     existing: &mut Box<dyn AggregateCore>,
     expected: &str,
     update: impl FnOnce(&mut T) -> Result<(), String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut state = existing
-        .as_any()
-        .downcast_ref::<T>()
-        .ok_or_else(|| {
-            format!("apply_modified_otlp_delta_bytes: existing accumulator is not a {expected}")
-        })?
-        .clone();
-    update(&mut state)?;
-    *existing = Box::new(state);
+    let state = existing.as_any_mut().downcast_mut::<T>().ok_or_else(|| {
+        format!("apply_modified_otlp_delta_bytes: existing accumulator is not a {expected}")
+    })?;
+    update(state)?;
     Ok(())
 }
 
@@ -3262,15 +3293,53 @@ mod dispatcher_tests {
     use asap_sketchlib::DdSketch;
     use asap_sketchlib::HllVariant;
 
+    // Bare deltas inherit the full frame's probability and mutate the existing kernel.
+    #[test]
+    fn sampled_base_delta_preserves_probability_and_allocation() {
+        use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta};
+        use planner_types::{post_asap::SketchQuery, pre_asap::ColumnRef};
+        let mut acc: Box<dyn AggregateCore> = Box::new(
+            DDSketchAccumulator::from_sketch(DdSketch::from_raw(0.01, vec![1], 0), 0.25).unwrap(),
+        );
+        let address = acc.as_any().downcast_ref::<DDSketchAccumulator>().unwrap() as *const _;
+        let delta = DdSketchDelta {
+            buckets: vec![DdSketchBucketDelta {
+                index: 0,
+                d_count: 1,
+            }],
+        }
+        .encode_to_vec();
+        apply_modified_otlp_delta_bytes(
+            SketchAlgorithm::DDSketch,
+            ENCODING_PROTO_DELTA,
+            &mut acc,
+            &delta,
+        )
+        .unwrap();
+        assert_eq!(
+            address,
+            acc.as_any().downcast_ref::<DDSketchAccumulator>().unwrap() as *const _
+        );
+        assert_eq!(
+            acc.estimate(&SketchQuery::PointCount {
+                key: ColumnRef::SampleValue,
+                value: None
+            })
+            .unwrap(),
+            8.0
+        );
+    }
+
     #[test]
     fn apply_modified_otlp_delta_bytes_ddsketch_round_trip() {
         use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
         use prost::Message;
 
         // Base sketch represents the last full snapshot the agent sent.
-        let mut acc: Box<dyn AggregateCore> = Box::new(DDSketchAccumulator {
-            inner: DdSketch::from_raw(0.01, vec![1, 2, 3], 0),
-        });
+        let mut acc: Box<dyn AggregateCore> = Box::new(
+            DDSketchAccumulator::from_sketch(DdSketch::from_raw(0.01, vec![1, 2, 3], 0), 1.0)
+                .expect("validated sampling probability"),
+        );
 
         // The wire delta now carries only bucket deltas (tags 2-7
         // reserved post ProjectASAP/sketchlib-go#243 / asap_sketchlib#57).

@@ -44,6 +44,9 @@ enum StateCodec {
     KllMsgpackV1,
     DdMsgpackV1,
     HllMsgpackV1,
+    DdSampledV2,
+    HllSampledV2,
+    ExactAccumulatorV2,
 }
 fn invalid(message: impl ToString) -> Error {
     Error::Invalid(message.to_string())
@@ -54,13 +57,13 @@ impl StateCodec {
         let codec = if any.is::<physical::weighted_frequency::WeightedFrequency>() {
             Self::WeightedFrequencyV1
         } else if any.is::<physical::exact::ExactAccumulator>() {
-            Self::ExactAccumulatorV1
+            Self::ExactAccumulatorV2
         } else if any.is::<physical::DatasketchesKLLAccumulator>() {
             Self::KllMsgpackV1
         } else if any.is::<physical::DDSketchAccumulator>() {
-            Self::DdMsgpackV1
+            Self::DdSampledV2
         } else if any.is::<physical::HllSketchAccumulator>() {
-            Self::HllMsgpackV1
+            Self::HllSampledV2
         } else {
             return Err(invalid("physical summary has no persisted native codec"));
         };
@@ -69,15 +72,23 @@ impl StateCodec {
     fn decode(&self, bytes: &[u8]) -> Result<Arc<dyn AggregateCore>, Error> {
         let tag = match self {
             Self::WeightedFrequencyV1 => "WeightedFrequency",
-            Self::ExactAccumulatorV1 => codec::EXACT_V1,
+            Self::ExactAccumulatorV2 => codec::EXACT_V2,
+            Self::ExactAccumulatorV1 => {
+                return Err(invalid("native ExactAccumulatorV1 is retired; requires V2"))
+            }
             Self::SumAccumulatorV1 => {
                 return Err(invalid(
                     "native codec SumAccumulatorV1 is retired and no longer decoded",
                 ))
             }
             Self::KllMsgpackV1 => "DatasketchesKLLAccumulator",
-            Self::DdMsgpackV1 => "DDSketchAccumulator",
-            Self::HllMsgpackV1 => "HllSketchAccumulator",
+            Self::DdSampledV2 => "DDSketchAccumulatorV2",
+            Self::DdMsgpackV1 | Self::HllMsgpackV1 => {
+                return Err(invalid(
+                    "native sampled sketch codec V1 is retired; requires V2",
+                ))
+            }
+            Self::HllSampledV2 => "HllSketchAccumulatorV2",
         };
         codec::decode(tag, bytes).map(Arc::from).map_err(invalid)
     }
@@ -185,6 +196,10 @@ impl AggregateCore for NativeSummaryOutput {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
     fn merge_with(&self, _: &dyn AggregateCore) -> Result<Box<dyn AggregateCore>, KernelError> {
         Err("native output snapshots require an explicit physical merge operator".into())
     }
