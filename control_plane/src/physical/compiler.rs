@@ -782,65 +782,8 @@ impl AccuracyEvidenceProvider for QueryEvidence<'_> {
     }
 }
 
-/// Planner's row-binary error when per-series rows carry no series identity.
-/// Planner reports it only as text, so reselection matches the message.
-const SERIES_IDENTITY_REQUIRED: &str =
-    "row binary requires grouped rows or rows with a series identity";
-
-/// Admit the workload selected over identity-typed roots as a candidate
-/// forest, or give the reason it is rejected.
-fn typed_reselection_forest(
-    typed: &mut [QueryCompilationInput],
-    canonical: &[QueryCompilationInput],
-    retyped: &[bool],
-    needs_identity: &dyn Fn(&Rc<SummaryNode>) -> bool,
-    inputs: &BackendLocalPhysicalInputs,
-    target: PhysicalDeploymentTarget,
-) -> Result<(), String> {
-    if !canonical.iter().zip(&*typed).any(|(canonical, typed)| {
-        needs_identity(&canonical.selected_plan_root) && !needs_identity(&typed.selected_plan_root)
-    }) {
-        return Err("no computation compiles over identity-typed roots".into());
-    }
-    for query in typed.iter_mut() {
-        prepare_window_implementations(
-            query,
-            &inputs.window_cost_model,
-            target,
-            inputs.query_retention_margin_ms,
-        )
-        .map_err(|error| format!("{}: {error}", query.query_id))?;
-    }
-    // A root that cannot be retyped keeps its canonical states. Sharing one
-    // with a retyped root would give one deployed output two definitions.
-    let fingerprints = |retyped_side: bool| -> Result<BTreeSet<_>, String> {
-        let mut all = BTreeSet::new();
-        for (query, _) in typed
-            .iter()
-            .zip(retyped)
-            .filter(|(_, &retyped)| retyped == retyped_side)
-        {
-            all.extend(state_fingerprints(query, target)?);
-        }
-        Ok(all)
-    };
-    if !fingerprints(true)?.is_disjoint(&fingerprints(false)?) {
-        return Err("a root without a series identity shares state with a retyped root".into());
-    }
-    // Native realizations of typed roots are bound only through their
-    // lifecycle placement.
-    for (query, &retyped) in typed.iter_mut().zip(retyped) {
-        if retyped {
-            query.retain(None)
-        } else {
-            query.retain_physical_candidate()
-        }
-        .map_err(|error| error.to_string())?;
-    }
-    Ok(())
-}
-
 /// Deployed-output fingerprints of the states a query's selected root reads.
+#[cfg(test)]
 fn state_fingerprints(
     query: &QueryCompilationInput,
     target: PhysicalDeploymentTarget,
@@ -1082,9 +1025,18 @@ impl BackendLocalPlanningInput {
                 exact_costs_by_id.insert(format!("compat-query-{index}"), rows.clone());
             }
         }
+        // PromQL rows carry their complete identity before PlanSpace chooses
+        // shared states, so arithmetic never needs a second logical selection.
+        let logical_roots = canonical_roots
+            .iter()
+            .map(|root| {
+                planner_types::pre_asap::schema::with_promql_series_identity(root)
+                    .map_or_else(|_| Rc::clone(root), Rc::new)
+            })
+            .collect();
         let mut planner_selection_trace = select_logical_roots_with_scoped_evidence_and_trace(
             &mut queries,
-            canonical_roots.clone(),
+            logical_roots,
             &topk_evidence_by_id,
             &scoped_evidence_by_id,
             &exact_costs_by_id,
@@ -1101,71 +1053,6 @@ impl BackendLocalPlanningInput {
             query.retain_physical_candidate()?;
         }
         let mut planner_candidate_forests = Vec::new();
-        // Planner matches per-series rows in query-time arithmetic only by the
-        // series identity. When a selected computation fails to compile for
-        // lack of it, the workload selected over identity-typed roots is one
-        // more forest; deployment pricing chooses among all forests.
-        let needs_identity = |root: &Rc<SummaryNode>| {
-            crate::query_plan::is_query_computation(root)
-                && crate::query_plan::compile_query_computation(root)
-                    .is_err_and(|error| error.to_string().contains(SERIES_IDENTITY_REQUIRED))
-        };
-        if queries
-            .iter()
-            .any(|query| needs_identity(&query.selected_plan_root))
-        {
-            let reject = |reason: String| {
-                serde_json::json!({
-                    "stage": "planner.series_identity_reselection",
-                    "status": "rejected", "reason": reason,
-                })
-            };
-            let typed_roots: Vec<_> = canonical_roots
-                .iter()
-                .map(|root| {
-                    asap_physical_operators::physical_planner::promql_rows::with_series_identity(
-                        root,
-                    )
-                    .map_or_else(|_| Rc::clone(root), Rc::new)
-                })
-                .collect();
-            let retyped: Vec<_> = typed_roots
-                .iter()
-                .zip(&canonical_roots)
-                .map(|(typed, canonical)| !Rc::ptr_eq(typed, canonical))
-                .collect();
-            let mut typed = queries.clone();
-            match select_logical_roots_with_scoped_evidence_and_trace(
-                &mut typed,
-                typed_roots,
-                &topk_evidence_by_id,
-                &scoped_evidence_by_id,
-                &exact_costs_by_id,
-                self.physical_inputs.erp.as_ref(),
-                self.environment.observed_at_unix_ms,
-            ) {
-                Err(error) => planner_selection_trace.push(reject(error.to_string())),
-                Ok(trace) => {
-                    planner_selection_trace.extend(trace.into_iter().map(|mut event| {
-                        if let Some(event) = event.as_object_mut() {
-                            event.insert("reselection".into(), "series_identity".into());
-                        }
-                        event
-                    }));
-                    match typed_reselection_forest(
-                        &mut typed,
-                        &queries,
-                        &retyped,
-                        &needs_identity,
-                        &self.physical_inputs,
-                        self.environment.target,
-                    ) {
-                        Ok(()) => planner_candidate_forests.push(typed),
-                        Err(reason) => planner_selection_trace.push(reject(reason)),
-                    }
-                }
-            }
-        }
         // Native physical realizations need the complete series identity in
         // their rows. Planner's PlanSpace proposes them for the identity-typed
         // root; each is a logical alternative whose readout-built states are
@@ -5465,27 +5352,20 @@ pub(crate) mod tests {
         snapshot
     }
 
-    fn needs_series_identity(root: &Rc<SummaryNode>) -> bool {
-        crate::query_plan::compile_query_computation(root)
-            .is_err_and(|error| error.to_string().contains(SERIES_IDENTITY_REQUIRED))
-    }
-
-    // The identity-typed reselection is only a candidate forest: the primary
-    // workload stays the canonical selection, and its trace entries are tagged.
+    // Per-series arithmetic compiles on the first selection, without retrying PlanSpace.
     #[test]
-    fn typed_reselection_is_only_a_candidate_forest() {
+    fn logical_candidates_have_series_identity_before_selection() {
         let (request, _) = exact_workload_snapshot(&["avg_over_time(data[5m])"])
             .into_physical_compilation_request()
             .unwrap();
-        assert!(needs_series_identity(
+        assert!(crate::query_plan::compile_query_computation(
             &request.queries[0].selected_plan_root
-        ));
-        let typed = &request.planner_candidate_forests[0];
-        assert!(crate::query_plan::compile_query_computation(&typed[0].selected_plan_root).is_ok());
-        assert!(request
-            .planner_selection_trace
-            .iter()
-            .any(|event| event["reselection"] == "series_identity"));
+        )
+        .is_ok());
+        assert!(request.planner_selection_trace.iter().all(|event| {
+            event["reselection"].is_null()
+                && event["stage"] != "planner.series_identity_reselection"
+        }));
     }
 
     // Workloads mixing per-series arithmetic with aggregates of the same
@@ -5523,8 +5403,7 @@ pub(crate) mod tests {
         }
     }
 
-    // A state shared by a retyped and a canonical root has the same deployed
-    // fingerprint either way, so it must keep one definition.
+    // Typing changes physical schemas without changing the stored-state identity.
     #[test]
     fn shared_state_fingerprint_is_independent_of_series_identity() {
         let (request, _) =
@@ -5532,59 +5411,35 @@ pub(crate) mod tests {
                 .into_physical_compilation_request()
                 .unwrap();
         let target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
-        let canonical = state_fingerprints(&request.queries[1], target).unwrap();
-        let typed = &request.planner_candidate_forests[0];
-        assert!(!canonical.is_empty());
-        assert_eq!(canonical, state_fingerprints(&typed[1], target).unwrap());
-        assert!(canonical.is_subset(&state_fingerprints(&typed[0], target).unwrap()));
+        let typed = state_fingerprints(&request.queries[1], target).unwrap();
+        let mut canonical = request.queries.clone();
+        select_logical_roots_with_scoped_evidence_and_trace(
+            &mut canonical,
+            request.canonical_roots.clone(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            1_000,
+        )
+        .unwrap();
+        assert!(!typed.is_empty());
+        assert_eq!(typed, state_fingerprints(&canonical[1], target).unwrap());
+        assert!(typed.is_subset(&state_fingerprints(&request.queries[0], target).unwrap()));
     }
 
-    // A typed workload whose unretyped root reads a state of a retyped root
-    // is rejected rather than deploying two definitions of that state.
+    // A sorted aggregation deploys from the first selected workload forest.
     #[test]
-    fn typed_reselection_rejects_state_shared_with_unretyped_root() {
-        let (request, _) =
-            exact_workload_snapshot(&["avg_over_time(data[5m])", "sum_over_time(data[5m])"])
-                .into_physical_compilation_request()
-                .unwrap();
-        let inputs = planning_snapshot().physical_inputs;
-        let target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
-        let mut typed = request.planner_candidate_forests[0].clone();
-        assert!(typed_reselection_forest(
-            &mut typed.clone(),
-            &request.queries,
-            &[true, true],
-            &needs_series_identity,
-            &inputs,
-            target,
-        )
-        .is_ok());
-        // The canonical `sum_over_time` stands in for a root that cannot be retyped.
-        typed[1] = request.queries[1].clone();
-        let error = typed_reselection_forest(
-            &mut typed,
-            &request.queries,
-            &[true, false],
-            &needs_series_identity,
-            &inputs,
-            target,
-        )
-        .unwrap_err();
-        assert!(error.contains("shares state"), "{error}");
-    }
-
-    // Reselection is gated on the missing series identity: a computation that
-    // fails to compile for another reason is not reselected.
-    #[test]
-    fn reselection_requires_the_series_identity_error() {
-        let query = "quantile_over_time(0.9,data[5m])/quantile_over_time(0.5,data[5m])";
-        let mut snapshot = planning_snapshot();
-        snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query = Query(query.into());
-        let (request, _) = snapshot.into_physical_compilation_request().unwrap();
-        assert!(request.planner_selection_trace.iter().all(|event| {
-            event["reselection"].is_null()
-                && event["stage"] != "planner.series_identity_reselection"
-        }));
+    fn sorted_aggregation_deploys_without_reselection() {
+        let query = "sort_desc(sum by (job) (rate(data[5m])))";
+        let (request, environment) = exact_workload_snapshot(&[query])
+            .into_physical_compilation_request()
+            .unwrap();
+        let plan = DeploymentPlanCompiler
+            .compile_promql(request, environment)
+            .unwrap();
+        let entry = plan.query_plan.lookup(query).unwrap();
+        assert!(!entry.materialization_bindings().is_empty());
     }
 
     // Quantile rank error does not certify relative error of a quotient.
