@@ -79,6 +79,36 @@ mod readiness_coverage_tests {
 }
 
 #[cfg(test)]
+mod stored_input_lag_tests {
+    // Only an execution that bound stored state beside raw inputs reports its lag.
+    #[test]
+    fn logical_execution_reports_stored_input_lag_when_mixed() {
+        use crate::query_engines::query_result::QueryResult;
+        let lag_warnings = |lag| {
+            let mut result = QueryResult::vector(vec![], 0);
+            let stats = super::super::logical_dag::ExecutionStats {
+                stored_input_lag_ms: lag,
+                ..Default::default()
+            };
+            super::annotate_logical_execution(&mut result, &stats);
+            let QueryResult::Vector(result) = result else {
+                unreachable!()
+            };
+            result
+                .warnings
+                .into_iter()
+                .filter(|warning| warning.starts_with("asap_stored_input_lag_ms:"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            lag_warnings(Some(40_000)),
+            ["asap_stored_input_lag_ms:40000"]
+        );
+        assert!(lag_warnings(None).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod forwarding_policy_tests {
     use super::ASAPQueryEngine;
     use crate::query_engines::asap_query_engine::test_plan;
@@ -198,6 +228,9 @@ pub struct ASAPQueryEngine {
     query_forwarding_policy: crate::query_engines::QueryForwardingPolicy,
     exact_subquery_client: reqwest::Client,
     execution_limits: asap_physical_operators::dag::Limits,
+    /// Deployment override of the staleness bound for stored inputs bound
+    /// beside query-time raw inputs; None uses each stored output's slide.
+    max_stored_input_lag_ms: Option<u64>,
 }
 
 impl ASAPQueryEngine {
@@ -278,6 +311,7 @@ impl ASAPQueryEngine {
         Self {
             prometheus_scrape_interval,
             execution_limits: Default::default(),
+            max_stored_input_lag_ms: None,
             summary_store: None,
             active_physical_plan: None,
             exact_subquery_endpoint: None,
@@ -305,6 +339,10 @@ impl ASAPQueryEngine {
         policy: crate::query_engines::QueryForwardingPolicy,
     ) -> Self {
         self.query_forwarding_policy = policy;
+        self
+    }
+    pub fn with_max_stored_input_lag_ms(mut self, max_lag_ms: Option<u64>) -> Self {
+        self.max_stored_input_lag_ms = max_lag_ms;
         self
     }
     pub fn with_execution_limits(mut self, limits: asap_physical_operators::dag::Limits) -> Self {
@@ -535,13 +573,31 @@ impl ASAPQueryEngine {
                 .as_deref()
                 .filter(|_| self.query_forwarding_policy.allows_external_queries())
                 .map(|endpoint| (&self.exact_subquery_client, endpoint));
-            super::logical_dag::native_values::execute_stored(
-                entry,
+            let (plan_id, plan_version) = (
                 physical.query_plan.plan_id,
                 physical.query_plan.plan_version,
-                index,
+            );
+            super::logical_dag::native_values::execute_stored(
+                entry,
                 raw_endpoint,
+                self.max_stored_input_lag_ms,
                 at,
+                &mut |binding, window, schema, max_bytes| {
+                    let store = index.ok_or("summary store unavailable")?;
+                    let address = asap_types::sds::StoredSummaryKey {
+                        plan_id,
+                        plan_version,
+                        stored_output_id: binding.stored_output_reference.stored_output_id,
+                        population: std::collections::BTreeMap::new(),
+                        window,
+                    };
+                    store.read_bound_native_summary(
+                        &address,
+                        &binding.stored_output_reference,
+                        schema,
+                        max_bytes,
+                    )
+                },
             )
         } else {
             super::logical_dag::execute_installed(entry, leaves, at, |root, evaluation_ms| {
@@ -737,6 +793,7 @@ impl ASAPQueryEngine {
             total.remote_evaluations += stats.remote_evaluations;
             total.remote_rpcs += stats.remote_rpcs;
             total.remote_branch_evaluations += stats.remote_branch_evaluations;
+            total.stored_input_lag_ms = total.stored_input_lag_ms.max(stats.stored_input_lag_ms);
             let _step_result = crate::query_engines::request::reserve(result.retained_bytes())?;
             let QueryResult::Vector(result) = result else {
                 return Err(EngineError::capability_miss(
@@ -1058,6 +1115,9 @@ fn annotate_logical_execution(
             }
             .into(),
         );
+    }
+    if let Some(lag) = stats.stored_input_lag_ms {
+        warnings.push(format!("asap_stored_input_lag_ms:{lag}"));
     }
     warnings.push(format!(
         "asap_logical_stats:raw={},summary={},memo_hits={},remote={},remote_rpcs={},remote_branches={}",

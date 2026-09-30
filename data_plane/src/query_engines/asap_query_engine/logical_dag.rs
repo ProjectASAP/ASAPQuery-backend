@@ -57,6 +57,9 @@ pub struct ExecutionStats {
     pub remote_evaluations: usize,
     pub remote_rpcs: usize,
     pub remote_branch_evaluations: usize,
+    /// Largest `t_q - t_s` over stored inputs bound beside query-time raw
+    /// inputs; None when the program has no such mix.
+    pub stored_input_lag_ms: Option<u64>,
 }
 fn miss(detail: impl Into<String>) -> EngineError {
     EngineError::capability_miss("installed_logical_dag", detail)
