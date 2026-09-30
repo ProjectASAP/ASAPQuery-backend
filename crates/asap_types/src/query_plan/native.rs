@@ -111,7 +111,30 @@ impl QueryPlanEntry {
         {
             return Err(invalid("invalid physical vector source mapping or budget"));
         }
+        let raw = |input: &QueryNodeId| {
+            matches!(
+                self.nodes.get(input),
+                Some(QueryPlanNode::Logical {
+                    operator: query_time::QueryTimeOperator::Scan {
+                        metric: Some(_),
+                        range_ms: Some(_),
+                        ..
+                    },
+                    ..
+                })
+            )
+        };
+        // Raw samples are read from the external endpoint at query time; like
+        // exact cuts, they share no snapshot with installed summary state.
+        if inputs.iter().any(raw) && !inputs.iter().all(raw) {
+            return Err(invalid(
+                "query-time raw inputs cannot be mixed with installed state",
+            ));
+        }
         for input in inputs {
+            if raw(input) {
+                continue;
+            }
             if let Some(QueryPlanNode::ReadMaterialization { binding }) = self.nodes.get(input) {
                 if binding.readout_lookback_ms != Some(self.instant.lookback_ms)
                     || binding.window_ms != self.instant.lookback_ms
