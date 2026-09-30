@@ -185,7 +185,10 @@ pub(super) fn physical(
     at: i64,
     context: dag::RunContext,
 ) -> Result<Vector, EngineError> {
-    use asap_physical_operators::physical_planner::{CompiledPhysicalDag, Source};
+    use asap_physical_operators::physical_planner::{
+        promql_rows::{decode_series_identity, encode_series_identity, SERIES_IDENTITY_COLUMN},
+        CompiledPhysicalDag, Source,
+    };
     use futures::{FutureExt, StreamExt};
     use std::collections::{BTreeMap, VecDeque};
     let compiled = CompiledPhysicalDag::decode(encoded)?;
@@ -221,6 +224,13 @@ pub(super) fn physical(
                                 } else {
                                     Err(asap_physical_operators::Error::Invalid("protocol sample cannot represent the required Int64 input exactly".into()).into())
                                 }
+                            }
+                            // Planner matches per-series rows by their
+                            // complete label set.
+                            SummaryFamilyType::Plain(DataType::Utf8)
+                                if field.name == SERIES_IDENTITY_COLUMN =>
+                            {
+                                Ok(Value::Utf8(encode_series_identity(labels)?.into()))
                             }
                             SummaryFamilyType::Plain(DataType::Utf8) => {
                                 Ok(labels.get(&field.name).map_or_else(
@@ -259,6 +269,12 @@ pub(super) fn physical(
         );
     }
     let output_schema = compiled.output_contract(compiled.roots()[0])?.schema;
+    // A per-series result names its series by identity; its other label
+    // columns are projections of that identity.
+    let output_identity = output_schema
+        .fields
+        .iter()
+        .position(|field| field.name == SERIES_IDENTITY_COLUMN);
     let graph = compiled.instantiate(sources)?;
     let mut streams = graph.execute(compiled.roots(), context)?;
     if streams.len() != 1 {
@@ -273,6 +289,27 @@ pub(super) fn physical(
         match stream.next().now_or_never() {
             Some(Some(batch)) => {
                 for row in batch?.rows() {
+                    if let Some(identity) = output_identity {
+                        let Value::Utf8(encoded) = &row[identity] else {
+                            return Err(miss("invalid physical series identity"));
+                        };
+                        let sample = output_schema
+                            .fields
+                            .iter()
+                            .zip(row)
+                            .find_map(|(field, cell)| match cell {
+                                Value::Float64(value)
+                                    if field.dtype
+                                        == SummaryFamilyType::Plain(DataType::Float64) =>
+                                {
+                                    Some(*value)
+                                }
+                                _ => None,
+                            })
+                            .ok_or_else(|| miss("native vector output has no numeric value"))?;
+                        result.push((decode_series_identity(encoded)?, sample));
+                        continue;
+                    }
                     if row_input.is_none() {
                         let mut labels = Labels::new();
                         let mut sample = None;

@@ -196,12 +196,26 @@ pub(super) fn bound_reference(
 /// An exact PromQL query lowered by the control plane: backend readouts over
 /// fixture bindings, with Planner-compiled computation above them.
 pub(super) fn planner_computed_entry(query: &str) -> QueryPlanEntry {
+    computed_entry(query, false)
+}
+
+/// [`planner_computed_entry`] selected over the identity-typed root, as the
+/// control plane does for per-series arithmetic.
+pub(super) fn planner_series_entry(query: &str) -> QueryPlanEntry {
+    computed_entry(query, true)
+}
+
+fn computed_entry(query: &str, series_identity: bool) -> QueryPlanEntry {
     let canonical = canonical_promql(query).unwrap();
-    let expr = control_plane::query_parser::parse_query_expr_canonical(
+    let mut expr = control_plane::query_parser::parse_query_expr_canonical(
         &canonical,
         planner_types::types::AccuracyTarget::Exact,
     )
     .unwrap();
+    if series_identity {
+        expr = asap_physical_operators::physical_planner::promql_rows::with_series_identity(&expr)
+            .unwrap();
+    }
     let selected = control_plane::planner_selection::select_query(
         &expr,
         &control_plane::physical::post_asap::cost_model::ControlPlaneCostModel::new(

@@ -814,7 +814,9 @@ mod join_tests {
 #[cfg(test)]
 mod planner_computation_tests {
     use super::*;
-    use crate::query_engines::asap_query_engine::test_plan::planner_computed_entry;
+    use crate::query_engines::asap_query_engine::test_plan::{
+        planner_computed_entry, planner_series_entry,
+    };
 
     fn readout(values: &[(&str, f64)], at: u64) -> QueryResult {
         QueryResult::vector(
@@ -917,6 +919,99 @@ mod planner_computation_tests {
             vec![("b", 1.2), ("c", 0.8)]
         );
         assert_eq!(stats.summary_readout_evaluations, 1);
+    }
+
+    fn series_readout(series: &[(&[(&str, &str)], f64)], at: u64) -> QueryResult {
+        QueryResult::vector(
+            series
+                .iter()
+                .map(|(labels, value)| {
+                    InstantVectorElement::new(
+                        KeyByLabelValues::new_with_labels(
+                            labels.iter().map(|(_, v)| (*v).into()).collect(),
+                        ),
+                        *value,
+                    )
+                    .with_label_keys_override(labels.iter().map(|(k, _)| (*k).into()).collect())
+                })
+                .collect(),
+            at,
+        )
+    }
+
+    // Per-series division over two readouts matches series on their labels
+    // without the metric name, drops unmatched series and the metric name.
+    #[test]
+    fn per_series_ratio_matches_readout_series() {
+        let entry = planner_series_entry("rate(a[5m]) / rate(b[5m])");
+        assert!(matches!(
+            entry.nodes[&entry.root],
+            QueryPlanNode::PhysicalFragment { .. }
+        ));
+        let [a, b] = readouts(&entry).try_into().unwrap();
+        let (result, _) = execute_installed(&entry, &BTreeMap::new(), 300_000, |id, at| {
+            Ok(if id == a {
+                series_readout(
+                    &[
+                        (&[("__name__", "a"), ("job", "api")], 6.0),
+                        (&[("__name__", "a"), ("job", "db")], 1.0),
+                    ],
+                    at,
+                )
+            } else {
+                assert_eq!(id, b);
+                series_readout(
+                    &[
+                        (&[("__name__", "b"), ("job", "api")], 3.0),
+                        (&[("__name__", "b"), ("job", "web")], 1.0),
+                    ],
+                    at,
+                )
+            })
+        })
+        .unwrap();
+        let QueryResult::Vector(result) = result else {
+            panic!("instant vector expected")
+        };
+        assert_eq!(
+            result
+                .values
+                .iter()
+                .map(|point| (point.labels.labels.clone(), point.value))
+                .collect::<Vec<_>>(),
+            vec![(vec!["api".to_string()], 2.0)]
+        );
+    }
+
+    // A literal operand scales every per-series readout value.
+    #[test]
+    fn per_series_scalar_arithmetic_scales_each_series() {
+        let entry = planner_series_entry("rate(a[5m]) * 2");
+        let [a] = readouts(&entry).try_into().unwrap();
+        let (result, _) = execute_installed(&entry, &BTreeMap::new(), 300_000, |id, at| {
+            assert_eq!(id, a);
+            Ok(series_readout(
+                &[(&[("job", "api")], 1.5), (&[("job", "db")], 4.0)],
+                at,
+            ))
+        })
+        .unwrap();
+        let QueryResult::Vector(result) = result else {
+            panic!("instant vector expected")
+        };
+        let mut values = result
+            .values
+            .iter()
+            .map(|point| (point.labels.labels.clone(), point.value))
+            .collect::<Vec<_>>();
+        values.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            values,
+            vec![
+                (vec!["api".to_string()], 3.0),
+                (vec!["db".to_string()], 8.0)
+            ]
+        );
     }
 
     // Source failures keep their routing classification across the shared runtime.
