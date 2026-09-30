@@ -81,6 +81,7 @@ impl Placement {
 /// state's estimated bytes for every retained pane and partition at the
 /// summary-store price; an unknown size under a positive price leaves
 /// retention unpriced.
+#[derive(Clone)]
 struct LifecycleCosts {
     costs: LifecycleUnitCosts,
     /// States the installed window layout retains. Without one, panes are
