@@ -592,11 +592,12 @@ impl RevisionRuntime {
             .iter()
             .filter(|c| c.derived_input.is_none())
         {
-            let program = super::raw_dag::RawDagProgram::from_plan(&plan.precompute_plan, config)?;
-            let bytes = encode_state(
-                Arc::from(program.updater()?.into_accumulator()),
-                program.family,
-            )?;
+            let program = plan
+                .installed_precompute_plan
+                .raw_programs
+                .get(&config.policy_fp_u64())
+                .ok_or("revision raw program missing")?;
+            let bytes = encode_state(Arc::from(program.empty_state()?), program.family.clone())?;
             if bytes.len() > self.policy.max_checkpoint_bytes {
                 return Err(Box::new(asap_physical_operators::Error::MemoryLimit));
             }

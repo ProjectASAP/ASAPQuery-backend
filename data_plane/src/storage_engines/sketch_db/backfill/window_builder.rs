@@ -161,21 +161,25 @@ mod tests {
     }
 }
 
-/// Backfill uses the same selected DAG producer and update expressions as live input.
+/// Backfill builds a window with the same installed Planner graph as live
+/// input, over the window's samples in ingestion order. `None` means the graph
+/// admitted no population from them.
 pub fn build_dag_accumulator(
     program: &crate::precompute_engine::raw_dag::RawDagProgram,
     samples: &[RawSample],
-) -> Result<Box<dyn AggregateCore>, String> {
-    let mut updater = program.updater()?;
-    // A selected program never converts samples to counter deltas; rate is an
-    // explicit upstream operator, so each sample is applied as it arrives.
-    for sample in samples {
-        program.apply(
-            &mut *updater,
-            &sample.labels,
-            sample.value,
-            sample.timestamp_ms,
-        )?;
-    }
-    Ok(updater.take_accumulator())
+    window: (u64, u64),
+) -> Result<Option<Box<dyn AggregateCore>>, String> {
+    let window = (
+        i64::try_from(window.0).map_err(|_| "backfill window start overflow")?,
+        i64::try_from(window.1).map_err(|_| "backfill window end overflow")?,
+    );
+    program
+        .build(
+            samples
+                .iter()
+                .map(|sample| (sample.labels.as_str(), sample.timestamp_ms, sample.value)),
+            window,
+            asap_physical_operators::runtime::Limits::default().max_bytes,
+        )
+        .map_err(|e| e.to_string())
 }
