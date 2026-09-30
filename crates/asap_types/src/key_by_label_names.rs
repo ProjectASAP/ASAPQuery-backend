@@ -3,7 +3,7 @@
 //! Formerly `promql_utilities::data_model::key_by_label_names` — moved
 //! here for the same reason as [`crate::Statistic`]: `asap_types`
 //! (`PrecomputeMaterialization::grouping_labels`, `PolicyFingerprint`,
-//! `PolicyRegistry`, `capability_matching`) is its real center of
+//! `capability_matching`) is its real center of
 //! gravity and the shared foundation both `control_plane`'s ecosystem
 //! and `data_plane` can depend on without a cycle. Closer to a runtime
 //! index key than a planning IR node — ASAPController's

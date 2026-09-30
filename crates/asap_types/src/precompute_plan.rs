@@ -314,6 +314,11 @@ pub enum PrecomputePlanError {
     InvalidSchema { schema_id: String },
     #[error("materialization {0} uses a summary family unsupported by the runtime schema")]
     UnsupportedFamily(u64),
+    #[error("materialization {materialization} has no consistent Planner computation: {reason}")]
+    InvalidComputation {
+        materialization: u64,
+        reason: String,
+    },
     #[error("materialization {materialization} has an invalid window layout: {reason}")]
     InvalidWindowLayout {
         materialization: u64,
@@ -466,7 +471,9 @@ impl PrecomputePlan {
 
     /// The Planner SummaryAgg node that produces `output`, with the source
     /// expression feeding it when that input is a raw source. `None` when no
-    /// installed DAG produces the output with a SummaryAgg.
+    /// installed DAG produces the output with a SummaryAgg. Every DAG that
+    /// produces the output must agree on both, or the plan is rejected: the
+    /// runtime routes, filters and catalogs the output once.
     #[allow(clippy::type_complexity)]
     pub fn summary_producer(
         &self,
@@ -479,6 +486,10 @@ impl PrecomputePlan {
         String,
     > {
         use planner_types::post_asap::PostAsapOperatorPayload;
+        let mut selected: Option<(
+            planner_types::post_asap::PostAsapDagNode,
+            Option<planner_types::pre_asap::QueryExpr>,
+        )> = None;
         for installed in self.executable_dags.values() {
             let Some(node) = installed.binding.nodes.iter().find_map(|(node, binding)| {
                 matches!(binding, crate::executable_plan::BackendNodeBinding::Materialization { stored_output } if *stored_output == output).then_some(*node)
@@ -508,9 +519,39 @@ impl PrecomputePlan {
                     }),
                 _ => None,
             };
-            return Ok(Some((producer.clone(), source)));
+            if let Some((first, first_source)) = &selected {
+                // Shared outputs may be read by scans that project different
+                // columns; what must agree is the update and its population.
+                let population =
+                    |node: &planner_types::post_asap::PostAsapDagNode,
+                     source: &Option<planner_types::pre_asap::QueryExpr>| {
+                        let PostAsapOperatorPayload::SummaryAgg { family, .. } = &node.payload
+                        else {
+                            return None;
+                        };
+                        source.as_ref().map(|expression| {
+                            raw_time_series_input_contract(
+                                expression,
+                                matches!(family, SummaryFamilyType::ExactAggregate(..)),
+                            )
+                            .map(|(metric, _, filter)| {
+                                (metric, crate::utils::normalize_spatial_filter(&filter))
+                            })
+                        })
+                    };
+                if first.payload != producer.payload
+                    || population(first, first_source) != population(producer, &source)
+                {
+                    return Err(format!(
+                        "stored output {} is produced by DAGs that disagree on its computation",
+                        output.as_u64()
+                    ));
+                }
+            } else {
+                selected = Some((producer.clone(), source));
+            }
         }
-        Ok(None)
+        Ok(selected)
     }
 
     /// Canonical population predicate of `config`'s input: the typed table
@@ -523,8 +564,16 @@ impl PrecomputePlan {
         if config.table_name.is_some() || config.derived_input.is_some() {
             return Ok(table);
         }
-        let Some((_, Some(expression))) = self.summary_producer(config.stored_output_id)? else {
-            return Ok(String::new());
+        let expression = match self.summary_producer(config.stored_output_id)? {
+            Some((_, Some(expression))) => expression,
+            // A bound raw output whose input cannot be read must not be
+            // treated as unfiltered.
+            Some((_, None)) => {
+                return Err("raw output's Planner producer does not read a source scan".into())
+            }
+            // Only plans without a Planner DAG for this output (imported or
+            // fixture outputs) have no predicate to read.
+            None => return Ok(String::new()),
         };
         let family = self.state_family(config.stored_output_id);
         let (_, _, filter) = raw_time_series_input_contract(
@@ -1033,6 +1082,28 @@ impl PrecomputePlan {
                     schema.materialization.as_u64(),
                 ));
             }
+            let invalid_computation = |reason: String| PrecomputePlanError::InvalidComputation {
+                materialization: schema.materialization.as_u64(),
+                reason,
+            };
+            let raw =
+                materialization.table_name.is_none() && materialization.derived_input.is_none();
+            // Once a plan carries Planner DAGs, a raw output's input predicate
+            // exists only on its producer; an unbound output would silently
+            // read every series of its metric.
+            if raw
+                && !self.executable_dags.is_empty()
+                && self
+                    .summary_producer(schema.materialization)
+                    .map_err(invalid_computation)?
+                    .is_none()
+            {
+                return Err(invalid_computation(
+                    "raw output has no Planner producer".into(),
+                ));
+            }
+            self.population_filter(materialization)
+                .map_err(invalid_computation)?;
             let source = materialization.table_name.as_ref().map_or_else(
                 || Source::TimeSeries {
                     metric: materialization.metric.clone(),

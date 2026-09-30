@@ -262,6 +262,77 @@ impl Default for InstalledPrecomputePlan {
 
 #[cfg(test)]
 mod tests {
+    fn filtered_plan(job: &str) -> control_plane::physical::compiler::PrecomputePlan {
+        let mut snapshot: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        snapshot["query_workload"]["repeating_queries"][0]["query"] =
+            serde_json::json!(format!("quantile_over_time(0.99, m{{job=\"{job}\"}}[1m])"));
+        crate::tests::test_utilities::planning::quoted_snapshot(
+            serde_json::from_value(snapshot).unwrap(),
+            false,
+        )
+        .compile_promql()
+        .unwrap()
+        .precompute_plan
+    }
+
+    /// Rebind every materialization node of `plan`'s DAGs to `output`.
+    fn bind_all(plan: &mut control_plane::physical::compiler::PrecomputePlan, output: u64) {
+        for installed in plan.executable_dags.values_mut() {
+            for binding in installed.binding.nodes.values_mut() {
+                if let asap_types::executable_plan::BackendNodeBinding::Materialization {
+                    stored_output,
+                } = binding
+                {
+                    *stored_output = asap_types::sds::StoredOutputId(output);
+                }
+            }
+        }
+    }
+
+    // Two DAGs that read different populations cannot share one stored output.
+    #[test]
+    fn producers_disagreeing_on_population_are_rejected() {
+        let mut plan = filtered_plan("a");
+        let output = plan.materializations[0].stored_output_id.as_u64();
+        let mut other = filtered_plan("b");
+        bind_all(&mut other, output);
+        let (_, mut dag) = other.executable_dags.into_iter().next().unwrap();
+        dag.document.query_id = "other-population".into();
+        plan.executable_dags.insert("other-population".into(), dag);
+        let error = plan.validate().unwrap_err().to_string();
+        assert!(error.contains("disagree on its computation"), "{error}");
+    }
+
+    // A raw output with no Planner producer is not read as unfiltered.
+    #[test]
+    fn unbound_raw_output_is_rejected() {
+        let mut plan = filtered_plan("a");
+        let mut unbound = plan.materializations[0].clone();
+        unbound.metric = "unbound".into();
+        unbound.stored_output_id = asap_types::sds::StoredOutputId(1);
+        let mut schema = plan.schemas[0].clone();
+        schema.materialization = unbound.stored_output_id;
+        schema.schema_id = schema.schema_id.replace(
+            &plan.materializations[0]
+                .stored_output_id
+                .as_u64()
+                .to_string(),
+            "1",
+        );
+        schema.stored_output_reference =
+            asap_types::sds::StoredOutputReference::for_output(unbound.stored_output_id);
+        plan.materializations.push(unbound);
+        plan.schemas.push(schema);
+        let error = plan.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("raw output has no Planner producer"),
+            "{error}"
+        );
+    }
+
     // A raw output's input predicate, pane convention and stored state kind
     // come from its installed Planner producer, not from the materialization.
     #[test]

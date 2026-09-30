@@ -1919,6 +1919,14 @@ fn derive_sketch_policy_fp(
         if bound_output.is_some_and(|output| output != config.stored_output_id)
             || config.metric != metric
             || &keys != group_by_keys
+            // A plain sketch envelope never fills a shared (Hydra) state.
+            || matches!(
+                snap.state_family(config.stored_output_id),
+                Some(planner_types::post_asap::SummaryFamilyType::Sketch(
+                    _,
+                    planner_types::post_asap::GroupingStrategy::SharedMultiSubpopulation { .. }
+                ))
+            )
             || snap
                 .agg_kind(config.stored_output_id)
                 .is_none_or(|installed| installed.canonical_string() != expected)

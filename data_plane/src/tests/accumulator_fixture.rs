@@ -42,20 +42,15 @@ fn topk_weight(update: &SummaryUpdate) -> TopkWeight {
 // Factory function
 // ---------------------------------------------------------------------------
 
-/// Read the KLL `k` out of `SketchParams::Kll`. `accumulator_spec()`
-/// always builds a `SketchKind` whose `SketchAlgorithm::Kll` is paired with
-/// `SketchParams::Kll`, so the
-/// other arm is unreachable from a `spec` this module builds itself.
+/// Read the KLL `k` out of `SketchParams::Kll`; a valid `SketchKind`
+/// pairs `SketchAlgorithm::Kll` with no other params.
 #[cfg(test)]
 fn kll_k(params: &SketchParams) -> u16 {
     match params {
-        // Lossless: `accumulator_spec()` only ever stores a value that
-        // already fit in `u16` (via `kll_k_param`'s own `u16::try_from`
-        // fallback) widened to `u32`.
         SketchParams::Kll { k } => *k as u16,
-        other => unreachable!(
-            "accumulator_spec() paired SketchAlgorithm::Kll with non-Kll params: {other:?}"
-        ),
+        other => {
+            unreachable!("SketchKind paired SketchAlgorithm::Kll with non-Kll params: {other:?}")
+        }
     }
 }
 
@@ -67,7 +62,7 @@ fn cms_dims(params: &SketchParams) -> (usize, usize) {
             (*depth as usize, *width as usize)
         }
         other => unreachable!(
-            "accumulator_spec() paired SketchAlgorithm::Cms/CountSketch with unexpected params: {other:?}"
+            "SketchKind paired SketchAlgorithm::Cms/CountSketch with unexpected params: {other:?}"
         ),
     }
 }
@@ -87,7 +82,7 @@ fn cms_heap_dims(params: &SketchParams) -> (usize, usize, usize) {
             heap_size,
         } => (*depth as usize, *width as usize, *heap_size as usize),
         other => unreachable!(
-            "accumulator_spec() paired a WithHeap SketchAlgorithm with unexpected params: {other:?}"
+            "SketchKind paired a WithHeap SketchAlgorithm with unexpected params: {other:?}"
         ),
     }
 }
@@ -98,7 +93,7 @@ fn ddsketch_alpha(params: &SketchParams) -> f64 {
     match params {
         SketchParams::DDSketch { alpha } => *alpha,
         other => unreachable!(
-            "accumulator_spec() paired SketchAlgorithm::DDSketch with non-DDSketch params: {other:?}"
+            "SketchKind paired SketchAlgorithm::DDSketch with non-DDSketch params: {other:?}"
         ),
     }
 }
@@ -157,9 +152,8 @@ pub fn create_fixture_accumulator(
         // Heap-bearing top-k variant (raw-input ingest path): route to the
         // real `CmsHeapAccumulatorUpdater` so the per-policy top-k heap is
         // BUILT (heap-less CMS could not answer `topk(...)` — recall 0).
-        // Keyed by the configured group-by `aggregated_labels` (e.g. `host`),
-        // ranked by Σ value per key by default (`weight_mode: value`), or Σ
-        // count for genuine frequency-top-k (`weight_mode: count`). The OTLP
+        // Keyed by the update's item, ranked by Σ value per key, or Σ count
+        // when the update weight is the constant 1. The OTLP
         // modified-sketch path builds the heap agent-side and uses
         // `SketchEnvelope` ingest, not this raw arm.
         (SummaryFamilyType::Sketch(kind, _), _)

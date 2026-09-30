@@ -583,14 +583,22 @@ mod tests {
                 GroupingStrategy::PerSubpopulationInstance,
             )
         };
-        let a = with_family(1, 1, &[config("requests", "", 60)], &kll(100)).unwrap();
-        let b = with_family(1, 1, &[config("requests", "", 60)], &kll(200)).unwrap();
-        assert_ne!(a.summary_descriptors, b.summary_descriptors);
-        assert_eq!(a.data_descriptors, b.data_descriptors);
-        let catalog = a;
-        assert_eq!(catalog.summary_descriptors.len(), 1);
+        let (small, large) = (kll(100), kll(200));
+        let output = |family: &SummaryFamilyType| {
+            let (mut config, _) = config("requests", "", 60);
+            config.allocate_stored_output_id(family);
+            config
+        };
+        let (a, b) = (output(&small), output(&large));
+        let catalog = SummaryCatalog::from_outputs(
+            1,
+            1,
+            vec![(&a, &small, String::new()), (&b, &large, String::new())],
+        )
+        .unwrap();
+        assert_eq!(catalog.summary_descriptors.len(), 2);
         assert_eq!(catalog.data_descriptors.len(), 1);
-        assert_eq!(catalog.outputs.len(), 1);
+        assert_eq!(catalog.outputs.len(), 2);
     }
 
     // Construction order cannot affect the published snapshot bytes.
