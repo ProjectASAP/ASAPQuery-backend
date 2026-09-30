@@ -1,5 +1,6 @@
 //! Issue workloads execute their selected Planner DAG on the production HTTP path.
 use super::*;
+use asap_types::physical_plan_codec::PhysicalPlanCodec;
 use control_plane::physical::{
     compiler::{
         BackendLocalPlanningInput, DeploymentPlanCompiler, BACKEND_REVISION, PLANNER_REVISION,
@@ -54,7 +55,7 @@ fn queries() -> Vec<(String, u64, u64)> {
         ));
         queries.push((format!("quantile by(job)({q}, issue701_data)"), 1, 1));
     }
-    for operation in ["sum", "count", "min", "max"] {
+    for operation in ["sum", "count", "avg", "min", "max"] {
         queries.push((format!("{operation}_over_time(issue701_data[5m])"), 300, 30));
     }
     for operation in ["sum", "count", "avg"] {
@@ -76,7 +77,7 @@ fn queries() -> Vec<(String, u64, u64)> {
     queries
 }
 
-// A single mixed workload covers moving windows, current series and extrema,
+// A single mixed workload covers moving windows, current series, minimum/average,
 // without uncertified ratios. Optional native URL adds a real Prometheus differential oracle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn issue_workloads_execute_warm_at_successive_evaluations() {
@@ -311,6 +312,7 @@ async fn issue_702_individual_queries_execute_without_fallback() {
         "quantile by (job) (0.9, issue701_data)",
         "sum by (job) (issue701_data)",
         "sum(issue701_data)",
+        "avg_over_time(issue701_data[5m])",
         "count by (job) (issue701_data)",
         "count(issue701_data)",
         "avg by (job) (issue701_data)",
@@ -367,10 +369,9 @@ fn issue_701_702_uncertified_ratios_require_exact_fallback() {
     }
 }
 
-// A per-series average is forwarded exactly while its sum and count stay warm;
-// Planner does not yet match per-series rows in a division.
+// Finite input can overflow sum; the installed average must fall back while zero stays warm.
 #[tokio::test]
-async fn temporal_average_forwards_exactly_while_sum_and_count_stay_warm() {
+async fn temporal_average_overflow_falls_back_after_state_is_warm() {
     let native = std::env::var("ASAP_CURRENT_SERIES_PROMETHEUS_URL").ok();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mock_url = format!("http://{}", listener.local_addr().unwrap());
@@ -398,18 +399,26 @@ async fn temporal_average_forwards_exactly_while_sum_and_count_stay_warm() {
         .into();
     let snapshot = quote_snapshot_for_test(serde_json::from_value(fixture).unwrap());
     let plan = snapshot.clone().compile_promql().unwrap();
-    let average = plan
-        .query_plan
-        .entries
-        .values()
-        .find(|entry| entry.canonical_query.starts_with("avg_over_time"))
-        .unwrap();
     assert!(
-        matches!(
-            average.nodes.get(&average.root),
-            Some(control_plane::query_plan::QueryPlanNode::ExactFallback { .. })
-        ),
-        "a per-series average has no Planner-compiled local plan: {average:?}"
+        plan.query_plan
+            .entries
+            .values()
+            .flat_map(|entry| entry.nodes.values())
+            .any(|node| {
+                let control_plane::query_plan::QueryPlanNode::PhysicalFragment { dag, .. } = node
+                else {
+                    return false;
+                };
+                asap_physical_operators::physical_planner::CompiledPhysicalDag::decode(dag)
+                    .unwrap();
+                let document: serde_json::Value = serde_json::from_slice(dag).unwrap();
+                document["nodes"].as_object().unwrap().values().any(|node| {
+                    node["Operator"]["operator"]["kind"]["VectorBinary"]["operator"]
+                        ["checked_finite_division"]
+                        == true
+                })
+            }),
+        "average must retain its native finite-division contract"
     );
     let output = tempfile::tempdir().unwrap();
     let path = output.path().join("snapshot.json");
@@ -462,20 +471,20 @@ async fn temporal_average_forwards_exactly_while_sum_and_count_stay_warm() {
             .await;
         }
         let query = "avg_over_time(average_overflow[5s])";
-        let params = [("query", query.to_string()), ("time", at.to_string())];
-        let actual: Value = client
-            .get(format!("{backend}/api/v1/query"))
-            .query(&params)
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert!(!is_warm(&actual), "average must be forwarded: {actual}");
-        if let Some(url) = &native {
-            let expected: Value = client
-                .get(format!("{url}/api/v1/query"))
+        if value == 0.0 {
+            let result = wait_for_issue_warm_instant(
+                &client,
+                &backend,
+                query,
+                at,
+                &output.path().join("query_engine.log"),
+            )
+            .await;
+            assert_eq!(first_value(&result, "value"), Some(0.0));
+        } else {
+            let params = [("query", query.to_string()), ("time", at.to_string())];
+            let actual: Value = client
+                .get(format!("{backend}/api/v1/query"))
                 .query(&params)
                 .send()
                 .await
@@ -483,9 +492,23 @@ async fn temporal_average_forwards_exactly_while_sum_and_count_stay_warm() {
                 .json()
                 .await
                 .unwrap();
-            assert_eq!(actual["data"], expected["data"]);
-        } else {
+            assert!(
+                !is_warm(&actual),
+                "overflowed average must fall back: {actual}"
+            );
             assert_eq!(first_value(&actual, "value"), Some(1e308), "{actual}");
+            if let Some(url) = &native {
+                let expected: Value = client
+                    .get(format!("{url}/api/v1/query"))
+                    .query(&params)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                assert_eq!(actual["data"], expected["data"]);
+            }
         }
     }
     mock.abort();

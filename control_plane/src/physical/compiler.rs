@@ -5095,6 +5095,7 @@ pub(crate) mod tests {
     #[test]
     fn issue_701_702_temporal_workloads_have_warm_candidates() {
         for text in [
+            "avg_over_time(data[5m])",
             "min_over_time(data[5m])",
             "quantile_over_time(0.9,data[5m])",
         ] {
@@ -5150,30 +5151,31 @@ pub(crate) mod tests {
         assert!(plan.precompute_plan.materializations.is_empty());
     }
 
-    // avg_over_time divides two per-series readouts. Planner does not yet
-    // match per-series rows in a Binary, so no candidate keeps local state and
-    // the exact engine evaluates the query.
+    // Per-series arithmetic over stored readouts runs as one Planner fragment
+    // over those readouts, not as an exact fallback.
     #[test]
-    fn per_series_average_has_no_warm_candidate_until_planner_matches_series() {
-        let mut snapshot = planning_snapshot();
-        let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
-        entry.query = Query("avg_over_time(data[5m])".into());
-        entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
-        let (request, environment) = snapshot.into_physical_compilation_request().unwrap();
-        for candidate in
-            super::super::workload_cost::enumerate_exact_and_materialized_candidates(request)
-                .unwrap()
-        {
-            let Ok(plan) = DeploymentPlanCompiler.compile_promql(candidate, environment.clone())
-            else {
-                continue;
-            };
-            assert!(plan.precompute_plan.materializations.is_empty());
-            assert!(plan
-                .query_plan
-                .entries
-                .values()
-                .all(|entry| entry.materialization_bindings().is_empty()));
+    fn per_series_arithmetic_executes_as_a_planner_fragment() {
+        for query in [
+            "avg_over_time(a[1m])",
+            "rate(a[5m]) / rate(b[5m])",
+            "rate(a[5m]) * 2",
+            "sum_over_time(a[1m]) + sum_over_time(a{job=\"x\"}[1m])",
+        ] {
+            let mut environment = environment(10_000);
+            environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+            environment.target_collector_ids.clear();
+            let plan = DeploymentPlanCompiler
+                .compile_promql(request("arithmetic", query), environment)
+                .unwrap();
+            let entry = plan.query_plan.lookup(query).unwrap();
+            assert!(
+                matches!(
+                    &entry.nodes[&entry.root],
+                    crate::query_plan::QueryPlanNode::PhysicalFragment { .. }
+                ),
+                "{query}: {entry:?}"
+            );
+            assert!(!entry.materialization_bindings().is_empty(), "{query}");
         }
     }
 
