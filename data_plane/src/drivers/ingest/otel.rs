@@ -3307,7 +3307,6 @@ mod dispatcher_tests {
                 index: 0,
                 d_count: 1,
             }],
-            ..Default::default()
         }
         .encode_to_vec();
         apply_modified_otlp_delta_bytes(
