@@ -57,8 +57,9 @@ struct GroupState {
     /// `group_key` field.
     group_key: Arc<GroupKey>,
     window_manager: WindowManager,
-    /// Active panes for raw-sample accumulation, keyed by pane_start_ms.
-    active_panes: BTreeMap<i64, Box<dyn AccumulatorUpdater>>,
+    /// Samples admitted to each open pane, keyed by pane_start_ms, in arrival
+    /// order. The installed Planner graph builds the pane's state at close.
+    active_panes: BTreeMap<i64, Vec<(String, i64, f64)>>,
     /// Last cumulative counter sample per source series for heap membership
     /// materializations. This is bounded O(series) derivative state, not a
     /// raw-sample history, and deliberately survives pane rotation.
@@ -691,16 +692,15 @@ impl Worker {
                                 continue;
                             }
                             record_late_input("append_correction", "raw_sample");
-                            let mut updater =
-                                installed_updater(state.program.as_deref(), &state.config)?;
-                            apply_installed_sample(
+                            let Some(correction) = build_pane(
                                 state.program.as_deref(),
-                                &mut *updater,
-                                series_key,
-                                *val,
-                                *ts,
                                 &state.config,
-                            )?;
+                                &[(series_key.clone(), *ts, *val)],
+                                (bucket_start, bucket_end),
+                            )?
+                            else {
+                                continue;
+                            };
                             if let (Some(observer), Some(revision)) =
                                 (&self.erp_observer, &input_revision)
                             {
@@ -731,7 +731,7 @@ impl Worker {
                                 state.catalog_generation.as_ref(),
                                 state.stored_output_reference.clone(),
                             );
-                            emit_batch.push((output, updater.take_accumulator()));
+                            emit_batch.push((output, correction));
                             debug!(
                                 "Forwarding late sample to store for evicted pane [{}, {})",
                                 bucket_start, bucket_end
@@ -746,21 +746,9 @@ impl Worker {
                 // only closes an idle pane, not a long-running bulk ingest whose
                 // records share one event timestamp.
                 state.touch_pane(bucket_start, now_ms);
-                if let std::collections::btree_map::Entry::Vacant(entry) =
-                    state.active_panes.entry(bucket_start)
-                {
-                    entry.insert(installed_updater(state.program.as_deref(), &state.config)?);
-                }
-                let updater = state.active_panes.get_mut(&bucket_start).unwrap();
+                let pane = state.active_panes.entry(bucket_start).or_default();
                 if let Some(value) = value {
-                    apply_installed_sample(
-                        state.program.as_deref(),
-                        &mut **updater,
-                        series_key,
-                        value,
-                        *ts,
-                        &state.config,
-                    )?;
+                    pane.push((series_key.clone(), *ts, value));
                     if let (Some(observer), Some(revision)) = (&self.erp_observer, &input_revision)
                     {
                         observer.observe(
@@ -792,10 +780,8 @@ impl Worker {
 
         for window_start in &closed {
             let (_, window_end) = state.bucket_bounds(*window_start);
-            let pane_starts = [*window_start];
 
-            if let Some(accumulator) = merge_panes_for_window(&mut state.active_panes, &pane_starts)
-            {
+            if let Some(accumulator) = close_pane(state, *window_start)? {
                 let key = build_group_key_label_values(group_key);
                 let output = precomputed_output_for_group(
                     *window_start as u64,
@@ -971,12 +957,10 @@ impl Worker {
         let closed = state.closed_buckets(previous_closure_watermark, event_watermark);
         for window_start in &closed {
             let (_, window_end) = state.bucket_bounds(*window_start);
-            let pane_starts = [*window_start];
 
             // Emit from the raw-sample pane map (in case both sources are
             // populated for the same group; rare but supported).
-            if let Some(accumulator) = merge_panes_for_window(&mut state.active_panes, &pane_starts)
-            {
+            if let Some(accumulator) = close_pane(state, *window_start)? {
                 let key = build_group_key_label_values(group_key);
                 let output = precomputed_output_for_group(
                     *window_start as u64,
@@ -993,9 +977,7 @@ impl Worker {
             }
 
             // Emit from the sketch pane map.
-            if let Some(accumulator) =
-                merge_sketch_panes_for_window(&mut state.sketch_panes, &pane_starts)
-            {
+            if let Some(accumulator) = state.sketch_panes.remove(window_start) {
                 let key = build_group_key_label_values(group_key);
                 let output = precomputed_output_for_group(
                     *window_start as u64,
@@ -1177,11 +1159,8 @@ impl Worker {
 
             for window_start in &closed {
                 let (_, window_end) = state.bucket_bounds(*window_start);
-                let pane_starts = [*window_start];
 
-                if let Some(accumulator) =
-                    merge_panes_for_window(&mut state.active_panes, &pane_starts)
-                {
+                if let Some(accumulator) = close_pane(state, *window_start)? {
                     let key = build_group_key_label_values(&group_key);
                     let output = precomputed_output_for_group(
                         *window_start as u64,
@@ -1197,9 +1176,7 @@ impl Worker {
                     emit_batch.push((output, accumulator));
                 }
 
-                if let Some(accumulator) =
-                    merge_sketch_panes_for_window(&mut state.sketch_panes, &pane_starts)
-                {
+                if let Some(accumulator) = state.sketch_panes.remove(window_start) {
                     let key = build_group_key_label_values(&group_key);
                     let output = precomputed_output_for_group(
                         *window_start as u64,
@@ -1285,11 +1262,8 @@ impl Worker {
 
             for window_start in &closed {
                 let (_, window_end) = state.bucket_bounds(*window_start);
-                let pane_starts = [*window_start];
 
-                if let Some(accumulator) =
-                    merge_panes_for_window(&mut state.active_panes, &pane_starts)
-                {
+                if let Some(accumulator) = close_pane(state, *window_start)? {
                     let key = build_group_key_label_values(&group_key);
                     let output = precomputed_output_for_group(
                         *window_start as u64,
@@ -1305,9 +1279,7 @@ impl Worker {
                     emit_batch.push((output, accumulator));
                 }
 
-                if let Some(accumulator) =
-                    merge_sketch_panes_for_window(&mut state.sketch_panes, &pane_starts)
-                {
+                if let Some(accumulator) = state.sketch_panes.remove(window_start) {
                     let key = build_group_key_label_values(&group_key);
                     let output = precomputed_output_for_group(
                         *window_start as u64,
@@ -1614,45 +1586,52 @@ pub fn decode_label_value(s: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
-fn installed_updater(
+/// Build a pane's state from its samples with the installed Planner graph.
+fn build_pane(
     program: Option<&super::raw_dag::RawDagProgram>,
     config: &PrecomputeMaterialization,
-) -> Result<Box<dyn AccumulatorUpdater>, String> {
+    samples: &[(String, i64, f64)],
+    pane: (i64, i64),
+) -> Result<Option<Box<dyn AggregateCore>>, String> {
     if let Some(program) = program {
-        return program.updater();
+        return program.build(
+            samples
+                .iter()
+                .map(|(series, time, value)| (series.as_str(), *time, *value)),
+            pane,
+            asap_physical_operators::runtime::Limits::default().max_bytes,
+        );
     }
     #[cfg(test)]
     {
-        Ok(create_fixture_accumulator(config))
+        let _ = pane;
+        let mut updater = create_fixture_accumulator(config);
+        for (series, time, value) in samples {
+            apply_sample(&mut *updater, series, *value, *time, config);
+        }
+        Ok(Some(updater.take_accumulator()))
     }
     #[cfg(not(test))]
     {
-        let _ = config;
+        let _ = (config, samples, pane);
         Err("missing installed Planner producer".into())
     }
 }
 
-fn apply_installed_sample(
-    program: Option<&super::raw_dag::RawDagProgram>,
-    updater: &mut dyn AccumulatorUpdater,
-    series: &str,
-    value: f64,
-    timestamp: i64,
-    config: &PrecomputeMaterialization,
-) -> Result<(), String> {
-    if let Some(program) = program {
-        return program.apply(updater, series, value, timestamp);
-    }
-    #[cfg(test)]
-    {
-        apply_sample(updater, series, value, timestamp, config);
-        Ok(())
-    }
-    #[cfg(not(test))]
-    {
-        let _ = config;
-        Err("missing installed Planner producer".into())
-    }
+/// Remove a closed pane and build its state from every sample it admitted.
+fn close_pane(
+    state: &mut GroupState,
+    start: i64,
+) -> Result<Option<Box<dyn AggregateCore>>, String> {
+    let Some(samples) = state.active_panes.remove(&start) else {
+        return Ok(None);
+    };
+    build_pane(
+        state.program.as_deref(),
+        &state.config,
+        &samples,
+        state.bucket_bounds(start),
+    )
 }
 
 /// Route a single sample to `updater`, dispatching keyed vs. non-keyed based on config.
@@ -1753,75 +1732,6 @@ fn extract_aggregated_key_from_series(
     }
 
     KeyByLabelValues::new_with_labels(values)
-}
-
-/// Merge the pane accumulators that constitute a closed window.
-///
-/// The oldest pane (index 0) is taken destructively from `active_panes`
-/// (no future window needs it). All later panes are snapshot-read
-/// (non-destructive; they are shared by newer overlapping windows).
-///
-/// Returns `None` if all panes for the window are absent.
-fn merge_panes_for_window(
-    active_panes: &mut BTreeMap<i64, Box<dyn AccumulatorUpdater>>,
-    pane_starts: &[i64],
-) -> Option<Box<dyn AggregateCore>> {
-    let mut merged: Option<Box<dyn AggregateCore>> = None;
-
-    for (i, &ps) in pane_starts.iter().enumerate() {
-        let pane_acc = if i == 0 {
-            // Oldest pane: evict and MOVE the accumulator out (no clone).
-            active_panes
-                .remove(&ps)
-                .map(|updater| updater.into_accumulator())
-        } else {
-            // Shared pane: non-destructive snapshot
-            active_panes
-                .get(&ps)
-                .map(|updater| updater.snapshot_accumulator())
-        };
-
-        if let Some(acc) = pane_acc {
-            merged = Some(match merged {
-                None => acc,
-                Some(existing) => existing.merge_with(acc.as_ref()).unwrap_or(existing),
-            });
-        }
-    }
-
-    merged
-}
-
-/// Merge pre-built accumulator panes for a window.
-///
-/// Equivalent to `merge_panes_for_window` but operating on the sketch pane
-/// map (`Box<dyn AggregateCore>` directly). The oldest pane is destructively
-/// taken (it will never be needed by a later window); subsequent panes are
-/// cloned so that still-open overlapping windows can still read them.
-fn merge_sketch_panes_for_window(
-    sketch_panes: &mut BTreeMap<i64, Box<dyn AggregateCore>>,
-    pane_starts: &[i64],
-) -> Option<Box<dyn AggregateCore>> {
-    let mut merged: Option<Box<dyn AggregateCore>> = None;
-
-    for (i, &ps) in pane_starts.iter().enumerate() {
-        let pane_acc: Option<Box<dyn AggregateCore>> = if i == 0 {
-            // Oldest pane: destructive take + evict
-            sketch_panes.remove(&ps)
-        } else {
-            // Shared pane: non-destructive clone
-            sketch_panes.get(&ps).map(|acc| acc.clone_boxed_core())
-        };
-
-        if let Some(acc) = pane_acc {
-            merged = Some(match merged {
-                None => acc,
-                Some(existing) => existing.merge_with(acc.as_ref()).unwrap_or(existing),
-            });
-        }
-    }
-
-    merged
 }
 
 #[cfg(test)]
@@ -4685,6 +4595,232 @@ mod dag_execution_tests {
         }
     }
 
+    fn plan_with(
+        query: &str,
+        accuracy: Option<serde_json::Value>,
+        entry: usize,
+    ) -> Option<control_plane::physical::compiler::CompiledPhysicalPlan> {
+        let mut json: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+        ))
+        .unwrap();
+        let mut item = json["query_workload"]["repeating_queries"][entry].clone();
+        item["query"] = query.into();
+        if let Some(accuracy) = accuracy {
+            item["requirements"]["accuracy"] = accuracy;
+        }
+        json["query_workload"]["repeating_queries"] = serde_json::json!([item]);
+        let snapshot = serde_json::from_value(json).ok()?;
+        crate::tests::test_utilities::planning::quoted_snapshot(snapshot, false)
+            .compile_promql()
+            .ok()
+    }
+
+    /// Queries, accuracies and snapshot entries whose plans install raw outputs
+    /// of every exact family, DDSketch and grouped variants.
+    fn raw_output_fixtures() -> Vec<control_plane::physical::compiler::CompiledPhysicalPlan> {
+        let accuracies = [
+            None,
+            Some(serde_json::json!({"explicit": {"Epsilon": 0.05}})),
+            Some(
+                serde_json::json!({"explicit": {"EpsilonDelta": {"epsilon": 0.01, "delta": 0.01}}}),
+            ),
+        ];
+        let mut plans = Vec::new();
+        for query in [
+            "sum_over_time(asap_demo_gauge[5s])",
+            "count_over_time(asap_demo_gauge[5s])",
+            "min_over_time(asap_demo_gauge[5s])",
+            "max_over_time(asap_demo_gauge[5s])",
+            "rate(asap_demo_counter_total[5s])",
+            "increase(asap_demo_counter_total[5s])",
+            "sum by (service) (sum_over_time(asap_demo_gauge[5s]))",
+            "sum by (service) (rate(asap_demo_counter_total[5s]))",
+            "quantile_over_time(0.99, asap_demo_gauge[5s])",
+            "sum by (service) (quantile_over_time(0.99, asap_demo_gauge[5s]))",
+            "quantile by (service) (0.9, asap_demo_gauge)",
+            "distinct_over_time(asap_demo_gauge[5s])",
+            "count(asap_demo_gauge)",
+            "topk(2, sum_over_time(asap_demo_gauge[5s]))",
+            "topk(2, rate(asap_demo_counter_total[5s]))",
+            "topk(2, asap_demo_gauge)",
+        ] {
+            for accuracy in &accuracies {
+                for entry in [0, 3] {
+                    plans.extend(plan_with(query, accuracy.clone(), entry));
+                }
+            }
+        }
+        plans
+    }
+
+    // Live raw ingest builds each pane with the installed Planner graph, and
+    // every stored state equals feeding the selected kernel sample by sample.
+    #[test]
+    fn live_panes_execute_planner_dag_with_identical_states() {
+        let mut outputs = 0;
+        let mut families = std::collections::BTreeSet::new();
+        for plan in raw_output_fixtures() {
+            let installed =
+                InstalledPrecomputePlan::from_precompute_plan(plan.precompute_plan.clone())
+                    .unwrap();
+            for config in plan
+                .precompute_plan
+                .materializations
+                .iter()
+                .filter(|c| c.derived_input.is_none())
+            {
+                let fp = config.policy_fingerprint();
+                let program = installed.raw_programs[&fp.as_u64()].clone();
+                let series_scoped = config.partitioning
+                    == Some(asap_types::sds::PopulationPartitioning::PerEntity)
+                    || (config.partitioning.is_none()
+                        && matches!(
+                            config.aggregation_type,
+                            asap_types::AggregationType::Increase
+                                | asap_types::AggregationType::Rate
+                                | asap_types::AggregationType::Min
+                                | asap_types::AggregationType::Max
+                        ));
+                // Routing identity as Remote Write assigns it.
+                let mut groups = BTreeMap::<Vec<(String, String)>, Vec<(String, i64, f64)>>::new();
+                for time in (500..=9500).step_by(1000) {
+                    for (index, (service, instance)) in
+                        [("a", "1"), ("a", "2"), ("b", "1")].into_iter().enumerate()
+                    {
+                        let labels = BTreeMap::from([
+                            ("instance".to_string(), instance.to_string()),
+                            ("service".to_string(), service.to_string()),
+                        ]);
+                        let key = if series_scoped {
+                            labels.clone().into_iter().collect()
+                        } else {
+                            config
+                                .grouping_labels
+                                .iter()
+                                .map(|n| (n.clone(), labels.get(n).cloned().unwrap_or_default()))
+                                .collect()
+                        };
+                        let value = (index as f64 + 1.0) * time as f64 / 100.0;
+                        groups.entry(key).or_default().push((
+                            format!(
+                                "{}{{instance=\"{instance}\",service=\"{service}\"}}",
+                                config.metric
+                            ),
+                            time,
+                            value,
+                        ));
+                    }
+                }
+                let sink = Arc::new(CapturingOutputSink::new());
+                let (_tx, rx) = mpsc::channel(8);
+                let mut worker = Worker::new(
+                    0,
+                    rx,
+                    sink.clone(),
+                    InstalledPrecomputePlanHandle::new(installed.clone()),
+                    WorkerRuntimeConfig {
+                        max_buffer_per_series: 100,
+                        allowed_lateness_ms: 60_000,
+                        pass_raw_samples: false,
+                        raw_mode_aggregation_id: 0,
+                        late_data_policy: LateDataPolicy::Drop,
+                        wall_clock_idle_grace_period_ms: 0,
+                        wall_clock_max_open_grace_period_ms: 0,
+                    },
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicI64::new(0)),
+                );
+                let manager = WindowManager::with_layout(
+                    config.window_size,
+                    config.slide_interval,
+                    config.pane_origin_ms,
+                    &config.window_layout,
+                );
+                let right_closed = config
+                    .parameters
+                    .get("promql_right_closed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let mut expected = BTreeMap::new();
+                for (sid, (key, samples)) in groups.iter().enumerate() {
+                    let group_key = Arc::new(GroupKey::new(
+                        key.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+                    ));
+                    for (series, time, value) in samples {
+                        let pane_time = if right_closed { time - 1 } else { *time };
+                        for start in manager.stored_bucket_starts(pane_time) {
+                            let (start, end) = manager.stored_bucket_bounds(start);
+                            let updater = expected
+                                .entry((
+                                    group_key.values().labels.join(";"),
+                                    start as u64,
+                                    end as u64,
+                                ))
+                                .or_insert_with(|| program.updater().unwrap());
+                            program
+                                .apply(&mut **updater, series, *value, *time)
+                                .unwrap();
+                        }
+                    }
+                    worker
+                        .process_group_samples(sid as u64 + 1, fp, &group_key, samples.clone())
+                        .unwrap();
+                }
+                worker.force_close_all().unwrap();
+                let actual = sink
+                    .drain()
+                    .into_iter()
+                    .map(|(output, state)| {
+                        let key = output
+                            .key
+                            .as_ref()
+                            .map(|k| k.labels.join(";"))
+                            .unwrap_or_default();
+                        (
+                            (key, output.start_timestamp, output.end_timestamp),
+                            state.serialize_to_bytes(),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let expected = expected
+                    .into_iter()
+                    .map(|(key, mut updater)| {
+                        (key, updater.take_accumulator().serialize_to_bytes())
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                assert_eq!(
+                    actual.keys().collect::<Vec<_>>(),
+                    expected.keys().collect::<Vec<_>>(),
+                    "{}",
+                    config.metric
+                );
+                assert_eq!(actual, expected, "{:?}", config.aggregation_type);
+                outputs += 1;
+                families.insert(
+                    format!("{:?}", config.accumulator_spec().unwrap().family)
+                        .split(['(', ' ', ','])
+                        .find(|part| {
+                            [
+                                "Sum", "Count", "Min", "Max", "Rate", "Increase", "DDSketch",
+                                "Kll", "Hll",
+                            ]
+                            .contains(part)
+                        })
+                        .unwrap_or("other")
+                        .to_owned(),
+                );
+            }
+        }
+        assert!(outputs >= 50, "only {outputs} raw outputs exercised");
+        for family in ["Sum", "Count", "Min", "Max", "Rate", "Increase", "DDSketch"] {
+            assert!(
+                families.contains(family),
+                "no {family} output: {families:?}"
+            );
+        }
+    }
+
     // A flat config and a DAG whose producer no longer matches its binding cannot install.
     #[test]
     fn execution_requires_matching_dag_producer() {
@@ -4700,6 +4836,18 @@ mod dag_execution_tests {
             .unwrap_err()
             .to_string()
             .contains("DAG producer"));
+    }
+    // A raw output installs only with its Planner-compiled precompute graph.
+    #[test]
+    fn raw_output_requires_its_planner_precompute_graph() {
+        let mut plan = plan("sum_over_time(asap_demo_gauge[5s])").precompute_plan;
+        for installed in plan.executable_dags.values_mut() {
+            installed.native_programs.clear();
+        }
+        assert!(InstalledPrecomputePlan::from_precompute_plan(plan)
+            .unwrap_err()
+            .to_string()
+            .contains("Planner precompute graph"));
     }
     // Changing a raw update must not silently reuse the original summary identity.
     #[test]
