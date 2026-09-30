@@ -85,7 +85,11 @@ measurements.
 ## Supported migration scope
 
 The default inventory compares the Planner-selected workload with its
-whole-workload exact fallback. Within a candidate, whether each summary state
+whole-workload exact fallback, maintained-population variants, and one
+substitution per native physical realization that Planner's PlanSpace proposes
+for a query (for example a heap over per-series Rate readouts). Planner's
+global selection, not a quote per alternative, decides every other summary
+choice such as the sketch family. Within a candidate, whether each summary state
 is precomputed or rebuilt at query time is not a separate candidate: the
 compiler chooses a summary-maintenance lifecycle per unique state from
 `implementation.lifecycle_costs`, pricing shared state once. Continuously
@@ -96,8 +100,10 @@ ephemeral state costs build, read and retirement per read, and is offered only
 when the deployment can read raw series from Prometheus at query time (not
 under `require_backend_local_execution`). A query rebuilds all of its states or
 none; with no state left it runs natively over raw series. The manifest of the
-resulting placement is quoted like any other. `workload_cost::select` also
-accepts additional Planner-authorized, already-bindable forests. This does not
+resulting placement is quoted like any other. A state built from another
+retained state's readouts (such as that heap) is placed the same way: retained,
+it is maintained over complete per-series states each window; ephemeral, it is
+rebuilt per query from the readouts. This does not
 claim exhaustive search over every lifecycle, engine or Planner algorithm.
 An exact alternative without an accessible native backend is unavailable even
 if its numeric quote would be cheap.

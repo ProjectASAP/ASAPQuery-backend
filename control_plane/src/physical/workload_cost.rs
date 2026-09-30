@@ -939,10 +939,10 @@ mod tests {
     use super::super::compiler::BackendLocalPlanningInput;
     use super::*;
 
-    /// Deployment pricing must see candidate sketch families, not only an
-    /// upstream winner chosen before runtime resource evidence is applied.
+    /// PlanSpace decides the computation: every quantile family it can
+    /// realize is ranked in the selection trace, and one is committed.
     #[test]
-    fn planner_quantile_inventory_reaches_backend_before_family_selection() {
+    fn planner_ranks_quantile_families_before_committing_one() {
         let mut input = fixture();
         let queries = input.query_workload.repeating_queries.as_mut().unwrap();
         queries.truncate(1);
@@ -951,20 +951,11 @@ mod tests {
             crate::types::AccuracyTarget::Epsilon(0.05),
         );
         let (request, _) = input.into_physical_compilation_request().unwrap();
-        let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
-        let roots = candidates
-            .iter()
-            .flat_map(|c| &c.queries)
-            .map(|q| format!("{:?}", q.selected_plan_root))
-            .collect::<Vec<_>>();
-        assert!(
-            roots.iter().any(|r| r.contains("Kll")),
-            "KLL disappeared before backend pricing"
-        );
-        assert!(
-            roots.iter().any(|r| r.contains("DDSketch")),
-            "DDSketch disappeared before backend pricing"
-        );
+        let trace = serde_json::to_string(&request.planner_selection_trace).unwrap();
+        assert!(trace.contains("Kll sketch"), "KLL was not ranked");
+        assert!(trace.contains("DDSketch sketch"), "DDSketch was not ranked");
+        let committed = format!("{:?}", request.queries[0].selected_plan_root);
+        assert!(committed.contains("Kll") != committed.contains("DDSketch"));
     }
 
     /// A deployment without external execution rejects native candidates before pricing.
@@ -1218,12 +1209,7 @@ mod tests {
         let evidence = input.workload_cost_evidence.clone().unwrap();
         let (request, env) = input.into_physical_compilation_request().unwrap();
         let candidates = enumerate_exact_and_materialized_candidates(request).unwrap();
-        assert!(candidates.len() > 2);
-        assert!(candidates[1..].iter().any(|candidate| candidate
-            .queries
-            .iter()
-            .zip(&candidates[0].queries)
-            .any(|(a, b)| Rc::ptr_eq(&a.selected_plan_root, &b.selected_plan_root))));
+        assert!(candidates.len() >= 2);
 
         let reference = candidates
             .iter()
