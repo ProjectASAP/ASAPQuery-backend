@@ -656,17 +656,53 @@ impl RevisionRuntime {
         ranges: &[(StoredOutputId, u64, u64)],
         expected: &CatalogGeneration,
     ) -> Result<crate::storage_engines::sketch_db::index::SketchStore, RevisionError> {
+        let ranges: Vec<_> = ranges
+            .iter()
+            .map(|&(output, start, end)| RevisionQueryRange {
+                output,
+                start,
+                end,
+                max_lag: 0,
+            })
+            .collect();
+        self.query_view_ranges(required, now_ms, &ranges, expected)
+    }
+
+    fn query_view_ranges(
+        &self,
+        required: &BTreeSet<StoredOutputId>,
+        now_ms: u64,
+        ranges: &[RevisionQueryRange],
+        expected: &CatalogGeneration,
+    ) -> Result<crate::storage_engines::sketch_db::index::SketchStore, RevisionError> {
         let (plan, store) = self.installed()?;
         if plan.precompute_plan.summary_catalog.as_ref() != Some(expected) {
             return Err("query snapshot generation differs from the selected QueryPlan".into());
         }
         let mut pinned = store.pin_matching(required, now_ms, |outputs| {
-            ranges
-                .iter()
-                .all(|(output, start, end)| records_cover(&outputs[&output.0], *start, *end))
+            ranges.iter().all(|range| {
+                range
+                    .covered_window(outputs[&range.output.0].iter())
+                    .is_some()
+            })
         })?;
+        // Keep only the admitted windows from the single pinned revision.
+        // An incomplete newer window must not shadow a complete older one.
+        let selected: Vec<_> = ranges
+            .iter()
+            .map(|range| {
+                let records = pinned
+                    .records
+                    .iter()
+                    .filter(|record| record.reference.stored_output_id == range.output);
+                let (start, end) = range
+                    .covered_window(records)
+                    .expect("pinned revision covered every requested range");
+                (range.output, start, end)
+            })
+            .collect();
         pinned.records.retain(|r| {
-            ranges.iter().any(|(output, start, end)| {
+            selected.iter().any(|(output, start, end)| {
                 r.reference.stored_output_id == *output && r.start_ms >= *start && r.end_ms <= *end
             })
         });
@@ -720,6 +756,35 @@ mod tests {
     }
     fn output_set() -> BTreeSet<StoredOutputId> {
         BTreeSet::from([StoredOutputId(1), StoredOutputId(2)])
+    }
+
+    // Off-grid mixed reads pin the newest complete window within the bound;
+    // exact reads and tighter bounds reject the same lagged records.
+    #[test]
+    fn revision_windows_honor_stored_input_lag_and_group_completeness() {
+        let mut first = record(1, 1);
+        first.start_ms = 100;
+        first.end_ms = 200;
+        let mut second = first.clone();
+        second.group.insert("job".into(), "second".into());
+        let mut partial = first.clone();
+        partial.start_ms = 110;
+        partial.end_ms = 210;
+        let records = [first, second, partial];
+        let mut range = RevisionQueryRange {
+            output: StoredOutputId(1),
+            start: 115,
+            end: 215,
+            max_lag: 15,
+        };
+        assert_eq!(range.covered_window(records.iter()), Some((100, 200)));
+        range.max_lag = 14;
+        assert_eq!(range.covered_window(records.iter()), None);
+        range.max_lag = 0;
+        assert_eq!(range.covered_window(records.iter()), None);
+        range.start = 100;
+        range.end = 200;
+        assert_eq!(range.covered_window(records.iter()), Some((100, 200)));
     }
 
     /// A durable partial r2 cannot force a two-branch query to mix r1 and r2.
@@ -842,7 +907,7 @@ mod tests {
         let eligible = |records: &BTreeMap<u64, Vec<RevisionRecord>>| {
             outputs
                 .iter()
-                .all(|o| records_cover(&records[&o.0], 0, 100))
+                .all(|o| records_cover(records[&o.0].iter(), 0, 100))
         };
         assert_eq!(
             store
@@ -974,6 +1039,7 @@ pub(crate) fn pin_query(
     entry: &asap_types::query_plan::QueryPlanEntry,
     times: &[u64],
     generation: Option<&CatalogGeneration>,
+    max_stored_input_lag_ms: Option<u64>,
 ) -> Result<
     Option<crate::storage_engines::sketch_db::index::SketchStore>,
     crate::query_engines::EngineError,
@@ -1018,21 +1084,24 @@ pub(crate) fn pin_query(
         .materialization_bindings()
         .into_iter()
         .flat_map(|binding| {
-            times.iter().map(move |time| {
-                (
-                    binding.materialization,
-                    time.saturating_sub(
-                        binding
-                            .readout_lookback_ms
-                            .unwrap_or(entry.instant.lookback_ms),
-                    ),
-                    *time,
-                )
+            times.iter().map(move |time| RevisionQueryRange {
+                output: binding.materialization,
+                start: time.saturating_sub(
+                    binding
+                        .readout_lookback_ms
+                        .unwrap_or(entry.instant.lookback_ms),
+                ),
+                end: *time,
+                max_lag: if entry.mixes_raw_and_stored_inputs() {
+                    max_stored_input_lag_ms.unwrap_or_else(|| binding.slide_ms())
+                } else {
+                    0
+                },
             })
         })
         .collect();
     runtime
-        .query_view(
+        .query_view_ranges(
             &required,
             now,
             &ranges,
@@ -1056,7 +1125,38 @@ pub(crate) fn pin_query(
         })
 }
 
-fn records_cover(records: &[RevisionRecord], start: u64, end: u64) -> bool {
+/// A mixed query may shift its stored window back within its lag bound;
+/// ordinary stored-only queries require the exact requested interval.
+struct RevisionQueryRange {
+    output: StoredOutputId,
+    start: u64,
+    end: u64,
+    max_lag: u64,
+}
+
+impl RevisionQueryRange {
+    fn covered_window<'a>(
+        &self,
+        records: impl Iterator<Item = &'a RevisionRecord> + Clone,
+    ) -> Option<(u64, u64)> {
+        if self.max_lag == 0 {
+            return records_cover(records, self.start, self.end).then_some((self.start, self.end));
+        }
+        let ends: BTreeSet<_> = records.clone().map(|record| record.end_ms).collect();
+        ends.into_iter().rev().find_map(|end| {
+            let lag = self.end.checked_sub(end)?;
+            let start = self.start.checked_sub(lag)?;
+            (lag <= self.max_lag && records_cover(records.clone(), start, end))
+                .then_some((start, end))
+        })
+    }
+}
+
+fn records_cover<'a>(
+    records: impl Iterator<Item = &'a RevisionRecord>,
+    start: u64,
+    end: u64,
+) -> bool {
     let mut groups = BTreeMap::<&BTreeMap<String, String>, Vec<(u64, u64)>>::new();
     for record in records {
         let windows = groups.entry(&record.group).or_default();
