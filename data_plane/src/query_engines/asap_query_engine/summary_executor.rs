@@ -1,5 +1,4 @@
 //! Deployment adapters for resolving, decoding, and reading installed materializations.
-use asap_summary_state::summary_kernels::{MaxAccumulator, MinAccumulator};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -469,11 +468,15 @@ impl QueryExecutionContext<'_> {
                                         project_group_key(keys, &labels)
                                     }
                                 };
-                                let accumulator: Arc<dyn AggregateCore> = if is_min {
-                                    Arc::new(MinAccumulator::with_value(value))
+                                let kind = if is_min {
+                                    planner_types::post_asap::ExactKind::Min
                                 } else {
-                                    Arc::new(MaxAccumulator::with_value(value))
+                                    planner_types::post_asap::ExactKind::Max
                                 };
+                                let accumulator: Arc<dyn AggregateCore> =
+                                    Arc::new(asap_summary_state::stored_state::codec::exact_value(
+                                        kind, value,
+                                    ));
                                 source_order.entry(key.clone()).or_insert(sid);
                                 by_group.entry(key).or_default().push(GroupState::ExactAgg {
                                     entries: vec![Rc::new(BTreeMap::from([(
@@ -1016,13 +1019,20 @@ mod tests {
 
     #[test]
     fn keyed_count_state_follows_planner_family_and_query_readout() {
-        use asap_summary_state::summary_kernels::KeyedSumCountAccumulator;
+        use asap_physical_operators::summary_kernels::exact::ExactAccumulator;
         use asap_types::query_plan::ExactReadout;
 
         let key = KeyByLabelValues::new_with_labels(vec!["web".to_string()]);
-        let mut payload = KeyedSumCountAccumulator::for_family(ExactKind::Count);
-        payload.update(key.clone(), 10.0);
-        payload.update(key.clone(), 20.0);
+        let mut payload = ExactAccumulator::new(
+            planner_types::post_asap::SummaryFamilyType::ExactAggregate(
+                ExactKind::Count,
+                planner_types::post_asap::ExactParams::Count,
+            ),
+            true,
+        )
+        .unwrap();
+        payload.update(Some(&key), 10.0, 0);
+        payload.update(Some(&key), 20.0, 0);
         let state = GroupState::ExactAgg {
             entries: vec![Rc::new(BTreeMap::from([(
                 60_000,
@@ -1213,8 +1223,7 @@ mod tests {
     #[test]
     fn bound_univmon_merges_panes_for_four_readouts() {
         use crate::storage_engines::sketch_db::index::SketchEncoding;
-        use crate::storage_engines::types::SerializableToSink;
-        use asap_summary_state::summary_kernels::univmon::UnivMonAccumulator;
+        use asap_summary_state::univmon::UnivMonAccumulator;
         use asap_types::query_plan::{MaterializationBinding, PhysicalGrouping};
         let index = SketchStore::new();
         let fp = asap_types::PolicyFingerprint(701);
@@ -1243,7 +1252,7 @@ mod tests {
                 BTreeMap::from([("job".into(), "a".into())]),
                 (start, start + 1000),
                 SketchSampleState {
-                    bytes: state.serialize_to_bytes(),
+                    bytes: state.to_bytes().unwrap(),
                     encoding: SketchEncoding::MsgpackFull,
                 },
             );
@@ -1300,16 +1309,21 @@ mod tests {
 
     #[test]
     fn typed_dds_quantile_interpolates_without_changing_portable_rank_semantics() {
+        use asap_physical_operators::summary_kernels::DDSketchAccumulator;
         let mut sketch = asap_sketchlib::DdSketch::new(0.01);
         assert!(sketch_query_value(
-            &SummaryState::Dd(sketch.clone()),
+            &SummaryState::Dd(DDSketchAccumulator {
+                inner: sketch.clone(),
+            }),
             &SketchQuery::Quantile { q: 0.9 }
         )
         .is_err());
         sketch.update(20.0);
         for q in [0.0, 0.5, 0.9, 1.0] {
             let value = sketch_query_value(
-                &SummaryState::Dd(sketch.clone()),
+                &SummaryState::Dd(DDSketchAccumulator {
+                    inner: sketch.clone(),
+                }),
                 &SketchQuery::Quantile { q },
             )
             .unwrap();
@@ -1319,14 +1333,16 @@ mod tests {
         assert!(sketch.quantile(0.9).unwrap() < 21.0);
         for (q, expected) in [(0.0, 20.0), (0.5, 30.0), (0.9, 38.0), (1.0, 40.0)] {
             let value = sketch_query_value(
-                &SummaryState::Dd(sketch.clone()),
+                &SummaryState::Dd(DDSketchAccumulator {
+                    inner: sketch.clone(),
+                }),
                 &SketchQuery::Quantile { q },
             )
             .unwrap();
             assert!((value - expected).abs() <= expected * 0.01);
         }
         assert!(sketch_query_value(
-            &SummaryState::Dd(sketch),
+            &SummaryState::Dd(DDSketchAccumulator { inner: sketch }),
             &SketchQuery::Quantile { q: f64::NAN }
         )
         .is_err());

@@ -22,7 +22,6 @@ pub mod storage_backend;
 pub mod summary_catalog;
 pub mod summary_semantics;
 pub mod table_population;
-pub mod traits;
 pub mod utils;
 
 pub use accumulator_spec::{AccumulatorSpec, AccumulatorSpecError, SampleUpdateRule};

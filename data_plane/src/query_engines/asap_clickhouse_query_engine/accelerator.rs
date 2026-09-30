@@ -2,7 +2,6 @@
 #[cfg(test)]
 use asap_types::physical_plan_codec::PhysicalPlanCodec;
 
-use asap_summary_state::summary_kernels::SumAccumulator;
 use async_trait::async_trait;
 use axum::{
     body::Bytes,
@@ -533,7 +532,6 @@ mod tests {
     }
 
     use crate::storage_engines::sketch_db::index::{AggKind, Capability, SummarySeriesMetadata};
-    use asap_summary_state::summary_kernels::SumAccumulator;
     use asap_types::query_plan::{
         ClickHousePlanningContext, ExactReadout, ExternalExactOutput, ExternalExactRequest,
         FallbackPolicy, FixedEvaluationRange, InstantExecution, MaterializationBinding,
@@ -1003,13 +1001,13 @@ mod tests {
                 7,
                 Default::default(),
                 (0, 1_000),
-                Box::new(SumAccumulator::with_sum(2.0)),
+                Box::new(crate::tests::accumulator_fixture::sum_state(2.0)),
             );
             store.append_precompute(
                 7,
                 Default::default(),
                 (1_000, 2_000),
-                Box::new(SumAccumulator::with_sum(3.0)),
+                Box::new(crate::tests::accumulator_fixture::sum_state(3.0)),
             );
         }
         let envelope = asap_types::precompute_plan::PlanEnvelope {
@@ -1178,7 +1176,7 @@ mod tests {
             7,
             Default::default(),
             (2000, 3000),
-            Box::new(SumAccumulator::with_sum(5.0)),
+            Box::new(crate::tests::accumulator_fixture::sum_state(5.0)),
         );
         for (sql, expected) in [
             (request.sql.clone(), "1970-01-01T00:00:01\t20.0\n"),

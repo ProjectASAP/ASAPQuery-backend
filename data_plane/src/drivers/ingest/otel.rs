@@ -36,7 +36,6 @@ use asap_otel_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use asap_otel_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
 use asap_sketchlib::proto::sketchlib::{sketch_envelope, SketchEnvelope};
 use asap_sketchlib::MessagePackCodec;
-use asap_summary_state::summary_kernels::sketch_envelope::SketchEnvelopeAccumulator;
 use axum::{body::Bytes, extract::State, routing::post, Json, Router};
 use flate2::read::GzDecoder;
 use planner_types::post_asap::SketchAlgorithm;
@@ -769,14 +768,10 @@ async fn route_otlp_to_precompute(
                 continue;
             }
             let group_key = IngestState::extract_group_key_for(&series_key, config);
-            // Wrap the raw SketchEnvelope bytes in a SketchEnvelopeAccumulator
-            // so the precompute engine receives the opaque sketch as-is. This
-            // preserves all sketch state end-to-end; per-variant decoding
-            // (e.g. CountMin → CountMinSketchAccumulator) can layer on top
-            // later without changing the routing contract.
+            // Decode the envelope into the Planner kernel of its family.
             let accumulator: Box<dyn AggregateCore> =
-                match SketchEnvelopeAccumulator::from_proto_bytes(point.payload.clone()) {
-                    Ok(acc) => Box::new(acc),
+                match asap_summary_state::stored_state::codec::decode_envelope(&point.payload) {
+                    Ok(state) => state,
                     Err(e) => {
                         warn!(
                             "OTLP sketch decode failed for metric='{}' attr='{}': {}",
@@ -1517,7 +1512,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                     // starts fresh, so the reconstructed `state(N)` is
                     // window N only. Sketch-agnostic: the reset is the
                     // additive families' (DDSketch / CMS / CountSketch /
-                    // HLL) `AggregateCore::reset_to_empty`; KLL never
+                    // HLL) `codec::empty_like`; KLL never
                     // deltas. Full frames keep REPLACE semantics and set
                     // the stored `window_start`.
                     let accumulator: Box<dyn AggregateCore> = if dp.encoding == ENCODING_PROTO_DELTA
@@ -1597,7 +1592,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                  new_window_start={}); rotating per-series base",
                                 metric.name, series_key, base_window_start, dp.start_time_unix_nano
                             );
-                            merged.reset_to_empty();
+                            reset_to_empty(&mut merged);
                         }
                         if let Err(e) = apply_modified_otlp_delta_bytes(
                             dp.algorithm.clone(),
@@ -2110,9 +2105,8 @@ fn dp_carries_heap(dp: &ModifiedOtlpSketchDp) -> bool {
                 .unwrap_or(false)
         }
         ENCODING_MSGPACK_DELTA => {
-            use asap_summary_state::summary_kernels::CountMinSketchWithHeapAccumulator;
-            CountMinSketchWithHeapAccumulator::from_msgpack_heap_delta_bytes(&dp.sketch)
-                .map(|acc| !acc.inner.topk_heap_items().is_empty())
+            asap_summary_state::stored_state::decoders::cms_with_heap_from_msgpack_delta(&dp.sketch)
+                .map(|heap| !heap.topk_heap_items().is_empty())
                 .unwrap_or(false)
         }
         _ => false,
@@ -2311,7 +2305,7 @@ fn preflight_summary_frames(
                     format!("delta frame for {metric_name} has no reconstructable base")
                 })?;
             if base_window_start != dp.start_time_unix_nano {
-                base.reset_to_empty();
+                reset_to_empty(&mut base);
             }
             apply_modified_otlp_delta_bytes(
                 dp.algorithm.clone(),
@@ -2539,10 +2533,8 @@ fn decode_modified_otlp_sketch_bytes(
     encoding: i32,
     bytes: &[u8],
 ) -> Result<Box<dyn AggregateCore>, Box<dyn std::error::Error>> {
-    use asap_summary_state::summary_kernels::{
-        CountMinSketchAccumulator, CountSketchAccumulator, DDSketchAccumulator,
-        DatasketchesKLLAccumulator, HllSketchAccumulator,
-    };
+    use asap_physical_operators::summary_kernels as k;
+    use asap_summary_state::stored_state::decoders as d;
 
     // The encoding value is the raw i32 from the per-sketch encoding
     // enum. All five sketch variants share the same wire tag layout:
@@ -2554,101 +2546,82 @@ fn decode_modified_otlp_sketch_bytes(
     //                                 not standalone-decodable)
     //   3  — ENCODING_MSGPACK        (full sketch-core msgpack state)
     //   4  — ENCODING_MSGPACK_DELTA  (MSGPACK diff; not yet wired)
-
-    match encoding {
-        ENCODING_PROTO => match algorithm {
-            // The neutral codec accepts both full envelopes and supported bare
-            // states. Query accumulators retain their family-specific readouts.
-            SketchAlgorithm::DDSketch => {
-                let (inner, sample_p) = asap_sketch_codec::reconstruct_ddsketch(bytes)?;
-                let sample_p = if sample_p.is_finite() && sample_p > 0.0 && sample_p < 1.0 {
-                    sample_p
-                } else {
-                    1.0
-                };
-                Ok(Box::new(DDSketchAccumulator { inner, sample_p }))
-            }
-            SketchAlgorithm::Kll => Ok(Box::new(
-                DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(bytes)?,
-            )),
-            SketchAlgorithm::Cms => Ok(Box::new(
-                CountMinSketchAccumulator::from_sketchlib_proto_bytes(bytes)?,
-            )),
-            SketchAlgorithm::CountSketch => Ok(Box::new(
-                CountSketchAccumulator::from_sketchlib_proto_bytes(bytes)?,
-            )),
-            SketchAlgorithm::Hll => Ok(Box::new(HllSketchAccumulator::from_sketchlib_proto_bytes(
-                bytes,
-            )?)),
-            other => {
-                Err(format!("modified-OTLP PROTO decoding is not implemented for {other:?}").into())
-            }
-        },
-        ENCODING_MSGPACK => match algorithm {
-            SketchAlgorithm::Cms => Ok(Box::new(CountMinSketchAccumulator::from_msgpack_bytes(
-                bytes,
-            )?)),
-            SketchAlgorithm::CountSketch => {
-                // Heap-bearing CountSketch full frame: the bytes are the
-                // `{sketch,topk_heap,heap_size}` envelope (a DIFFERENT inner
-                // field order than the plain CountSketch msgpack), so
-                // `CountSketch::from_msgpack` can't parse it. Try the heap
-                // decode FIRST when the heap is non-empty (the same promotion
-                // gate `sketch_algorithm_for` uses); cache THAT heap
-                // accumulator as the per-series base so a later MSGPACK_DELTA
-                // frame applies its matrix delta + heap onto a heap
-                // accumulator. Fall back to the plain CountSketch decode for
-                // heap-less msgpack frames (byte-parity path, PR I).
-                //
-                // Uses the real `CountSketchWithHeap` (median-of-signed-rows),
-                // NOT `CountMinSketchWithHeap` — the two share the same wire
-                // envelope shape (structural peek only), but decoding a real
-                // CountSketch's matrix through the CMS wrapper would silently
-                // apply CMS's min-of-rows math to CountSketch data forever
-                // after (the same conflation bug fixed on the write side in
-                // `accumulator_factory.rs`).
-                use asap_sketchlib::CountSketchWithHeap;
-                if let Ok(heap) = CountSketchWithHeap::from_msgpack(bytes) {
-                    if !heap.topk_heap_items().is_empty() {
-                        use asap_summary_state::summary_kernels::CountSketchWithHeapAccumulator;
-                        return Ok(Box::new(
-                            CountSketchWithHeapAccumulator::from_msgpack_with_heap_bytes(bytes)?,
-                        ));
-                    }
+    Ok(match (encoding, algorithm) {
+        (ENCODING_PROTO, SketchAlgorithm::DDSketch) => Box::new(k::DDSketchAccumulator {
+            inner: d::ddsketch_from_proto(bytes)?,
+        }),
+        (ENCODING_PROTO, SketchAlgorithm::Kll) => Box::new(k::DatasketchesKLLAccumulator {
+            inner: d::kll_from_proto(bytes)?,
+        }),
+        (ENCODING_PROTO, SketchAlgorithm::Cms) => Box::new(k::CountMinSketchAccumulator {
+            inner: d::cms_from_proto(bytes)?,
+        }),
+        (ENCODING_PROTO, SketchAlgorithm::CountSketch) => Box::new(k::CountSketchAccumulator {
+            inner: d::cs_from_proto(bytes)?,
+        }),
+        (ENCODING_PROTO, SketchAlgorithm::Hll) => Box::new(k::HllSketchAccumulator {
+            inner: d::hll_from_proto(bytes)?,
+        }),
+        (ENCODING_MSGPACK, SketchAlgorithm::Cms) => Box::new(k::CountMinSketchAccumulator {
+            inner: d::cms_from_msgpack(bytes)?,
+        }),
+        (ENCODING_MSGPACK, SketchAlgorithm::CountSketch) => {
+            // A heap-bearing CountSketch full frame is the
+            // `{sketch,topk_heap,heap_size}` envelope, which the plain
+            // CountSketch decoder cannot parse. A non-empty heap selects the
+            // heap state (median-of-signed-rows, never the Count-Min heap),
+            // so a later MSGPACK_DELTA frame applies onto a heap base.
+            match d::cs_with_heap_from_msgpack(bytes) {
+                Ok(heap) if !heap.topk_heap_items().is_empty() => {
+                    Box::new(k::CountSketchWithHeapAccumulator { inner: heap })
                 }
-                Ok(Box::new(CountSketchAccumulator::from_msgpack_bytes(bytes)?))
+                _ => Box::new(k::CountSketchAccumulator {
+                    inner: d::cs_from_msgpack(bytes)?,
+                }),
             }
-            SketchAlgorithm::Kll => Ok(Box::new(DatasketchesKLLAccumulator::from_msgpack_bytes(
-                bytes,
-            )?)),
-            SketchAlgorithm::DDSketch => {
-                Ok(Box::new(DDSketchAccumulator::from_msgpack_bytes(bytes)?))
-            }
-            SketchAlgorithm::Hll => Ok(Box::new(HllSketchAccumulator::from_msgpack_bytes(bytes)?)),
-            other => Err(format!(
-                "modified-OTLP MSGPACK decoding is not implemented for {other:?}"
+        }
+        (ENCODING_MSGPACK, SketchAlgorithm::Kll) => Box::new(k::DatasketchesKLLAccumulator {
+            inner: d::kll_from_msgpack(bytes)?,
+        }),
+        (ENCODING_MSGPACK, SketchAlgorithm::DDSketch) => Box::new(k::DDSketchAccumulator {
+            inner: d::ddsketch_from_msgpack(bytes)?,
+        }),
+        (ENCODING_MSGPACK, SketchAlgorithm::Hll) => Box::new(k::HllSketchAccumulator {
+            inner: d::hll_from_msgpack(bytes)?,
+        }),
+        (ENCODING_PROTO, other) => {
+            return Err(
+                format!("modified-OTLP PROTO decoding is not implemented for {other:?}").into(),
             )
-            .into()),
-        },
-        ENCODING_PROTO_DELTA => Err(format!(
-            "sketch encoding PROTO_DELTA (2) is not standalone-decodable — \
+        }
+        (ENCODING_MSGPACK, other) => {
+            return Err(
+                format!("modified-OTLP MSGPACK decoding is not implemented for {other:?}").into(),
+            )
+        }
+        (ENCODING_PROTO_DELTA, _) => {
+            return Err(
+                "sketch encoding PROTO_DELTA (2) is not standalone-decodable — \
              it carries only a diff against the caller's base snapshot. \
              Caller must route these through \
              `apply_modified_otlp_delta_bytes` with a cached accumulator; \
              this decoder is for full-state frames only."
-        )
-        .into()),
-        ENCODING_MSGPACK_DELTA => Err(format!(
-            "sketch encoding MSGPACK_DELTA (4) deferred — PR G wires \
+                    .into(),
+            )
+        }
+        (ENCODING_MSGPACK_DELTA, _) => {
+            return Err("sketch encoding MSGPACK_DELTA (4) deferred — PR G wires \
              PROTO_DELTA only; msgpack delta is a follow-up."
-        )
-        .into()),
-        _ => Err(format!(
-            "unknown modified-OTLP sketch encoding {encoding} \
-             (expected 1 / 2 / 3 / 4)"
-        )
-        .into()),
-    }
+                .into())
+        }
+        _ => {
+            return Err(format!(
+                "unknown modified-OTLP sketch encoding {encoding} \
+                 (expected 1 / 2 / 3 / 4)"
+            )
+            .into())
+        }
+    })
 }
 
 /// P1-1/P1-2 — construct an EMPTY accumulator matching a sketch
@@ -2676,41 +2649,32 @@ fn empty_accumulator_for_delta_bootstrap(
     encoding: i32,
 ) -> Option<Box<dyn AggregateCore>> {
     use crate::storage_engines::sketch_db::index::SketchConfig;
-    use asap_summary_state::summary_kernels::{
-        CountMinSketchAccumulator, CountSketchAccumulator, CountSketchWithHeapAccumulator,
-        HllSketchAccumulator,
-    };
+    use asap_physical_operators::summary_kernels as k;
 
     match (algorithm, config) {
         (SketchAlgorithm::Hll, SketchConfig::Hll { precision }) => {
-            use asap_sketchlib::HllVariant;
             // Regular is the default agent variant; HLL's additive delta
             // merge tolerates an empty same-precision base.
-            Some(Box::new(HllSketchAccumulator::new(
-                HllVariant::Regular,
+            Some(Box::new(k::HllSketchAccumulator::new(
+                asap_sketchlib::HllVariant::Regular,
                 *precision,
             )))
         }
         (SketchAlgorithm::Cms, SketchConfig::CountMin { rows, cols }) => Some(Box::new(
-            CountMinSketchAccumulator::new(*rows as usize, *cols as usize),
+            k::CountMinSketchAccumulator::new(*rows as usize, *cols as usize),
         )),
         (SketchAlgorithm::CountSketch, SketchConfig::CountSketch { rows, cols }) => {
-            // A heap-bearing DELTA-HEAP frame must reconstruct onto a heap
-            // accumulator (the apply path downcasts to
-            // `CountSketchWithHeapAccumulator`); a plain matrix delta
-            // reconstructs onto a vanilla CountSketch. Pick the base shape
-            // from the encoding so the subsequent
-            // `apply_modified_otlp_delta_bytes` downcast succeeds.
+            // A DELTA-HEAP frame reconstructs onto a heap base; a plain matrix
+            // delta onto a heap-less CountSketch. heap_size 0 is fine: the
+            // DELTA-HEAP apply replaces the heap wholesale.
             if encoding == ENCODING_MSGPACK_DELTA {
-                // heap_size 0 is fine — the DELTA-HEAP apply REPLACES the
-                // heap wholesale from the frame's full heap.
-                Some(Box::new(CountSketchWithHeapAccumulator::new(
+                Some(Box::new(k::CountSketchWithHeapAccumulator::new(
                     *rows as usize,
                     *cols as usize,
                     0,
                 )))
             } else {
-                Some(Box::new(CountSketchAccumulator::new(
+                Some(Box::new(k::CountSketchAccumulator::new(
                     *rows as usize,
                     *cols as usize,
                 )))
@@ -2749,79 +2713,44 @@ pub(crate) fn apply_modified_otlp_delta_bytes(
     existing: &mut Box<dyn AggregateCore>,
     bytes: &[u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use asap_summary_state::summary_kernels::{
-        CountMinSketchAccumulator, CountSketchAccumulator, CountSketchWithHeapAccumulator,
-        DDSketchAccumulator, HllSketchAccumulator,
-    };
+    use asap_physical_operators::summary_kernels as k;
+    use asap_summary_state::stored_state::decoders as d;
 
     match (encoding, algorithm) {
-        (ENCODING_PROTO_DELTA, SketchAlgorithm::DDSketch) => {
-            let dd = existing
-                .as_any_mut()
-                .downcast_mut::<DDSketchAccumulator>()
-                .ok_or(
-                    "apply_modified_otlp_delta_bytes: existing accumulator is \
-                     not a DDSketchAccumulator",
-                )?;
-            dd.apply_proto_delta_bytes(bytes)
-        }
-        (ENCODING_PROTO_DELTA, SketchAlgorithm::Hll) => {
-            let hll = existing
-                .as_any_mut()
-                .downcast_mut::<HllSketchAccumulator>()
-                .ok_or(
-                    "apply_modified_otlp_delta_bytes: existing accumulator is \
-                     not an HllSketchAccumulator",
-                )?;
-            hll.apply_proto_delta_bytes(bytes)
-        }
-        (ENCODING_PROTO_DELTA, SketchAlgorithm::CountSketch) => {
-            let cs = existing
-                .as_any_mut()
-                .downcast_mut::<CountSketchAccumulator>()
-                .ok_or(
-                    "apply_modified_otlp_delta_bytes: existing accumulator is \
-                     not a CountSketchAccumulator",
-                )?;
-            cs.apply_proto_delta_bytes(bytes)
-        }
-        (ENCODING_PROTO_DELTA, SketchAlgorithm::Cms) => {
-            let cms = existing
-                .as_any_mut()
-                .downcast_mut::<CountMinSketchAccumulator>()
-                .ok_or(
-                    "apply_modified_otlp_delta_bytes: existing accumulator is \
-                     not a CountMinSketchAccumulator",
-                )?;
-            cms.apply_proto_delta_bytes(bytes)
-        }
+        (ENCODING_PROTO_DELTA, SketchAlgorithm::DDSketch) => edit(
+            existing,
+            "DDSketchAccumulator",
+            |s: &mut k::DDSketchAccumulator| d::apply_ddsketch_proto_delta(&mut s.inner, bytes),
+        ),
+        (ENCODING_PROTO_DELTA, SketchAlgorithm::Hll) => edit(
+            existing,
+            "HllSketchAccumulator",
+            |s: &mut k::HllSketchAccumulator| d::apply_hll_proto_delta(&mut s.inner, bytes),
+        ),
+        (ENCODING_PROTO_DELTA, SketchAlgorithm::CountSketch) => edit(
+            existing,
+            "CountSketchAccumulator",
+            |s: &mut k::CountSketchAccumulator| d::apply_cs_proto_delta(&mut s.inner, bytes),
+        ),
+        (ENCODING_PROTO_DELTA, SketchAlgorithm::Cms) => edit(
+            existing,
+            "CountMinSketchAccumulator",
+            |s: &mut k::CountMinSketchAccumulator| d::apply_cms_proto_delta(&mut s.inner, bytes),
+        ),
         (ENCODING_PROTO_DELTA, other) => Err(format!(
             "PROTO_DELTA for sketch kind {other:?} is not yet supported; \
              DDSketch / HLL / CountSketch / CountMin are wired"
         )
         .into()),
-        (ENCODING_MSGPACK_DELTA, SketchAlgorithm::CountSketch) => {
-            // DELTA-HEAP frame for the heap-bearing CountSketch: a sparse
-            // signed matrix delta + the full top-k heap. The cached base is
-            // a heap accumulator (window-1 full frame decoded via
-            // `from_msgpack_with_heap_bytes`); under the per-window-reset
-            // model the ingest caller has already reset it to empty at a
-            // window boundary, so applying the delta reconstructs the
-            // window's own matrix and replaces the heap. Decoded generically
-            // in `apply_msgpack_heap_delta_bytes` (rmp_serde, no
-            // `asap_sketchlib` delta API). Real `CountSketchWithHeapAccumulator`
-            // (median-of-signed-rows), not the CMS-family wrapper.
-            let heap = existing
-                .as_any_mut()
-                .downcast_mut::<CountSketchWithHeapAccumulator>()
-                .ok_or(
-                    "apply_modified_otlp_delta_bytes: existing accumulator is \
-                     not a CountSketchWithHeapAccumulator (heap-bearing \
-                     CountSketch delta requires a heap base — the window-1 \
-                     full frame must have promoted the sid)",
-                )?;
-            heap.apply_msgpack_heap_delta_bytes(bytes)
-        }
+        // DELTA-HEAP frame for the heap-bearing CountSketch: a sparse signed
+        // matrix delta plus the full top-k heap, applied onto a heap base
+        // (already reset at a window boundary by the caller).
+        (ENCODING_MSGPACK_DELTA, SketchAlgorithm::CountSketch) => edit(
+            existing,
+            "CountSketchWithHeapAccumulator (heap-bearing CountSketch delta requires a \
+             heap base — the window-1 full frame must have promoted the sid)",
+            |s: &mut k::CountSketchWithHeapAccumulator| d::apply_cs_heap_delta(&mut s.inner, bytes),
+        ),
         (ENCODING_MSGPACK_DELTA, other) => Err(format!(
             "MSGPACK_DELTA for sketch kind {other:?} is not yet wired; only \
              the heap-bearing CountSketch DELTA-HEAP frame is supported"
@@ -2834,6 +2763,33 @@ pub(crate) fn apply_modified_otlp_delta_bytes(
         )
         .into()),
         (other, _) => Err(format!("unknown modified-OTLP sketch encoding {other}").into()),
+    }
+}
+
+/// Apply `update` to the cached base of kernel type `T`. Planner kernels
+/// expose no mutable downcast, so the base is copied, updated and replaced.
+fn edit<T: AggregateCore + Clone + 'static>(
+    existing: &mut Box<dyn AggregateCore>,
+    expected: &str,
+    update: impl FnOnce(&mut T) -> Result<(), String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut state = existing
+        .as_any()
+        .downcast_ref::<T>()
+        .ok_or_else(|| {
+            format!("apply_modified_otlp_delta_bytes: existing accumulator is not a {expected}")
+        })?
+        .clone();
+    update(&mut state)?;
+    *existing = Box::new(state);
+    Ok(())
+}
+
+/// Rotate a cached delta base to an empty state of the same shape; families
+/// that never delta keep their base.
+fn reset_to_empty(state: &mut Box<dyn AggregateCore>) {
+    if let Ok(empty) = asap_summary_state::stored_state::codec::empty_like(state.as_ref()) {
+        *state = empty;
     }
 }
 
@@ -2995,13 +2951,16 @@ fn otlp_to_metric_points_and_sketches(request: &ExportMetricsServiceRequest) -> 
                         // ExactAgg(Sum) path as a plain delta Sum — the backend sums
                         // the per-window/per-shard partials for the same sid.
                         for dp in &sa.data_points {
-                            let value = match asap_summary_state::summary_kernels::sum::SumAccumulator::from_sum_bytes(&dp.sketch) {
-                                Ok(acc) => acc.sum,
-                                Err(e) => {
-                                    debug!("asap_edge: SumAgg data point decode failed (skipping): {e}");
-                                    continue;
-                                }
-                            };
+                            let value =
+                                match asap_summary_state::stored_state::decoders::sum_payload(
+                                    &dp.sketch,
+                                ) {
+                                    Ok(sum) => sum,
+                                    Err(e) => {
+                                        debug!("asap_edge: SumAgg data point decode failed (skipping): {e}");
+                                        continue;
+                                    }
+                                };
                             let labels = merge_point_attributes(&base_labels, &dp.attributes);
                             points.push(MetricPoint {
                                 name: metric.name.clone(),
@@ -3436,9 +3395,9 @@ mod policy_fp_lookup_tests {
 mod dispatcher_tests {
     use super::*;
     use crate::storage_engines::types::AggregateCore;
+    use asap_physical_operators::summary_kernels::{DDSketchAccumulator, HllSketchAccumulator};
     use asap_sketchlib::DdSketch;
     use asap_sketchlib::HllVariant;
-    use asap_summary_state::summary_kernels::{DDSketchAccumulator, HllSketchAccumulator};
 
     #[test]
     fn apply_modified_otlp_delta_bytes_ddsketch_round_trip() {
@@ -3448,7 +3407,6 @@ mod dispatcher_tests {
         // Base sketch represents the last full snapshot the agent sent.
         let mut acc: Box<dyn AggregateCore> = Box::new(DDSketchAccumulator {
             inner: DdSketch::from_raw(0.01, vec![1, 2, 3], 0),
-            sample_p: 1.0,
         });
 
         // The wire delta now carries only bucket deltas (tags 2-7
@@ -3486,13 +3444,9 @@ mod dispatcher_tests {
         use asap_otel_proto::sketchlib::v1::HllDelta as PbDelta;
         use prost::Message;
 
-        let mut acc: Box<dyn AggregateCore> =
-            Box::new(HllSketchAccumulator::new(HllVariant::Regular, 2));
-        acc.as_any_mut()
-            .downcast_mut::<HllSketchAccumulator>()
-            .unwrap()
-            .inner
-            .registers = vec![1, 5, 3, 7];
+        let mut base = HllSketchAccumulator::new(HllVariant::Regular, 2);
+        base.inner.registers = vec![1, 5, 3, 7];
+        let mut acc: Box<dyn AggregateCore> = Box::new(base);
 
         // Packed (index_delta, value) blob for updates {0:4, 2:6}.
         let bytes = PbDelta {
@@ -3789,8 +3743,8 @@ mod sid_resolution_tests {
     #[tokio::test]
     async fn delta_apply_rotates_per_series_base_at_window_boundary() {
         use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
+        use asap_physical_operators::summary_kernels::DDSketchAccumulator;
         use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
-        use asap_summary_state::summary_kernels::DDSketchAccumulator;
         use prost::Message;
 
         let (state, drain) = make_state().await;
@@ -4122,7 +4076,7 @@ mod sid_resolution_tests {
     #[tokio::test]
     async fn leading_cms_delta_bootstraps_onto_empty_base() {
         use asap_otel_proto::sketchlib::v1::CountMinDelta as PbDelta;
-        use asap_summary_state::summary_kernels::CountMinSketchAccumulator;
+        use asap_physical_operators::summary_kernels::CountMinSketchAccumulator;
         use prost::Message;
 
         let (state, drain) = make_state().await;
@@ -4208,7 +4162,7 @@ mod sid_resolution_tests {
     #[tokio::test]
     async fn leading_hll_delta_bootstraps_onto_empty_base() {
         use asap_otel_proto::sketchlib::v1::HllDelta as PbDelta;
-        use asap_summary_state::summary_kernels::HllSketchAccumulator;
+        use asap_physical_operators::summary_kernels::HllSketchAccumulator;
         use prost::Message;
 
         let (state, drain) = make_state().await;

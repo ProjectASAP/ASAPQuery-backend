@@ -1,30 +1,22 @@
-//! Shared sketch state reconstruction and decoding.
-use asap_sketchlib::CountMinSketch;
-use asap_sketchlib::CountMinSketchWithHeap;
-use asap_sketchlib::CountSketch;
-use asap_sketchlib::CountSketchWithHeap;
-use asap_sketchlib::DdSketch;
-use asap_sketchlib::HllSketch;
-use asap_sketchlib::HllVariant;
-use asap_sketchlib::KllSketch;
-use asap_sketchlib::MessagePackCodec;
-
-use super::decoders::{
-    decode_cms_from_msgpack, decode_cms_from_proto, decode_cms_from_proto_delta,
-    decode_cms_with_heap_from_msgpack, decode_cms_with_heap_from_msgpack_delta,
-    decode_cs_from_msgpack, decode_cs_from_proto, decode_cs_from_proto_delta,
-    decode_cs_with_heap_from_msgpack, decode_cs_with_heap_from_msgpack_delta,
+//! Reconstruction of stored window states from full and delta frames.
+use asap_physical_operators::summary_kernels as k;
+use asap_physical_operators::summary_kernels::weighted_frequency::{
+    FrequencyAlgorithm, WeightedFrequency,
 };
+use asap_physical_operators::AggregateCore;
+use asap_sketchlib::{
+    CountMinSketch, CountMinSketchWithHeap, CountSketch, CountSketchWithHeap, DdSketch, HllSketch,
+    HllVariant, KllSketch,
+};
+
+use super::decoders as d;
 use super::{SketchEncoding, SketchSampleState};
+use crate::univmon::UnivMonAccumulator;
 
 /// Which sketch family a candidate is, and the parameters needed to
 /// *bootstrap an empty state* — required by the per-window-reset (PWR)
 /// delta model where a window's FIRST frame is a delta-from-empty (no
-/// carry-in Full). Most families' deltas embed their own params in the
-/// wire fragment (decoded independently, then merged in — see
-/// `SummaryState::apply_delta_bytes`); HLL register deltas and DD's
-/// bucket-index deltas are applied onto a pre-sized structure instead,
-/// so those two need the params known up front to allocate it.
+/// carry-in Full).
 #[derive(Debug, Clone, Copy)]
 pub enum DeltaSketchKind {
     UnivMon {
@@ -50,15 +42,9 @@ pub enum DeltaSketchKind {
         rows: usize,
         cols: usize,
     },
-    /// `CmsWithHeap` wraps `asap_sketchlib::CountMinSketchWithHeap`
-    /// (min-over-rows estimator) and `CountSketchWithHeap` wraps the
-    /// distinct `asap_sketchlib::CountSketchWithHeap` (median-of-signed-rows
-    /// estimator) -- different algorithms that happen to share a storage
-    /// shape. Kept as two variants (not one shared `Heap`) so
-    /// `merge_same_family` rejects merging one into the other the same
-    /// way it already rejects e.g. merging a `Cms` into a `Kll`; now the
-    /// type system enforces it too, since the two variants hold different
-    /// Rust types.
+    /// Count-Min (min-over-rows) and Count Sketch (median-of-signed-rows)
+    /// heaps share a storage shape but are different algorithms, so they are
+    /// separate kinds and never merge into each other.
     CmsWithHeap {
         rows: usize,
         cols: usize,
@@ -72,61 +58,62 @@ pub enum DeltaSketchKind {
 }
 
 impl DeltaSketchKind {
-    /// Construct an EMPTY state for this kind, used to seed a new window
-    /// when its first frame is a delta-from-empty (PWR). A delta applied
-    /// onto this empty base reconstructs exactly that window's state
-    /// (delta-from-empty ⊕ empty = window state).
+    /// An EMPTY state for this kind, seeding a window whose first frame is a
+    /// delta-from-empty (PWR): empty ⊕ delta = that window's state.
     fn bootstrap_empty(&self) -> SummaryState {
-        match self {
+        match *self {
             Self::UnivMon {
                 heap_size,
                 sketch_rows,
                 sketch_cols,
                 layers,
             } => SummaryState::UnivMon(
-                crate::summary_kernels::univmon::UnivMonAccumulator::new(
-                    *heap_size as usize,
-                    *sketch_rows as usize,
-                    *sketch_cols as usize,
-                    *layers as usize,
+                UnivMonAccumulator::new(
+                    heap_size as usize,
+                    sketch_rows as usize,
+                    sketch_cols as usize,
+                    layers as usize,
                 )
                 .expect("validated UnivMon catalog dimensions"),
             ),
-            DeltaSketchKind::DDSketch { alpha } => SummaryState::Dd(DdSketch::new(*alpha)),
-            DeltaSketchKind::Kll { k } => SummaryState::Kll(KllSketch::new(*k as u16)),
-            DeltaSketchKind::Hll { precision } => {
-                SummaryState::Hll(HllSketch::new(HllVariant::Regular, *precision))
+            Self::DDSketch { alpha } => SummaryState::Dd(k::DDSketchAccumulator::new(alpha)),
+            Self::Kll { k } => SummaryState::Kll(k::DatasketchesKLLAccumulator::new(k as u16)),
+            Self::Hll { precision } => {
+                SummaryState::Hll(k::HllSketchAccumulator::new(HllVariant::Regular, precision))
             }
-            DeltaSketchKind::Cms { rows, cols } => {
-                SummaryState::Cms(CountMinSketch::new(*rows, *cols))
+            Self::Cms { rows, cols } => {
+                SummaryState::Cms(k::CountMinSketchAccumulator::new(rows, cols))
             }
-            DeltaSketchKind::CountSketch { rows, cols } => {
-                SummaryState::CountSketch(CountSketch::new(*rows, *cols))
+            Self::CountSketch { rows, cols } => {
+                SummaryState::CountSketch(k::CountSketchAccumulator::new(rows, cols))
             }
-            DeltaSketchKind::CmsWithHeap {
+            Self::CmsWithHeap {
                 rows,
                 cols,
                 heap_size,
-            } => SummaryState::CmsWithHeap(CountMinSketchWithHeap::new(*rows, *cols, *heap_size)),
-            DeltaSketchKind::CountSketchWithHeap {
+            } => SummaryState::CmsWithHeap(k::CountMinSketchWithHeapAccumulator::new(
+                rows, cols, heap_size,
+            )),
+            Self::CountSketchWithHeap {
                 rows,
                 cols,
                 heap_size,
-            } => SummaryState::CountSketchWithHeap(CountSketchWithHeap::new(
-                *rows, *cols, *heap_size,
+            } => SummaryState::CountSketchWithHeap(k::CountSketchWithHeapAccumulator::new(
+                rows, cols, heap_size,
             )),
         }
     }
 }
 
-/// Try to decode a "full" sketch from the bytes (used by both
-/// per-window and cumulative modes when the encoding is `*Full`).
+/// Decode a "full" frame (used by both per-window and cumulative modes when
+/// the encoding is `*Full`).
 fn decode_full(
     kind: &DeltaSketchKind,
     bytes: &[u8],
     encoding: SketchEncoding,
 ) -> Result<SummaryState, String> {
-    match (kind, encoding) {
+    use SketchEncoding::{MsgpackFull, ProtoFull, WeightedFrequencyV1};
+    Ok(match (kind, encoding) {
         (
             DeltaSketchKind::UnivMon {
                 heap_size,
@@ -134,10 +121,9 @@ fn decode_full(
                 sketch_cols,
                 layers,
             },
-            SketchEncoding::MsgpackFull,
+            MsgpackFull,
         ) => {
-            let state = crate::summary_kernels::univmon::UnivMonAccumulator::from_bytes(bytes)
-                .map_err(|e| e.to_string())?;
+            let state = UnivMonAccumulator::from_bytes(bytes).map_err(|e| e.to_string())?;
             if state.dimensions()
                 != (
                     *heap_size as usize,
@@ -148,91 +134,67 @@ fn decode_full(
             {
                 return Err("UnivMon payload dimensions differ from installed catalog".into());
             }
-            Ok(SummaryState::UnivMon(state))
+            SummaryState::UnivMon(state)
         }
-        (DeltaSketchKind::DDSketch { .. }, SketchEncoding::ProtoFull) => {
-            let sk = dd_from_proto(bytes)?;
-            Ok(SummaryState::Dd(sk))
+        (DeltaSketchKind::DDSketch { .. }, ProtoFull) => dd(d::ddsketch_from_proto(bytes)?),
+        (DeltaSketchKind::DDSketch { .. }, MsgpackFull) => dd(d::ddsketch_from_msgpack(bytes)?),
+        (DeltaSketchKind::Hll { .. }, ProtoFull) => hll(d::hll_from_proto(bytes)?),
+        (DeltaSketchKind::Hll { .. }, MsgpackFull) => hll(d::hll_from_msgpack(bytes)?),
+        (DeltaSketchKind::Kll { .. }, ProtoFull) => kll(d::kll_from_proto(bytes)?),
+        (DeltaSketchKind::Kll { .. }, MsgpackFull) => kll(d::kll_from_msgpack(bytes)?),
+        (DeltaSketchKind::Cms { .. }, ProtoFull) => cms(d::cms_from_proto(bytes)?),
+        (DeltaSketchKind::Cms { .. }, MsgpackFull) => cms(d::cms_from_msgpack(bytes)?),
+        (DeltaSketchKind::CountSketch { .. }, ProtoFull) => cs(d::cs_from_proto(bytes)?),
+        (DeltaSketchKind::CountSketch { .. }, MsgpackFull) => cs(d::cs_from_msgpack(bytes)?),
+        // The legacy heap wire format is msgpack-only.
+        (DeltaSketchKind::CmsWithHeap { .. }, ProtoFull | MsgpackFull) => {
+            cms_heap_state(d::cms_with_heap_from_msgpack(bytes)?)
         }
-        (DeltaSketchKind::DDSketch { .. }, SketchEncoding::MsgpackFull) => {
-            let sk = DdSketch::from_msgpack(bytes)
-                .map_err(|e| format!("deserialize DDSketch msgpack: {e}"))?;
-            Ok(SummaryState::Dd(sk))
+        (DeltaSketchKind::CountSketchWithHeap { .. }, ProtoFull | MsgpackFull) => {
+            cs_heap_state(d::cs_with_heap_from_msgpack(bytes)?)
         }
-        (DeltaSketchKind::Hll { .. }, SketchEncoding::ProtoFull) => {
-            let sk = hll_from_proto(bytes)?;
-            Ok(SummaryState::Hll(sk))
-        }
-        (DeltaSketchKind::Hll { .. }, SketchEncoding::MsgpackFull) => {
-            let sk = HllSketch::from_msgpack(bytes)
-                .map_err(|e| format!("deserialize HllSketch msgpack: {e}"))?;
-            Ok(SummaryState::Hll(sk))
-        }
-        (DeltaSketchKind::Kll { .. }, SketchEncoding::ProtoFull) => {
-            let sk = kll_from_proto(bytes)?;
-            Ok(SummaryState::Kll(sk))
-        }
-        (DeltaSketchKind::Kll { .. }, SketchEncoding::MsgpackFull) => {
-            let sk = KllSketch::from_msgpack(bytes)
-                .map_err(|e| format!("deserialize KllSketch msgpack: {e}"))?;
-            Ok(SummaryState::Kll(sk))
-        }
-        (DeltaSketchKind::Cms { .. }, SketchEncoding::ProtoFull) => {
-            Ok(SummaryState::Cms(decode_cms_from_proto(bytes)?))
-        }
-        (DeltaSketchKind::Cms { .. }, SketchEncoding::MsgpackFull) => {
-            Ok(SummaryState::Cms(decode_cms_from_msgpack(bytes)?))
-        }
-        (DeltaSketchKind::CountSketch { .. }, SketchEncoding::ProtoFull) => {
-            Ok(SummaryState::CountSketch(decode_cs_from_proto(bytes)?))
-        }
-        (DeltaSketchKind::CountSketch { .. }, SketchEncoding::MsgpackFull) => {
-            Ok(SummaryState::CountSketch(decode_cs_from_msgpack(bytes)?))
-        }
-        // The heap-bearing wire format is msgpack-only in this
-        // deployment; `decode_cms_with_heap_from_msgpack` is the same
-        // "Full" decoder the reducer's existing per-frame dispatch falls
-        // through to for any non-MsgpackDelta encoding.
         (
-            DeltaSketchKind::CmsWithHeap { .. },
-            SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull,
-        ) => Ok(SummaryState::CmsWithHeap(
-            decode_cms_with_heap_from_msgpack(bytes)?,
-        )),
-        (
-            DeltaSketchKind::CountSketchWithHeap { .. },
-            SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull,
-        ) => Ok(SummaryState::CountSketchWithHeap(
-            decode_cs_with_heap_from_msgpack(bytes)?,
-        )),
-        (
-            DeltaSketchKind::CmsWithHeap { .. } | DeltaSketchKind::CountSketchWithHeap { .. },
-            SketchEncoding::WeightedFrequencyV1,
+            DeltaSketchKind::CmsWithHeap { rows, cols, .. }
+            | DeltaSketchKind::CountSketchWithHeap { rows, cols, .. },
+            WeightedFrequencyV1,
         ) => {
-            use crate::summary_kernels::weighted_frequency::FrequencyAlgorithm;
-            let kernel = asap_sketchlib::WeightedFrequency::from_bytes(bytes)
-                .map_err(|e| format!("deserialize weighted frequency: {e:?}"))?;
-            let (expected, rows, cols) = match kind {
-                DeltaSketchKind::CmsWithHeap { rows, cols, .. } => {
-                    (FrequencyAlgorithm::Cms, *rows, *cols)
-                }
-                DeltaSketchKind::CountSketchWithHeap { rows, cols, .. } => {
-                    (FrequencyAlgorithm::CountSketch, *rows, *cols)
-                }
-                _ => unreachable!("matched heap kinds"),
+            let expected = match kind {
+                DeltaSketchKind::CmsWithHeap { .. } => FrequencyAlgorithm::Cms,
+                _ => FrequencyAlgorithm::CountSketch,
             };
+            let state = super::codec::frequency_state(bytes).map_err(|e| e.to_string())?;
+            let kernel = super::codec::frequency_kernel(&state).map_err(|e| e.to_string())?;
             // The catalog's heap size is not carried here; matrix shape is.
             let (width, depth, _) = kernel.shape();
-            if kernel.algorithm() != expected || (width, depth) != (cols, rows) {
+            if kernel.algorithm() != expected || (width, depth) != (*cols, *rows) {
                 return Err("weighted frequency shape differs from installed catalog".into());
             }
-            Ok(SummaryState::WeightedFrequency(
-                rmp_serde::from_slice(&rmp_serde::to_vec(&kernel).map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())?,
-            ))
+            SummaryState::WeightedFrequency(state)
         }
-        (_, e) => Err(format!("decode_full called with non-Full encoding {e:?}")),
-    }
+        (_, e) => return Err(format!("decode_full called with non-Full encoding {e:?}")),
+    })
+}
+
+fn dd(inner: DdSketch) -> SummaryState {
+    SummaryState::Dd(k::DDSketchAccumulator { inner })
+}
+fn hll(inner: HllSketch) -> SummaryState {
+    SummaryState::Hll(k::HllSketchAccumulator { inner })
+}
+fn kll(inner: KllSketch) -> SummaryState {
+    SummaryState::Kll(k::DatasketchesKLLAccumulator { inner })
+}
+fn cms(inner: CountMinSketch) -> SummaryState {
+    SummaryState::Cms(k::CountMinSketchAccumulator { inner })
+}
+fn cs(inner: CountSketch) -> SummaryState {
+    SummaryState::CountSketch(k::CountSketchAccumulator { inner })
+}
+fn cms_heap_state(inner: CountMinSketchWithHeap) -> SummaryState {
+    SummaryState::CmsWithHeap(k::CountMinSketchWithHeapAccumulator { inner })
+}
+fn cs_heap_state(inner: CountSketchWithHeap) -> SummaryState {
+    SummaryState::CountSketchWithHeap(k::CountSketchWithHeapAccumulator { inner })
 }
 
 /// Render a ranked heap item as the legacy heap key: item parts joined by
@@ -294,238 +256,175 @@ fn series_key(labels: &std::collections::BTreeMap<String, String>) -> String {
     }
 }
 
-/// The reconstructed state one candidate sid contributes — either
-/// folded across a window (or several) via delta application, or merged
-/// in from another sid's own reconstruction.
+/// The reconstructed Planner kernel state one candidate sid contributes —
+/// either folded across a window (or several) via delta application, or
+/// merged in from another sid's own reconstruction.
 pub enum SummaryState {
-    UnivMon(crate::summary_kernels::univmon::UnivMonAccumulator),
-    Dd(DdSketch),
-    Hll(HllSketch),
-    Kll(KllSketch),
-    Cms(CountMinSketch),
-    CountSketch(CountSketch),
-    /// See `DeltaSketchKind::CmsWithHeap`/`CountSketchWithHeap` for why
-    /// these are two variants holding two different sketchlib types.
-    CmsWithHeap(CountMinSketchWithHeap),
-    CountSketchWithHeap(CountSketchWithHeap),
+    UnivMon(UnivMonAccumulator),
+    Dd(k::DDSketchAccumulator),
+    Hll(k::HllSketchAccumulator),
+    Kll(k::DatasketchesKLLAccumulator),
+    Cms(k::CountMinSketchAccumulator),
+    CountSketch(k::CountSketchAccumulator),
+    /// See `DeltaSketchKind::CmsWithHeap` for why the two heaps differ.
+    CmsWithHeap(k::CountMinSketchWithHeapAccumulator),
+    CountSketchWithHeap(k::CountSketchWithHeapAccumulator),
     /// Planner's weighted-frequency heap, read through its ranked rows.
-    WeightedFrequency(crate::summary_kernels::weighted_frequency::PhysicalWeightedFrequency),
+    WeightedFrequency(WeightedFrequency),
 }
 
 impl SummaryState {
-    /// Apply a delta-encoded payload from a window sample. For DD / KLL,
-    /// the delta is interpreted as a "mergeable fragment" decoded
-    /// through the same full-state decoder and merged into the
-    /// rolling state. For HLL, the wire delta is a sparse register
-    /// update applied via the sketch's `apply_delta`.
-    ///
-    /// On encoding mismatch (e.g. trying to apply an HllDelta to a
-    /// DDSketch rolling state) returns Err.
+    /// The Planner kernel this state holds.
+    pub fn kernel(&self) -> &dyn AggregateCore {
+        match self {
+            Self::UnivMon(s) => s,
+            Self::Dd(s) => s,
+            Self::Hll(s) => s,
+            Self::Kll(s) => s,
+            Self::Cms(s) => s,
+            Self::CountSketch(s) => s,
+            Self::CmsWithHeap(s) => s,
+            Self::CountSketchWithHeap(s) => s,
+            Self::WeightedFrequency(s) => s,
+        }
+    }
+
+    /// Rewrap a kernel of the same variant as `self`.
+    fn same_variant(&self, state: &dyn AggregateCore) -> Option<Self> {
+        let any = state.as_any();
+        Some(match self {
+            Self::UnivMon(_) => Self::UnivMon(any.downcast_ref::<UnivMonAccumulator>()?.clone()),
+            Self::Dd(_) => Self::Dd(any.downcast_ref::<k::DDSketchAccumulator>()?.clone()),
+            Self::Hll(_) => Self::Hll(any.downcast_ref::<k::HllSketchAccumulator>()?.clone()),
+            Self::Kll(_) => Self::Kll(any.downcast_ref::<k::DatasketchesKLLAccumulator>()?.clone()),
+            Self::Cms(_) => Self::Cms(any.downcast_ref::<k::CountMinSketchAccumulator>()?.clone()),
+            Self::CountSketch(_) => {
+                Self::CountSketch(any.downcast_ref::<k::CountSketchAccumulator>()?.clone())
+            }
+            Self::CmsWithHeap(_) => Self::CmsWithHeap(
+                any.downcast_ref::<k::CountMinSketchWithHeapAccumulator>()?
+                    .clone(),
+            ),
+            Self::CountSketchWithHeap(_) => Self::CountSketchWithHeap(
+                any.downcast_ref::<k::CountSketchWithHeapAccumulator>()?
+                    .clone(),
+            ),
+            Self::WeightedFrequency(_) => {
+                Self::WeightedFrequency(any.downcast_ref::<WeightedFrequency>()?.clone())
+            }
+        })
+    }
+
+    /// Apply a delta-encoded frame. DDSketch bucket deltas and HLL register
+    /// deltas apply in place; every other frame decodes independently and
+    /// merges in.
     pub fn apply_delta_bytes(
         &mut self,
         bytes: &[u8],
         encoding: SketchEncoding,
     ) -> Result<(), String> {
-        if !matches!(
-            encoding,
-            SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta
-        ) {
+        use SketchEncoding::{MsgpackDelta, MsgpackFull, ProtoDelta, ProtoFull};
+        if !matches!(encoding, ProtoDelta | MsgpackDelta) {
             return Err(format!(
                 "apply_delta_bytes called with non-Delta encoding {encoding:?}"
             ));
         }
-        match self {
-            SummaryState::UnivMon(_) => Err("UnivMon requires full pane snapshots".into()),
-            SummaryState::Dd(sk) => {
-                match encoding {
-                    // PROTO_DELTA: dispatch on the payload SHAPE, mirroring the
-                    // supported DDSketch frame decoder, which tries the
-                    // full-envelope decode first, then falls back to
-                    // the bucket-delta proto. Two wire shapes can arrive on the
-                    // ProtoDelta channel:
-                    //
-                    //   1. `SketchEnvelope{DdSketchState}` — a full-state
-                    //      fragment, mergeable via `DdSketch::merge`. (The edge
-                    //      sends this when `compute_delta_against` hits the
-                    //      empty-current / undecodable-prior fallback and ships
-                    //      a full snapshot tagged as a delta.)
-                    //   2. `DDSketchDelta { buckets: [{index, d_count}] }` — a
-                    //      bucket-index delta proto, applied additively. This is
-                    //      the COMMON delta_transmission frame the edge emits
-                    //      under per-window-reset (`compute_delta(&empty)`).
-                    //
-                    // Before this fix the reducer decoded ONLY shape (1) via
-                    // `decode_full`. A real shape-(2) frame failed with a wire-
-                    // type mismatch on field 1 (delta field 1 = repeated
-                    // submessage; state field 1 = `double alpha`) → the whole
-                    // `quantile_over_time` returned `No result` for every
-                    // delta_transmission DDSketch stream. We wrap the rolling
-                    // `DdSketch` in a transient accumulator so the bucket-delta
-                    // apply lands on `sk` in place.
-                    SketchEncoding::ProtoDelta => {
-                        // Shape (1): full envelope fragment → merge. Try this
-                        // first (cheap decode attempt; a bucket-delta proto
-                        // fails it on the field-1 wire-type mismatch).
-                        if let Ok(SummaryState::Dd(other)) = decode_full(
-                            &DeltaSketchKind::DDSketch { alpha: 0.0 },
-                            bytes,
-                            SketchEncoding::ProtoFull,
-                        ) {
-                            sk.merge(&other)
-                                .map_err(|e| format!("merge DDSketch delta envelope: {e}"))?;
-                            return Ok(());
-                        }
-                        // Shape (2): bucket-delta proto → additive apply via the
-                        // SAME decoder the ingest delta path uses.
-                        use crate::summary_kernels::dd_sketch::DDSketchAccumulator;
-                        let mut acc = DDSketchAccumulator {
-                            inner: std::mem::replace(sk, DdSketch::new(sk.alpha)),
-                            sample_p: 1.0,
-                        };
-                        let res = acc.apply_proto_delta_bytes(bytes);
-                        *sk = acc.inner;
-                        res.map_err(|e| format!("apply DDSketch proto bucket-delta: {e}"))?;
-                        Ok(())
-                    }
-                    // MSGPACK_DELTA: a serialized full-sketch fragment, mergeable
-                    // via the full-state decoder. Kept for completeness — the
-                    // edge wires PROTO_DELTA for DDSketch today.
-                    SketchEncoding::MsgpackDelta => {
-                        let other = match decode_full(
-                            &DeltaSketchKind::DDSketch { alpha: 0.0 },
-                            bytes,
-                            SketchEncoding::MsgpackFull,
-                        ) {
-                            Ok(SummaryState::Dd(s)) => s,
-                            Ok(_) => {
-                                return Err(
-                                    "decode_full(DDSketch) returned non-DDSketch state".to_string()
-                                )
-                            }
-                            Err(e) => return Err(e),
-                        };
-                        sk.merge(&other)
-                            .map_err(|e| format!("merge DDSketch delta: {e}"))?;
-                        Ok(())
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            SummaryState::Hll(sk) => {
-                // HLL has a true sparse register delta in the proto
-                // wire format. Use the same path the precompute
-                // accumulator uses (`apply_proto_delta_bytes`-style).
-                if encoding == SketchEncoding::ProtoDelta {
-                    apply_hll_proto_delta(sk, bytes)
-                } else {
-                    // MsgpackDelta for HLL isn't a sparse encoding;
-                    // it's a serialized HllSketch fragment, mergeable
-                    // via `HllSketch::merge`.
-                    let other = HllSketch::from_msgpack(bytes)
-                        .map_err(|e| format!("deserialize HllSketch (delta-as-msgpack): {e}"))?;
-                    sk.merge(&other)
-                        .map_err(|e| format!("merge HLL delta: {e}"))?;
-                    Ok(())
-                }
-            }
-            SummaryState::Kll(sk) => {
-                let full_enc = match encoding {
-                    SketchEncoding::ProtoDelta => SketchEncoding::ProtoFull,
-                    SketchEncoding::MsgpackDelta => SketchEncoding::MsgpackFull,
-                    _ => unreachable!(),
-                };
-                let other = match decode_full(&DeltaSketchKind::Kll { k: 0 }, bytes, full_enc) {
-                    Ok(SummaryState::Kll(s)) => s,
-                    Ok(_) => return Err("decode_full(Kll) returned non-Kll state".to_string()),
-                    Err(e) => return Err(e),
-                };
-                sk.merge(&other)
-                    .map_err(|e| format!("merge KLL delta: {e}"))?;
-                Ok(())
-            }
-            // CMS/CountSketch/Heap have no true sparse in-place delta
-            // (unlike DD's bucket-index proto or HLL's register proto,
-            // above) — every delta frame already decodes into a
-            // complete, standalone state on its own (the PWR wire
-            // contract resets to empty at the source), so applying one
-            // is always "decode independently, then merge".
-            SummaryState::Cms(sk) => {
-                if encoding != SketchEncoding::ProtoDelta {
-                    return Err(
-                        "CountMin (heap-less) MSGPACK_DELTA is not a valid producer encoding \
-                         (msgpack-delta is the heap-bearing form)"
-                            .to_string(),
-                    );
-                }
-                let other = decode_cms_from_proto_delta(bytes)?;
-                sk.merge(&other)
-                    .map_err(|e| format!("merge CountMinSketch delta: {e}"))
-            }
-            SummaryState::CountSketch(sk) => {
-                if encoding != SketchEncoding::ProtoDelta {
-                    return Err(
-                        "CountSketch (heap-less) MSGPACK_DELTA is not a valid producer encoding \
-                         (msgpack-delta is the heap-bearing form)"
-                            .to_string(),
-                    );
-                }
-                let other = decode_cs_from_proto_delta(bytes)?;
-                sk.merge(&other)
-                    .map_err(|e| format!("merge CountSketch delta: {e}"))
-            }
-            SummaryState::CmsWithHeap(sk) => {
-                // Matches the existing per-frame reducer dispatch: only
-                // MsgpackDelta gets true delta treatment; ProtoDelta (not
-                // produced for this family in this deployment) falls
-                // through to the full-msgpack decoder, same as `decode_full`.
-                let other = if encoding == SketchEncoding::MsgpackDelta {
-                    decode_cms_with_heap_from_msgpack_delta(bytes)?
-                } else {
-                    decode_cms_with_heap_from_msgpack(bytes)?
-                };
-                sk.merge(&other)
-                    .map_err(|e| format!("merge CmsWithHeap delta: {e}"))
-            }
-            SummaryState::WeightedFrequency(_) => {
+        let fragment = |kind: DeltaSketchKind, full| decode_full(&kind, bytes, full);
+        match (&mut *self, encoding) {
+            (Self::UnivMon(_), _) => Err("UnivMon requires full pane snapshots".into()),
+            (Self::WeightedFrequency(_), _) => {
                 Err("weighted frequency frames are complete states, not deltas".into())
             }
-            SummaryState::CountSketchWithHeap(sk) => {
-                let other = if encoding == SketchEncoding::MsgpackDelta {
-                    decode_cs_with_heap_from_msgpack_delta(bytes)?
+            // Two shapes arrive on the DDSketch proto-delta channel: a full
+            // envelope fragment (merged) and the common bucket-index delta.
+            (Self::Dd(sketch), ProtoDelta) => {
+                if d::carries_sketch_state(bytes) {
+                    let other = fragment(DeltaSketchKind::DDSketch { alpha: 0.0 }, ProtoFull)?;
+                    self.merge_same_family(&other)
                 } else {
-                    decode_cs_with_heap_from_msgpack(bytes)?
+                    d::apply_ddsketch_proto_delta(&mut sketch.inner, bytes)
+                        .map_err(|e| format!("apply DDSketch proto bucket-delta: {e}"))
+                }
+            }
+            (Self::Dd(_), _) => {
+                let other = fragment(DeltaSketchKind::DDSketch { alpha: 0.0 }, MsgpackFull)?;
+                self.merge_same_family(&other)
+            }
+            (Self::Hll(sketch), ProtoDelta) => d::apply_hll_proto_delta(&mut sketch.inner, bytes),
+            (Self::Hll(_), _) => {
+                let other = fragment(DeltaSketchKind::Hll { precision: 0 }, MsgpackFull)?;
+                self.merge_same_family(&other)
+            }
+            (Self::Kll(_), _) => {
+                let full = if encoding == ProtoDelta {
+                    ProtoFull
+                } else {
+                    MsgpackFull
                 };
-                sk.merge(&other)
-                    .map_err(|e| format!("merge CountSketchWithHeap delta: {e}"))
+                let other = fragment(DeltaSketchKind::Kll { k: 0 }, full)?;
+                self.merge_same_family(&other)
+            }
+            (Self::Cms(_), ProtoDelta) => {
+                let other = cms(d::cms_from_proto_delta(bytes)?);
+                self.merge_same_family(&other)
+            }
+            (Self::CountSketch(_), ProtoDelta) => {
+                let other = cs(d::cs_from_proto_delta(bytes)?);
+                self.merge_same_family(&other)
+            }
+            (Self::Cms(_) | Self::CountSketch(_), _) => Err(
+                "heap-less CountMin/CountSketch MSGPACK_DELTA is not a valid producer encoding \
+                 (msgpack-delta is the heap-bearing form)"
+                    .into(),
+            ),
+            // A heap delta frame decodes to a standalone window state and
+            // merges in; heap proto "deltas" are full msgpack states.
+            (Self::CmsWithHeap(_), _) => {
+                let other = cms_heap_state(if encoding == MsgpackDelta {
+                    d::cms_with_heap_from_msgpack_delta(bytes)?
+                } else {
+                    d::cms_with_heap_from_msgpack(bytes)?
+                });
+                self.merge_same_family(&other)
+            }
+            (Self::CountSketchWithHeap(_), _) => {
+                let other = cs_heap_state(if encoding == MsgpackDelta {
+                    d::cs_with_heap_from_msgpack_delta(bytes)?
+                } else {
+                    d::cs_with_heap_from_msgpack(bytes)?
+                });
+                self.merge_same_family(&other)
             }
         }
     }
 
     pub fn quantile(&self, q: f64) -> f64 {
+        use planner_types::post_asap::SketchQuery;
         match self {
-            SummaryState::Dd(sk) => sk.quantile(q).unwrap_or(0.0),
-            SummaryState::Kll(sk) => sk.quantile(q),
+            Self::Dd(_) | Self::Kll(_) => self
+                .kernel()
+                .estimate(&SketchQuery::Quantile { q })
+                .unwrap_or(0.0),
             _ => 0.0,
         }
     }
 
     pub fn cardinality(&self) -> f64 {
+        use planner_types::post_asap::SketchQuery;
         match self {
-            SummaryState::Hll(sk) => sk.estimate(),
+            Self::Hll(s) => s.estimate(&SketchQuery::Cardinality).unwrap_or(0.0),
             _ => 0.0,
         }
     }
 
-    /// The bucket TOTAL — sum of row 0 of the underlying matrix. What a
-    /// bare `count_over_time`/`sum by (item) (rate(...))`-shaped query
-    /// (no specific item key) reads out. `0.0` for non-Frequency-family
-    /// states.
+    /// The bucket TOTAL — sum of row 0 of the underlying matrix, what a bare
+    /// (no item key) frequency readout reads. `0.0` for other families.
     pub fn total(&self) -> f64 {
         let matrix = match self {
-            SummaryState::Cms(c) => c.sketch(),
-            SummaryState::CountSketch(c) => c.sketch().clone(),
-            SummaryState::CmsWithHeap(h) => h.sketch_matrix(),
-            SummaryState::CountSketchWithHeap(h) => h.sketch_matrix(),
+            Self::Cms(c) => c.inner.sketch(),
+            Self::CountSketch(c) => c.inner.sketch().clone(),
+            Self::CmsWithHeap(h) => h.inner.sketch_matrix(),
+            Self::CountSketchWithHeap(h) => h.inner.sketch_matrix(),
             _ => return 0.0,
         };
         matrix
@@ -534,44 +433,39 @@ impl SummaryState {
             .unwrap_or(0.0)
     }
 
-    /// Per-key point estimate — `count(metric{item="x"})`-shaped queries.
-    /// Unlike [`Self::topk_items`], no heap is needed: all four Frequency
-    /// variants (heap-bearing or not) already carry a keyed `estimate`
-    /// over their matrix. `None` for the quantile/cardinality states,
-    /// which have no item universe at all.
+    /// Per-item point estimate; `None` for families without an item universe.
     pub fn estimate(&self, key: &str) -> Option<f64> {
         match self {
-            SummaryState::Cms(c) => Some(c.estimate(key)),
-            SummaryState::CountSketch(c) => Some(c.estimate(key)),
-            SummaryState::CmsWithHeap(h) => Some(h.estimate(key)),
-            SummaryState::CountSketchWithHeap(h) => Some(h.estimate(key)),
+            Self::Cms(c) => Some(c.inner.estimate(key)),
+            Self::CountSketch(c) => Some(c.inner.estimate(key)),
+            Self::CmsWithHeap(h) => Some(h.inner.estimate(key)),
+            Self::CountSketchWithHeap(h) => Some(h.inner.estimate(key)),
             _ => None,
         }
     }
 
-    /// Top-k `(key, value)` pairs from the heap, descending by value.
-    /// `None` for anything other than a heap-bearing state — the
-    /// heap-less Frequency states (`Cms`/`CountSketch`) carry no item
-    /// universe to enumerate, and the quantile/cardinality states have
-    /// no heap at all. `group` is the stored group the state belongs to.
+    /// Heap `(key, value)` pairs, unordered; `None` for a heap-less state.
+    /// `group` is the stored group the state belongs to.
     pub fn topk_items(
         &self,
         group: &std::collections::BTreeMap<String, String>,
     ) -> Option<Vec<(String, f64)>> {
         match self {
-            SummaryState::CmsWithHeap(h) => Some(
-                h.topk_heap_items()
+            Self::CmsWithHeap(h) => Some(
+                h.inner
+                    .topk_heap_items()
                     .into_iter()
                     .map(|item| (item.key, item.value))
                     .collect(),
             ),
-            SummaryState::CountSketchWithHeap(h) => Some(
-                h.topk_heap_items()
+            Self::CountSketchWithHeap(h) => Some(
+                h.inner
+                    .topk_heap_items()
                     .into_iter()
                     .map(|item| (item.key, item.value))
                     .collect(),
             ),
-            SummaryState::WeightedFrequency(h) => Some(
+            Self::WeightedFrequency(h) => Some(
                 h.rows(usize::MAX)
                     .into_iter()
                     .filter_map(|mut row| {
@@ -587,72 +481,31 @@ impl SummaryState {
         }
     }
 
-    /// Merge `other` into `self` in place — both must be the same sketch
-    /// family. Used to combine several sids' reconstructed states
-    /// (`cumulative_summary_state`/`per_window_summary_states`) into one
-    /// cross-sid answer. `CmsWithHeap`/`CountSketchWithHeap` fall through
-    /// to the catch-all mismatch arm below like any other mixed pair —
-    /// and since the two variants now hold distinct sketchlib types
-    /// (`CountMinSketchWithHeap` vs `CountSketchWithHeap`), there is no
-    /// arm that could accidentally match them together — see their doc
-    /// on `DeltaSketchKind`.
+    /// Merge `other` into `self` with the Planner kernel's merge; both must be
+    /// the same family and shape.
     pub fn merge_same_family(&mut self, other: &SummaryState) -> Result<(), String> {
-        match (self, other) {
-            (SummaryState::UnivMon(a), SummaryState::UnivMon(b)) => {
-                a.merge_in_place(b).map_err(|e| e.to_string())
-            }
-            (SummaryState::Dd(a), SummaryState::Dd(b)) => {
-                a.merge(b).map_err(|e| format!("merge DDSketch: {e}"))
-            }
-            (SummaryState::Hll(a), SummaryState::Hll(b)) => {
-                a.merge(b).map_err(|e| format!("merge HLL: {e}"))
-            }
-            (SummaryState::Kll(a), SummaryState::Kll(b)) => {
-                a.merge(b).map_err(|e| format!("merge KLL: {e}"))
-            }
-            (SummaryState::Cms(a), SummaryState::Cms(b)) => {
-                a.merge(b).map_err(|e| format!("merge CountMinSketch: {e}"))
-            }
-            (SummaryState::CountSketch(a), SummaryState::CountSketch(b)) => {
-                a.merge(b).map_err(|e| format!("merge CountSketch: {e}"))
-            }
-            (SummaryState::CmsWithHeap(a), SummaryState::CmsWithHeap(b)) => {
-                a.merge(b).map_err(|e| format!("merge CmsWithHeap: {e}"))
-            }
-            (SummaryState::CountSketchWithHeap(a), SummaryState::CountSketchWithHeap(b)) => a
-                .merge(b)
-                .map_err(|e| format!("merge CountSketchWithHeap: {e}")),
-            (SummaryState::WeightedFrequency(a), SummaryState::WeightedFrequency(b)) => {
-                use asap_physical_operators::AggregateCore;
-                let merged = a
-                    .merge_with(b)
-                    .map_err(|e| format!("merge weighted frequency: {e}"))?;
-                *a = merged
-                    .as_any()
-                    .downcast_ref::<crate::summary_kernels::weighted_frequency::PhysicalWeightedFrequency>()
-                    .ok_or("weighted frequency merge changed state type")?
-                    .clone();
-                Ok(())
-            }
-            (a, _) => Err(format!(
-                "SummaryState family mismatch in merge_same_family (self is {})",
-                a.family_name()
-            )),
-        }
+        let merged = self
+            .kernel()
+            .merge_with(other.kernel())
+            .map_err(|e| format!("merge {} state: {e}", self.family_name()))?;
+        *self = self
+            .same_variant(merged.as_ref())
+            .ok_or("Planner merge changed the state family")?;
+        Ok(())
     }
 
     /// Diagnostic family name for error messages — not used for dispatch.
     fn family_name(&self) -> &'static str {
         match self {
-            SummaryState::UnivMon(_) => "UnivMon",
-            SummaryState::Dd(_) => "DDSketch",
-            SummaryState::Hll(_) => "Hll",
-            SummaryState::Kll(_) => "Kll",
-            SummaryState::Cms(_) => "Cms",
-            SummaryState::CountSketch(_) => "CountSketch",
-            SummaryState::CmsWithHeap(_) => "CmsWithHeap",
-            SummaryState::CountSketchWithHeap(_) => "CountSketchWithHeap",
-            SummaryState::WeightedFrequency(_) => "WeightedFrequency",
+            Self::UnivMon(_) => "UnivMon",
+            Self::Dd(_) => "DDSketch",
+            Self::Hll(_) => "Hll",
+            Self::Kll(_) => "Kll",
+            Self::Cms(_) => "Cms",
+            Self::CountSketch(_) => "CountSketch",
+            Self::CmsWithHeap(_) => "CmsWithHeap",
+            Self::CountSketchWithHeap(_) => "CountSketchWithHeap",
+            Self::WeightedFrequency(_) => "WeightedFrequency",
         }
     }
 }
@@ -817,51 +670,6 @@ fn visit_window_summary_states(
     Ok(skipped)
 }
 
-// ---------------------------------------------------------------------------
-// Proto-envelope decoders — P2-4: ONE decoder per family.
-//
-// These delegate to the precompute-side accumulators'
-// `from_sketchlib_proto_bytes`, which are the single source of truth for
-// the modified-OTLP proto wire format (envelope unwrapping, alpha/k/
-// precision validation, and — critically for HLL — SPARSE
-// `registers_sparse` expansion). Folding the warm read path onto the
-// same decoder the ingest path uses means the sparse-register fix (and
-// any future format change) can never drift between the two copies again
-// — the bug class P2-3 / P2-4 closed. We extract the accumulator's
-// public `inner` sketch for the rolling-state merge.
-// ---------------------------------------------------------------------------
-
-fn dd_from_proto(buffer: &[u8]) -> Result<DdSketch, String> {
-    use crate::summary_kernels::dd_sketch::DDSketchAccumulator;
-    DDSketchAccumulator::from_sketchlib_proto_bytes(buffer)
-        .map(|acc| acc.inner)
-        .map_err(|e| e.to_string())
-}
-
-fn kll_from_proto(buffer: &[u8]) -> Result<KllSketch, String> {
-    use crate::summary_kernels::datasketches_kll::DatasketchesKLLAccumulator;
-    DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(buffer)
-        .map(|acc| acc.inner)
-        .map_err(|e| e.to_string())
-}
-
-fn hll_from_proto(buffer: &[u8]) -> Result<HllSketch, String> {
-    use crate::summary_kernels::hll_sketch::HllSketchAccumulator;
-    HllSketchAccumulator::from_sketchlib_proto_bytes(buffer)
-        .map(|acc| acc.inner)
-        .map_err(|e| e.to_string())
-}
-
-/// Apply a proto-encoded `HllDelta` frame onto the HLL register vector — the
-/// delta is a varint-packed (index_delta, value) blob; decode + apply
-/// (register-wise max) via the shared sketch library so the unpacking stays a
-/// single source of truth.
-fn apply_hll_proto_delta(sk: &mut HllSketch, buffer: &[u8]) -> Result<(), String> {
-    sk.apply_delta_bytes(buffer)
-        .map_err(|e| format!("apply HLLDelta: {e}"))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     //! P2-3 / P2-4 regression tests for the consolidated single-decoder
@@ -876,21 +684,18 @@ mod tests {
     // with another window, and ranks items under their series keys.
     #[test]
     fn weighted_frequency_frames_rank_items_by_series_key() {
-        use crate::summary_kernels::weighted_frequency::{
-            FrequencyAlgorithm, PhysicalWeightedFrequency, WeightedFrequency,
-        };
-        use crate::SerializableToSink;
         use asap_physical_operators::values::Value;
         let frame = |weight| {
-            let mut state =
-                PhysicalWeightedFrequency::new(FrequencyAlgorithm::Cms, 64, 3, 8).unwrap();
+            let mut state = WeightedFrequency::new(FrequencyAlgorithm::Cms, 64, 3, 8).unwrap();
             let identity = r#"{"__name__":"m","endpoint":"a\"b"}"#;
             state
                 .update(&[Value::Utf8(identity.into())], weight)
                 .unwrap();
             state.update(&[Value::Utf8("plain".into())], 1.0).unwrap();
             SketchSampleState {
-                bytes: WeightedFrequency(state).serialize_to_bytes(),
+                bytes: crate::stored_state::codec::frequency_kernel(&state)
+                    .unwrap()
+                    .to_bytes(),
                 encoding: SketchEncoding::WeightedFrequencyV1,
             }
         };
@@ -930,11 +735,8 @@ mod tests {
     // restores non-empty ones from the stored group and keeps identity values.
     #[test]
     fn weighted_frequency_items_restore_group_labels() {
-        use crate::summary_kernels::weighted_frequency::{
-            FrequencyAlgorithm, PhysicalWeightedFrequency,
-        };
         use asap_physical_operators::values::Value;
-        let mut state = PhysicalWeightedFrequency::new(FrequencyAlgorithm::Cms, 64, 3, 8).unwrap();
+        let mut state = WeightedFrequency::new(FrequencyAlgorithm::Cms, 64, 3, 8).unwrap();
         let identity = r#"{"__name__":"m","endpoint":"a"}"#;
         state.update(&[Value::Utf8(identity.into())], 2.0).unwrap();
         let state = SummaryState::WeightedFrequency(state);
@@ -968,44 +770,6 @@ mod tests {
         };
         SketchEnvelope {
             sketch_state: Some(sketch_envelope::SketchState::Ddsketch(state)),
-            ..Default::default()
-        }
-        .encode_to_vec()
-    }
-
-    fn encode_kll(k: u16, items: &[f64]) -> Vec<u8> {
-        use asap_sketchlib::proto::sketchlib::{sketch_envelope, KllState, SketchEnvelope};
-        use prost::Message;
-        let state = KllState {
-            k: k as u32,
-            items: items.to_vec(),
-            levels: vec![],
-            num_levels: 0,
-            ..Default::default()
-        };
-        SketchEnvelope {
-            sketch_state: Some(sketch_envelope::SketchState::Kll(state)),
-            ..Default::default()
-        }
-        .encode_to_vec()
-    }
-
-    fn encode_hll_dense(sk: &HllSketch) -> Vec<u8> {
-        use asap_sketchlib::proto::sketchlib::{
-            sketch_envelope, HllVariant as ProtoVariant, HyperLogLogState, SketchEnvelope,
-        };
-        use prost::Message;
-        let state = HyperLogLogState {
-            variant: ProtoVariant::Regular as i32,
-            precision: sk.precision,
-            registers: sk.registers.clone(),
-            hip_kxq0: sk.hip_kxq0,
-            hip_kxq1: sk.hip_kxq1,
-            hip_est: sk.hip_est,
-            registers_sparse: None,
-        };
-        SketchEnvelope {
-            sketch_state: Some(sketch_envelope::SketchState::Hll(state)),
             ..Default::default()
         }
         .encode_to_vec()
@@ -1073,7 +837,7 @@ mod tests {
         let precision = 12u32;
         let nonzero = [(3u64, 5u8), (100, 2), (4000, 7)];
         let bytes = encode_hll_sparse(precision, &nonzero);
-        let sk = hll_from_proto(&bytes).expect("sparse HLL frame must decode (P2-3 regression)");
+        let sk = d::hll_from_proto(&bytes).expect("sparse HLL frame must decode (P2-3 regression)");
         assert_eq!(sk.registers.len(), 1usize << precision);
         for (idx, val) in nonzero {
             assert_eq!(
@@ -1081,56 +845,6 @@ mod tests {
                 "sparse register {idx} expanded to wrong value"
             );
         }
-    }
-
-    #[test]
-    fn hll_from_proto_matches_accumulator_decoder() {
-        // P2-4: the warm read path and the ingest accumulator must decode
-        // the SAME bytes to the SAME sketch (one source of truth).
-        use crate::summary_kernels::hll_sketch::HllSketchAccumulator;
-        let mut sk = HllSketch::new(HllVariant::Regular, 12);
-        for i in 0..500u64 {
-            sk.update(format!("item-{i}").as_bytes());
-        }
-        let bytes = encode_hll_dense(&sk);
-        let via_delta = hll_from_proto(&bytes).expect("delta_apply hll decode");
-        let via_acc = HllSketchAccumulator::from_sketchlib_proto_bytes(&bytes)
-            .expect("accumulator hll decode")
-            .inner;
-        assert_eq!(
-            via_delta.registers, via_acc.registers,
-            "delta_apply and accumulator must produce identical HLL registers"
-        );
-        assert!((via_delta.estimate() - via_acc.estimate()).abs() < 1e-9);
-    }
-
-    #[test]
-    fn dd_from_proto_matches_accumulator_decoder() {
-        use crate::summary_kernels::dd_sketch::DDSketchAccumulator;
-        let mut sk = DdSketch::new(0.01);
-        for v in [1.0, 2.0, 5.0, 5.0, 9.0, 42.0] {
-            sk.update(v);
-        }
-        let bytes = encode_dd(&sk);
-        let via_delta = dd_from_proto(&bytes).expect("delta_apply dd decode");
-        let via_acc = DDSketchAccumulator::from_sketchlib_proto_bytes(&bytes)
-            .expect("accumulator dd decode")
-            .inner;
-        // Same quantile answers from the same bytes through both paths.
-        assert_eq!(via_delta.quantile(0.5), via_acc.quantile(0.5));
-        assert_eq!(via_delta.quantile(0.99), via_acc.quantile(0.99));
-    }
-
-    #[test]
-    fn kll_from_proto_matches_accumulator_decoder() {
-        use crate::summary_kernels::datasketches_kll::DatasketchesKLLAccumulator;
-        let items: Vec<f64> = (0..200).map(|i| i as f64).collect();
-        let bytes = encode_kll(256, &items);
-        let via_delta = kll_from_proto(&bytes).expect("delta_apply kll decode");
-        let via_acc = DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&bytes)
-            .expect("accumulator kll decode")
-            .inner;
-        assert_eq!(via_delta.quantile(0.5), via_acc.quantile(0.5));
     }
 
     // -----------------------------------------------------------------
@@ -1166,6 +880,29 @@ mod tests {
         sk
     }
 
+    // A sampled DDSketch envelope on the delta channel is rejected rather
+    // than read as an empty bucket delta.
+    #[test]
+    fn sampled_ddsketch_envelope_on_delta_channel_is_rejected() {
+        use asap_sketchlib::proto::sketchlib::{sketch_envelope, SketchEnvelope};
+        use prost::Message;
+        let sketch = dd_over(0.01, &[1., 2.]);
+        let state = asap_sketch_codec::ddsketch_state(&encode_dd(&sketch))
+            .unwrap()
+            .0;
+        let sampled = SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::Ddsketch(state)),
+            sample_p: 0.5,
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let mut rolling = DeltaSketchKind::DDSketch { alpha: 0.01 }.bootstrap_empty();
+        assert!(rolling
+            .apply_delta_bytes(&sampled, SketchEncoding::ProtoDelta)
+            .unwrap_err()
+            .contains("edge-sampled"));
+    }
+
     /// A full re-snapshot replaces its pane's earlier frames; cumulative
     /// readout must merge the finalized panes without counting updates twice.
     #[test]
@@ -1180,7 +917,7 @@ mod tests {
         let SummaryState::Dd(state) = state else {
             panic!("expected DDSketch state");
         };
-        assert_eq!(state.store_counts.iter().sum::<u64>(), 4);
+        assert_eq!(state.inner.store_counts.iter().sum::<u64>(), 4);
     }
 
     /// PWR across 3 windows: window 1 is `[Full]`, windows 2 & 3 are
@@ -1346,23 +1083,16 @@ mod tests {
         let mut cs_heap = CountSketchWithHeap::new(4, 256, 10);
         cs_heap.update("b", 1.0);
 
-        let mut a = SummaryState::CmsWithHeap(
+        let mut a = cms_heap_state(
             CountMinSketchWithHeap::from_msgpack(&cms_heap.to_msgpack().unwrap()).unwrap(),
         );
-        let b = SummaryState::CountSketchWithHeap(
+        let b = cs_heap_state(
             CountSketchWithHeap::from_msgpack(&cs_heap.to_msgpack().unwrap()).unwrap(),
         );
-
-        match a.merge_same_family(&b) {
-            Err(msg) => assert!(
-                msg.contains("family mismatch"),
-                "expected a family-mismatch error, got: {msg}"
-            ),
-            Ok(()) => panic!(
-                "CmsWithHeap must not merge with CountSketchWithHeap -- \
-                 different algorithms sharing only a storage shape"
-            ),
-        }
+        assert!(
+            a.merge_same_family(&b).is_err(),
+            "CmsWithHeap must not merge with CountSketchWithHeap"
+        );
     }
 
     fn encode_delta_heap(
@@ -1419,8 +1149,8 @@ mod tests {
         .expect("decode_full CountSketchWithHeap");
         match full_state {
             SummaryState::CountSketchWithHeap(inner) => {
-                assert_eq!(inner.sketch_matrix(), expected_matrix);
-                assert_eq!(inner.estimate("k"), expected_estimate);
+                assert_eq!(inner.inner.sketch_matrix(), expected_matrix);
+                assert_eq!(inner.inner.estimate("k"), expected_estimate);
             }
             other => panic!(
                 "expected CountSketchWithHeap state, got {}",
@@ -1465,11 +1195,11 @@ mod tests {
         match rolling {
             SummaryState::CountSketchWithHeap(inner) => {
                 assert_eq!(
-                    inner.sketch_matrix(),
+                    inner.inner.sketch_matrix(),
                     expected_matrix,
                     "delta path must reconstruct the identical matrix"
                 );
-                assert_eq!(inner.estimate("k"), expected_estimate);
+                assert_eq!(inner.inner.estimate("k"), expected_estimate);
             }
             other => panic!(
                 "expected CountSketchWithHeap state, got {}",

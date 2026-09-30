@@ -325,7 +325,7 @@ mod tests {
     use super::*;
     use crate::storage_engines::sketch_db::index::{AggKind, SeriesLookup};
     use crate::storage_engines::types::{InstalledPrecomputePlan, KeyByLabelValues};
-    use asap_summary_state::summary_kernels::{DDSketchAccumulator, SumAccumulator};
+    use asap_physical_operators::summary_kernels::DDSketchAccumulator;
     use asap_types::aggregation_config::PrecomputeMaterialization;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
@@ -428,7 +428,8 @@ mod tests {
         let key = KeyByLabelValues::new_with_labels(vec!["z0".to_string()]);
         let output =
             PrecomputedOutput::new(1000, 2000, Some(key), asap_types::PolicyFingerprint(agg_id));
-        let acc: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(42.0));
+        let acc: Box<dyn AggregateCore> =
+            Box::new(crate::tests::accumulator_fixture::sum_state(42.0));
 
         sink.emit_batch(vec![(output, acc)]).expect("emit ok");
 
@@ -495,12 +496,18 @@ mod tests {
             output.catalog_generation = Some(Arc::clone(&original_generation));
             output
         };
-        sink.emit_batch(vec![(output(), Box::new(SumAccumulator::with_sum(7.0)))])
-            .unwrap();
+        sink.emit_batch(vec![(
+            output(),
+            Box::new(crate::tests::accumulator_fixture::sum_state(7.0)),
+        )])
+        .unwrap();
         let old_sid = store.series_ids_for_policy(fingerprint)[0];
         store.remove_instance(old_sid).unwrap();
         assert!(sink
-            .emit_batch(vec![(output(), Box::new(SumAccumulator::with_sum(11.0)))])
+            .emit_batch(vec![(
+                output(),
+                Box::new(crate::tests::accumulator_fixture::sum_state(11.0))
+            )])
             .is_err());
         let mut stale_output = output();
         stale_output.storage_handle = Some(old_sid);
@@ -512,33 +519,36 @@ mod tests {
         assert!(sink
             .emit_batch(vec![(
                 stale_output.clone(),
-                Box::new(SumAccumulator::with_sum(99.0))
+                Box::new(crate::tests::accumulator_fixture::sum_state(99.0))
             )])
             .is_err());
         let mut next_output = output();
         next_output.catalog_generation = Some(next_generation);
         sink.emit_batch(vec![(
             next_output,
-            Box::new(SumAccumulator::with_sum(11.0)),
+            Box::new(crate::tests::accumulator_fixture::sum_state(11.0)),
         )])
         .unwrap();
         assert!(sink
             .emit_batch(vec![(
                 stale_output,
-                Box::new(SumAccumulator::with_sum(99.0))
+                Box::new(crate::tests::accumulator_fixture::sum_state(99.0))
             )])
             .is_err());
         let new_sid = store.series_ids_for_policy(fingerprint)[0];
         // A derived/unbound stale output must not reuse an already rotated cache hit.
         assert!(sink
-            .emit_batch(vec![(output(), Box::new(SumAccumulator::with_sum(101.0)))])
+            .emit_batch(vec![(
+                output(),
+                Box::new(crate::tests::accumulator_fixture::sum_state(101.0))
+            )])
             .is_err());
         let mut stale_routed_output = output();
         stale_routed_output.storage_handle = Some(new_sid);
         assert!(sink
             .emit_batch(vec![(
                 stale_routed_output,
-                Box::new(SumAccumulator::with_sum(103.0))
+                Box::new(crate::tests::accumulator_fixture::sum_state(103.0))
             )])
             .is_err());
         let mut missing_generation = PrecomputedOutput::new(1000, 2000, None, fingerprint);
@@ -546,14 +556,16 @@ mod tests {
         assert!(sink
             .emit_batch(vec![(
                 missing_generation,
-                Box::new(SumAccumulator::with_sum(107.0))
+                Box::new(crate::tests::accumulator_fixture::sum_state(107.0))
             )])
             .is_err());
         assert_ne!(old_sid, new_sid);
         assert!(store.query_exact_agg_range(old_sid, 1000, 2000).is_empty());
         let values = store.query_exact_agg_range(new_sid, 1000, 2000);
         assert_eq!(
-            values[0].1.values().next().unwrap().aux_stats().sum,
+            Some(crate::tests::accumulator_fixture::sum_of(
+                values[0].1.values().next().unwrap().as_ref()
+            )),
             Some(11.0)
         );
     }
@@ -620,7 +632,8 @@ mod tests {
         );
 
         let output = PrecomputedOutput::new(1000, 2000, None, asap_types::PolicyFingerprint(99));
-        let acc: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(1.0));
+        let acc: Box<dyn AggregateCore> =
+            Box::new(crate::tests::accumulator_fixture::sum_state(1.0));
         sink.emit_batch(vec![(output, acc)])
             .expect_err("unpersisted output must not be acknowledged");
         assert_eq!(summary_store.instance_count(), 0);
@@ -644,7 +657,8 @@ mod tests {
 
         // policy_fp=42 is absent from the empty registry → registry miss.
         let output = PrecomputedOutput::new(1000, 2000, None, asap_types::PolicyFingerprint(42));
-        let acc: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(1.0));
+        let acc: Box<dyn AggregateCore> =
+            Box::new(crate::tests::accumulator_fixture::sum_state(1.0));
         sink.emit_batch(vec![(output, acc)])
             .expect_err("unpersisted output must not be acknowledged");
 
@@ -663,7 +677,8 @@ mod tests {
         // The UNSET sentinel is an expected raw-mode skip, NOT a policy
         // miss — it must not bump the counter.
         let unset = PrecomputedOutput::new(1000, 2000, None, asap_types::PolicyFingerprint::UNSET);
-        let acc2: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(1.0));
+        let acc2: Box<dyn AggregateCore> =
+            Box::new(crate::tests::accumulator_fixture::sum_state(1.0));
         sink.emit_batch(vec![(unset, acc2)])
             .expect_err("unpersisted output must not be acknowledged");
         assert_eq!(

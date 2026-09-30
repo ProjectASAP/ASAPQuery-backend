@@ -1,17 +1,19 @@
 //! Versioned physical output batches. Deployment identities and coverage remain
 //! outside this payload and must be checked before decoding with the bound schema.
-use crate::summary_kernels::{
-    datasketches_kll::DatasketchesKLLAccumulator, dd_sketch::DDSketchAccumulator,
-    exact::ExactAccumulator, hll_sketch::HllSketchAccumulator, SumAccumulator,
-};
+use super::codec::{self, StoredState};
+use crate::AggregationType;
 use asap_physical_operators::{
     summary_kernels as physical,
     values::{Batch, Schema, Value},
-    AggregateCore, Error,
+    AggregateCore, Error, KernelError,
 };
 use planner_types::post_asap::{SummaryFamilyType, SummarySchema};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// Stored type tag of a published native output snapshot.
+pub const NATIVE_OUTPUT_TYPE: &str = "NativePhysicalOutputV1";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,7 +39,7 @@ enum Cell {
 enum StateCodec {
     WeightedFrequencyV1,
     ExactAccumulatorV1,
-    /// Read-only: decodes to Planner's exact Sum state.
+    /// Retired: kept only so old batches fail with a named rejection.
     SumAccumulatorV1,
     KllMsgpackV1,
     DdMsgpackV1,
@@ -46,25 +48,14 @@ enum StateCodec {
 fn invalid(message: impl ToString) -> Error {
     Error::Invalid(message.to_string())
 }
-type Kernel = asap_sketchlib::WeightedFrequency;
 impl StateCodec {
     fn encode(state: &dyn AggregateCore) -> Result<(Self, Vec<u8>), Error> {
         let any = state.as_any();
-        if let Some(state) = any.downcast_ref::<physical::weighted_frequency::WeightedFrequency>() {
-            return Ok((
-                Self::WeightedFrequencyV1,
-                crate::physical::frequency_kernel(state)
-                    .map_err(invalid)?
-                    .to_bytes(),
-            ));
-        }
-        if let Some(state) = any.downcast_ref::<physical::exact::ExactAccumulator>() {
-            return Ok((
-                Self::ExactAccumulatorV1,
-                rmp_serde::to_vec_named(state).map_err(invalid)?,
-            ));
-        }
-        let codec = if any.is::<physical::DatasketchesKLLAccumulator>() {
+        let codec = if any.is::<physical::weighted_frequency::WeightedFrequency>() {
+            Self::WeightedFrequencyV1
+        } else if any.is::<physical::exact::ExactAccumulator>() {
+            Self::ExactAccumulatorV1
+        } else if any.is::<physical::DatasketchesKLLAccumulator>() {
             Self::KllMsgpackV1
         } else if any.is::<physical::DDSketchAccumulator>() {
             Self::DdMsgpackV1
@@ -73,35 +64,132 @@ impl StateCodec {
         } else {
             return Err(invalid("physical summary has no persisted native codec"));
         };
-        let stored = crate::physical::from_physical(state).map_err(invalid)?;
-        Ok((codec, stored.serialize_to_bytes()))
+        Ok((codec, state.encode().map_err(invalid)?))
     }
     fn decode(&self, bytes: &[u8]) -> Result<Arc<dyn AggregateCore>, Error> {
-        let stored: Box<dyn crate::AggregateCore> = match self {
-            Self::WeightedFrequencyV1 => {
-                let kernel = Kernel::from_bytes(bytes).map_err(|e| invalid(format!("{e:?}")))?;
-                let state: physical::weighted_frequency::WeightedFrequency =
-                    rmp_serde::from_slice(&rmp_serde::to_vec(&kernel).map_err(invalid)?)
-                        .map_err(invalid)?;
-                return Ok(Arc::new(state));
-            }
-            Self::ExactAccumulatorV1 => {
-                Box::new(ExactAccumulator::deserialize_from_bytes(bytes).map_err(invalid)?)
-            }
+        let tag = match self {
+            Self::WeightedFrequencyV1 => "WeightedFrequency",
+            Self::ExactAccumulatorV1 => codec::EXACT_V1,
             Self::SumAccumulatorV1 => {
-                Box::new(SumAccumulator::deserialize_from_bytes(bytes).map_err(invalid)?)
+                return Err(invalid(
+                    "native codec SumAccumulatorV1 is retired and no longer decoded",
+                ))
             }
-            Self::KllMsgpackV1 => {
-                Box::new(DatasketchesKLLAccumulator::from_msgpack_bytes(bytes).map_err(invalid)?)
-            }
-            Self::DdMsgpackV1 => {
-                Box::new(DDSketchAccumulator::from_msgpack_bytes(bytes).map_err(invalid)?)
-            }
-            Self::HllMsgpackV1 => {
-                Box::new(HllSketchAccumulator::from_msgpack_bytes(bytes).map_err(invalid)?)
-            }
+            Self::KllMsgpackV1 => "DatasketchesKLLAccumulator",
+            Self::DdMsgpackV1 => "DDSketchAccumulator",
+            Self::HllMsgpackV1 => "HllSketchAccumulator",
         };
-        crate::physical::to_physical(stored.as_ref()).map_err(invalid)
+        codec::decode(tag, bytes).map(Arc::from).map_err(invalid)
+    }
+}
+
+/// A published native result held in the store as one opaque snapshot. It is
+/// storage, not a kernel: it never merges and is read only by decoding its
+/// batch against the installed physical DAG.
+#[derive(Clone)]
+pub struct NativeSummaryOutput {
+    batch: Batch,
+    bytes: Vec<u8>,
+    kind: AggregationType,
+}
+
+impl NativeSummaryOutput {
+    /// Validate that the batch carries one summary family and fits the budget.
+    pub fn new(batch: Batch, max_bytes: usize) -> Result<Self, String> {
+        let families = batch
+            .schema()
+            .fields
+            .iter()
+            .filter_map(|field| {
+                (!matches!(field.dtype, SummaryFamilyType::Plain(_))).then_some(&field.dtype)
+            })
+            .collect::<Vec<_>>();
+        let [family] = families.as_slice() else {
+            return Err("native stored batch requires one summary column".into());
+        };
+        use planner_types::post_asap::SketchAlgorithm;
+        let mut kind = match family {
+            SummaryFamilyType::Sketch(sketch, _) => match sketch.algorithm() {
+                SketchAlgorithm::CmsWithHeap => Some(AggregationType::CountMinSketchWithHeap),
+                SketchAlgorithm::CountSketchWithHeap => Some(AggregationType::CountSketchWithHeap),
+                _ => None,
+            },
+            SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _) => {
+                Some(AggregationType::Sum)
+            }
+            _ => None,
+        };
+        for row in batch.rows() {
+            let states = row
+                .iter()
+                .filter_map(|value| match value {
+                    Value::Summary { state, .. } => Some(state),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let [state] = states.as_slice() else {
+                return Err("native stored row requires one summary state".into());
+            };
+            codec::check_storable(state.as_ref()).map_err(|error| error.to_string())?;
+            let row_kind = state.get_accumulator_type();
+            if kind.is_some_and(|kind| kind != row_kind) {
+                return Err("native stored rows have different summary families".into());
+            }
+            kind = Some(row_kind);
+        }
+        let kind = kind.ok_or("empty native batch has no supported summary family")?;
+        let bytes = encode_batch(&batch).map_err(|error| error.to_string())?;
+        if bytes.len() > max_bytes || batch.bytes() > max_bytes {
+            return Err("native summary exceeds publication/read budget".into());
+        }
+        Ok(Self { batch, bytes, kind })
+    }
+
+    pub fn batch(&self) -> &Batch {
+        &self.batch
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub fn kind(&self) -> AggregationType {
+        self.kind
+    }
+
+    /// Every stored group label must match the batch's own group column.
+    pub fn validate_group(&self, group: &BTreeMap<String, String>) -> Result<(), String> {
+        for (key, value) in group {
+            let column = self
+                .batch
+                .schema()
+                .fields
+                .iter()
+                .position(|field| &field.name == key)
+                .ok_or("native output is missing its stored group key")?;
+            if self
+                .batch
+                .rows()
+                .iter()
+                .any(|row| !matches!(&row[column], Value::Utf8(actual) if actual.as_ref() == value))
+            {
+                return Err("native output group differs from stored address".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl AggregateCore for NativeSummaryOutput {
+    fn clone_boxed_core(&self) -> Box<dyn AggregateCore> {
+        Box::new(self.clone())
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn merge_with(&self, _: &dyn AggregateCore) -> Result<Box<dyn AggregateCore>, KernelError> {
+        Err("native output snapshots require an explicit physical merge operator".into())
+    }
+    fn approx_memory_bytes(&self) -> usize {
+        self.bytes.len() + self.batch.bytes()
     }
 }
 
@@ -385,25 +473,5 @@ mod tests {
             usize::MAX
         )
         .is_err());
-    }
-
-    // A stored Sum payload is read back as Planner's exact Sum with the same value.
-    #[test]
-    fn stored_sum_payload_decodes_as_planner_exact_sum() {
-        use crate::SerializableToSink;
-        use planner_types::post_asap::{ExactKind, ExactParams};
-        let family = SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum);
-        let state = StateCodec::SumAccumulatorV1
-            .decode(&SumAccumulator::with_sum(5.5).serialize_to_bytes())
-            .unwrap();
-        let exact = state
-            .as_any()
-            .downcast_ref::<physical::exact::ExactAccumulator>()
-            .unwrap();
-        assert_eq!(exact.family(), &family);
-        assert_eq!(
-            exact.readout(crate::Statistic::Sum, None, None).unwrap(),
-            Some(5.5)
-        );
     }
 }

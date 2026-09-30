@@ -5,6 +5,7 @@
 //! summary. Completion is an admission barrier, not merely an emitted flag.
 use super::*;
 use crate::storage_engines::types::AggregateCore;
+use asap_summary_state::StoredState;
 
 pub(crate) struct FrozenExactWindows {
     pub(crate) stored_output_reference: asap_types::sds::StoredOutputReference,
@@ -283,7 +284,7 @@ impl SketchStore {
             expected_windows,
             group,
             |name, _, bytes| {
-                reconstruct_exact_agg(name, bytes)
+                reconstruct_exact_agg(name, bytes)?
                     .ok_or_else(|| "immutable input accumulator cannot be decoded".to_string())
             },
         )
@@ -797,8 +798,6 @@ impl SketchStore {
 mod tests {
     use super::*;
     use crate::storage_engines::types::PrecomputedOutput;
-    use asap_summary_state::summary_kernels::SumAccumulator;
-    use asap_types::traits::SerializableToSink;
 
     #[test]
     fn complete_population_keeps_every_sid_and_rejects_missing_live_binding() {
@@ -855,8 +854,8 @@ mod tests {
             let mut output = PrecomputedOutput::new(0, 1000, None, config.policy_fingerprint());
             output.catalog_generation = Some(Arc::clone(&generation));
             output.population_labels = Some(population);
-            let mut sum = SumAccumulator::new();
-            sum.update(5.0 + index as f64);
+            let mut sum = crate::tests::accumulator_fixture::sum_state(0.0);
+            sum.update(None, 5.0 + index as f64, 0);
             let sid = 900 + index as u64;
             store
                 .publish_admitted_summary_update(
@@ -970,8 +969,8 @@ mod tests {
                 .unwrap();
             let mut output = PrecomputedOutput::new(0, 1000, None, config.policy_fingerprint());
             output.catalog_generation = Some(Arc::clone(&generation));
-            let mut sum = SumAccumulator::new();
-            sum.update(5.0 + index as f64);
+            let mut sum = crate::tests::accumulator_fixture::sum_state(0.0);
+            sum.update(None, 5.0 + index as f64, 0);
             let sid = 900 + index as u64;
             store
                 .publish_admitted_summary_update(
@@ -1006,8 +1005,8 @@ mod tests {
         let mut extra_window =
             PrecomputedOutput::new(1000, 2000, None, configs[0].policy_fingerprint());
         extra_window.catalog_generation = Some(Arc::clone(&generation));
-        let mut extra_sum = SumAccumulator::new();
-        extra_sum.update(99.0);
+        let mut extra_sum = crate::tests::accumulator_fixture::sum_state(0.0);
+        extra_sum.update(None, 99.0, 0);
         store
             .publish_admitted_summary_update(
                 &generation,
@@ -1053,8 +1052,8 @@ mod tests {
         let target = &configs[2];
         let mut output = PrecomputedOutput::new(0, 1000, None, target.policy_fingerprint());
         output.catalog_generation = Some(Arc::clone(&generation));
-        let mut sum = SumAccumulator::new();
-        sum.update(11.0);
+        let mut sum = crate::tests::accumulator_fixture::sum_state(0.0);
+        sum.update(None, 11.0, 0);
         assert!(store
             .publish_complete_raw_maintenance_output(
                 902, target, &output, &sum, &complete, [42; 32]
@@ -1196,8 +1195,8 @@ mod tests {
             let mut output = PrecomputedOutput::new(0, 60_000, None, source.policy_fingerprint());
             output.population_labels = Some(population);
             output.catalog_generation = Some(Arc::clone(&generation));
-            let mut sum = SumAccumulator::new();
-            sum.update(value);
+            let mut sum = crate::tests::accumulator_fixture::sum_state(0.0);
+            sum.update(None, value, 0);
             store
                 .publish_admitted_summary_update(
                     &generation,
@@ -1305,7 +1304,7 @@ mod tests {
         );
         let assert_complete_output = |store: &SketchStore| {
             use crate::storage_engines::sketch_db::data::SketchEncoding;
-            use asap_summary_state::summary_kernels::DDSketchAccumulator;
+            use asap_physical_operators::summary_kernels::DDSketchAccumulator;
             let rows = store.query_range(target_sid, 0, 60_000);
             assert_eq!(rows.len(), 1);
             assert!(rows[0].series_label_values.is_empty());
@@ -1313,12 +1312,18 @@ mod tests {
             let frames = &rows[0].samples[&60_000];
             assert_eq!(frames.len(), 1);
             let sketch = match frames[0].encoding {
-                SketchEncoding::MsgpackFull => {
-                    DDSketchAccumulator::from_msgpack_bytes(&frames[0].bytes).unwrap()
-                }
-                SketchEncoding::ProtoFull => {
-                    DDSketchAccumulator::from_sketchlib_proto_bytes(&frames[0].bytes).unwrap()
-                }
+                SketchEncoding::MsgpackFull => DDSketchAccumulator {
+                    inner: asap_summary_state::stored_state::decoders::ddsketch_from_msgpack(
+                        &frames[0].bytes,
+                    )
+                    .unwrap(),
+                },
+                SketchEncoding::ProtoFull => DDSketchAccumulator {
+                    inner: asap_summary_state::stored_state::decoders::ddsketch_from_proto(
+                        &frames[0].bytes,
+                    )
+                    .unwrap(),
+                },
                 other => panic!("unexpected derived encoding: {other:?}"),
             };
             assert_eq!(sketch.inner.total_count(), 2);
@@ -1395,8 +1400,8 @@ mod tests {
         let mut output = PrecomputedOutput::new(0, 60_000, None, source.policy_fingerprint());
         output.population_labels = Some(population.clone());
         output.catalog_generation = Some(Arc::clone(&next_generation));
-        let mut sum = SumAccumulator::new();
-        sum.update(9.0);
+        let mut sum = crate::tests::accumulator_fixture::sum_state(0.0);
+        sum.update(None, 9.0, 0);
         restarted
             .publish_admitted_summary_update(
                 &next_generation,
@@ -1513,7 +1518,7 @@ mod tests {
         let record = store
             .metadata_record(&store.instances.read().unwrap()[&601])
             .unwrap();
-        let state = SumAccumulator::new();
+        let state = crate::tests::accumulator_fixture::sum_state(0.0);
         let snapshot = persistence::source::EpochSnapshot {
             agg_id: 601,
             epoch_id: 0,
@@ -1524,9 +1529,9 @@ mod tests {
                 start_ts: 0,
                 end_ts: 1000,
                 label: None,
-                sketch_type_name: state.type_name().into(),
+                sketch_type_name: StoredState::type_name(&state as &dyn AggregateCore).into(),
                 encoding_tag: 0,
-                sketch_bytes: state.serialize_to_bytes(),
+                sketch_bytes: StoredState::serialize_to_bytes(&state as &dyn AggregateCore),
             }],
         };
         persistence
@@ -1563,7 +1568,7 @@ mod tests {
             601,
             BTreeMap::new(),
             (2000, 3000),
-            Box::new(SumAccumulator::new())
+            Box::new(crate::tests::accumulator_fixture::sum_state(0.0))
         ));
         assert!(!store.append_sample(
             601,

@@ -1,7 +1,7 @@
 use super::*;
-use asap_summary_state::summary_kernels::univmon::UnivMonAccumulator;
+use asap_summary_state::univmon::UnivMonAccumulator;
 use control_plane::physical::erp::ErpShapeObserver;
-use data_plane::storage_engines::types::{AggregateCore, SerializableToSink};
+use data_plane::storage_engines::types::AggregateCore;
 
 fn values(offset: usize) -> Vec<f64> {
     (1..=128)
@@ -48,18 +48,16 @@ fn measured_artifact() -> Value {
             }
             let other = panes[1].clone();
             panes[0].merge_in_place(&other).unwrap();
-            bytes = bytes.max(panes[0].serialize_to_bytes().len());
+            bytes = bytes.max(panes[0].to_bytes().unwrap().len());
             for (i, stat) in [
-                asap_types::Statistic::Cardinality,
-                asap_types::Statistic::FrequencyL2,
-                asap_types::Statistic::FrequencyEntropy,
+                planner_types::post_asap::SketchQuery::Cardinality,
+                planner_types::post_asap::SketchQuery::FrequencyL2,
+                planner_types::post_asap::SketchQuery::FrequencyEntropy,
             ]
             .into_iter()
             .enumerate()
             {
-                let estimate = panes[0]
-                    .query_statistic(stat, &None, &Default::default())
-                    .unwrap();
+                let estimate = panes[0].estimate(&stat).unwrap();
                 assert!(estimate.is_finite());
                 let error = (estimate - exact[i]).abs() / if i == 2 { 1.0 } else { exact[i] };
                 errors[i] = errors[i].max(error);

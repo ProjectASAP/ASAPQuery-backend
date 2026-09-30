@@ -107,8 +107,6 @@ pub fn create_window_merger(_accumulator_type: AggregationType) -> Box<dyn Windo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_engines::types::{KeyByLabelValues, SerializableToSink};
-    use serde_json::Value;
     use std::any::Any;
 
     /// Mock accumulator for testing - simply sums values
@@ -123,30 +121,12 @@ mod tests {
         }
     }
 
-    impl SerializableToSink for MockSumAccumulator {
-        fn serialize_to_json(&self) -> Value {
-            serde_json::json!({"value": self.value})
-        }
-
-        fn serialize_to_bytes(&self) -> Vec<u8> {
-            self.value.to_le_bytes().to_vec()
-        }
-    }
-
     impl AggregateCore for MockSumAccumulator {
         fn clone_boxed_core(&self) -> Box<dyn AggregateCore> {
             Box::new(self.clone())
         }
 
-        fn type_name(&self) -> &'static str {
-            "MockSumAccumulator"
-        }
-
         fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
             self
         }
 
@@ -161,23 +141,6 @@ mod tests {
             } else {
                 Err("Cannot merge with different accumulator type".into())
             }
-        }
-
-        fn get_accumulator_type(&self) -> AggregationType {
-            AggregationType::Sum
-        }
-
-        fn get_keys(&self) -> Option<Vec<KeyByLabelValues>> {
-            None
-        }
-
-        fn query_statistic(
-            &self,
-            _statistic: asap_types::Statistic,
-            _key: &Option<KeyByLabelValues>,
-            _query_kwargs: &std::collections::HashMap<String, String>,
-        ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-            Err("MockSumAccumulator does not support query_statistic".into())
         }
     }
 

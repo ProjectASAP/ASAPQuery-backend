@@ -19,6 +19,7 @@
 //! See design doc §4.6 ("OTLP metadata model + backend store layout") at
 //! `docs/design_docs/series-identity.md`.
 
+use asap_summary_state::StoredState;
 use asap_types::sds::StoredOutputReference;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -83,57 +84,44 @@ fn tag_to_encoding(tag: u8) -> SketchEncoding {
 }
 
 /// Reconstruct an exact-aggregation accumulator from its on-disk
-/// `(type_name, bytes)` pair so the durable tier can serve the
-/// exact-agg query path (`query_exact_agg_range` / `sum by (...)`) after
-/// flush+evict. Covers the deterministic scalar accumulators the live
-/// marquee `sum by (zone)` path uses; the sketch-backed accumulator forms
-/// (DDSketch/KLL/HLL/CountSketch — registered as `AggKind::Sketch`) are
-/// served as opaque bytes via [`SketchStore::query_range`] and are NOT
-/// reconstructed here. Returns `None` for an unrecognized `type_name`
-/// (the caller skips the disk entry rather than fabricating a wrong
-/// payload) — see the remaining-follow-up note in the PR.
+/// `(type_name, bytes)` pair so the durable tier can serve the exact-agg query
+/// path after flush+evict. `Ok(None)` for entries that are not exact state
+/// (sketch-backed forms are served as opaque bytes via
+/// [`SketchStore::query_range`]); an error names an unreadable or retired
+/// exact format instead of misreading it.
 fn reconstruct_exact_agg(
     type_name: &str,
     bytes: &[u8],
-) -> Option<Box<dyn crate::storage_engines::types::AggregateCore>> {
-    use crate::storage_engines::types::AggregateCore;
-    use asap_summary_state::summary_kernels::{
-        IncreaseAccumulator, KeyedCounterState, KeyedSumCountAccumulator, MaxAccumulator,
-        MinAccumulator, SumAccumulator,
-    };
-    match type_name {
-        "PlannerExactAccumulatorV1" => {
-            asap_summary_state::summary_kernels::exact::ExactAccumulator::deserialize_from_bytes(
-                bytes,
-            )
-            .ok()
-            .map(|a| Box::new(a) as Box<dyn AggregateCore>)
-        }
-        "SumAccumulator" => SumAccumulator::deserialize_from_bytes(bytes)
-            .ok()
-            .map(|a| Box::new(a) as Box<dyn AggregateCore>),
-        "IncreaseAccumulator" => IncreaseAccumulator::deserialize_from_bytes(bytes)
-            .ok()
-            .map(|a| Box::new(a) as Box<dyn AggregateCore>),
-        "MinAccumulator" => MinAccumulator::deserialize_from_bytes(bytes)
-            .ok()
-            .map(|a| Box::new(a) as Box<dyn AggregateCore>),
-        "MaxAccumulator" => MaxAccumulator::deserialize_from_bytes(bytes)
-            .ok()
-            .map(|a| Box::new(a) as Box<dyn AggregateCore>),
-        "KeyedSumCountAccumulator" => KeyedSumCountAccumulator::deserialize_from_bytes(bytes)
-            .ok()
-            .map(|a| Box::new(a) as Box<dyn AggregateCore>),
-        "KeyedCounterState" => KeyedCounterState::deserialize_from_bytes(bytes)
-            .ok()
-            .map(|a| Box::new(a) as Box<dyn AggregateCore>),
-        // The keyed `MultipleMin`/`MultipleMax` forms and the
-        // sketch-backed accumulators have no generic byte factory — left
-        // to the deferred exact-agg/sketch precompute read-back work (see
-        // PR follow-up note). They are still served from memory; only the
-        // evicted-to-disk portion is skipped for these types.
-        _ => None,
+) -> Result<Option<Box<dyn crate::storage_engines::types::AggregateCore>>, String> {
+    use asap_summary_state::stored_state::codec;
+    if type_name != codec::EXACT_V1 && !codec::is_retired_exact(type_name) {
+        return Ok(None);
     }
+    codec::decode(type_name, bytes)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+/// The rollup value of an unkeyed exact MIN/MAX pane; an empty pane has none.
+fn extremum_rollup(
+    payload: &dyn crate::storage_engines::types::AggregateCore,
+) -> Option<(RollupReduction, f64)> {
+    use asap_physical_operators::summary_kernels::exact::ExactAccumulator;
+    use planner_types::post_asap::{ExactKind, SummaryFamilyType};
+    let state = payload
+        .as_any()
+        .downcast_ref::<ExactAccumulator>()
+        .filter(|state| !state.is_keyed())?;
+    let (reduction, statistic) = match state.family() {
+        SummaryFamilyType::ExactAggregate(ExactKind::Min, _) => {
+            (RollupReduction::Min, asap_types::Statistic::Min)
+        }
+        SummaryFamilyType::ExactAggregate(ExactKind::Max, _) => {
+            (RollupReduction::Max, asap_types::Statistic::Max)
+        }
+        _ => return None,
+    };
+    Some((reduction, state.readout(statistic, None, None).ok()??))
 }
 
 /// Joint helper shared by [`SketchStore::ingest_precompute_for_agg_config`]
@@ -312,6 +300,10 @@ struct ReductionRollupSeries {
     base_width_ms: Option<u64>,
     next_start_ms: Option<u64>,
     valid: bool,
+    /// A pane that does not extend the series contiguously (a late correction,
+    /// a replacement or a gap) is not folded in, so the rollup can no longer
+    /// answer and stays invalid; readers fall back to the exact panes.
+    broken: bool,
     levels: Vec<BTreeMap<u64, ReductionRollupNode>>,
 }
 
@@ -323,6 +315,7 @@ impl ReductionRollupSeries {
             base_width_ms: None,
             next_start_ms: None,
             valid: false,
+            broken: false,
             levels: Vec::new(),
         }
     }
@@ -330,9 +323,13 @@ impl ReductionRollupSeries {
 
 impl ReductionRollupSeries {
     fn append(&mut self, window: TimestampRange, value: f64, retention_horizon_ms: Option<u64>) {
+        if self.broken {
+            return;
+        }
         let width = window.1.saturating_sub(window.0);
         if width == 0 || self.next_start_ms.is_some_and(|next| next != window.0) {
             self.valid = false;
+            self.broken = true;
             return;
         }
         let anchor = *self.anchor_start_ms.get_or_insert(window.0);
@@ -342,6 +339,7 @@ impl ReductionRollupSeries {
             || !(window.0 - anchor).is_multiple_of(base_width)
         {
             self.valid = false;
+            self.broken = true;
             return;
         }
         self.valid = true;
@@ -1706,6 +1704,12 @@ impl SketchStore {
         window: TimestampRange,
         payload: Box<dyn crate::storage_engines::types::AggregateCore>,
     ) -> bool {
+        if let Err(error) =
+            asap_summary_state::stored_state::codec::check_storable(payload.as_ref())
+        {
+            tracing::warn!(sid, %error, "rejecting summary state without a stored codec");
+            return false;
+        }
         let completed = self.completed_windows.read().unwrap();
         if completed.get(&sid).is_some_and(|end| window.1 <= *end) {
             return false;
@@ -1716,16 +1720,7 @@ impl SketchStore {
         // Both directions are their own accumulator type, so the reduction
         // follows from the payload's type rather than from a `sub_type`
         // string that had to agree with it.
-        let rollup_value = payload
-            .as_any()
-            .downcast_ref::<asap_summary_state::summary_kernels::MinAccumulator>()
-            .map(|acc| (RollupReduction::Min, acc.value))
-            .or_else(|| {
-                payload
-                    .as_any()
-                    .downcast_ref::<asap_summary_state::summary_kernels::MaxAccumulator>()
-                    .map(|acc| (RollupReduction::Max, acc.value))
-            });
+        let rollup_value = extremum_rollup(payload.as_ref());
         let store = self
             .series
             .entry(sid)
@@ -2328,9 +2323,14 @@ impl SketchStore {
                 let Ok(entry) = reader.load_entry(&rec) else {
                     continue;
                 };
-                let Some(acc) = reconstruct_exact_agg(&entry.sketch_type_name, &entry.sketch_bytes)
-                else {
-                    continue;
+                let acc = match reconstruct_exact_agg(&entry.sketch_type_name, &entry.sketch_bytes)
+                {
+                    Ok(Some(acc)) => acc,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(sid, %error, "exact-agg disk read: skipping unreadable entry");
+                        continue;
+                    }
                 };
                 let label_map = Self::rebuild_label_map(&keys, &entry.label);
                 by_label_map
@@ -2420,8 +2420,10 @@ impl SketchStore {
                     let Ok(entry) = reader.load_entry(&rec) else {
                         continue;
                     };
-                    if reconstruct_exact_agg(&entry.sketch_type_name, &entry.sketch_bytes).is_none()
-                    {
+                    if !matches!(
+                        reconstruct_exact_agg(&entry.sketch_type_name, &entry.sketch_bytes),
+                        Ok(Some(_))
+                    ) {
                         continue;
                     }
                     any = true;
@@ -3329,6 +3331,10 @@ impl SketchStore {
         output: &crate::storage_engines::types::PrecomputedOutput,
         accumulator: &dyn crate::storage_engines::types::AggregateCore,
     ) -> Option<u64> {
+        if let Err(error) = asap_summary_state::stored_state::codec::check_storable(accumulator) {
+            tracing::warn!(sid, %error, "rejecting summary state without a stored codec");
+            return None;
+        }
         let expected = agg_cfg.accumulator_spec().ok()?.family;
         if matches!(
             expected,
@@ -3883,6 +3889,19 @@ pub use crate::storage_engines::sketch_db::persistence;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A late correction to a closed pane makes the rollup stop answering
+    // instead of serving the uncorrected extremum.
+    #[test]
+    fn min_rollup_stops_answering_after_a_late_correction() {
+        let mut rollup = ReductionRollupSeries::new(RollupReduction::Min);
+        rollup.append((0, 1000), 7.0, None);
+        rollup.append((1000, 2000), 3.0, None);
+        assert_eq!(rollup.query(0, 2000), Some(3.0));
+        rollup.append((0, 1000), 1.0, None);
+        rollup.append((2000, 3000), 5.0, None);
+        assert_eq!(rollup.query(0, 3000), None);
+    }
 
     #[test]
     fn max_rollup_answers_aligned_and_partial_ranges_and_prunes_history() {
@@ -4619,10 +4638,43 @@ mod tests {
         assert_eq!(canonical_parameters(&p_ab), canonical_parameters(&p_ba));
     }
 
+    // Unkeyed Planner exact MIN panes feed the MIN rollup.
+    #[test]
+    fn planner_exact_min_panes_feed_the_min_rollup() {
+        use planner_types::post_asap::ExactKind;
+        let idx = SketchStore::new();
+        let mut min_meta = meta(43);
+        min_meta.capability = None;
+        min_meta.accuracy = None;
+        min_meta.agg_kind = AggKind::ExactAgg {
+            agg_type: AggregationType::Min,
+            parameters_canonical: String::new(),
+            spatial_filter_canonical: String::new(),
+        };
+        idx.register(min_meta);
+        for (start, value) in [(0, 7.0), (1000, 3.0)] {
+            idx.append_precompute(
+                43,
+                BTreeMap::new(),
+                (start, start + 1000),
+                Box::new(asap_summary_state::stored_state::codec::exact_value(
+                    ExactKind::Min,
+                    value,
+                )),
+            );
+        }
+        assert_eq!(
+            idx.query_rollup_range(RollupReduction::Min, 43, 0, 2000),
+            Some(vec![(BTreeMap::new(), 3.0)])
+        );
+        assert_eq!(
+            idx.query_rollup_range(RollupReduction::Max, 43, 0, 2000),
+            None
+        );
+    }
+
     #[test]
     fn precompute_payload_round_trips_through_storage() {
-        use asap_summary_state::summary_kernels::SumAccumulator;
-
         let idx = SketchStore::new();
         let cfg = SketchConfig::DDSketch {
             relative_accuracy: 0.01,
@@ -4642,7 +4694,7 @@ mod tests {
             42,
             BTreeMap::new(),
             (1000, 1010),
-            Box::new(SumAccumulator::with_sum(5.0)),
+            Box::new(crate::tests::accumulator_fixture::sum_state(5.0)),
         );
 
         // Sketch-side query_range filters out precompute payloads, so
@@ -4662,8 +4714,6 @@ mod tests {
 
     #[test]
     fn query_precomputes_by_agg_returns_data_grouped_by_label_values() {
-        use asap_summary_state::summary_kernels::SumAccumulator;
-
         let idx = SketchStore::new();
         let cfg = SketchConfig::DDSketch {
             relative_accuracy: 0.01,
@@ -4689,13 +4739,13 @@ mod tests {
             99,
             lv.clone(),
             (1000, 2000),
-            Box::new(SumAccumulator::with_sum(1.0)),
+            Box::new(crate::tests::accumulator_fixture::sum_state(1.0)),
         );
         idx.append_precompute(
             99,
             lv,
             (2000, 3000),
-            Box::new(SumAccumulator::with_sum(2.0)),
+            Box::new(crate::tests::accumulator_fixture::sum_state(2.0)),
         );
 
         let result = idx.query_precomputes_by_agg("cpu_seconds", AggregationType::Sum, 0, 10_000);
@@ -4815,9 +4865,8 @@ mod tests {
         });
         assert!(sketch.as_sketch().is_some());
         assert!(sketch.as_exact_agg().is_none());
-
-        use asap_summary_state::summary_kernels::SumAccumulator;
-        let exact_agg = AggPayload::ExactAgg(Arc::new(SumAccumulator::with_sum(1.0)));
+        let exact_agg =
+            AggPayload::ExactAgg(Arc::new(crate::tests::accumulator_fixture::sum_state(1.0)));
         assert!(exact_agg.as_sketch().is_none());
         assert!(exact_agg.as_exact_agg().is_some());
     }
@@ -5628,7 +5677,7 @@ mod tests {
             850,
             BTreeMap::new(),
             (0, 30_000),
-            Box::new(asap_summary_state::summary_kernels::SumAccumulator::new())
+            Box::new(crate::tests::accumulator_fixture::sum_state(0.0))
         ));
         // A flusher that captured metadata before completion cannot reopen it.
         writer.upsert_all(&[stale_record]).unwrap();
@@ -6096,11 +6145,7 @@ mod tests {
                     8100,
                     lv_zone("z0"),
                     (s, s + 30_000),
-                    Box::new(
-                        asap_summary_state::summary_kernels::SumAccumulator::with_sum(
-                            (i + 1) as f64,
-                        ),
-                    ),
+                    Box::new(crate::tests::accumulator_fixture::sum_state((i + 1) as f64)),
                 );
             }
             assert!(
@@ -6315,9 +6360,7 @@ mod tests {
                 8001,
                 lv_zone("z0"),
                 (s, s + 30_000),
-                Box::new(
-                    asap_summary_state::summary_kernels::SumAccumulator::with_sum((i + 1) as f64),
-                ),
+                Box::new(crate::tests::accumulator_fixture::sum_state((i + 1) as f64)),
             );
         }
         assert!(
@@ -6380,9 +6423,9 @@ mod tests {
                 lv_zone("z0"),
                 (s, s + 30_000),
                 Box::new({
-                    let mut acc = asap_summary_state::summary_kernels::SumAccumulator::new();
-                    acc.update((i + 1) as f64);
-                    acc.update(10.0);
+                    let mut acc = crate::tests::accumulator_fixture::sum_state(0.0);
+                    acc.update(None, (i + 1) as f64, 0);
+                    acc.update(None, 10.0, 0);
                     acc
                 }),
             );
@@ -6405,10 +6448,10 @@ mod tests {
             samples.contains_key(&30_000),
             "evicted exact-agg window missing from disk"
         );
-        let stats = samples[&30_000].aux_stats();
-        assert_eq!(stats.count, Some(2));
-        assert_eq!(stats.sum, Some(11.0));
-        assert_eq!(stats.sum.unwrap() / stats.count.unwrap() as f64, 5.5);
+        assert_eq!(
+            crate::tests::accumulator_fixture::sum_of(samples[&30_000].as_ref()),
+            11.0
+        );
         drop(p);
     }
 
@@ -6574,7 +6617,7 @@ mod tests {
     #[test]
     fn planner_exact_families_survive_disk_eviction_and_restart() {
         use crate::storage_engines::types::{AggregateCore, AggregationType};
-        use asap_summary_state::summary_kernels::exact::ExactAccumulator;
+        use asap_physical_operators::summary_kernels::exact::ExactAccumulator;
         let kinds = [
             AggregationType::Sum,
             AggregationType::Count,
@@ -6641,17 +6684,14 @@ mod tests {
             assert_eq!(series.len(), 1, "{kind:?}");
             let state = &series[0].1[&30000];
             assert_eq!(state.get_accumulator_type(), *kind);
+            let exact = state.as_any().downcast_ref::<ExactAccumulator>().unwrap();
             assert_eq!(
-                state
-                    .query_statistic(stats[i], &None, &HashMap::new())
-                    .unwrap(),
-                expected[i]
+                exact.readout(stats[i], None, None).unwrap(),
+                Some(expected[i])
             );
             for (j, stat) in stats.iter().enumerate() {
                 if i != j {
-                    assert!(state
-                        .query_statistic(*stat, &None, &HashMap::new())
-                        .is_err());
+                    assert!(exact.readout(*stat, None, None).is_err());
                 }
             }
         }

@@ -1,6 +1,7 @@
 //! Config fixtures for backend integration tests; production binds Planner payloads.
-use asap_summary_state::factory::*;
-use asap_summary_state::{AggregateCore, AggregationType};
+use asap_physical_operators::factory::*;
+use asap_physical_operators::summary_kernels::exact::ExactAccumulator;
+use asap_summary_state::{AggregateCore, KeyByLabelValues};
 use asap_types::{accumulator_spec::cms_params, PrecomputeMaterialization};
 use planner_types::post_asap::{ExactKind, SketchAlgorithm, SketchParams, SummaryFamilyType};
 #[cfg(test)]
@@ -109,40 +110,9 @@ pub fn create_fixture_accumulator(
     let keyed = spec.grouping.is_some();
 
     match (&spec.family, keyed) {
-        (SummaryFamilyType::ExactAggregate(ExactKind::Sum | ExactKind::Count, _), false) => {
-            Box::new(SumAccumulatorUpdater::new())
-        }
-        (SummaryFamilyType::ExactAggregate(ExactKind::Sum, _), true) => {
-            Box::new(KeyedSumCountAccumulatorUpdater::for_family(ExactKind::Sum))
-        }
-        (SummaryFamilyType::ExactAggregate(ExactKind::Count, _), true) => Box::new(
-            KeyedSumCountAccumulatorUpdater::for_family(ExactKind::Count),
-        ),
-
-        // Direction comes off the family itself now. It used to be read
-        // back out of `aggregation_sub_type` because Planner had one
-        // `MinMax` accumulator for both directions, which meant a config
-        // whose sub_type was lost or misspelled silently built the wrong
-        // extremum.
-        (SummaryFamilyType::ExactAggregate(ExactKind::Min, _), false) => {
-            Box::new(MinAccumulatorUpdater::new())
-        }
-        (SummaryFamilyType::ExactAggregate(ExactKind::Min, _), true) => {
-            Box::new(KeyedMinStateUpdater::new())
-        }
-        (SummaryFamilyType::ExactAggregate(ExactKind::Max, _), false) => {
-            Box::new(MaxAccumulatorUpdater::new())
-        }
-        (SummaryFamilyType::ExactAggregate(ExactKind::Max, _), true) => {
-            Box::new(KeyedMaxStateUpdater::new())
-        }
-
-        (SummaryFamilyType::ExactAggregate(ExactKind::Increase | ExactKind::Rate, _), false) => {
-            Box::new(IncreaseAccumulatorUpdater::new())
-        }
-        (SummaryFamilyType::ExactAggregate(ExactKind::Increase | ExactKind::Rate, _), true) => {
-            Box::new(KeyedCounterStateUpdater::new())
-        }
+        (SummaryFamilyType::ExactAggregate(..), keyed) => Box::new(ExactUpdater {
+            acc: ExactAccumulator::new(spec.family.clone(), keyed).expect("exact fixture family"),
+        }),
 
         (SummaryFamilyType::Sketch(kind, _), false)
             if kind.algorithm() == &SketchAlgorithm::Kll =>
@@ -232,7 +202,7 @@ pub fn create_fixture_accumulator(
             else {
                 unreachable!("validated UnivMon family parameters")
             };
-            asap_summary_state::factory::create_planner_accumulator(
+            create_planner_accumulator(
                 &spec.family,
                 &planner_types::post_asap::SummaryUpdate::column(
                     planner_types::pre_asap::ColumnRef::SampleValue,
@@ -248,7 +218,7 @@ pub fn create_fixture_accumulator(
             let SketchParams::Hll { precision } = kind.params() else {
                 unreachable!("validated HLL family parameters")
             };
-            asap_summary_state::factory::create_planner_accumulator(
+            create_planner_accumulator(
                 &spec.family,
                 &planner_types::post_asap::SummaryUpdate::column(
                     planner_types::pre_asap::ColumnRef::SampleValue,
@@ -262,4 +232,91 @@ pub fn create_fixture_accumulator(
             panic!("unsupported isolated kernel fixture {other_family:?}, keyed={keyed}")
         }
     }
+}
+
+/// Feeds Planner's exact state directly; Planner keeps its own exact updater private.
+#[cfg(test)]
+struct ExactUpdater {
+    acc: ExactAccumulator,
+}
+
+#[cfg(test)]
+impl AccumulatorUpdater for ExactUpdater {
+    fn update_single(&mut self, value: f64, timestamp_ms: i64) {
+        self.acc.update(None, value, timestamp_ms);
+    }
+    fn update_keyed(&mut self, key: &KeyByLabelValues, value: f64, timestamp_ms: i64) {
+        self.acc.update(Some(key), value, timestamp_ms);
+    }
+    fn take_accumulator(&mut self) -> Box<dyn AggregateCore> {
+        let taken = Box::new(self.acc.clone());
+        self.reset();
+        taken
+    }
+    fn snapshot_accumulator(&self) -> Box<dyn AggregateCore> {
+        Box::new(self.acc.clone())
+    }
+    fn reset(&mut self) {
+        self.acc = ExactAccumulator::new(self.acc.family().clone(), self.acc.is_keyed())
+            .expect("exact fixture family");
+    }
+    fn is_keyed(&self) -> bool {
+        self.acc.is_keyed()
+    }
+    fn memory_usage_bytes(&self) -> usize {
+        self.acc.approx_memory_bytes()
+    }
+}
+
+/// Planner's unkeyed exact Sum holding `sum`.
+#[cfg(test)]
+pub fn sum_state(sum: f64) -> ExactAccumulator {
+    asap_summary_state::stored_state::codec::exact_value(ExactKind::Sum, sum)
+}
+
+/// The value of an unkeyed exact Sum state.
+#[cfg(test)]
+pub fn sum_of(state: &dyn AggregateCore) -> f64 {
+    state
+        .as_any()
+        .downcast_ref::<ExactAccumulator>()
+        .expect("exact Sum state")
+        .readout(asap_types::Statistic::Sum, None, None)
+        .expect("exact Sum readout")
+        .expect("present Sum population")
+}
+
+/// Test view of an unkeyed exact Sum state's value.
+#[cfg(test)]
+pub struct SumView {
+    pub sum: f64,
+}
+
+/// Panics unless `state` is an unkeyed exact Sum.
+#[cfg(test)]
+pub fn sum_view(state: &ExactAccumulator) -> SumView {
+    SumView {
+        sum: state
+            .readout(asap_types::Statistic::Sum, None, None)
+            .expect("exact Sum readout")
+            .expect("present exact population"),
+    }
+}
+
+/// Planner's unkeyed exact counter state (Rate or Increase) over `samples`
+/// of `(timestamp_ms, value)`.
+#[cfg(test)]
+pub fn counter_state(kind: ExactKind, samples: &[(i64, f64)]) -> ExactAccumulator {
+    use planner_types::post_asap::ExactParams;
+    let params = match kind {
+        ExactKind::Rate => ExactParams::Rate,
+        ExactKind::Increase => ExactParams::Increase,
+        other => panic!("{other:?} is not a counter family"),
+    };
+    let mut state = ExactAccumulator::new(SummaryFamilyType::ExactAggregate(kind, params), false)
+        .expect("counter family");
+    for (timestamp, value) in samples {
+        state.update(None, *value, *timestamp);
+    }
+    state
 }

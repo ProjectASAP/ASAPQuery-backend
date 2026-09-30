@@ -2,13 +2,13 @@
 //! The backend supplies one typed sample batch per pane; the Planner-compiled
 //! precompute graph owns every update, grouping and item computation.
 use crate::storage_engines::types::AggregateCore;
+use asap_physical_operators::factory::create_planner_accumulator;
 use asap_physical_operators::{
     operators::Operator,
     physical_planner::{precompute, CompiledPhysicalDag, Source as PhysicalSource},
     runtime::{Limits, RunContext, Scope},
     values::{Batch, Value},
 };
-use asap_summary_state::factory::create_planner_accumulator;
 use asap_types::physical_plan_codec::PhysicalPlanCodec;
 use asap_types::{executable_plan::BackendNodeBinding, PrecomputeMaterialization};
 use planner_types::post_asap::{
@@ -234,9 +234,10 @@ impl RawDagProgram {
         match self.execute(samples, pane, max_bytes)?.as_slice() {
             [] => Ok(None),
             [row] => match row.as_slice() {
-                [_, _, Value::Summary { state, .. }] => Ok(Some(
-                    asap_summary_state::physical::from_physical(state.as_ref())?,
-                )),
+                [_, _, Value::Summary { state, .. }] => {
+                    asap_summary_state::stored_state::codec::check_storable(state.as_ref())?;
+                    Ok(Some(state.clone_boxed_core()))
+                }
                 _ => Err("raw precompute output is not a population state".into()),
             },
             _ => Err("one routed group produced several populations".into()),
@@ -264,8 +265,8 @@ impl RawDagProgram {
     /// The family's empty state, for a pane known to have no samples. Heaps
     /// are Planner weighted-frequency states, as `build` produces.
     pub fn empty_state(&self) -> Result<Box<dyn AggregateCore>, String> {
-        use asap_summary_state::summary_kernels::weighted_frequency::{
-            FrequencyAlgorithm, PhysicalWeightedFrequency, WeightedFrequency,
+        use asap_physical_operators::summary_kernels::weighted_frequency::{
+            FrequencyAlgorithm, WeightedFrequency,
         };
         use planner_types::post_asap::SketchParams;
         if let SummaryFamilyType::Sketch(kind, _) = &self.family {
@@ -283,14 +284,32 @@ impl RawDagProgram {
                 _ => None,
             };
             if let Some((algorithm, width, depth, heap_size)) = heap {
-                let state = PhysicalWeightedFrequency::new(
+                let state = WeightedFrequency::new(
                     algorithm,
                     *width as usize,
                     *depth as usize,
                     *heap_size as usize,
                 )
                 .map_err(|e| e.to_string())?;
-                return Ok(Box::new(WeightedFrequency(state)));
+                return Ok(Box::new(state));
+            }
+            // Planner's UnivMon has no stored codec; the store keeps the
+            // backend UnivMon shim.
+            if let SketchParams::UnivMon {
+                heap_size,
+                sketch_rows,
+                sketch_cols,
+                layers,
+            } = kind.params()
+            {
+                return asap_summary_state::univmon::UnivMonAccumulator::new(
+                    *heap_size as usize,
+                    *sketch_rows as usize,
+                    *sketch_cols as usize,
+                    *layers as usize,
+                )
+                .map(|state| Box::new(state) as Box<dyn AggregateCore>)
+                .map_err(|e| e.to_string());
             }
         }
         Ok(
@@ -432,7 +451,7 @@ mod tests {
             source: 0,
         };
         let empty = program.empty_state().unwrap();
-        assert!(asap_summary_state::physical::to_physical(empty.as_ref()).is_ok());
+        assert!(asap_summary_state::stored_state::codec::check_storable(empty.as_ref()).is_ok());
         assert_eq!(
             asap_summary_state::stored_state::SketchEncoding::full_frame_for(empty.as_ref()),
             asap_summary_state::stored_state::SketchEncoding::WeightedFrequencyV1

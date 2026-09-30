@@ -1,8 +1,8 @@
 //! Measure readout-specific ERP evidence from finite JSONL evaluation data.
 //! This offline tool retains samples; the production backend does not.
-use asap_summary_state::summary_kernels::hll_sketch::HllSketchAccumulator;
-use asap_summary_state::summary_kernels::univmon::UnivMonAccumulator;
-use data_plane::storage_engines::types::{AggregateCore, SerializableToSink};
+use asap_physical_operators::summary_kernels::hll_sketch::HllSketchAccumulator;
+use asap_summary_state::univmon::UnivMonAccumulator;
+use data_plane::storage_engines::types::{AggregateCore, StoredState};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader};
@@ -109,18 +109,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|e| e.to_string())?;
             }
             left.merge_in_place(&right).map_err(|e| e.to_string())?;
-            bytes = bytes.max(left.serialize_to_bytes().len());
+            bytes = bytes.max(left.to_bytes().map_err(|e| e.to_string())?.len());
             for (i, stat) in [
-                asap_types::Statistic::Cardinality,
-                asap_types::Statistic::FrequencyL2,
-                asap_types::Statistic::FrequencyEntropy,
+                planner_types::post_asap::SketchQuery::Cardinality,
+                planner_types::post_asap::SketchQuery::FrequencyL2,
+                planner_types::post_asap::SketchQuery::FrequencyEntropy,
             ]
             .into_iter()
             .enumerate()
             {
-                let answer = left
-                    .query_statistic(stat, &None, &Default::default())
-                    .map_err(|e| e.to_string())?;
+                let answer = left.estimate(&stat).map_err(|e| e.to_string())?;
                 if !answer.is_finite() {
                     return Err("nonfinite estimate".into());
                 }
@@ -171,15 +169,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .downcast_ref::<HllSketchAccumulator>()
                 .ok_or("HLL merge type")?;
             let estimate = merged
-                .query_statistic(
-                    asap_types::Statistic::Cardinality,
-                    &None,
-                    &Default::default(),
-                )
+                .estimate(&planner_types::post_asap::SketchQuery::Cardinality)
                 .map_err(|e| e.to_string())?;
             max_error =
                 max_error.max((estimate - distinct.len() as f64).abs() / distinct.len() as f64);
-            bytes = bytes.max(merged.serialize_to_bytes().len());
+            bytes = bytes.max((merged as &dyn AggregateCore).serialize_to_bytes().len());
         }
         records.push(json!({"id":format!("hll-p{precision}"),"sketch":"hll","implementation":"asap-sketchlib-hll-regular-v1",
             "parameters":{"precision":precision},"trials":populations.len(),

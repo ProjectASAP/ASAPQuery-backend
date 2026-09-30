@@ -1,5 +1,6 @@
 //! Bind immutable inputs to retained physical graphs and publish their stored outputs.
 use asap_summary_state::codec::KeyCodec;
+use asap_summary_state::StoredState;
 #[cfg(test)]
 use asap_types::physical_plan_codec::PhysicalPlanCodec;
 
@@ -1563,7 +1564,6 @@ pub(crate) fn affected_materializations(
 mod tests {
 
     use super::*;
-    use asap_summary_state::summary_kernels::SumAccumulator;
     use planner_types::post_asap::{
         EdgeRole, GroupingEdgeCompatibility, PostAsapDag, PostAsapDagEdge, SummarySchema,
         WindowEdgeCompatibility,
@@ -1619,8 +1619,8 @@ mod tests {
     fn cohort_lineage_is_order_independent_and_binds_every_input() {
         use crate::storage_engines::sketch_db::index::FrozenExactWindows;
         let make = |sid, id, value| {
-            let mut state = asap_summary_state::summary_kernels::SumAccumulator::new();
-            state.update(value);
+            let mut state = crate::tests::accumulator_fixture::sum_state(0.0);
+            state.update(None, value, 0);
             FrozenExactWindows {
                 stored_output_reference: asap_types::sds::StoredOutputReference::for_output(
                     definition(id),
@@ -1721,8 +1721,8 @@ mod tests {
     }
 
     fn sum(value: f64) -> SummaryState {
-        let mut accumulator = SumAccumulator::new();
-        accumulator.update(value);
+        let mut accumulator = crate::tests::accumulator_fixture::sum_state(0.0);
+        accumulator.update(None, value, 0);
         Arc::new(accumulator)
     }
 
@@ -1806,7 +1806,6 @@ mod tests {
             reduction: Reduction::by(vec![]),
             grouping: GroupingStrategy::default(),
         };
-        let kwargs = std::collections::HashMap::from([("quantile".into(), "0.5".into())]);
         let mut source_node = node(1);
         source_node.output_schema.fields = vec![SummaryField {
             name: "state".into(),
@@ -2056,7 +2055,7 @@ mod tests {
         .unwrap());
         assert_eq!(
             result
-                .query_statistic(asap_types::Statistic::Quantile, &None, &kwargs)
+                .estimate(&planner_types::post_asap::SketchQuery::Quantile { q: 0.5 })
                 .unwrap(),
             3.0
         );
@@ -2461,11 +2460,7 @@ mod tests {
             assert!(group.is_empty());
             assert_eq!(
                 state
-                    .query_statistic(
-                        asap_types::Statistic::Quantile,
-                        &None,
-                        &std::collections::HashMap::from([("quantile".into(), "1.0".into())])
-                    )
+                    .estimate(&planner_types::post_asap::SketchQuery::Quantile { q: 1.0 })
                     .unwrap(),
                 29.0
             );
@@ -2521,11 +2516,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             result
-                .query_statistic(
-                    asap_types::Statistic::Quantile,
-                    &None,
-                    &std::collections::HashMap::from([("quantile".into(), "0.5".into())])
-                )
+                .estimate(&planner_types::post_asap::SketchQuery::Quantile { q: 0.5 })
                 .unwrap(),
             9.0
         );

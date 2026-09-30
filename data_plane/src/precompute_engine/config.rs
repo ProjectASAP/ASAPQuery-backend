@@ -24,7 +24,7 @@ pub struct PrecomputeEngineConfig {
     /// Capacity of the MPSC channel between router and each worker.
     pub channel_buffer_size: usize,
     /// When true, skip all aggregation and pass each raw sample directly to the
-    /// output sink as a `SumAccumulator::with_sum(value)`.
+    /// output sink as an exact Sum state of that value.
     pub pass_raw_samples: bool,
     /// Aggregation ID to stamp on each raw-mode output.
     pub raw_mode_aggregation_id: u64,

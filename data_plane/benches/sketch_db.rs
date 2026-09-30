@@ -33,7 +33,6 @@ use asap_sketchlib::DdSketch;
 use asap_sketchlib::{HllSketch, HllVariant};
 use prost::Message;
 
-use asap_summary_state::summary_kernels::SumAccumulator;
 use data_plane::storage_engines::sketch_db::data::{
     AccuracyBound, AggKind, AggregationType, Capability, SketchAlgorithm, SketchConfig,
     SketchEncoding,
@@ -280,7 +279,7 @@ fn bench_append_precompute(c: &mut Criterion) {
                         sid,
                         BTreeMap::new(),
                         win,
-                        Box::new(SumAccumulator::with_sum(c as f64)),
+                        Box::new(exact_sum(c as f64)),
                     );
                     black_box(&*store);
                 },
@@ -349,7 +348,7 @@ fn build_precompute_store(num_sids: usize, windows_per_sid: u64, metric: &str) -
                 sid,
                 BTreeMap::new(),
                 win,
-                Box::new(SumAccumulator::with_sum((sid + i) as f64)),
+                Box::new(exact_sum((sid + i) as f64)),
             );
         }
     }
@@ -513,3 +512,11 @@ criterion_group!(
     bench_group_key_projection,
 );
 criterion_main!(benches);
+
+/// Planner's unkeyed exact Sum holding `sum`.
+fn exact_sum(sum: f64) -> asap_physical_operators::summary_kernels::exact::ExactAccumulator {
+    asap_summary_state::stored_state::codec::exact_value(
+        planner_types::post_asap::ExactKind::Sum,
+        sum,
+    )
+}
