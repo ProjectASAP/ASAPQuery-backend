@@ -303,7 +303,9 @@ impl Worker {
             // behind a successful drain. The engine must be restarted explicitly.
             if let Some(error) = &processing_error {
                 match msg {
-                    WorkerMessage::Drain(reply) | WorkerMessage::CompleteDag { reply, .. } => {
+                    WorkerMessage::Drain(reply)
+                    | WorkerMessage::CompleteDag { reply, .. }
+                    | WorkerMessage::AdvanceWatermark { reply, .. } => {
                         let _ = reply.send(Err(error.clone()));
                     }
                     WorkerMessage::Shutdown => break,
@@ -447,6 +449,17 @@ impl Worker {
                         self.receiver.close();
                     }
                     let _ = reply.send(processing_error.clone().map_or(Ok(()), Err));
+                }
+                WorkerMessage::AdvanceWatermark {
+                    event_time_ms,
+                    reply,
+                } => {
+                    let result = self.close_through(event_time_ms).map_err(|e| e.to_string());
+                    if let Err(error) = &result {
+                        processing_error = Some(error.clone());
+                        warn!("Worker {} watermark barrier error: {}", self.id, error);
+                    }
+                    let _ = reply.send(result);
                 }
                 WorkerMessage::CompleteDag { plan, reply } => {
                     let result = match &processing_error {
@@ -1225,6 +1238,94 @@ impl Worker {
         if !emit_batch.is_empty() {
             debug!(
                 "Worker {} flush emitting {} outputs",
+                self.id,
+                emit_batch.len()
+            );
+            self.output_sink.emit_batch(emit_batch)?;
+        }
+
+        Ok(())
+    }
+
+    /// Live event-time barrier: the producer asserts that every sample with a
+    /// timestamp at or before `event_time_ms` has been written. Close, in
+    /// every group, each stored bucket whose samples all lie at or before
+    /// that time, including groups that stopped receiving input. Observed
+    /// event time is not changed; later input for a closed bucket follows the
+    /// configured late-data policy. A repeated or lower barrier is a no-op.
+    fn close_through(
+        &mut self,
+        event_time_ms: i64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.pass_raw_samples {
+            return Ok(());
+        }
+
+        let mut emit_batch: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)> = Vec::new();
+
+        for state in self.group_states.values_mut() {
+            if state.max_event_time_ms == i64::MIN {
+                continue; // No samples received yet — no panes to close.
+            }
+            // Buckets are `[start, end)` of pane timestamps and close once the
+            // closure watermark reaches `end`. A PromQL right-closed group
+            // files a sample at `t` as `t - 1`, so its buckets ending at
+            // `event_time_ms` are complete; otherwise they end one later.
+            let right_closed = state
+                .config
+                .parameters
+                .get("promql_right_closed")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let barrier = if right_closed {
+                event_time_ms
+            } else {
+                event_time_ms.saturating_add(1)
+            };
+            if barrier <= state.closure_watermark_ms {
+                continue;
+            }
+
+            // Advance no further than the end of the latest open bucket, as
+            // force_close_all does: later buckets hold no data, the scan walks
+            // one slide at a time, and a far-future barrier must not make
+            // input for never-opened buckets late.
+            let max_active = state.active_panes.keys().next_back().copied();
+            let max_sketch = state.sketch_panes.keys().next_back().copied();
+            if let Some(max_open) = max_active.max(max_sketch) {
+                let (_, max_open_end) = state.bucket_bounds(max_open);
+                let close_to = barrier.min(max_open_end);
+                let group_key = state.group_key.clone();
+                for window_start in state.closed_buckets(state.closure_watermark_ms, close_to) {
+                    let (_, window_end) = state.bucket_bounds(window_start);
+                    let pane_starts = [window_start];
+                    let accumulators = [
+                        merge_panes_for_window(&mut state.active_panes, &pane_starts),
+                        merge_sketch_panes_for_window(&mut state.sketch_panes, &pane_starts),
+                    ];
+                    for accumulator in accumulators.into_iter().flatten() {
+                        let output = precomputed_output_for_group(
+                            window_start as u64,
+                            window_end as u64,
+                            build_group_key_label_values(&group_key),
+                            PolicyFingerprint::from_config(&state.config),
+                            &group_key,
+                            &state.input_revisions,
+                            state.series_id,
+                            state.catalog_generation.as_ref(),
+                            state.stored_output_reference.clone(),
+                        );
+                        emit_batch.push((output, accumulator));
+                    }
+                }
+                state.closure_watermark_ms = state.closure_watermark_ms.max(close_to);
+                state.prune_pane_wall_clock();
+            }
+        }
+
+        if !emit_batch.is_empty() {
+            debug!(
+                "Worker {} watermark barrier emitting {} outputs",
                 self.id,
                 emit_batch.len()
             );
@@ -3198,6 +3299,146 @@ mod tests {
         assert_eq!(emitted[0].0.end_timestamp, 5_000);
         assert_eq!(emitted[1].0.start_timestamp, 5_000);
         assert_eq!(emitted[1].0.end_timestamp, 10_000);
+    }
+
+    fn drain_emitted_sums(sink: &CapturingOutputSink) -> Vec<(u64, u64, Vec<String>, f64)> {
+        sink.drain()
+            .into_iter()
+            .map(|(output, accumulator)| {
+                (
+                    output.start_timestamp,
+                    output.end_timestamp,
+                    output.key.map(|key| key.labels).unwrap_or_default(),
+                    accumulator
+                        .as_any()
+                        .downcast_ref::<SumAccumulator>()
+                        .unwrap()
+                        .sum,
+                )
+            })
+            .collect()
+    }
+
+    // A stopped group's complete pane closes exactly at the barrier (T for PromQL
+    // right-closed membership, else T + 1); repeats and lower barriers are no-ops.
+    #[test]
+    fn watermark_barrier_closes_complete_pane_of_stopped_group() {
+        for (right_closed, stopped_ts, boundary) in [(false, 2_000, 9_999), (true, 10_000, 10_000)]
+        {
+            let mut config = make_agg_config(
+                1,
+                "cpu",
+                AggregationType::SingleSubpopulation,
+                "Sum",
+                10,
+                0,
+                vec![],
+            );
+            if right_closed {
+                config
+                    .parameters
+                    .insert("promql_right_closed".into(), serde_json::json!(true));
+            }
+            let sink = Arc::new(CapturingOutputSink::new());
+            let mut worker = make_worker(
+                HashMap::from([(1, config)]),
+                sink.clone(),
+                false,
+                0,
+                LateDataPolicy::Drop,
+            );
+            // Group a moves on to [10s, 20s); group b stops inside [0, 10s).
+            for (sid, group, ts, value) in [
+                (1, "a", 1_000, 1.0),
+                (2, "b", stopped_ts, 2.0),
+                (1, "a", 12_000, 3.0),
+            ] {
+                worker
+                    .process_group_samples(
+                        sid,
+                        PolicyFingerprint(1),
+                        &test_group_key(group),
+                        group_samples("cpu", vec![(ts, value)]),
+                    )
+                    .unwrap();
+            }
+            sink.drain();
+
+            worker.close_through(boundary - 1).unwrap();
+            assert!(sink.is_empty(), "right_closed={right_closed}");
+            worker.close_through(boundary).unwrap();
+            assert_eq!(
+                drain_emitted_sums(&sink),
+                vec![(0, 10_000, vec!["b".to_string()], 2.0)],
+                "right_closed={right_closed}"
+            );
+            worker.close_through(boundary).unwrap();
+            worker.close_through(5_000).unwrap();
+            assert!(sink.is_empty(), "right_closed={right_closed}");
+            worker.force_close_all().unwrap();
+            assert_eq!(
+                drain_emitted_sums(&sink),
+                vec![(10_000, 20_000, vec!["a".to_string()], 3.0)],
+                "the barrier left group a's later pane open"
+            );
+        }
+    }
+
+    // FullWindow buckets close too; an unbounded barrier terminates and does not
+    // make input for later, never-opened windows late.
+    #[test]
+    fn watermark_barrier_closes_full_windows_and_bounds_its_scan() {
+        let mut config = make_agg_config(
+            1,
+            "cpu",
+            AggregationType::SingleSubpopulation,
+            "Sum",
+            30,
+            10,
+            vec![],
+        );
+        config.window_layout = asap_types::WindowMaterializationLayout::FullWindow;
+        let sink = Arc::new(CapturingOutputSink::new());
+        let mut worker = make_worker(
+            HashMap::from([(1, config)]),
+            sink.clone(),
+            false,
+            0,
+            LateDataPolicy::Drop,
+        );
+        let sample = |worker: &mut Worker, ts: i64| {
+            worker
+                .process_group_samples(
+                    1,
+                    PolicyFingerprint(1),
+                    &test_group_key("a"),
+                    group_samples("cpu", vec![(ts, 42.0)]),
+                )
+                .unwrap();
+        };
+        // 15s lies in [0, 30s) and [10s, 40s).
+        sample(&mut worker, 15_000);
+        worker.close_through(29_999).unwrap();
+        assert_eq!(
+            drain_emitted_sums(&sink),
+            vec![(0, 30_000, vec!["a".to_string()], 42.0)]
+        );
+        worker.close_through(i64::MAX).unwrap();
+        assert_eq!(
+            drain_emitted_sums(&sink),
+            vec![(10_000, 40_000, vec!["a".to_string()], 42.0)]
+        );
+        // 50s lies in [30s, 60s), [40s, 70s) and [50s, 80s), none opened before.
+        sample(&mut worker, 50_000);
+        sample(&mut worker, 51_000);
+        worker.force_close_all().unwrap();
+        assert_eq!(
+            drain_emitted_sums(&sink),
+            [30_000, 40_000, 50_000]
+                .map(|start| (start, start + 30_000, vec!["a".to_string()], 84.0))
+                .to_vec(),
+            "input after the barrier aggregates normally"
+        );
     }
 
     #[test]

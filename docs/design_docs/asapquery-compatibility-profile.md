@@ -211,8 +211,10 @@ Remote Write carries neither a producer-partition roster nor an authoritative
 watermark. Finite `POST /api/v1/precompute/drain` closes the input generation;
 it is not continuous completion. Existing typed `SummaryWatermarkBarrier` and
 coordinator APIs need registered producer/partition identity and publication
-ordering before they can establish continuous closure. There is no public HTTP
-barrier endpoint in this profile.
+ordering before they can establish continuous closure. The live
+`POST /api/v1/precompute/watermark?time_ms=T` endpoint is a producer assertion
+without that identity: each worker closes, in every group, the stored buckets
+whose samples all lie at or before `T`, and input stays open.
 
 ### SummaryStore
 

@@ -1915,5 +1915,131 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     assert!(metrics.contains("asap_remote_write_rejected_requests_total 1"));
 }
 
+// A series that stops sending keeps its last pane open, so a grouped query over
+// that window falls back; the live watermark barrier closes it with input open.
+#[tokio::test]
+async fn watermark_barrier_serves_window_of_stopped_series() {
+    let fallback_app = Router::new()
+        .route("/-/healthy", get(|| async { "Prometheus is Healthy." }))
+        .route(
+            "/api/v1/query",
+            get(|| async {
+                Json(serde_json::json!({
+                    "status": "success",
+                    "data": {"resultType": "vector", "result": []}
+                }))
+            }),
+        );
+    let fallback_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fallback");
+    let fallback_address = fallback_listener.local_addr().expect("fallback address");
+    tokio::spawn(async move {
+        axum::serve(fallback_listener, fallback_app)
+            .await
+            .expect("serve fallback")
+    });
+
+    let backend_port = unused_port();
+    let output_dir = tempfile::tempdir().expect("backend output directory");
+    let fixture: control_plane::physical::compiler::BackendLocalPlanningInput =
+        serde_json::from_str(include_str!(
+            "../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+        ))
+        .unwrap();
+    let snapshot = output_dir.path().join("snapshot.json");
+    std::fs::write(
+        &snapshot,
+        serde_json::to_vec(&quote_snapshot_for_test(fixture)).unwrap(),
+    )
+    .unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_data_plane"))
+        .args(["--profile", "asapquery", "--planning-snapshot"])
+        .arg(&snapshot)
+        .arg("--prometheus-server")
+        .arg(format!("http://{fallback_address}"))
+        .args([
+            "--forward-unsupported-queries",
+            "--precompute-allowed-lateness-ms",
+            "0",
+            "--precompute-flush-interval-ms",
+            "25",
+            "--http-port",
+            &backend_port.to_string(),
+            "--output-dir",
+        ])
+        .arg(output_dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("start production backend");
+    let mut child = ChildGuard(child);
+    let client = reqwest::Client::new();
+    let backend = format!("http://127.0.0.1:{backend_port}");
+    wait_until_ready(&client, &format!("{backend}/api/v1/health"), &mut child.0).await;
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_millis() as i64;
+    let base = now_ms - now_ms.rem_euclid(5_000) - 20_000;
+    // `api` continues past the first 5 s window; `worker` stops inside it.
+    let request = WriteRequest {
+        timeseries: vec![
+            series_with_labels(
+                "asap_demo_gauge",
+                &[("job", "api")],
+                &[(base + 500, 1.0), (base + 2_900, 3.0), (base + 6_600, 6.0)],
+            ),
+            series_with_labels(
+                "asap_demo_gauge",
+                &[("job", "worker")],
+                &[(base + 700, 100.0), (base + 3_100, 100.0)],
+            ),
+        ],
+    };
+    assert_eq!(remote_write(&client, &backend, &request).await, 204);
+
+    let query = "topk(1, sum_over_time(asap_demo_gauge[5s]))";
+    let eval = (base + 5_000) as f64 / 1_000.0;
+    let (client_ref, backend_ref) = (&client, &backend);
+    let instant = move || async move {
+        client_ref
+            .get(format!("{backend_ref}/api/v1/query"))
+            .query(&[("query", query.to_string()), ("time", eval.to_string())])
+            .send()
+            .await
+            .expect("instant query")
+            .json::<Value>()
+            .await
+            .expect("instant JSON")
+    };
+    let before = instant().await;
+    assert!(!is_warm(&before), "stopped series' pane is open: {before}");
+
+    let barrier = client
+        .post(format!("{backend}/api/v1/precompute/watermark"))
+        .query(&[("time_ms", base + 5_000)])
+        .send()
+        .await
+        .expect("watermark request");
+    assert_eq!(barrier.status().as_u16(), 200);
+
+    // Panes are published before the barrier returns, so one query suffices.
+    let warm = instant().await;
+    assert!(is_warm(&warm), "{warm}");
+    assert_eq!(first_value(&warm, "value"), Some(200.0), "{warm}");
+    assert_eq!(
+        warm["data"]["result"][0]["metric"],
+        serde_json::json!({"job": "worker"})
+    );
+    // Input stays open after the barrier.
+    let later = series_with_labels("asap_demo_gauge", &[("job", "api")], &[(base + 7_000, 7.0)]);
+    let later = WriteRequest {
+        timeseries: vec![later],
+    };
+    assert_eq!(remote_write(&client, &backend, &later).await, 204);
+}
+
 #[path = "support/univmon_erp_process.rs"]
 mod univmon_erp_process;

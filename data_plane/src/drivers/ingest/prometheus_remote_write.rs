@@ -208,6 +208,19 @@ impl PrometheusRemoteWriteReceiver {
         }
     }
 
+    /// Live completion barrier: the producer asserts that every sample at or
+    /// before `event_time_ms` has been written. Requests already acknowledged
+    /// are queued ahead of the barrier on every worker, so their completed
+    /// panes are published before this returns. Unlike `drain`, input stays
+    /// open.
+    pub async fn advance_watermark(&self, event_time_ms: i64) -> Result<(), String> {
+        self.inner
+            .ingest
+            .router
+            .advance_watermark(event_time_ms)
+            .await
+    }
+
     /// Permanently seal this finite source before queuing worker barriers.
     pub async fn drain(&self) -> Result<(), String> {
         if self.inner.config.revisions.is_some() {
