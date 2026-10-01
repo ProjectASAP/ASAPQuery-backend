@@ -66,6 +66,16 @@ forwarded as lifecycle events. Native histograms and exemplars are rejected.
 For plan/SID inspection and finite-replay boundaries, use the
 [E2E physical-DAG walkthrough](../evaluation/e2e-physical-dag.md).
 
+A summary window is published only after a later sample arrives in the same
+series, or after it has been idle for the window length plus 5 s. A series that
+stops sending therefore delays every query over its last window. A producer that
+knows it has written every sample up to time `T` (milliseconds) can say so with
+`POST /api/v1/precompute/watermark?time_ms=T`. The backend then publishes every
+window that ends at or before `T`, in all series, before returning `200`;
+earlier acknowledged writes are included. With several producers, send it only
+after all of them have written through `T`. Input stays open; a later sample for
+a published window is handled as late data.
+
 The deduplication horizon must cover allowed lateness plus the deployment's
 maximum expected Prometheus retry interval. Configure those assumptions with
 `--precompute-allowed-lateness-ms`,
