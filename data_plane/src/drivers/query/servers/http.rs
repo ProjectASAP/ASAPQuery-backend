@@ -445,6 +445,10 @@ impl HttpServer {
             )
             .route("/api/v1/store/metrics", get(handle_store_metrics))
             .route("/api/v1/precompute/drain", post(handle_precompute_drain))
+            .route(
+                "/api/v1/precompute/watermark",
+                post(handle_precompute_watermark),
+            )
             .route("/api/v1/physical-plan", post(handle_post_physical_plan))
             .route(
                 "/api/v1/physical-plan/discard",
@@ -548,6 +552,10 @@ impl HttpServer {
 
         let app = Router::new()
             .route("/api/v1/precompute/drain", post(handle_precompute_drain))
+            .route(
+                "/api/v1/precompute/watermark",
+                post(handle_precompute_watermark),
+            )
             .route(query_endpoint, get(handle_instant_query))
             .route(query_endpoint, post(handle_instant_query_post))
             .route(range_query_endpoint, get(handle_range_query))
@@ -5353,6 +5361,39 @@ async fn handle_precompute_drain(State(state): State<AppState>) -> Response {
             axum::Json(serde_json::json!({
                 "status": "error", "input_closed": true, "complete": false, "error": error
             })),
+        )
+            .into_response(),
+    }
+}
+
+/// Live completion barrier: `POST /api/v1/precompute/watermark?time_ms=T`
+/// declares every Remote Write sample at or before `T` written. Input stays
+/// open, unlike `/api/v1/precompute/drain`.
+async fn handle_precompute_watermark(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(receiver) = state.remote_write.as_ref() else {
+        return (StatusCode::NOT_FOUND, "Remote Write is disabled").into_response();
+    };
+    let Some(time_ms) = params.get("time_ms").and_then(|v| v.parse::<i64>().ok()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "status": "error", "error": "time_ms must be an integer number of milliseconds"
+            })),
+        )
+            .into_response();
+    };
+    match receiver.advance_watermark(time_ms).await {
+        Ok(()) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"status": "success", "time_ms": time_ms})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"status": "error", "error": error})),
         )
             .into_response(),
     }

@@ -84,6 +84,12 @@ pub enum WorkerMessage {
     Flush,
     /// Finite-input barrier: acknowledge only after queued input and trailing panes reach the sink.
     Drain(tokio::sync::oneshot::Sender<Result<(), String>>),
+    /// Live-input barrier: every sample at or before `event_time_ms` has been
+    /// sent, so buckets complete by then close in every group. Input stays open.
+    AdvanceWatermark {
+        event_time_ms: i64,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     /// Execute downstream DAG work after all raw windows have been sealed.
     CompleteDag {
         plan: Arc<crate::storage_engines::types::RuntimePhysicalPlan>,
@@ -141,6 +147,10 @@ impl fmt::Debug for WorkerMessage {
                 .finish(),
             Self::Flush => f.write_str("Flush"),
             Self::Drain(_) => f.write_str("Drain"),
+            Self::AdvanceWatermark { event_time_ms, .. } => f
+                .debug_struct("AdvanceWatermark")
+                .field("event_time_ms", event_time_ms)
+                .finish(),
             Self::CompleteDag { .. } => f.write_str("CompleteDag"),
             Self::Shutdown => f.write_str("Shutdown"),
         }
@@ -275,6 +285,7 @@ impl SeriesRouter {
                 }
                 WorkerMessage::Flush
                 | WorkerMessage::Drain(_)
+                | WorkerMessage::AdvanceWatermark { .. }
                 | WorkerMessage::Shutdown
                 | WorkerMessage::CompleteDag { .. } => 0,
             };
@@ -319,6 +330,27 @@ impl SeriesRouter {
             let (tx, rx) = tokio::sync::oneshot::channel();
             sender
                 .send(WorkerMessage::Drain(tx))
+                .await
+                .map_err(|e| e.to_string())?;
+            replies.push(rx);
+        }
+        for reply in replies {
+            reply.await.map_err(|e| e.to_string())??;
+        }
+        Ok(())
+    }
+
+    /// Send a live event-time barrier to every worker and wait for all of
+    /// them. Input already routed is queued ahead of the barrier.
+    pub async fn advance_watermark(&self, event_time_ms: i64) -> Result<(), String> {
+        let mut replies = Vec::new();
+        for sender in &self.senders {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            sender
+                .send(WorkerMessage::AdvanceWatermark {
+                    event_time_ms,
+                    reply: tx,
+                })
                 .await
                 .map_err(|e| e.to_string())?;
             replies.push(rx);
