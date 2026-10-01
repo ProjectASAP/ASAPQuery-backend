@@ -2299,7 +2299,8 @@ impl SketchStore {
         }
 
         // Union the durable disk tier for the flushed-then-evicted portion
-        // of the range. In-memory wins on a window-end collision.
+        // of the range. In-memory wins on a window-end collision; the disk
+        // tier keeps one record per window and does not merge.
         self.union_disk_exact_agg_into(sid, start_unix_ms, end_unix_ms, &mut by_label_map);
 
         Ok(by_label_map.into_iter().collect())
