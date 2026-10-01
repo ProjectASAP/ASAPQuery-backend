@@ -489,6 +489,7 @@ impl QueryExecutionContext<'_> {
                     let Some((labels, windows)) = self
                         .index
                         .query_exact_agg_range(sid, self.t0_ms, self.t1_ms)
+                        .map_err(SummaryExecutorError::Decode)?
                         .into_iter()
                         .next()
                     else {

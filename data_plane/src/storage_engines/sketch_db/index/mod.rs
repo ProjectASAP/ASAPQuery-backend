@@ -50,6 +50,28 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Add one stored exact state to its window, merging with any state already
+/// read for that window.
+fn merge_exact_window(
+    windows: &mut BTreeMap<i64, Arc<dyn crate::storage_engines::types::AggregateCore>>,
+    window_end: u64,
+    state: &Arc<dyn crate::storage_engines::types::AggregateCore>,
+) -> Result<(), String> {
+    match windows.entry(window_end as i64) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(Arc::clone(state));
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            let merged = entry
+                .get()
+                .merge_with(state.as_ref())
+                .map_err(|error| error.to_string())?;
+            entry.insert(Arc::from(merged));
+        }
+    }
+    Ok(())
+}
+
 /// Map a [`SketchEncoding`] to the on-disk encoding tag stored per part
 /// entry, so the disk read-back path can reconstruct the Full-vs-Delta
 /// distinction the delta-stitching carry-in relies on.
@@ -2210,15 +2232,22 @@ impl SketchStore {
     /// in `[start, end]` (or is sketch-backed). Defensive — caller
     /// is responsible for confirming the sid's `agg_kind` is
     /// `AggKind::ExactAgg { .. }` before calling.
+    ///
+    /// In-memory states for one window are merged: a `ForwardToStore`
+    /// correction is appended beside the window's earlier state. States
+    /// that cannot merge are an error rather than a partial result.
     pub fn query_exact_agg_range(
         &self,
         sid: u64,
         start_unix_ms: u64,
         end_unix_ms: u64,
-    ) -> Vec<(
-        BTreeMap<String, String>,
-        BTreeMap<i64, Arc<dyn crate::storage_engines::types::AggregateCore>>,
-    )> {
+    ) -> Result<
+        Vec<(
+            BTreeMap<String, String>,
+            BTreeMap<i64, Arc<dyn crate::storage_engines::types::AggregateCore>>,
+        )>,
+        String,
+    > {
         // Key by the resolved label MAP (not `LabelValuesId`) so the
         // in-memory tier and the durable disk tier — which carry
         // independent intern spaces — union by label identity. Mirrors
@@ -2244,10 +2273,7 @@ impl SketchStore {
                 .range_query_into(start_unix_ms, end_unix_ms, &mut buf);
             for (win, label_id, payload) in &buf {
                 if let Some(p) = payload.as_exact_agg_arc() {
-                    by_label_id
-                        .entry(*label_id)
-                        .or_default()
-                        .insert(win.1 as i64, Arc::clone(p));
+                    merge_exact_window(by_label_id.entry(*label_id).or_default(), win.1, p)?;
                 }
             }
             buf.clear();
@@ -2256,10 +2282,7 @@ impl SketchStore {
                 sealed.range_query_into(start_unix_ms, end_unix_ms, &mut buf);
                 for (win, label_id, payload) in &buf {
                     if let Some(p) = payload.as_exact_agg_arc() {
-                        by_label_id
-                            .entry(*label_id)
-                            .or_default()
-                            .insert(win.1 as i64, Arc::clone(p));
+                        merge_exact_window(by_label_id.entry(*label_id).or_default(), win.1, p)?;
                     }
                 }
                 buf.clear();
@@ -2276,10 +2299,11 @@ impl SketchStore {
         }
 
         // Union the durable disk tier for the flushed-then-evicted portion
-        // of the range. In-memory wins on a window-end collision.
+        // of the range. In-memory wins on a window-end collision; the disk
+        // tier keeps one record per window and does not merge.
         self.union_disk_exact_agg_into(sid, start_unix_ms, end_unix_ms, &mut by_label_map);
 
-        by_label_map.into_iter().collect()
+        Ok(by_label_map.into_iter().collect())
     }
 
     /// Union the durable disk tier's exact-aggregation entries into
@@ -6135,7 +6159,7 @@ mod tests {
         ));
 
         // The Sum exact-agg range query must resolve from disk.
-        let series = idx2.query_exact_agg_range(8100, 0, 150_000);
+        let series = idx2.query_exact_agg_range(8100, 0, 150_000).unwrap();
         assert!(
             !series.is_empty(),
             "recovered exact-agg query returned No result after fresh reopen"
@@ -6277,6 +6301,37 @@ mod tests {
         drop(p2);
     }
 
+    /// A late correction appended for an already-published exact window is
+    /// read merged with that window's earlier state, not in place of it.
+    #[test]
+    fn exact_agg_range_merges_late_correction_for_same_window() {
+        use crate::storage_engines::types::AggregationType;
+        let idx = SketchStore::new();
+        let mut m = meta(8002);
+        m.agg_kind = AggKind::ExactAgg {
+            agg_type: AggregationType::Sum,
+            parameters_canonical: String::new(),
+            spatial_filter_canonical: String::new(),
+        };
+        idx.register(m);
+        for value in [15.0, 40.0] {
+            assert!(idx.append_precompute(
+                8002,
+                BTreeMap::new(),
+                (0, 10_000),
+                Box::new(asap_physical_operators::summary_kernels::SumAccumulator::with_sum(value)),
+            ));
+        }
+        let series = idx.query_exact_agg_range(8002, 0, 10_000).unwrap();
+        assert_eq!(series.len(), 1);
+        let sum = series[0].1[&10_000]
+            .as_any()
+            .downcast_ref::<asap_physical_operators::summary_kernels::SumAccumulator>()
+            .unwrap()
+            .sum;
+        assert_eq!(sum, 55.0);
+    }
+
     /// BUG #2: after flush+evict, an exact-agg (`sum by (zone)` shape)
     /// range query must still resolve from disk. On origin/main
     /// `query_exact_agg_range` reads ONLY the in-memory current+sealed
@@ -6327,7 +6382,7 @@ mod tests {
             "exact-agg windows never fully evicted"
         );
         // Query the EVICTED portion [0, 150_000) — must come back from disk.
-        let series = idx.query_exact_agg_range(8001, 0, 150_000);
+        let series = idx.query_exact_agg_range(8001, 0, 150_000).unwrap();
         assert!(
             !series.is_empty(),
             "LIVE BUG #2: exact-agg query returned No result after flush+evict \
@@ -6394,7 +6449,7 @@ mod tests {
             "exact-agg windows never fully evicted"
         );
         // Query the EVICTED portion [0, 150_000) — must come back from disk.
-        let series = idx.query_exact_agg_range(8001, 0, 150_000);
+        let series = idx.query_exact_agg_range(8001, 0, 150_000).unwrap();
         assert!(
             !series.is_empty(),
             "exact-agg query returned no result after flush and eviction"
@@ -6636,7 +6691,9 @@ mod tests {
             .start_persistence(durable_cfg(temp.path().to_path_buf()))
             .unwrap();
         for (i, kind) in kinds.iter().enumerate() {
-            let series = store.query_exact_agg_range(9000 + i as u64, 0, 30001);
+            let series = store
+                .query_exact_agg_range(9000 + i as u64, 0, 30001)
+                .unwrap();
             assert_eq!(series.len(), 1, "{kind:?}");
             let state = &series[0].1[&30000];
             assert_eq!(state.get_accumulator_type(), *kind);

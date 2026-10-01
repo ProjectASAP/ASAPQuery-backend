@@ -1580,6 +1580,23 @@ mod tests {
         assert_eq!(receiver.stats().duplicates.load(Ordering::Relaxed), 1);
     }
 
+    /// Bound read of `configured_receiver`'s pane [0, 60s), grouped by `job`.
+    fn job_pane_binding(ingest: &IngestState) -> asap_types::query_plan::MaterializationBinding {
+        let snapshot = ingest.hot_reload_config.snapshot();
+        let policy = *snapshot.materializations_by_output.keys().next().unwrap();
+        let catalog = ingest.summary_store.summary_catalog_snapshot().unwrap();
+        asap_types::query_plan::MaterializationBinding {
+            full_window_slide_ms: None,
+            materialization: policy,
+            stored_output_reference: catalog.output_reference(policy).unwrap(),
+            output_grouping: asap_types::query_plan::PhysicalGrouping::Reduce(vec!["job".into()]),
+            item_labels: vec![],
+            window_ms: 60_000,
+            pane_origin_ms: Some(0),
+            readout_lookback_ms: None,
+        }
+    }
+
     #[tokio::test]
     async fn queued_population_blocks_partial_warm_read_until_both_workers_publish() {
         use crate::precompute_engine::{
@@ -1651,28 +1668,7 @@ mod tests {
         let (done, result) = tokio::sync::oneshot::channel();
         fast.send(WorkerMessage::Drain(done)).await.unwrap();
         result.await.unwrap().unwrap();
-        let policy = *ingest
-            .hot_reload_config
-            .snapshot()
-            .materializations_by_output
-            .keys()
-            .next()
-            .unwrap();
-        let binding = asap_types::query_plan::MaterializationBinding {
-            full_window_slide_ms: None,
-            materialization: policy,
-            stored_output_reference: ingest
-                .summary_store
-                .summary_catalog_snapshot()
-                .unwrap()
-                .output_reference(policy)
-                .unwrap(),
-            output_grouping: asap_types::query_plan::PhysicalGrouping::Reduce(vec!["job".into()]),
-            item_labels: vec![],
-            window_ms: 60_000,
-            pane_origin_ms: Some(0),
-            readout_lookback_ms: None,
-        };
+        let binding = job_pane_binding(ingest);
         let context = QueryExecutionContext {
             index: &ingest.summary_store,
             t0_ms: 0,
@@ -1698,6 +1694,88 @@ mod tests {
         slow.send(WorkerMessage::Shutdown).await.unwrap();
         fast_task.await.unwrap();
         slow_task.await.unwrap();
+    }
+
+    /// A late sample for an already closed and published pane is merged into
+    /// that pane's read, and retried samples are counted once.
+    #[tokio::test]
+    async fn late_sample_merges_into_closed_pane_and_retries_count_once() {
+        use crate::precompute_engine::{
+            config::LateDataPolicy,
+            output_sink::SketchStoreSink,
+            worker::{Worker, WorkerRuntimeConfig},
+        };
+        use crate::query_engines::asap_query_engine::summary_executor::QueryExecutionContext;
+        use std::sync::atomic::AtomicI64;
+        let (receiver, mut queued) = configured_receiver();
+        let ingest = &receiver.inner.ingest;
+        let sink = Arc::new(SketchStoreSink::new(
+            ingest.summary_store.clone(),
+            ingest.hot_reload_config.clone(),
+            ingest.series_resolver.clone(),
+        ));
+        let (worker, rx) = mpsc::channel(8);
+        let config = WorkerRuntimeConfig {
+            max_buffer_per_series: 100,
+            allowed_lateness_ms: 0,
+            pass_raw_samples: false,
+            raw_mode_aggregation_id: 0,
+            late_data_policy: LateDataPolicy::ForwardToStore,
+            wall_clock_idle_grace_period_ms: i64::MAX,
+            wall_clock_max_open_grace_period_ms: i64::MAX,
+        };
+        let (groups, watermark) = (Arc::default(), Arc::new(AtomicI64::new(i64::MIN)));
+        let plan = ingest.hot_reload_config.clone();
+        tokio::spawn(Worker::new(0, rx, sink, plan, config, groups, watermark).run());
+        // Each write is drained, so the first write's pane is closed and published.
+        let mut write = async |samples: &[(i64, f64)]| {
+            let series = TimeSeries {
+                labels: [("__name__", "requests_total"), ("job", "a")]
+                    .map(|(name, value)| Label {
+                        name: name.into(),
+                        value: value.into(),
+                    })
+                    .into(),
+                samples: samples
+                    .iter()
+                    .map(|&(timestamp, value)| Sample { timestamp, value })
+                    .collect(),
+                exemplars: vec![],
+                histograms: vec![],
+            };
+            let request = WriteRequest {
+                timeseries: vec![series],
+            };
+            receiver.accept(&compressed(request)).unwrap();
+            while let Ok(message) = queued.try_recv() {
+                worker.send(message).await.unwrap();
+            }
+            let (done, result) = tokio::sync::oneshot::channel();
+            worker.send(WorkerMessage::Drain(done)).await.unwrap();
+            result.await.unwrap().unwrap();
+        };
+        let binding = job_pane_binding(ingest);
+        let context = QueryExecutionContext {
+            index: &ingest.summary_store,
+            t0_ms: 0,
+            t1_ms: 60_000,
+            is_cumulative: true,
+            allowed_materializations: None,
+        };
+        let read = || {
+            context.read_bound_materialization(&binding).unwrap()[0]
+                .1
+                .exact_value(&None)
+        };
+        let (first, late) = ([(1_000, 1.0), (2_000, 2.0)], [(3_000, 4.0)]);
+        write(&first).await;
+        write(&late).await;
+        assert_eq!(read(), Some(7.0));
+        write(&first).await;
+        write(&late).await;
+        assert_eq!(read(), Some(7.0));
+        write(&[(2_000, 2.0), (5_000, 16.0)]).await;
+        assert_eq!(read(), Some(23.0));
     }
 
     #[tokio::test]
