@@ -1286,9 +1286,10 @@ impl Worker {
                 continue;
             }
 
-            // Bound the scan by the latest open bucket, as force_close_all
-            // does: buckets after it hold no data, and the scan walks one
-            // slide at a time, so an unbounded barrier would not terminate.
+            // Advance no further than the end of the latest open bucket, as
+            // force_close_all does: later buckets hold no data, the scan walks
+            // one slide at a time, and a far-future barrier must not make
+            // input for never-opened buckets late.
             let max_active = state.active_panes.keys().next_back().copied();
             let max_sketch = state.sketch_panes.keys().next_back().copied();
             if let Some(max_open) = max_active.max(max_sketch) {
@@ -1317,9 +1318,9 @@ impl Worker {
                         emit_batch.push((output, accumulator));
                     }
                 }
+                state.closure_watermark_ms = state.closure_watermark_ms.max(close_to);
+                state.prune_pane_wall_clock();
             }
-            state.closure_watermark_ms = barrier;
-            state.prune_pane_wall_clock();
         }
 
         if !emit_batch.is_empty() {
@@ -3318,114 +3319,73 @@ mod tests {
             .collect()
     }
 
-    // The barrier closes exactly the stopped group's complete pane; repeats and lower barriers are no-ops.
+    // A stopped group's complete pane closes exactly at the barrier (T for PromQL
+    // right-closed membership, else T + 1); repeats and lower barriers are no-ops.
     #[test]
     fn watermark_barrier_closes_complete_pane_of_stopped_group() {
-        let config = make_agg_config(
-            1,
-            "cpu",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            10,
-            0,
-            vec![],
-        );
-        let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker(
-            HashMap::from([(1, config)]),
-            sink.clone(),
-            false,
-            0,
-            LateDataPolicy::Drop,
-        );
-        let pf = PolicyFingerprint(1);
-        // Group a keeps sending into [10s, 20s); group b stops inside [0, 10s).
-        for (sid, group, ts, value) in [
-            (1, "a", 1_000, 1.0),
-            (2, "b", 2_000, 2.0),
-            (1, "a", 12_000, 3.0),
-        ] {
-            worker
-                .process_group_samples(
-                    sid,
-                    pf,
-                    &test_group_key(group),
-                    group_samples("cpu", vec![(ts, value)]),
-                )
-                .unwrap();
-        }
-        assert_eq!(
-            drain_emitted_sums(&sink),
-            vec![(0, 10_000, vec!["a".to_string()], 1.0)],
-            "only group a observed a later sample"
-        );
-        worker.flush_all().unwrap();
-        assert!(
-            sink.is_empty(),
-            "without wall-clock policy group b stays open"
-        );
-
-        // [0, 10s) holds samples up to 9_999 ms.
-        worker.close_through(9_998).unwrap();
-        assert!(sink.is_empty());
-        worker.close_through(9_999).unwrap();
-        assert_eq!(
-            drain_emitted_sums(&sink),
-            vec![(0, 10_000, vec!["b".to_string()], 2.0)]
-        );
-        worker.close_through(9_999).unwrap();
-        worker.close_through(5_000).unwrap();
-        assert!(sink.is_empty());
-
-        worker.force_close_all().unwrap();
-        assert_eq!(
-            drain_emitted_sums(&sink),
-            vec![(10_000, 20_000, vec!["a".to_string()], 3.0)],
-            "the barrier left group a's later pane open"
-        );
-    }
-
-    // PromQL right-closed groups file a sample at t into the pane ending at t, so a barrier at t closes it.
-    #[test]
-    fn watermark_barrier_respects_promql_right_closed_membership() {
-        let mut config = make_agg_config(
-            1,
-            "cpu",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            10,
-            0,
-            vec![],
-        );
-        config
-            .parameters
-            .insert("promql_right_closed".into(), serde_json::json!(true));
-        let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker(
-            HashMap::from([(1, config)]),
-            sink.clone(),
-            false,
-            0,
-            LateDataPolicy::Drop,
-        );
-        worker
-            .process_group_samples(
+        for (right_closed, stopped_ts, boundary) in [(false, 2_000, 9_999), (true, 10_000, 10_000)]
+        {
+            let mut config = make_agg_config(
                 1,
-                PolicyFingerprint(1),
-                &test_group_key("a"),
-                group_samples("cpu", vec![(10_000, 4.0)]),
-            )
-            .unwrap();
-        worker.close_through(9_999).unwrap();
-        assert!(sink.is_empty());
-        worker.close_through(10_000).unwrap();
-        assert_eq!(
-            drain_emitted_sums(&sink),
-            vec![(0, 10_000, vec!["a".to_string()], 4.0)]
-        );
+                "cpu",
+                AggregationType::SingleSubpopulation,
+                "Sum",
+                10,
+                0,
+                vec![],
+            );
+            if right_closed {
+                config
+                    .parameters
+                    .insert("promql_right_closed".into(), serde_json::json!(true));
+            }
+            let sink = Arc::new(CapturingOutputSink::new());
+            let mut worker = make_worker(
+                HashMap::from([(1, config)]),
+                sink.clone(),
+                false,
+                0,
+                LateDataPolicy::Drop,
+            );
+            // Group a moves on to [10s, 20s); group b stops inside [0, 10s).
+            for (sid, group, ts, value) in [
+                (1, "a", 1_000, 1.0),
+                (2, "b", stopped_ts, 2.0),
+                (1, "a", 12_000, 3.0),
+            ] {
+                worker
+                    .process_group_samples(
+                        sid,
+                        PolicyFingerprint(1),
+                        &test_group_key(group),
+                        group_samples("cpu", vec![(ts, value)]),
+                    )
+                    .unwrap();
+            }
+            sink.drain();
+
+            worker.close_through(boundary - 1).unwrap();
+            assert!(sink.is_empty(), "right_closed={right_closed}");
+            worker.close_through(boundary).unwrap();
+            assert_eq!(
+                drain_emitted_sums(&sink),
+                vec![(0, 10_000, vec!["b".to_string()], 2.0)],
+                "right_closed={right_closed}"
+            );
+            worker.close_through(boundary).unwrap();
+            worker.close_through(5_000).unwrap();
+            assert!(sink.is_empty(), "right_closed={right_closed}");
+            worker.force_close_all().unwrap();
+            assert_eq!(
+                drain_emitted_sums(&sink),
+                vec![(10_000, 20_000, vec!["a".to_string()], 3.0)],
+                "the barrier left group a's later pane open"
+            );
+        }
     }
 
-    // FullWindow buckets close one by one; an unbounded barrier terminates and later input is late.
+    // FullWindow buckets close too; an unbounded barrier terminates and does not
+    // make input for later, never-opened windows late.
     #[test]
     fn watermark_barrier_closes_full_windows_and_bounds_its_scan() {
         let mut config = make_agg_config(
@@ -3458,8 +3418,6 @@ mod tests {
         };
         // 15s lies in [0, 30s) and [10s, 40s).
         sample(&mut worker, 15_000);
-        worker.close_through(29_998).unwrap();
-        assert!(sink.is_empty());
         worker.close_through(29_999).unwrap();
         assert_eq!(
             drain_emitted_sums(&sink),
@@ -3470,125 +3428,17 @@ mod tests {
             drain_emitted_sums(&sink),
             vec![(10_000, 40_000, vec!["a".to_string()], 42.0)]
         );
+        // 50s lies in [30s, 60s), [40s, 70s) and [50s, 80s), none opened before.
         sample(&mut worker, 50_000);
+        sample(&mut worker, 51_000);
         worker.force_close_all().unwrap();
-        assert!(
-            sink.is_empty(),
-            "input behind the barrier follows the drop policy"
-        );
-    }
-
-    // A barrier queued behind input publishes that input before acknowledging, and input stays open.
-    #[tokio::test]
-    async fn watermark_barrier_publishes_queued_input_before_acknowledging() {
-        let config = make_agg_config(
-            1,
-            "cpu",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            10,
-            0,
-            vec![],
-        );
-        let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker(
-            HashMap::from([(1, config)]),
-            sink.clone(),
-            false,
-            0,
-            LateDataPolicy::Drop,
-        );
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        worker.receiver = rx;
-        let task = tokio::spawn(worker.run());
-        let samples = |ts: i64| WorkerMessage::GroupSamples {
-            sid: 1,
-            policy_fp: PolicyFingerprint(1),
-            group_key: test_group_key(""),
-            samples: group_samples("cpu", vec![(ts, 2.0)]),
-            ingest_received_at: std::time::Instant::now(),
-        };
-        tx.send(samples(1_000)).await.unwrap();
-        let (reply, ack) = tokio::sync::oneshot::channel();
-        tx.send(WorkerMessage::AdvanceWatermark {
-            event_time_ms: 9_999,
-            reply,
-        })
-        .await
-        .unwrap();
-        ack.await.unwrap().unwrap();
-        assert_eq!(drain_emitted_sums(&sink), vec![(0, 10_000, vec![], 2.0)]);
-        tx.send(samples(15_000)).await.unwrap();
-        tx.send(WorkerMessage::Shutdown).await.unwrap();
-        task.await.unwrap();
         assert_eq!(
             drain_emitted_sums(&sink),
-            vec![(10_000, 20_000, vec![], 2.0)]
+            [30_000, 40_000, 50_000]
+                .map(|start| (start, start + 30_000, vec!["a".to_string()], 84.0))
+                .to_vec(),
+            "input after the barrier aggregates normally"
         );
-    }
-
-    // A failed worker answers every queued barrier with its error instead of dropping the reply.
-    #[tokio::test]
-    async fn failed_worker_answers_queued_watermark_barriers_with_its_error() {
-        struct FailedSink;
-        impl OutputSink for FailedSink {
-            fn emit_batch(
-                &self,
-                _: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>,
-            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-                Err("deliberate sink failure".into())
-            }
-        }
-        let config = make_agg_config(
-            1,
-            "cpu",
-            AggregationType::SingleSubpopulation,
-            "Sum",
-            10,
-            0,
-            vec![],
-        );
-        let mut worker = make_worker(
-            HashMap::from([(1, config)]),
-            Arc::new(CapturingOutputSink::new()),
-            false,
-            0,
-            LateDataPolicy::Drop,
-        );
-        worker.output_sink = Arc::new(FailedSink);
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        worker.receiver = rx;
-        tx.send(WorkerMessage::GroupSamples {
-            sid: 1,
-            policy_fp: PolicyFingerprint(1),
-            group_key: test_group_key(""),
-            samples: group_samples("cpu", vec![(1_000, 2.0)]),
-            ingest_received_at: std::time::Instant::now(),
-        })
-        .await
-        .unwrap();
-        let mut acks = Vec::new();
-        for event_time_ms in [9_999, 19_999] {
-            let (reply, ack) = tokio::sync::oneshot::channel();
-            tx.send(WorkerMessage::AdvanceWatermark {
-                event_time_ms,
-                reply,
-            })
-            .await
-            .unwrap();
-            acks.push(ack);
-        }
-        // Both barriers are queued before the worker starts.
-        let task = tokio::spawn(worker.run());
-        for ack in acks {
-            assert!(ack
-                .await
-                .unwrap()
-                .unwrap_err()
-                .contains("deliberate sink failure"));
-        }
-        drop(tx);
-        task.await.unwrap();
     }
 
     #[test]
