@@ -2015,10 +2015,7 @@ async fn watermark_barrier_serves_window_of_stopped_series() {
             .expect("instant JSON")
     };
     let before = instant().await;
-    assert!(
-        !is_warm(&before),
-        "the stopped series' pane is still open: {before}"
-    );
+    assert!(!is_warm(&before), "stopped series' pane is open: {before}");
 
     let barrier = client
         .post(format!("{backend}/api/v1/precompute/watermark"))
@@ -2026,12 +2023,7 @@ async fn watermark_barrier_serves_window_of_stopped_series() {
         .send()
         .await
         .expect("watermark request");
-    assert_eq!(
-        barrier.status().as_u16(),
-        200,
-        "{}",
-        barrier.text().await.unwrap()
-    );
+    assert_eq!(barrier.status().as_u16(), 200);
 
     // Panes are published before the barrier returns, so one query suffices.
     let warm = instant().await;
@@ -2042,12 +2034,9 @@ async fn watermark_barrier_serves_window_of_stopped_series() {
         serde_json::json!({"job": "worker"})
     );
     // Input stays open after the barrier.
+    let later = series_with_labels("asap_demo_gauge", &[("job", "api")], &[(base + 7_000, 7.0)]);
     let later = WriteRequest {
-        timeseries: vec![series_with_labels(
-            "asap_demo_gauge",
-            &[("job", "api")],
-            &[(base + 7_000, 7.0)],
-        )],
+        timeseries: vec![later],
     };
     assert_eq!(remote_write(&client, &backend, &later).await, 204);
 }
