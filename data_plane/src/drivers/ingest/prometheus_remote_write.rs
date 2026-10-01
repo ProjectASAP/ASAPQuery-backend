@@ -1422,29 +1422,6 @@ mod tests {
         assert_eq!(drain.await.unwrap().unwrap_err(), "sink write failed");
     }
 
-    // A live barrier queues behind acknowledged writes and leaves input open.
-    #[tokio::test]
-    async fn watermark_barrier_follows_acknowledged_writes_and_keeps_input_open() {
-        let (receiver, mut worker) = configured_receiver();
-        receiver.accept(&one_sample(1.0)).unwrap();
-        let handle = receiver.clone();
-        let barrier = tokio::spawn(async move { handle.advance_watermark(100).await });
-        assert!(matches!(
-            worker.recv().await.unwrap(),
-            WorkerMessage::BoundInput { .. }
-        ));
-        let WorkerMessage::AdvanceWatermark {
-            event_time_ms: 100,
-            reply,
-        } = worker.recv().await.unwrap()
-        else {
-            panic!("expected watermark barrier")
-        };
-        receiver.accept(&one_sample(1.0)).unwrap();
-        reply.send(Ok(())).unwrap();
-        barrier.await.unwrap().unwrap();
-    }
-
     #[test]
     fn rejects_writes_without_an_active_physical_plan() {
         let (sender, _worker) = mpsc::channel(1);

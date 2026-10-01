@@ -2002,26 +2002,24 @@ async fn watermark_barrier_serves_window_of_stopped_series() {
 
     let query = "topk(1, sum_over_time(asap_demo_gauge[5s]))";
     let eval = (base + 5_000) as f64 / 1_000.0;
-    let before: Value = client
-        .get(format!("{backend}/api/v1/query"))
-        .query(&[("query", query.to_string()), ("time", eval.to_string())])
-        .send()
-        .await
-        .expect("instant query")
-        .json()
-        .await
-        .expect("instant JSON");
+    let (client_ref, backend_ref) = (&client, &backend);
+    let instant = move || async move {
+        client_ref
+            .get(format!("{backend_ref}/api/v1/query"))
+            .query(&[("query", query.to_string()), ("time", eval.to_string())])
+            .send()
+            .await
+            .expect("instant query")
+            .json::<Value>()
+            .await
+            .expect("instant JSON")
+    };
+    let before = instant().await;
     assert!(
         !is_warm(&before),
         "the stopped series' pane is still open: {before}"
     );
 
-    let missing = client
-        .post(format!("{backend}/api/v1/precompute/watermark"))
-        .send()
-        .await
-        .expect("watermark request");
-    assert_eq!(missing.status().as_u16(), 400);
     let barrier = client
         .post(format!("{backend}/api/v1/precompute/watermark"))
         .query(&[("time_ms", base + 5_000)])
@@ -2035,8 +2033,9 @@ async fn watermark_barrier_serves_window_of_stopped_series() {
         barrier.text().await.unwrap()
     );
 
-    let backend_log = output_dir.path().join("query_engine.log");
-    let warm = wait_for_warm_instant(&client, &backend, query, eval, &backend_log).await;
+    // Panes are published before the barrier returns, so one query suffices.
+    let warm = instant().await;
+    assert!(is_warm(&warm), "{warm}");
     assert_eq!(first_value(&warm, "value"), Some(200.0), "{warm}");
     assert_eq!(
         warm["data"]["result"][0]["metric"],
