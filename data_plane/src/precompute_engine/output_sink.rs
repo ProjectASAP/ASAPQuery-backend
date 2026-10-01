@@ -550,8 +550,11 @@ mod tests {
             )])
             .is_err());
         assert_ne!(old_sid, new_sid);
-        assert!(store.query_exact_agg_range(old_sid, 1000, 2000).is_empty());
-        let values = store.query_exact_agg_range(new_sid, 1000, 2000);
+        assert!(store
+            .query_exact_agg_range(old_sid, 1000, 2000)
+            .unwrap()
+            .is_empty());
+        let values = store.query_exact_agg_range(new_sid, 1000, 2000).unwrap();
         assert_eq!(
             values[0].1.values().next().unwrap().aux_stats().sum,
             Some(11.0)
@@ -603,6 +606,7 @@ mod tests {
         );
         assert!(summary_store
             .query_exact_agg_range(meta.storage_handle, 1_000, 2_000)
+            .unwrap()
             .is_empty());
     }
 

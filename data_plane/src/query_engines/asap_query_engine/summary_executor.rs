@@ -489,6 +489,9 @@ impl QueryExecutionContext<'_> {
                     let Some((labels, windows)) = self
                         .index
                         .query_exact_agg_range(sid, self.t0_ms, self.t1_ms)
+                        .map_err(|_| {
+                            SummaryExecutorError::Unsupported("stored exact states do not merge")
+                        })?
                         .into_iter()
                         .next()
                     else {
