@@ -61,6 +61,14 @@ cargo run -p data_plane -- --plan plan.json --prometheus-url http://localhost:90
 `--capabilities caps.json` replaces the default capabilities, which are the
 Planner executor's capabilities without state kept across query evaluations.
 
+## Examples
+
+`examples/` holds #509's PromQL example workloads (1, 3a, 3b, 4a, 4b) as
+Planner `PlanningWorkload`s. `data_plane/tests/e2e_examples.rs` plans each
+one, runs the `data_plane` binary against a Prometheus holding generated
+samples, Remote Writes the same samples, and checks every planned query
+against the Planner executor running the workload entirely at query time.
+
 ## Development
 
 ```sh

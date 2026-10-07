@@ -1,0 +1,177 @@
+{
+  "query_workload": {
+    "language": "promql",
+    "query_batch": null,
+    "repeating_queries": [
+      {
+        "query": "quantile_over_time(0.99, latency_ms[5y])",
+        "demand": {
+          "fixed_interval": 2592000000
+        },
+        "requirements": {
+          "accuracy": {
+            "explicit": {
+              "EpsilonDelta": {
+                "epsilon": 0.005,
+                "delta": 0.01
+              }
+            }
+          },
+          "response_latency": "unspecified"
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": 1767225600000
+          }
+        },
+        "time_selection": {
+          "scope": "longitudinal",
+          "lookback": 157680000000,
+          "as_of": null
+        }
+      },
+      {
+        "query": "quantile_over_time(0.99, latency_ms[1y])",
+        "demand": {
+          "fixed_interval": 2592000000
+        },
+        "requirements": {
+          "accuracy": {
+            "explicit": {
+              "EpsilonDelta": {
+                "epsilon": 0.005,
+                "delta": 0.01
+              }
+            }
+          },
+          "response_latency": "unspecified"
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": 1767225600000
+          }
+        },
+        "time_selection": {
+          "scope": "longitudinal",
+          "lookback": 31536000000,
+          "as_of": null
+        }
+      },
+      {
+        "query": "quantile_over_time(0.99, latency_ms[1y] offset 1y)",
+        "demand": {
+          "fixed_interval": 2592000000
+        },
+        "requirements": {
+          "accuracy": {
+            "explicit": {
+              "EpsilonDelta": {
+                "epsilon": 0.005,
+                "delta": 0.01
+              }
+            }
+          },
+          "response_latency": "unspecified"
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": 1767225600000
+          }
+        },
+        "time_selection": {
+          "scope": "longitudinal",
+          "lookback": 31536000000,
+          "as_of": null
+        }
+      },
+      {
+        "query": "quantile_over_time(0.99, latency_ms[1y] offset 2y)",
+        "demand": {
+          "fixed_interval": 2592000000
+        },
+        "requirements": {
+          "accuracy": {
+            "explicit": {
+              "EpsilonDelta": {
+                "epsilon": 0.005,
+                "delta": 0.01
+              }
+            }
+          },
+          "response_latency": "unspecified"
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": 1767225600000
+          }
+        },
+        "time_selection": {
+          "scope": "longitudinal",
+          "lookback": 31536000000,
+          "as_of": null
+        }
+      },
+      {
+        "query": "quantile_over_time(0.99, latency_ms[3y] offset 2y)",
+        "demand": {
+          "fixed_interval": 2592000000
+        },
+        "requirements": {
+          "accuracy": {
+            "explicit": {
+              "EpsilonDelta": {
+                "epsilon": 0.005,
+                "delta": 0.01
+              }
+            }
+          },
+          "response_latency": "unspecified"
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": 1767225600000
+          }
+        },
+        "time_selection": {
+          "scope": "longitudinal",
+          "lookback": 94608000000,
+          "as_of": null
+        }
+      }
+    ]
+  },
+  "data_workload": {
+    "arrival": "mixed",
+    "data_ingestion_interval": {
+      "value": 15000,
+      "source": "declared",
+      "observed_at_ms": null,
+      "valid_for_ms": null
+    },
+    "ingestion_volume": {
+      "value": null,
+      "source": "unknown",
+      "observed_at_ms": null,
+      "valid_for_ms": null
+    },
+    "ingestion_rate": {
+      "value": 66666.66666666667,
+      "source": "declared",
+      "observed_at_ms": null,
+      "valid_for_ms": null
+    },
+    "input_cardinality": {
+      "value": 1000000,
+      "source": "declared",
+      "observed_at_ms": null,
+      "valid_for_ms": null
+    },
+    "distribution": {
+      "value": "zipf",
+      "source": "declared",
+      "observed_at_ms": null,
+      "valid_for_ms": null
+    },
+    "metric_types": {}
+  }
+}
