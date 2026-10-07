@@ -2,7 +2,7 @@
 //! watermark passes its end.
 //!
 //! For every [`SummaryDefinition`] the engine buffers the samples of its
-//! `Scan`'s metric by tumbling pane. A pane `[end - pane, end)` closes when
+//! `Scan`'s metric by tumbling pane. A pane `(end - pane, end]` closes when
 //! the watermark (the newest sample time minus the allowed lateness) reaches
 //! `end`. Closing it runs the plan's `Scan` over the buffered samples, which
 //! applies the label matchers, then the definition's build from its
@@ -205,8 +205,10 @@ impl Precompute {
 }
 
 /// End of the tumbling pane of width `pane_ms` that contains `timestamp_ms`.
+/// Panes are `(end - pane_ms, end]`, like PromQL ranges: a sample at a pane
+/// boundary belongs to the pane it ends.
 pub fn pane_end(timestamp_ms: i64, pane_ms: i64) -> i64 {
-    (timestamp_ms.div_euclid(pane_ms) + 1) * pane_ms
+    -(-timestamp_ms).div_euclid(pane_ms) * pane_ms
 }
 
 /// Runs the plan's `Scan` over `samples`, then the definition's build over

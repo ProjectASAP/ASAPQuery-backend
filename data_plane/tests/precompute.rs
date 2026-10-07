@@ -29,7 +29,7 @@ fn sample(metric: &str, job: &str, timestamp_ms: i64, value: f64) -> RawSample {
     }
 }
 
-/// One sample every 15 s for each job in `[from, to)`.
+/// One sample every 15 s for each job, at `from`, `from + 15 s`, ... before `to`.
 fn samples(metric: &str, jobs: &[&str], from: i64, to: i64) -> Vec<RawSample> {
     (from..to)
         .step_by(15_000)
@@ -43,7 +43,8 @@ fn samples(metric: &str, jobs: &[&str], from: i64, to: i64) -> Vec<RawSample> {
 fn builds_panes_after_the_first_as_the_watermark_passes() {
     let (mut engine, sds) = precompute(common::plan("example4b", false));
     let id = sds.definitions.keys().next().unwrap().clone();
-    engine.ingest(&samples("latency_ms", &["a", "b"], 0, 35 * MINUTE));
+    // The first sample, at 1 min, opens pane (0, 10 min], which is skipped.
+    engine.ingest(&samples("latency_ms", &["a", "b"], MINUTE, 35 * MINUTE));
     assert_eq!(engine.store.get(&id, PANE).map(|_| ()), None, "first pane");
     for end in [2 * PANE, 3 * PANE] {
         let pane = engine.store.get(&id, end).expect("built pane");
@@ -57,9 +58,9 @@ fn builds_panes_after_the_first_as_the_watermark_passes() {
     let stats = engine.stats;
     assert_eq!(stats.panes_built, 2);
     assert_eq!(stats.panes_failed, 0);
-    // Samples in [0, 10 min) are dropped with the first pane.
-    assert_eq!(stats.dropped, 2 * 40);
-    assert_eq!(stats.accepted, 2 * 100);
+    // Samples in (0, 10 min] are dropped with the first pane.
+    assert_eq!(stats.dropped, 2 * 37);
+    assert_eq!(stats.accepted, 2 * 99);
 }
 
 /// Samples of other metrics are ignored; samples for a built pane are dropped.
@@ -81,7 +82,7 @@ fn stores_empty_panes() {
     let (mut engine, sds) = precompute(common::plan("example4b", false));
     let id = sds.definitions.keys().next().unwrap().clone();
     engine.ingest(&samples("latency_ms", &["a"], 0, 20 * MINUTE));
-    engine.ingest(&samples("latency_ms", &["a"], 40 * MINUTE, 41 * MINUTE));
+    engine.ingest(&[sample("latency_ms", "a", 45 * MINUTE, 1.0)]);
     assert_eq!(engine.store.get(&id, 2 * PANE).unwrap().rows().len(), 1);
     assert_eq!(engine.store.get(&id, 3 * PANE).unwrap().rows().len(), 0);
     assert_eq!(engine.store.get(&id, 4 * PANE).unwrap().rows().len(), 0);
@@ -106,11 +107,14 @@ fn applies_label_matchers() {
     assert_eq!(engine.store.get(&id, 2 * PANE).unwrap().rows().len(), 1);
 }
 
-/// A sample belongs to the pane whose end follows it, including at negative times.
+/// Panes are `(end - width, end]`, like PromQL ranges: a sample at a
+/// boundary belongs to the pane it ends.
 #[test]
-fn pane_end_is_the_next_boundary() {
-    assert_eq!(pane_end(0, PANE), PANE);
-    assert_eq!(pane_end(PANE - 1, PANE), PANE);
-    assert_eq!(pane_end(PANE, PANE), 2 * PANE);
+fn panes_are_left_open() {
+    assert_eq!(pane_end(1, PANE), PANE);
+    assert_eq!(pane_end(PANE, PANE), PANE);
+    assert_eq!(pane_end(PANE + 1, PANE), 2 * PANE);
+    assert_eq!(pane_end(0, PANE), 0);
     assert_eq!(pane_end(-1, PANE), 0);
+    assert_eq!(pane_end(-PANE, PANE), -PANE);
 }
