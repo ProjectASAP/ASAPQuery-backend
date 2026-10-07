@@ -1,13 +1,16 @@
 //! Backend data plane: receives Prometheus Remote Write samples and serves
 //! the Prometheus query API for an installed plan.
 //!
-//! The installed plan is ASAPPlanner's selected `PhysicalASAPDAG`. Executing
-//! it is not implemented yet: samples are validated and counted, and every
-//! query is forwarded to Prometheus.
+//! The installed plan is ASAPPlanner's selected `PhysicalASAPDAG`. The
+//! engine thread builds its ingestion-time outputs pane by pane; queries are
+//! still forwarded to Prometheus.
 
+pub mod engine;
+pub mod precompute;
 pub mod remote_write;
 pub mod sds;
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -17,14 +20,20 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use control_plane::InstalledPlan;
+use engine::EngineHandle;
+use precompute::RawSample;
+
+/// Prometheus' staleness marker: a NaN that ends a series, not a sample.
+const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
 
 /// Response header naming what answered a query.
 pub const EXECUTION_HEADER: &str = "x-asap-execution";
 
 pub struct DataPlane {
-    /// The installed plan's queries, in root order. The plan itself is not
-    /// `Send` (its operator payloads hold `Rc`s), so it stays with its loader.
+    /// The installed plan's queries, in root order.
     pub queries: Vec<String>,
+    pub engine: EngineHandle,
     /// Base URL of the Prometheus that answers forwarded queries.
     pub prometheus_url: String,
     pub limits: remote_write::Limits,
@@ -34,14 +43,23 @@ pub struct DataPlane {
 }
 
 impl DataPlane {
-    pub fn new(queries: Vec<String>, prometheus_url: String) -> Self {
-        Self {
-            queries,
+    /// Installs the plan serialized in `plan_json` (an [`InstalledPlan`]).
+    /// Panes close `allowed_lateness_ms` after the newest sample passes them.
+    pub fn new(
+        plan_json: String,
+        prometheus_url: String,
+        allowed_lateness_ms: i64,
+    ) -> anyhow::Result<Self> {
+        let plan: InstalledPlan = serde_json::from_str(&plan_json)?;
+        plan.validate()?;
+        Ok(Self {
+            queries: plan.queries,
+            engine: EngineHandle::spawn(plan_json, allowed_lateness_ms)?,
             prometheus_url: prometheus_url.trim_end_matches('/').to_string(),
             limits: remote_write::Limits::default(),
             samples: AtomicU64::new(0),
             client: reqwest::Client::new(),
-        }
+        })
     }
 }
 
@@ -57,9 +75,36 @@ pub fn router(state: Arc<DataPlane>) -> Router {
 async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
     match remote_write::decode(&body, &state.limits) {
         Ok(request) => {
-            let samples: usize = request.timeseries.iter().map(|s| s.samples.len()).sum();
-            state.samples.fetch_add(samples as u64, Ordering::Relaxed);
-            StatusCode::NO_CONTENT.into_response()
+            let mut samples = Vec::new();
+            for series in request.timeseries {
+                let labels: Arc<BTreeMap<String, String>> = Arc::new(
+                    series
+                        .labels
+                        .into_iter()
+                        .map(|label| (label.name, label.value))
+                        .collect(),
+                );
+                samples.extend(
+                    series
+                        .samples
+                        .into_iter()
+                        .filter(|s| s.value.to_bits() != STALE_NAN_BITS)
+                        .map(|s| RawSample {
+                            labels: labels.clone(),
+                            timestamp_ms: s.timestamp,
+                            value: s.value,
+                        }),
+                );
+            }
+            let count = samples.len() as u64;
+            match state.engine.try_ingest(samples) {
+                Ok(()) => {
+                    state.samples.fetch_add(count, Ordering::Relaxed);
+                    StatusCode::NO_CONTENT.into_response()
+                }
+                // Remote Write senders retry on 5xx.
+                Err(busy) => (StatusCode::SERVICE_UNAVAILABLE, busy.to_string()).into_response(),
+            }
         }
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
