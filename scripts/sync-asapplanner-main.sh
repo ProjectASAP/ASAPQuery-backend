@@ -27,9 +27,9 @@ PY
 
 cargo update \
   -p asap-types@0.1.0 \
-  -p asap-aware-mapping \
   -p asap-frontend-promql \
-  -p asap-frontend-sql \
+  -p asap-plan-selection \
+  -p asap-executor \
   --precise "$planner_rev"
 
 echo "synchronized ASAPPlanner dependencies to $planner_rev"

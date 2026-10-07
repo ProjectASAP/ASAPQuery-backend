@@ -1,79 +1,134 @@
-//! Backend control-plane library and standalone service.
+//! Backend control plane: asks ASAPPlanner for the workload's plan and
+//! writes it for the data plane to install.
 //!
-//! ASAPPlanner owns canonical semantic IR and legal logical selection. This
-//! crate adapts workload/evidence inputs, compiles physical candidates, checks
-//! provider quotes, and publishes one consistent catalog-backed generation.
-//! Shared execution and installation contracts live in `asap_types`.
-//!
-//! `physical::compiler`, `physical::workload_cost`, and `clickhouse` are the
-//! current compilation paths. Metric stage emission consumes the same canonical
-//! workload model through a registration adapter. Public modules are integration APIs,
-//! not an independent wire schema or a second semantic planner.
+//! The Planner runs every planning stage, including plan selection. This
+//! crate only supplies the deployment's capabilities and records which query
+//! each root of the selected `PhysicalASAPDAG` answers.
 
-#![allow(
-    clippy::collapsible_match,
-    clippy::doc_lazy_continuation,
-    clippy::doc_overindented_list_items,
-    clippy::field_reassign_with_default,
-    clippy::large_enum_variant,
-    clippy::map_identity,
-    clippy::result_large_err,
-    clippy::too_many_arguments,
-    clippy::type_complexity,
-    clippy::vec_init_then_push
-)]
+use std::path::Path;
 
-pub mod accuracy;
-pub mod backend_client;
-pub mod clickhouse;
-pub mod emit;
-pub mod epsilon_alloc;
-pub mod metrics_exposer;
-pub mod opamp;
-pub mod physical;
-pub mod planner_selection;
-pub mod query_parser;
-pub mod query_plan;
-pub mod runtime_samples;
-pub mod types;
-pub mod workload;
+use asap_plan_selection::{plan_stages, PlanningModels};
+use planner_types::deployment::DeploymentCapabilities;
+use planner_types::ir::physical_export::PhysicalASAPDAGDocument;
+use planner_types::ir::schema_support::with_promql_series_identity;
+use planner_types::ir::QueryRoot;
+use planner_types::workload::{PlanningWorkload, QueryLanguage, RootDemand};
+use serde::{Deserialize, Serialize};
 
-/// Crate-wide test-only utilities for serialising access to process-global
-/// state (environment variables).
-///
-/// `cargo test` runs `#[test]`/`#[tokio::test]` functions on multiple
-/// threads within a SINGLE process, and `std::env::set_var` /
-/// `std::env::remove_var` mutate the one process-global environment table.
-/// Those C `setenv`/`unsetenv` calls are not thread-safe — concurrent
-/// invocations (even on different keys) are documented as unsound and can
-/// corrupt the table — and any test that READS an env var via
-/// `std::env::var` can transiently observe a value another test set
-/// mid-emit. Both classes of failure are non-deterministic and surface as
-/// flaky test results.
-///
-/// Every unit test in this crate that reads OR writes a process-global env
-/// var (`ASAP_EDGE_FUSED`, `ASAP_AGENT_MEMORY_LIMIT_MIB`,
-/// `USE_TYPED_STAGE_SPLIT`, …) must serialise behind the SINGLE
-/// [`env_lock()`] below — one shared lock so no two such tests ever run
-/// concurrently, regardless of which module they live in. Tests that
-/// mutate env should use [`EnvVarGuard`] so the prior value is restored on
-/// drop (panic-safe), preventing state from leaking between tests.
-#[cfg(test)]
-pub(crate) mod test_support {
-    use std::rc::Rc;
+/// The plan the data plane installs: the Planner's selected physical DAG and
+/// the query each of its roots answers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledPlan {
+    /// PromQL text of each root of `dag`, in root order.
+    pub queries: Vec<String>,
+    pub dag: PhysicalASAPDAGDocument,
+}
 
-    use planner_types::pre_asap::{CompareOpKind, Predicate, QueryExpr, ScalarValue, Schema};
+#[derive(Debug, thiserror::Error)]
+pub enum PlanError {
+    #[error("only PromQL workloads are supported, got {0:?}")]
+    UnsupportedLanguage(QueryLanguage),
+    #[error("query {0} lowers to a scalar, which the physical DAG cannot carry yet")]
+    ScalarRoot(usize),
+    #[error("PromQL lowering: {0}")]
+    Lowering(String),
+    #[error("planning: {0}")]
+    Planning(String),
+    #[error("invalid physical DAG: {0}")]
+    InvalidDag(String),
+    #[error("the DAG has {roots} roots for {queries} queries")]
+    RootCount { roots: usize, queries: usize },
+    #[error("{path}: {message}")]
+    File { path: String, message: String },
+}
 
-    pub(crate) fn label_eq_predicate(
-        label: &str,
-        value: &str,
-        schema: &Schema,
-    ) -> Option<Predicate> {
-        let column = schema.column_id(label)?;
-        Some(Predicate(Rc::new(QueryExpr::Compare {
-            left: Rc::new(QueryExpr::Column(column)),
-            op: CompareOpKind::Eq,
-            right: Rc::new(QueryExpr::Literal(ScalarValue::Utf8(value.to_string()))),
-        })))
+impl InstalledPlan {
+    pub fn validate(&self) -> Result<(), PlanError> {
+        self.dag
+            .validate()
+            .map_err(|e| PlanError::InvalidDag(e.to_string()))?;
+        let roots = self.dag.dag.roots.len();
+        if roots != self.queries.len() {
+            return Err(PlanError::RootCount {
+                roots,
+                queries: self.queries.len(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Reads and validates a plan written by [`InstalledPlan::save`].
+    pub fn load(path: &Path) -> Result<Self, PlanError> {
+        let file_error = |message: String| PlanError::File {
+            path: path.display().to_string(),
+            message,
+        };
+        let text = std::fs::read_to_string(path).map_err(|e| file_error(e.to_string()))?;
+        let plan: Self = serde_json::from_str(&text).map_err(|e| file_error(e.to_string()))?;
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), PlanError> {
+        let text = serde_json::to_string_pretty(self).expect("plans serialize");
+        std::fs::write(path, text).map_err(|e| PlanError::File {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        })
+    }
+}
+
+/// Plans `workload` with the Planner's #509 stage pipeline and returns the
+/// selected plan. `capabilities` are what this deployment can execute; the
+/// Planner rejects every candidate that needs more.
+pub fn plan_workload(
+    workload: &PlanningWorkload,
+    capabilities: &DeploymentCapabilities,
+) -> Result<InstalledPlan, PlanError> {
+    let language = &workload.query_workload.language;
+    if *language != QueryLanguage::PromQL {
+        return Err(PlanError::UnsupportedLanguage(language.clone()));
+    }
+    let roots = asap_frontend_promql::lower_promql_query_workload(workload, 0)
+        .map_err(|e| PlanError::Lowering(e.to_string()))?
+        .into_iter()
+        .enumerate()
+        .map(|(i, root)| match root {
+            // Rows carry each series' full identity: the representation
+            // per-series state needs at runtime.
+            QueryRoot::Operator(node) => with_promql_series_identity(&node)
+                .map(|node| (i, QueryRoot::Operator(node)))
+                .map_err(|e| PlanError::Lowering(e.to_string())),
+            QueryRoot::Scalar(_) => Err(PlanError::ScalarRoot(i)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let entries: Vec<_> = workload.query_workload.entries().collect();
+    let demand: Vec<RootDemand> = entries.iter().map(RootDemand::from).collect();
+    let data = workload.data_workload.clone().unwrap_or_default();
+    let models = PlanningModels::builtin().with_capabilities(capabilities);
+    let run = plan_stages(roots, &demand, &data, models, 0)
+        .map_err(|e| PlanError::Planning(e.to_string()))?;
+    let physical = run.plan.physical;
+    tracing::info!(
+        candidate = %physical.id,
+        label = %physical.label,
+        materialization = %physical.materialization,
+        "selected physical plan"
+    );
+    let plan = InstalledPlan {
+        queries: entries.into_iter().map(|e| e.query.0).collect(),
+        dag: PhysicalASAPDAGDocument::new(physical.dag),
+    };
+    plan.validate()?;
+    Ok(plan)
+}
+
+/// What this backend's data plane can execute: the Planner executor it
+/// runs, without state kept across query evaluations.
+pub fn backend_capabilities() -> DeploymentCapabilities {
+    DeploymentCapabilities {
+        query_time_retention: false,
+        ..asap_executor::capabilities()
     }
 }

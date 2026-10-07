@@ -20,7 +20,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      # The full workspace links multiple DataFusion-heavy process test binaries.
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
@@ -32,9 +31,6 @@ jobs:
 
       - name: Install Rust components
         run: rustup component add rustfmt clippy
-
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
 
       - name: Configure private Cargo dependencies
         env:
@@ -57,9 +53,7 @@ jobs:
 
       - name: Check workspace formatting
         working-directory: ASAPQuery-backend
-        # `--all` also follows this workspace's sibling path dependencies.
-        # Keep the gate scoped to every backend-owned workspace member.
-        run: cargo fmt -p control_plane -p data_plane -p asap_types -p asap_otel_proto -- --check
+        run: cargo fmt -p control_plane -p data_plane -- --check
 
       - name: Check workspace
         env:
@@ -71,15 +65,10 @@ jobs:
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         working-directory: ASAPQuery-backend
-        # Preserve the existing warning policy while expanding runtime coverage.
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test workspace
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-          # Give background flusher/sealer waits headroom on hosted runners.
-          ASAP_TEST_TIMEOUT_SCALE: "4"
         working-directory: ASAPQuery-backend
-        # Persistence tests wait on background flushers with bounded deadlines.
-        # Match scripts/e2e.sh to avoid competing flushers exhausting those waits.
-        run: cargo test --workspace --locked -- --test-threads=1
+        run: cargo test --workspace --locked

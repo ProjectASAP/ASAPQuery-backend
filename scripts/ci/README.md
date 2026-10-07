@@ -15,7 +15,9 @@ MVP CI uses `--locked` and runs the workspace checks, Clippy, unit tests, and
 process E2E tests. Only a successful run for the current update PR head can
 trigger the merge workflow; it also verifies the repository, branch, base, and
 that main has not advanced since that run and only the two Cargo files changed. Branch protection remains in force.
-Failed updates stay open and main retains its last verified version. Fix an
+Failed updates stay open and main retains its last verified version.
+While `asap-plan-selection` and `asap-executor` exist only in the Planner's
+#509 stack, the pin is a stack revision and updates to Planner main fail CI. Fix an
 upstream incompatibility separately, or let the next upstream update refresh the
 PR. An automation failure is visible in Actions; check token permissions there.
 
