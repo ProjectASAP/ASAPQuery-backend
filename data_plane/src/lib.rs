@@ -6,6 +6,7 @@
 //! query is forwarded to Prometheus.
 
 pub mod remote_write;
+pub mod sds;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

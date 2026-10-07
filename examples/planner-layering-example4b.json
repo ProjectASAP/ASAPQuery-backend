@@ -1,0 +1,71 @@
+{
+  "query_workload": {
+    "language": "promql",
+    "query_batch": null,
+    "repeating_queries": [
+      {
+        "query": "quantile_over_time(0.99, latency_ms[60m])",
+        "demand": {
+          "fixed_interval": 600000
+        },
+        "requirements": {
+          "accuracy": {
+            "explicit": {
+              "EpsilonDelta": {
+                "epsilon": 0.01,
+                "delta": 0.01
+              }
+            }
+          },
+          "response_latency": {
+            "explicit_max_ms": 200.0
+          }
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        },
+        "time_selection": {
+          "scope": "real_time",
+          "lookback": 3600000,
+          "as_of": null
+        }
+      }
+    ]
+  },
+  "data_workload": {
+    "arrival": "continuously_ingesting",
+    "data_ingestion_interval": {
+      "value": 1000,
+      "source": "declared",
+      "observed_at_ms": null,
+      "valid_for_ms": null
+    },
+    "ingestion_volume": {
+      "value": null,
+      "source": "unknown",
+      "observed_at_ms": null,
+      "valid_for_ms": null
+    },
+    "ingestion_rate": {
+      "value": 1000.0,
+      "source": "declared",
+      "observed_at_ms": null,
+      "valid_for_ms": null
+    },
+    "input_cardinality": {
+      "value": 1000,
+      "source": "declared",
+      "observed_at_ms": null,
+      "valid_for_ms": null
+    },
+    "distribution": {
+      "value": "zipf",
+      "source": "declared",
+      "observed_at_ms": null,
+      "valid_for_ms": null
+    },
+    "metric_types": {}
+  }
+}
