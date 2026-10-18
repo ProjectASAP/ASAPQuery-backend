@@ -5,6 +5,9 @@ edition.workspace = true
 
 [dependencies]
 control_plane.workspace = true
+planner-types.workspace = true
+asap-executor.workspace = true
+sha2 = "0.10"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
