@@ -2,11 +2,14 @@
 //! the Prometheus query API for an installed plan.
 //!
 //! The installed plan is ASAPPlanner's selected `PhysicalASAPDAG`. The
-//! engine thread builds its ingestion-time outputs pane by pane; queries are
-//! still forwarded to Prometheus.
+//! engine thread builds its ingestion-time outputs pane by pane and answers
+//! the plan's instant queries from them; every other query, and any planned
+//! query it cannot answer, is forwarded to Prometheus.
 
 pub mod engine;
 pub mod precompute;
+pub mod prometheus;
+pub mod query;
 pub mod remote_write;
 pub mod sds;
 
@@ -23,9 +26,13 @@ use axum::routing::{get, post};
 use axum::Router;
 use engine::{EngineHandle, EngineOptions, IngestError};
 use precompute::RawSample;
+use prometheus::InstantQuery;
+use query::Unanswered;
 
-/// Response header naming what answered a query.
+/// Response header naming what answered a query: `plan` or `forwarded`.
 pub const EXECUTION_HEADER: &str = "x-asap-execution";
+/// Response header of a forwarded planned query: why the plan did not answer.
+pub const FORWARD_REASON_HEADER: &str = "x-asap-forward-reason";
 
 /// How long a forwarded query may take by default, matching Prometheus's
 /// default `--query.timeout` of two minutes.
@@ -177,6 +184,7 @@ async fn status(State(state): State<Arc<DataPlane>>) -> Response {
         .into_response()
 }
 
+/// Answers a planned instant query from the plan; forwards anything else.
 async fn query(
     state: State<Arc<DataPlane>>,
     method: Method,
@@ -184,7 +192,56 @@ async fn query(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    forward(state, "query", method, query, headers, body).await
+    let Some(instant) = InstantQuery::parse(query.0.as_deref(), &body) else {
+        return forward(state, "query", method, query, headers, body).await;
+    };
+    let reason = match answer(&state, instant, &headers).await {
+        Ok(response) => {
+            let mut response = axum::Json(response).into_response();
+            response
+                .headers_mut()
+                .insert(EXECUTION_HEADER, HeaderValue::from_static("plan"));
+            return response;
+        }
+        Err(Unanswered::NotPlanned(_)) => None,
+        Err(reason) => {
+            tracing::debug!(%reason, "forwarding a planned query");
+            HeaderValue::from_str(&reason.to_string()).ok()
+        }
+    };
+    let mut response = forward(state, "query", method, query, headers, body).await;
+    if let Some(reason) = reason {
+        response.headers_mut().insert(FORWARD_REASON_HEADER, reason);
+    }
+    response
+}
+
+/// Runs a planned instant query. Raw ranges are read from Prometheus with
+/// the caller's end-to-end `headers`, as a forwarded query would be.
+async fn answer(
+    state: &DataPlane,
+    query: InstantQuery,
+    headers: &HeaderMap,
+) -> Result<serde_json::Value, Unanswered> {
+    let time_ms = query.time_ms.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64)
+    });
+    let (root, ranges) = state.engine.raw_ranges(query.query, time_ms).await?;
+    let mut fetch_headers = forwarded_headers(headers);
+    // The raw read is a GET without the caller's body.
+    fetch_headers.remove(header::CONTENT_TYPE);
+    let mut raw = BTreeMap::new();
+    for range in &ranges {
+        let samples =
+            prometheus::fetch(&state.client, &state.prometheus_url, &fetch_headers, range)
+                .await
+                .map_err(|e| Unanswered::Execution(format!("fetching raw samples: {e}")))?;
+        raw.insert(range.node, samples);
+    }
+    let samples = state.engine.evaluate(root, time_ms, raw).await?;
+    Ok(prometheus::vector_response(time_ms, &samples))
 }
 
 async fn query_range(
