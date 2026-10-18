@@ -32,9 +32,13 @@ The backend is being rebuilt on the Planner's physical DAG:
 |---|---|
 | Control plane: plan a PromQL workload, write `plan.json` | done |
 | Data plane: load and validate `plan.json`, accept Remote Write | done |
-| Stored summaries (SDS) | next |
-| Precompute engine: run ingestion-time nodes per pane | planned |
+| Stored summaries (SDS): one definition per computation, panes by end time | done |
+| Precompute engine: build ingestion-time outputs once per tumbling pane | done |
 | Query engine: run query-time nodes over stored panes and raw data | planned |
+
+Panes close `--allowed-lateness-ms` (default 15 s) after the newest sample
+passes their end; later samples for them are dropped. The first pane after
+startup is skipped because it may be partial.
 
 Until the query engine lands, the data plane forwards every query to
 Prometheus and marks the response `x-asap-execution: forwarded`. SQL and

@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use control_plane::InstalledPlan;
 use data_plane::{router, DataPlane};
 
 /// Serve Remote Write ingestion and the Prometheus query API for a plan.
@@ -16,6 +15,9 @@ struct Args {
     prometheus_url: String,
     #[arg(long, default_value = "0.0.0.0:8088")]
     listen: String,
+    /// How long after the newest sample passes a pane's end it is built.
+    #[arg(long, default_value_t = 15_000)]
+    allowed_lateness_ms: i64,
 }
 
 #[tokio::main]
@@ -24,13 +26,13 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let args = Args::parse();
-    let plan = InstalledPlan::load(&args.plan)?;
-    tracing::info!(
-        queries = plan.queries.len(),
-        nodes = plan.dag.dag.nodes.len(),
-        "installed plan"
-    );
-    let state = Arc::new(DataPlane::new(plan.queries, args.prometheus_url));
+    let plan = std::fs::read_to_string(&args.plan)?;
+    let state = Arc::new(DataPlane::new(
+        plan,
+        args.prometheus_url,
+        args.allowed_lateness_ms,
+    )?);
+    tracing::info!(queries = state.queries.len(), "installed plan");
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     tracing::info!(address = %listener.local_addr()?, "listening");
     axum::serve(listener, router(state)).await?;

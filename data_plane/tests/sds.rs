@@ -1,22 +1,11 @@
-use std::path::Path;
+mod common;
 
 use asap_executor::physical_planner::frontier_from_timing;
-use control_plane::{plan_workload, DeploymentInputs, InstalledPlan};
+use common::plan;
 use data_plane::sds::{DefinitionId, Sds, SdsError, SummaryStore};
 use planner_types::ir::physical_export::PhysicalASAPDAG;
 use planner_types::ir::{NonASAPOp, Operator};
 use planner_types::physical::{Materialization, Medium};
-
-/// The selected plan of a #509 example workload in `examples/`, for a
-/// deployment that keeps raw data or not.
-fn plan(example: &str, raw_data_retained: bool) -> InstalledPlan {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(format!("../examples/planner-layering-{example}.json"));
-    let workload = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    let mut inputs = DeploymentInputs::default();
-    inputs.deployment_capabilities.raw_data_retained = raw_data_retained;
-    plan_workload(&workload, &inputs).unwrap()
-}
 
 fn sds_of(dag: &PhysicalASAPDAG) -> Result<Sds, SdsError> {
     Sds::from_dag(dag, &frontier_from_timing(dag).unwrap())

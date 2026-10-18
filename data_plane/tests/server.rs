@@ -1,3 +1,5 @@
+mod common;
+
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -45,7 +47,14 @@ async fn send(app: &Router, request: Request<Body>) -> (StatusCode, Option<Strin
 /// unchanged, and the response says it was forwarded.
 #[tokio::test]
 async fn forwards_queries_to_prometheus() {
-    let state = Arc::new(DataPlane::new(vec![], fake_prometheus().await));
+    let state = Arc::new(
+        DataPlane::new(
+            common::plan_json("example1", true),
+            fake_prometheus().await,
+            0,
+        )
+        .unwrap(),
+    );
     let app = router(state);
     let (status, execution, body) = send(
         &app,
@@ -73,7 +82,14 @@ async fn forwards_queries_to_prometheus() {
 /// rejected with 400.
 #[tokio::test]
 async fn accepts_remote_write() {
-    let state = Arc::new(DataPlane::new(vec![], "http://unused".into()));
+    let state = Arc::new(
+        DataPlane::new(
+            common::plan_json("example1", true),
+            "http://unused".into(),
+            0,
+        )
+        .unwrap(),
+    );
     let app = router(state.clone());
     let request = WriteRequest {
         timeseries: vec![TimeSeries {

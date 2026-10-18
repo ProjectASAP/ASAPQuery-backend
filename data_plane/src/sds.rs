@@ -11,7 +11,8 @@
 //! frontier node <- ... <- TimeRange(width) <- TimeShift(offset)* <- Scan
 //! ```
 //!
-//! At evaluation time `T` it covers `[T - offset - width, T - offset)`.
+//! At evaluation time `T` it covers `(T - offset - width, T - offset]`, the
+//! PromQL range convention.
 //! Outputs that differ only in `offset` compute the same thing over different
 //! panes, so they share one [`SummaryDefinition`]: the data plane builds each
 //! pane of a definition once, and every output reads the pane it needs.
@@ -33,7 +34,7 @@ pub struct DefinitionId(pub String);
 #[derive(Debug, Clone, PartialEq)]
 pub struct SummaryDefinition {
     pub id: DefinitionId,
-    /// Pane width: each stored summary covers `[end - pane_ms, end)`.
+    /// Pane width: each stored summary covers `(end - pane_ms, end]`.
     pub pane_ms: i64,
     /// The frontier output that builds a pane; any output of the definition
     /// computes the same, and this is the first in node order.
