@@ -53,8 +53,16 @@ sample minus `--allowed-lateness-ms`), and later evaluations reuse it; a pane
 read before it closes is computed again by later evaluations. Kept panes are
 evicted like stored ones, measured from the newest evaluation. Anything else is forwarded
 to Prometheus (`x-asap-execution: forwarded`); a planned query that could not
-be answered also says why in `x-asap-forward-reason`. Range queries, SQL and
-ClickHouse are not supported yet.
+be answered also says why in `x-asap-forward-reason`.
+
+A range query (`/api/v1/query_range`) whose text is one of the plan's queries
+is answered as one evaluation per step, `start + k * step` through `end`,
+and returns a Prometheus matrix. Each query-time raw range is read from
+Prometheus once for all steps and sliced per step; stored and kept panes are
+read per step, so a kept pane built at one step is reused by the later ones.
+If any step cannot be answered, for example because a step is off the pane
+grid or reads an evicted pane, the whole range query is forwarded with the
+reason. SQL and ClickHouse are not supported yet.
 
 ## Running
 

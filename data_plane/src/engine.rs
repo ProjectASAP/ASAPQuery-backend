@@ -32,6 +32,17 @@ pub enum Command {
         raw: BTreeMap<u64, Vec<RawSample>>,
         reply: Reply<Vec<ResultSample>>,
     },
+    RawRangesForSteps {
+        query: String,
+        steps: Vec<i64>,
+        reply: Reply<(usize, Vec<RawRange>)>,
+    },
+    EvaluateSteps {
+        root: usize,
+        steps: Vec<i64>,
+        raw: BTreeMap<u64, Vec<RawSample>>,
+        reply: Reply<Vec<Vec<ResultSample>>>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -98,6 +109,37 @@ impl EngineHandle {
         self.ask(|reply| Command::Evaluate {
             root,
             time_ms,
+            raw,
+            reply,
+        })
+        .await
+    }
+
+    /// The plan root answering `query` at every one of `steps` and the raw
+    /// samples they need; see [`QueryEngine::raw_ranges_for_steps`].
+    pub async fn raw_ranges_for_steps(
+        &self,
+        query: String,
+        steps: Vec<i64>,
+    ) -> Result<(usize, Vec<RawRange>), Unanswered> {
+        self.ask(|reply| Command::RawRangesForSteps {
+            query,
+            steps,
+            reply,
+        })
+        .await
+    }
+
+    /// Runs a root at every one of `steps`; see [`QueryEngine::evaluate_steps`].
+    pub async fn evaluate_steps(
+        &self,
+        root: usize,
+        steps: Vec<i64>,
+        raw: BTreeMap<u64, Vec<RawSample>>,
+    ) -> Result<Vec<Vec<ResultSample>>, Unanswered> {
+        self.ask(|reply| Command::EvaluateSteps {
+            root,
+            steps,
             raw,
             reply,
         })
@@ -173,6 +215,32 @@ impl Engine {
                     let _ = reply.send(self.query.evaluate(
                         root,
                         time_ms,
+                        &self.precompute.store,
+                        self.precompute.watermark_ms(),
+                        &raw,
+                    ));
+                }
+                Command::RawRangesForSteps {
+                    query,
+                    steps,
+                    reply,
+                } => {
+                    let _ = reply.send(self.query.raw_ranges_for_steps(
+                        &query,
+                        &steps,
+                        &self.precompute.store,
+                    ));
+                }
+                Command::EvaluateSteps {
+                    root,
+                    steps,
+                    raw,
+                    reply,
+                } => {
+                    // One watermark for every step of the request.
+                    let _ = reply.send(self.query.evaluate_steps(
+                        root,
+                        &steps,
                         &self.precompute.store,
                         self.precompute.watermark_ms(),
                         &raw,
