@@ -1,6 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use control_plane::{plan_workload, DeploymentInputs, InstalledPlan, PlanError};
+use control_plane::{
+    plan_selected_at_query_time, plan_workload, DeploymentInputs, InstalledPlan, PlanError,
+};
+use planner_types::ir::{ASAPOp, Operator};
+use planner_types::physical::Materialization;
 use planner_types::workload::{PlanningWorkload, QueryLanguage, SqlDialect};
 
 fn example1() -> PlanningWorkload {
@@ -60,4 +64,38 @@ fn load_rejects_a_plan_without_a_query_per_root() {
         })
     ));
     std::fs::remove_file(path).unwrap();
+}
+
+fn example4b() -> PlanningWorkload {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/planner-layering-example4b.json");
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// Without raw data the Planner builds Example 4b's panes at ingestion time,
+/// installed as plain panes (no `PaneChain`); the reference plan of the same
+/// selection materializes nothing.
+#[test]
+fn reference_plan_materializes_nothing() {
+    let mut inputs = DeploymentInputs::default();
+    inputs.deployment_capabilities.raw_data_retained = false;
+    let installed = plan_workload(&example4b(), &inputs).unwrap();
+    let materialized = |plan: &InstalledPlan| {
+        plan.dag
+            .dag
+            .nodes
+            .iter()
+            .filter(|n| n.materialization != Materialization::NotMaterialized)
+            .count()
+    };
+    assert_eq!(materialized(&installed), 6, "six ten-minute panes");
+    assert!(installed
+        .dag
+        .dag
+        .nodes
+        .iter()
+        .all(|n| !matches!(n.payload, Operator::ASAP(ASAPOp::PaneChain { .. }))));
+    let reference = plan_selected_at_query_time(&example4b(), &inputs).unwrap();
+    assert_eq!(materialized(&reference), 0);
+    assert_eq!(reference.queries, installed.queries);
 }
