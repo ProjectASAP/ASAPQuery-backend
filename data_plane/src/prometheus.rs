@@ -331,7 +331,7 @@ mod tests {
 
     /// What Prometheus rejects is not parsed: missing parameters, `end`
     /// before `start`, a step that is not positive or not a duration, and
-    /// more than 11,000 steps.
+    /// more than 11,000 steps. Neither is a nonzero series `limit`.
     #[test]
     fn rejects_invalid_range_queries() {
         for params in [
@@ -350,6 +350,10 @@ mod tests {
             assert_eq!(range(params), None, "{params}");
         }
         assert!(range("query=up&start=0&end=11000&step=1").is_some());
+        // A series limit is left to Prometheus; `limit=0` means no limit.
+        assert_eq!(range("query=up&start=0&end=60&step=15&limit=5"), None);
+        assert!(range("query=up&start=0&end=60&step=15&limit=0").is_some());
+        assert!(InstantQuery::parse(Some("query=up&limit=5"), b"").is_none());
     }
 
     /// Steps run from `start` by `step` and include `end` when on a step.
