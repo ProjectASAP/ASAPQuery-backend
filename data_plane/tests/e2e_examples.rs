@@ -108,8 +108,9 @@ fn sorted(mut samples: Vec<ResultSample>) -> Vec<ResultSample> {
 
 /// A Prometheus holding `all`: range selectors `{__name__="m"}[Nms]` at
 /// `time` return the samples in `[time - N, time]`, as Prometheus 2 does;
-/// every other query returns an empty vector. Returns its URL and how many
-/// range selectors it has answered.
+/// every other query returns an empty vector, and every range query an
+/// empty matrix. Returns its URL and how many range selectors it has
+/// answered.
 async fn prometheus(all: Arc<Vec<RawSample>>) -> (String, Arc<AtomicUsize>) {
     let range_reads = Arc::new(AtomicUsize::new(0));
     let reads = range_reads.clone();
@@ -153,7 +154,12 @@ async fn prometheus(all: Arc<Vec<RawSample>>) -> (String, Arc<AtomicUsize>) {
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let app = Router::new().route("/api/v1/query", get(handler));
+    let empty_matrix = || async {
+        Json(json!({"status": "success", "data": {"resultType": "matrix", "result": []}}))
+    };
+    let app = Router::new()
+        .route("/api/v1/query", get(handler))
+        .route("/api/v1/query_range", get(empty_matrix));
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (url, range_reads)
 }
@@ -293,6 +299,89 @@ async fn planned_answer(url: &str, query: &str, time_ms: i64) -> Vec<ResultSampl
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// The plan's answer to the range query `query` over `[start_ms, end_ms]`
+/// by `step` (a Prometheus duration or float seconds), retried until the
+/// plan answers: each step's samples, by step.
+async fn planned_range_answer(
+    url: &str,
+    query: &str,
+    start_ms: i64,
+    end_ms: i64,
+    step: &str,
+) -> BTreeMap<i64, Vec<ResultSample>> {
+    let client = reqwest::Client::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let response = client
+            .get(format!("{url}/api/v1/query_range"))
+            .query(&[
+                ("query", query),
+                ("start", &(start_ms as f64 / 1000.0).to_string()),
+                ("end", &(end_ms as f64 / 1000.0).to_string()),
+                ("step", step),
+            ])
+            .send()
+            .await
+            .unwrap();
+        let execution = response.headers().get("x-asap-execution").cloned();
+        let reason = response.headers().get("x-asap-forward-reason").cloned();
+        let body: Value = response.json().await.unwrap();
+        if execution.as_ref().is_some_and(|v| v == "plan") {
+            assert_eq!(body["data"]["resultType"], "matrix");
+            let mut steps: BTreeMap<i64, Vec<ResultSample>> = BTreeMap::new();
+            for series in body["data"]["result"].as_array().unwrap() {
+                let labels: BTreeMap<String, String> =
+                    serde_json::from_value(series["metric"].clone()).unwrap();
+                for point in series["values"].as_array().unwrap() {
+                    let t = (point[0].as_f64().unwrap() * 1000.0).round() as i64;
+                    steps.entry(t).or_default().push(ResultSample {
+                        labels: labels.clone(),
+                        value: point[1].as_str().unwrap().parse().unwrap(),
+                    });
+                }
+            }
+            return steps.into_iter().map(|(t, s)| (t, sorted(s))).collect();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "range {query} was not answered by the plan: {reason:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Answers `query` over `steps` (from `start_ms` by `step`, through
+/// `end_ms`) as one range query and checks each step against the Planner
+/// executor's reference and against the same instant query. Returns how
+/// many raw ranges the range query read from Prometheus.
+#[allow(clippy::too_many_arguments)]
+async fn check_range(
+    url: &str,
+    reads: &AtomicUsize,
+    at_query_time: &InstalledPlan,
+    query: &str,
+    (start_ms, end_ms, step): (i64, i64, &str),
+    step_ms: i64,
+    all: &[RawSample],
+) -> usize {
+    let before = reads.load(Ordering::SeqCst);
+    let answer = planned_range_answer(url, query, start_ms, end_ms, step).await;
+    let range_reads = reads.load(Ordering::SeqCst) - before;
+    let steps: Vec<i64> = (start_ms..=end_ms).step_by(step_ms as usize).collect();
+    assert_eq!(answer.keys().copied().collect::<Vec<_>>(), steps, "{query}");
+    for (t, actual) in &answer {
+        let expected = reference(at_query_time, query, *t, all);
+        assert_same(&format!("{query} @ {t}"), actual, &expected, 0.0);
+        let instant = planned_answer(url, query, *t).await;
+        assert_eq!(actual, &instant, "{query} @ {t}: range vs instant");
+    }
+    eprintln!(
+        "{query}: range over {} steps read {range_reads} raw ranges",
+        steps.len()
+    );
+    range_reads
 }
 
 /// `actual` and `expected` hold the same series with values within
@@ -484,4 +573,127 @@ async fn example4_b3() {
     }
     eprintln!("{query}: raw ranges read per evaluation {reads:?}");
     assert_eq!(reads, vec![5, 1, 1]);
+}
+
+/// Example 1 as range queries, a step every 30 s over [3 min, 6 min]: each
+/// query reads its one raw input from Prometheus once for all 7 steps, and
+/// every step equals the instant query and the Planner executor.
+#[tokio::test]
+async fn example1_range() {
+    let series = [
+        series("http_requests_total", &[("job", "api"), ("instance", "1")]),
+        series("http_requests_total", &[("job", "api"), ("instance", "2")]),
+        series("http_requests_total", &[("job", "web"), ("instance", "1")]),
+    ];
+    // Quadratic counters: the rate changes at every step.
+    let all = samples(&series, 0, 10 * MINUTE, 15_000, |i, t| {
+        (i as f64 + 1.0) * (t as f64 / 1000.0).powi(2)
+    });
+    let workload = workload("example1");
+    let inputs = DeploymentInputs::default();
+    let plan = plan_workload(&workload, &inputs).unwrap();
+    let at_query_time = plan_selected_at_query_time(&workload, &inputs).unwrap();
+    let all = Arc::new(all);
+    let (prometheus_url, reads) = prometheus(all.clone()).await;
+    let process = start(&plan, &prometheus_url).await;
+    remote_write(&process.url, &all).await;
+    for query in &plan.queries {
+        let range = (3 * MINUTE, 6 * MINUTE, "30s");
+        let read = check_range(
+            &process.url,
+            &reads,
+            &at_query_time,
+            query,
+            range,
+            30_000,
+            &all,
+        )
+        .await;
+        assert_eq!(read, 1, "{query}");
+    }
+}
+
+/// Example 4b as a range query on a deployment without raw data: every
+/// step reads six stored panes and nothing from Prometheus.
+#[tokio::test]
+async fn example4b_range() {
+    let series = [
+        series("latency_ms", &[("service", "a")]),
+        series("latency_ms", &[("service", "b")]),
+    ];
+    // Values grow with time, so each hour's p99 differs.
+    let all = samples(&series, MINUTE, 101 * MINUTE, 15_000, |i, t| {
+        (i * 1000) as f64 + (t / 15_000) as f64
+    });
+    let workload = workload("example4b");
+    let inputs = without_raw_data();
+    let plan = plan_workload(&workload, &inputs).unwrap();
+    let at_query_time = plan_selected_at_query_time(&workload, &inputs).unwrap();
+    let all = Arc::new(all);
+    let (prometheus_url, reads) = prometheus(all.clone()).await;
+    let process = start(&plan, &prometheus_url).await;
+    remote_write(&process.url, &all).await;
+    let query = &plan.queries[0];
+    let range = (90 * MINUTE, 100 * MINUTE, "10m");
+    let read = check_range(
+        &process.url,
+        &reads,
+        &at_query_time,
+        query,
+        range,
+        10 * MINUTE,
+        &all,
+    )
+    .await;
+    assert_eq!(read, 0);
+}
+
+/// Example 4's B3 as a range query, a step a minute over [10 min, 14 min]:
+/// one Prometheus read covers the raw samples of all 9 kept panes, each
+/// pane is built once and reused by later steps, and every step equals the
+/// instant query and the Planner executor. Samples run to 15 min, so every
+/// pane read is closed and kept. The same range query again reads one raw
+/// range, for the panes ending at 6..8 min: they were evicted, measured from
+/// the newest step.
+#[tokio::test]
+async fn example4_b3_range() {
+    let series = [
+        series("latency_ms", &[("service", "a")]),
+        series("latency_ms", &[("service", "b")]),
+    ];
+    let all = samples(&series, 0, 15 * MINUTE, 15_000, |i, t| {
+        (i * 100) as f64 + (t / 15_000 * 25 % 101) as f64
+    });
+    let workload = workload("example4-b3");
+    let inputs = DeploymentInputs::default();
+    let plan = plan_workload(&workload, &inputs).unwrap();
+    let at_query_time = plan_selected_at_query_time(&workload, &inputs).unwrap();
+    let all = Arc::new(all);
+    let (prometheus_url, reads) = prometheus(all.clone()).await;
+    let process = start(&plan, &prometheus_url).await;
+    remote_write(&process.url, &all).await;
+    let query = &plan.queries[0];
+    let range = (10 * MINUTE, 14 * MINUTE, "60");
+    let read = check_range(
+        &process.url,
+        &reads,
+        &at_query_time,
+        query,
+        range,
+        MINUTE,
+        &all,
+    )
+    .await;
+    assert_eq!(read, 1);
+    let read = check_range(
+        &process.url,
+        &reads,
+        &at_query_time,
+        query,
+        range,
+        MINUTE,
+        &all,
+    )
+    .await;
+    assert_eq!(read, 1, "the evicted panes");
 }

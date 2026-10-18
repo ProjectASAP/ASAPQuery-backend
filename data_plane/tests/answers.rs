@@ -31,7 +31,8 @@ fn series(metric: &str, labels: &[(&str, &str)]) -> BTreeMap<String, String> {
 /// A stand-in Prometheus holding `points`. It answers
 /// `{__name__="m"}[Nms]` at `time` with the samples in `[time - N, time]`,
 /// both ends included as Prometheus 2 does, and anything else with
-/// `{"forwarded": query}`.
+/// `{"forwarded": query}`. Range queries are answered with
+/// `{"forwarded_range": parameters}`.
 async fn fake_prometheus(points: Vec<Point>) -> String {
     let points = Arc::new(points);
     let handler = move |Query(params): Query<BTreeMap<String, String>>| {
@@ -64,7 +65,12 @@ async fn fake_prometheus(points: Vec<Point>) -> String {
             Json(json!({"status": "success", "data": {"resultType": "matrix", "result": result}}))
         }
     };
-    let app = Router::new().route("/api/v1/query", get(handler));
+    let range = |Query(params): Query<BTreeMap<String, String>>| async move {
+        Json(json!({ "forwarded_range": params }))
+    };
+    let app = Router::new()
+        .route("/api/v1/query", get(handler))
+        .route("/api/v1/query_range", get(range));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -78,11 +84,20 @@ struct Response {
 }
 
 async fn instant(app: &Router, query: &str, time_ms: i64) -> Response {
+    let time = (time_ms as f64 / 1000.0).to_string();
+    get_json(app, "query", &[("query", query), ("time", &time)]).await
+}
+
+/// `GET /api/v1/query_range` with `params`, as given.
+async fn range(app: &Router, params: &[(&str, &str)]) -> Response {
+    get_json(app, "query_range", params).await
+}
+
+async fn get_json(app: &Router, endpoint: &str, params: &[(&str, &str)]) -> Response {
     let uri = format!(
-        "/api/v1/query?{}",
+        "/api/v1/{endpoint}?{}",
         form_urlencoded::Serializer::new(String::new())
-            .append_pair("query", query)
-            .append_pair("time", &(time_ms as f64 / 1000.0).to_string())
+            .extend_pairs(params)
             .finish()
     );
     let response = app
@@ -193,10 +208,9 @@ async fn answers_query_time_plans_from_raw_samples() {
     assert_eq!(response.body, json!({"forwarded": "up"}));
 }
 
-/// Example 4b reads six stored 10-minute KLL panes built from Remote Write;
-/// at a time off the pane grid it forwards and says why.
-#[tokio::test]
-async fn answers_from_panes_built_from_remote_write() {
+/// Example 4b's data plane, with Remote Write samples every 15 s in
+/// `[1 min, end)` for jobs a and b.
+async fn example4b(end_ms: i64) -> (Arc<DataPlane>, Router) {
     let state = Arc::new(
         DataPlane::new(
             common::plan_json("example4b", false),
@@ -220,7 +234,7 @@ async fn answers_from_panes_built_from_remote_write() {
                     value: job.into(),
                 },
             ],
-            samples: (MINUTE..75 * MINUTE)
+            samples: (MINUTE..end_ms)
                 .step_by(15_000)
                 .map(|t| Sample {
                     timestamp: t,
@@ -239,6 +253,16 @@ async fn answers_from_panes_built_from_remote_write() {
         .await
         .unwrap();
     assert_eq!(write.status(), StatusCode::NO_CONTENT);
+    // Wait until the engine has ingested the samples.
+    state.engine.stats().await;
+    (state, app)
+}
+
+/// Example 4b reads six stored 10-minute KLL panes built from Remote Write;
+/// at a time off the pane grid it forwards and says why.
+#[tokio::test]
+async fn answers_from_panes_built_from_remote_write() {
+    let (state, app) = example4b(75 * MINUTE).await;
     // Panes ending at 20..70 min; the first, (0, 10 min], is skipped.
     assert_eq!(state.engine.stats().await.panes_built, 6);
 
@@ -262,4 +286,115 @@ async fn answers_from_panes_built_from_remote_write() {
     let response = instant(&app, query, 70 * MINUTE + 1_000).await;
     assert_eq!(response.execution.as_deref(), Some("forwarded"));
     assert!(response.reason.unwrap().contains("pane grid"));
+}
+
+const P99: &str = "quantile_over_time(0.99, latency_ms[60m])";
+
+/// A planned range query is answered with a Prometheus matrix, from `start`
+/// to `end` inclusive by `step` (a duration or float seconds); each value
+/// equals the instant query at its step.
+#[tokio::test]
+async fn answers_planned_range_queries() {
+    let (_, app) = example4b(101 * MINUTE).await;
+    for step in ["10m", "600", "600.0"] {
+        let response = range(
+            &app,
+            &[
+                ("query", P99),
+                ("start", "5400"),
+                ("end", "6000"),
+                ("step", step),
+            ],
+        )
+        .await;
+        assert_eq!(
+            response.execution.as_deref(),
+            Some("plan"),
+            "{step}: {:?}",
+            response.reason
+        );
+        assert_eq!(response.body["status"], "success");
+        assert_eq!(response.body["data"]["resultType"], "matrix");
+        let result = response.body["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 2, "{result:?}");
+        for series in result {
+            let job = series["metric"]["job"].as_str().unwrap();
+            let values = series["values"].as_array().unwrap();
+            let times: Vec<f64> = values.iter().map(|v| v[0].as_f64().unwrap()).collect();
+            assert_eq!(times, vec![5400.0, 6000.0], "the end is included");
+            for value in values {
+                let t = (value[0].as_f64().unwrap() * 1000.0) as i64;
+                let at_step = instant(&app, P99, t).await;
+                assert_eq!(at_step.execution.as_deref(), Some("plan"));
+                let expected = by_job(&at_step.body)
+                    .into_iter()
+                    .find(|(j, _)| j == job)
+                    .unwrap()
+                    .1;
+                assert_eq!(value[1].as_str().unwrap().parse::<f64>().unwrap(), expected);
+            }
+        }
+    }
+}
+
+/// A planned range query any of whose steps the plan cannot answer is
+/// forwarded whole, with the reason: a step off the 10-minute pane grid, or
+/// a step reading an evicted pane while the later steps could be answered.
+#[tokio::test]
+async fn forwards_whole_range_queries_a_step_cannot_answer() {
+    let (_, app) = example4b(101 * MINUTE).await;
+    for (start, step, reason) in [("5400", "5m", "pane grid"), ("4800", "10m", "not stored")] {
+        let params = [
+            ("query", P99),
+            ("start", start),
+            ("end", "6000"),
+            ("step", step),
+        ];
+        let response = range(&app, &params).await;
+        assert_eq!(response.execution.as_deref(), Some("forwarded"));
+        let header = response.reason.unwrap_or_default();
+        assert!(header.contains(reason), "{start} {step}: {header}");
+        assert_eq!(
+            response.body,
+            json!({"forwarded_range": {"query": P99, "start": start, "end": "6000", "step": step}}),
+            "forwarded unchanged"
+        );
+    }
+}
+
+/// Unplanned range queries, and range queries Prometheus would reject, are
+/// forwarded unchanged with no reason: Prometheus answers them.
+#[tokio::test]
+async fn forwards_unplanned_and_invalid_range_queries_unchanged() {
+    let (_, app) = example4b(101 * MINUTE).await;
+    for params in [
+        [
+            ("query", "up"),
+            ("start", "5400"),
+            ("end", "6000"),
+            ("step", "15s"),
+        ],
+        [
+            ("query", P99),
+            ("start", "5400"),
+            ("end", "6000"),
+            ("step", "0"),
+        ],
+        [
+            ("query", P99),
+            ("start", "6000"),
+            ("end", "5400"),
+            ("step", "10m"),
+        ],
+    ] {
+        let response = range(&app, &params).await;
+        assert_eq!(
+            response.execution.as_deref(),
+            Some("forwarded"),
+            "{params:?}"
+        );
+        assert_eq!(response.reason, None, "{params:?}");
+        let expected: BTreeMap<&str, &str> = params.into_iter().collect();
+        assert_eq!(response.body, json!({ "forwarded_range": expected }));
+    }
 }

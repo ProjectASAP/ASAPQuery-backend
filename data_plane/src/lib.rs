@@ -3,8 +3,8 @@
 //!
 //! The installed plan is ASAPPlanner's selected `PhysicalASAPDAG`. The
 //! engine thread builds its ingestion-time outputs pane by pane and answers
-//! the plan's instant queries from them; every other query, and any planned
-//! query it cannot answer, is forwarded to Prometheus.
+//! the plan's instant and range queries from them; every other query, and
+//! any planned query it cannot answer, is forwarded to Prometheus.
 
 pub mod engine;
 pub mod precompute;
@@ -26,7 +26,7 @@ use axum::Router;
 use control_plane::InstalledPlan;
 use engine::EngineHandle;
 use precompute::RawSample;
-use prometheus::InstantQuery;
+use prometheus::{InstantQuery, RangeQuery};
 use query::Unanswered;
 
 /// Prometheus' staleness marker: a NaN that ends a series, not a sample.
@@ -125,24 +125,57 @@ async fn query(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(instant) = InstantQuery::parse(query.0.as_deref(), &body) else {
-        return forward(state, "query", method, query, headers, body).await;
+    let answered = match InstantQuery::parse(query.0.as_deref(), &body) {
+        Some(instant) => Some(answer(&state, instant).await),
+        None => None,
     };
-    let reason = match answer(&state, instant).await {
-        Ok(response) => {
+    respond(answered, state, "query", method, query, headers, body).await
+}
+
+/// Answers a planned range query from the plan, one evaluation per step;
+/// forwards anything else, and the whole range query if any step cannot
+/// be answered.
+async fn query_range(
+    state: State<Arc<DataPlane>>,
+    method: Method,
+    query: RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let answered = match RangeQuery::parse(query.0.as_deref(), &body) {
+        Some(range) => Some(answer_range(&state, range).await),
+        None => None,
+    };
+    respond(answered, state, "query_range", method, query, headers, body).await
+}
+
+/// The plan's answer with `x-asap-execution: plan`, or else the request
+/// forwarded to `endpoint`, with the reason if the query is planned.
+/// `answered` is `None` for a request the data plane does not parse.
+async fn respond(
+    answered: Option<Result<serde_json::Value, Unanswered>>,
+    state: State<Arc<DataPlane>>,
+    endpoint: &str,
+    method: Method,
+    query: RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let reason = match answered {
+        Some(Ok(response)) => {
             let mut response = axum::Json(response).into_response();
             response
                 .headers_mut()
                 .insert(EXECUTION_HEADER, HeaderValue::from_static("plan"));
             return response;
         }
-        Err(Unanswered::NotPlanned(_)) => None,
-        Err(reason) => {
-            tracing::debug!(%reason, "forwarding a planned query");
+        None | Some(Err(Unanswered::NotPlanned(_))) => None,
+        Some(Err(reason)) => {
+            tracing::debug!(%reason, endpoint, "forwarding a planned query");
             HeaderValue::from_str(&reason.to_string()).ok()
         }
     };
-    let mut response = forward(state, "query", method, query, headers, body).await;
+    let mut response = forward(state, endpoint, method, query, headers, body).await;
     if let Some(reason) = reason {
         response.headers_mut().insert(FORWARD_REASON_HEADER, reason);
     }
@@ -156,25 +189,42 @@ async fn answer(state: &DataPlane, query: InstantQuery) -> Result<serde_json::Va
             .map_or(0, |d| d.as_millis() as i64)
     });
     let (root, ranges) = state.engine.raw_ranges(query.query, time_ms).await?;
+    let raw = fetch(state, &ranges).await?;
+    let samples = state.engine.evaluate(root, time_ms, raw).await?;
+    Ok(prometheus::vector_response(time_ms, &samples))
+}
+
+/// Answers every step of `query`, fetching each raw range once for all.
+async fn answer_range(
+    state: &DataPlane,
+    query: RangeQuery,
+) -> Result<serde_json::Value, Unanswered> {
+    let steps = query.steps();
+    let (root, ranges) = state
+        .engine
+        .raw_ranges_for_steps(query.query, steps.clone())
+        .await?;
+    let raw = fetch(state, &ranges).await?;
+    let results = state
+        .engine
+        .evaluate_steps(root, steps.clone(), raw)
+        .await?;
+    Ok(prometheus::matrix_response(&steps, &results))
+}
+
+/// The samples of each of `ranges` from Prometheus, by node.
+async fn fetch(
+    state: &DataPlane,
+    ranges: &[query::RawRange],
+) -> Result<BTreeMap<u64, Vec<RawSample>>, Unanswered> {
     let mut raw = BTreeMap::new();
-    for range in &ranges {
+    for range in ranges {
         let samples = prometheus::fetch(&state.client, &state.prometheus_url, range)
             .await
             .map_err(|e| Unanswered::Execution(format!("fetching raw samples: {e}")))?;
         raw.insert(range.node, samples);
     }
-    let samples = state.engine.evaluate(root, time_ms, raw).await?;
-    Ok(prometheus::vector_response(time_ms, &samples))
-}
-
-async fn query_range(
-    state: State<Arc<DataPlane>>,
-    method: Method,
-    query: RawQuery,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    forward(state, "query_range", method, query, headers, body).await
+    Ok(raw)
 }
 
 /// Sends the request to Prometheus unchanged and returns its response.

@@ -1,5 +1,6 @@
-//! The Prometheus HTTP API as the data plane speaks it: instant-query
-//! parameters and results, and fetching raw samples for query-time ranges.
+//! The Prometheus HTTP API as the data plane speaks it: instant- and
+//! range-query parameters and results, and fetching raw samples for
+//! query-time ranges.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -17,23 +18,124 @@ pub struct InstantQuery {
 }
 
 impl InstantQuery {
-    /// Reads `query` and `time` (Unix seconds); `None` if either is missing
-    /// or `time` is in another format, such as RFC 3339.
+    /// Reads `query` and `time` (Unix seconds or RFC 3339); `None` if
+    /// `query` is missing or `time` is invalid.
     pub fn parse(url_query: Option<&str>, form: &[u8]) -> Option<Self> {
-        let params: BTreeMap<String, String> =
-            form_urlencoded::parse(url_query.unwrap_or_default().as_bytes())
-                .chain(form_urlencoded::parse(form))
-                .map(|(k, v)| (k.into_owned(), v.into_owned()))
-                .collect();
+        let params = params(url_query, form)?;
         let time_ms = match params.get("time") {
             None => None,
-            Some(time) => Some(seconds_to_ms(time.parse().ok()?)),
+            Some(time) => Some(parse_time(time)?),
         };
         Some(Self {
             query: params.get("query")?.clone(),
             time_ms,
         })
     }
+}
+
+/// Parameters of a range query (`/api/v1/query_range`), from its URL query
+/// and form body.
+pub struct RangeQuery {
+    pub query: String,
+    /// First evaluation time, inclusive.
+    pub start_ms: i64,
+    /// Last possible evaluation time, inclusive.
+    pub end_ms: i64,
+    /// Time between consecutive evaluations, at least 1 ms.
+    pub step_ms: i64,
+}
+
+impl RangeQuery {
+    /// Reads `query`, `start`, `end` and `step` as Prometheus does; `None` if
+    /// one is missing or invalid, which Prometheus then reports.
+    pub fn parse(url_query: Option<&str>, form: &[u8]) -> Option<Self> {
+        let params = params(url_query, form)?;
+        let start_ms = parse_time(params.get("start")?)?;
+        let end_ms = parse_time(params.get("end")?)?;
+        let step_ms = parse_duration_ms(params.get("step")?)?;
+        if end_ms < start_ms || step_ms <= 0 || (end_ms - start_ms) / step_ms > MAX_STEPS {
+            return None;
+        }
+        Some(Self {
+            query: params.get("query")?.clone(),
+            start_ms,
+            end_ms,
+            step_ms,
+        })
+    }
+
+    /// The evaluation times `start + k * step` up to `end`, ascending.
+    pub fn steps(&self) -> Vec<i64> {
+        (self.start_ms..=self.end_ms)
+            .step_by(self.step_ms as usize)
+            .collect()
+    }
+}
+
+/// Prometheus' limit on `(end - start) / step`: 11,000 points per series.
+const MAX_STEPS: i64 = 11_000;
+
+/// The request's parameters, from its URL query and form body; `None` if it
+/// sets a nonzero `limit`, which the data plane leaves to Prometheus.
+fn params(url_query: Option<&str>, form: &[u8]) -> Option<BTreeMap<String, String>> {
+    let params: BTreeMap<String, String> =
+        form_urlencoded::parse(url_query.unwrap_or_default().as_bytes())
+            .chain(form_urlencoded::parse(form))
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+    match params.get("limit").map(String::as_str) {
+        None | Some("0") => Some(params),
+        Some(_) => None,
+    }
+}
+
+/// A Prometheus timestamp, Unix seconds or RFC 3339, in ms.
+fn parse_time(time: &str) -> Option<i64> {
+    if let Ok(seconds) = time.parse::<f64>() {
+        return seconds.is_finite().then(|| seconds_to_ms(seconds));
+    }
+    chrono::DateTime::parse_from_rfc3339(time)
+        .ok()
+        .map(|t| t.timestamp_millis())
+}
+
+/// A Prometheus `<duration | float>`: float seconds, or units `y w d h m s
+/// ms` in that order, each at most once (`1h30m`); in ms, truncated as
+/// Prometheus does.
+fn parse_duration_ms(duration: &str) -> Option<i64> {
+    if let Ok(seconds) = duration.parse::<f64>() {
+        let ns = seconds * 1e9;
+        return (ns.is_finite() && ns.abs() < i64::MAX as f64).then_some(ns as i64 / 1_000_000);
+    }
+    // In the order a duration lists them.
+    const UNITS: [(&str, i64); 7] = [
+        ("y", 365 * 86_400_000),
+        ("w", 7 * 86_400_000),
+        ("d", 86_400_000),
+        ("h", 3_600_000),
+        ("m", 60_000),
+        ("s", 1000),
+        ("ms", 1),
+    ];
+    let (mut rest, mut total, mut last) = (duration, 0i64, None);
+    while !rest.is_empty() {
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let count: i64 = rest[..digits].parse().ok()?;
+        rest = &rest[digits..];
+        // The longest unit that matches: "ms" rather than "m".
+        let (index, (unit, ms)) = UNITS
+            .iter()
+            .enumerate()
+            .filter(|(_, (unit, _))| rest.starts_with(unit))
+            .max_by_key(|(_, (unit, _))| unit.len())?;
+        if last.is_some_and(|last| last >= index) {
+            return None;
+        }
+        last = Some(index);
+        rest = &rest[unit.len()..];
+        total = total.checked_add(count.checked_mul(*ms)?)?;
+    }
+    last.map(|_| total)
 }
 
 fn seconds_to_ms(seconds: f64) -> i64 {
@@ -52,6 +154,26 @@ pub fn vector_response(time_ms: i64, samples: &[ResultSample]) -> Value {
         .map(|s| json!({"metric": s.labels, "value": [time, format_value(s.value)]}))
         .collect();
     json!({"status": "success", "data": {"resultType": "vector", "result": result}})
+}
+
+/// A Prometheus range-query response: each series' value at each of
+/// `steps` (`results[k]` at `steps[k]`), series sorted by labels.
+pub fn matrix_response(steps: &[i64], results: &[Vec<ResultSample>]) -> Value {
+    let mut series: BTreeMap<&BTreeMap<String, String>, Vec<Value>> = BTreeMap::new();
+    for (time_ms, samples) in steps.iter().zip(results) {
+        let time = *time_ms as f64 / 1000.0;
+        for s in samples {
+            series
+                .entry(&s.labels)
+                .or_default()
+                .push(json!([time, format_value(s.value)]));
+        }
+    }
+    let result: Vec<Value> = series
+        .into_iter()
+        .map(|(labels, values)| json!({"metric": labels, "values": values}))
+        .collect();
+    json!({"status": "success", "data": {"resultType": "matrix", "result": result}})
 }
 
 /// Prometheus' sample value format.
@@ -134,7 +256,13 @@ mod tests {
         let q = InstantQuery::parse(None, b"query=sum%28x%29").unwrap();
         assert_eq!((q.query.as_str(), q.time_ms), ("sum(x)", None));
         assert!(InstantQuery::parse(Some("time=1"), b"").is_none());
-        assert!(InstantQuery::parse(Some("query=up&time=2026-01-01T00:00:00Z"), b"").is_none());
+        let q = InstantQuery::parse(Some("query=up&time=2026-01-01T00:00:00Z"), b"").unwrap();
+        assert_eq!(
+            q.time_ms,
+            Some(1_767_225_600_000),
+            "RFC 3339, as Prometheus accepts"
+        );
+        assert!(InstantQuery::parse(Some("query=up&time=now"), b"").is_none());
     }
 
     /// Results use Prometheus' vector shape and value formatting.
@@ -158,5 +286,110 @@ mod tests {
             ]}})
         );
         assert_eq!(ms_to_seconds(4_200_001), "4200.001");
+    }
+
+    fn range(params: &str) -> Option<(i64, i64, i64)> {
+        RangeQuery::parse(Some(params), b"").map(|q| (q.start_ms, q.end_ms, q.step_ms))
+    }
+
+    /// `start` and `end` are Unix seconds or RFC 3339; `step` is float
+    /// seconds or a Prometheus duration; parameters may come in the body.
+    #[test]
+    fn parses_range_query_parameters() {
+        assert_eq!(
+            range("query=up&start=1.5&end=61.5&step=15"),
+            Some((1500, 61_500, 15_000))
+        );
+        assert_eq!(
+            range("query=up&start=1&end=2&step=0.25"),
+            Some((1000, 2000, 250))
+        );
+        assert_eq!(
+            range("query=up&start=2026-01-01T00:00:00Z&end=2026-01-01T00:01:00.5%2B00:00&step=1m"),
+            Some((1_767_225_600_000, 1_767_225_660_500, 60_000))
+        );
+        assert_eq!(
+            range("query=up&start=0&end=0&step=1h30m"),
+            Some((0, 0, 90 * 60_000))
+        );
+        for (step, ms) in [
+            ("500ms", 500),
+            ("1d", 86_400_000),
+            ("1w", 7 * 86_400_000),
+            ("1y", 365 * 86_400_000),
+            ("2m30s", 150_000),
+        ] {
+            assert_eq!(
+                range(&format!("query=up&start=0&end=0&step={step}")),
+                Some((0, 0, ms)),
+                "{step}"
+            );
+        }
+        let q = RangeQuery::parse(None, b"query=sum%28x%29&start=0&end=60&step=30").unwrap();
+        assert_eq!(q.query, "sum(x)");
+    }
+
+    /// What Prometheus rejects is not parsed: missing parameters, `end`
+    /// before `start`, a step that is not positive or not a duration, and
+    /// more than 11,000 steps.
+    #[test]
+    fn rejects_invalid_range_queries() {
+        for params in [
+            "start=0&end=60&step=15",
+            "query=up&end=60&step=15",
+            "query=up&start=0&step=15",
+            "query=up&start=0&end=60",
+            "query=up&start=60&end=0&step=15",
+            "query=up&start=0&end=60&step=0",
+            "query=up&start=0&end=60&step=-1",
+            "query=up&start=0&end=60&step=1m1h",
+            "query=up&start=0&end=60&step=15x",
+            "query=up&start=yesterday&end=60&step=15",
+            "query=up&start=0&end=11001&step=1",
+        ] {
+            assert_eq!(range(params), None, "{params}");
+        }
+        assert!(range("query=up&start=0&end=11000&step=1").is_some());
+    }
+
+    /// Steps run from `start` by `step` and include `end` when on a step.
+    #[test]
+    fn steps_include_the_end() {
+        let q = |end_ms| RangeQuery {
+            query: "up".into(),
+            start_ms: 1000,
+            end_ms,
+            step_ms: 500,
+        };
+        assert_eq!(q(2000).steps(), vec![1000, 1500, 2000]);
+        assert_eq!(q(1999).steps(), vec![1000, 1500]);
+        assert_eq!(q(1000).steps(), vec![1000]);
+    }
+
+    /// Range results use Prometheus' matrix shape: one entry per series
+    /// with its values in time order; a series absent at a step has no
+    /// value there, and series absent at every step are left out.
+    #[test]
+    fn formats_matrix_results() {
+        let sample = |job: &str, value| ResultSample {
+            labels: BTreeMap::from([("job".into(), job.into())]),
+            value,
+        };
+        let results = vec![
+            vec![sample("b", 1.0), sample("a", 2.0)],
+            vec![sample("b", 3.0)],
+            vec![],
+        ];
+        assert_eq!(
+            matrix_response(&[1500, 2000, 2500], &results),
+            json!({"status": "success", "data": {"resultType": "matrix", "result": [
+                {"metric": {"job": "a"}, "values": [[1.5, "2"]]},
+                {"metric": {"job": "b"}, "values": [[1.5, "1"], [2.0, "3"]]},
+            ]}})
+        );
+        assert_eq!(
+            matrix_response(&[1500], &[vec![]]),
+            json!({"status": "success", "data": {"resultType": "matrix", "result": []}})
+        );
     }
 }

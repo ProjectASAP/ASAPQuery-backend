@@ -14,6 +14,11 @@
 //!   bound to the samples in `(T - offset - range, T - offset]`, which the
 //!   caller fetches, filtered by the plan's `Scan`.
 //!
+//! A range query is one evaluation per step, in time order. Each raw range
+//! is fetched once for all steps and sliced per step, and each kept
+//! definition's missing panes once, so a kept pane built at one step is
+//! reused by the later ones.
+//!
 //! A query the engine cannot answer returns [`Unanswered`]; the caller then
 //! forwards it to Prometheus.
 
@@ -277,6 +282,127 @@ impl QueryEngine {
         result_samples(&program.output, rows)
     }
 
+    /// The root answering `query` at each of `steps` (ascending) and the
+    /// raw samples they need, each fetched once for all steps: per
+    /// query-time raw range, `(first step - offset - range, last step -
+    /// offset]`; per kept definition, the span of its panes no evaluation
+    /// has kept. Fails if the query is not planned or a stored pane any step
+    /// reads is missing.
+    pub fn raw_ranges_for_steps(
+        &self,
+        query: &str,
+        steps: &[i64],
+        store: &SummaryStore<Batch>,
+    ) -> Result<(usize, Vec<RawRange>), Unanswered> {
+        let (root, program) = self.program(query)?;
+        let (Some(&first), Some(&last)) = (steps.first(), steps.last()) else {
+            return Ok((root, Vec::new()));
+        };
+        for &time_ms in steps {
+            for input in &program.stored {
+                pane(input, time_ms, store)?;
+            }
+        }
+        let mut ranges: Vec<RawRange> = program
+            .raw
+            .iter()
+            .map(|input| RawRange {
+                node: input.node,
+                metric: input.scan.metric.clone(),
+                start_ms: first - input.offset_ms - input.range_ms,
+                end_ms: last - input.offset_ms,
+            })
+            .collect();
+        // The first and last end of each kept definition's missing panes.
+        let mut missing: BTreeMap<&DefinitionId, (i64, i64)> = BTreeMap::new();
+        for &time_ms in steps {
+            for input in &program.kept {
+                let end_ms = time_ms - input.offset_ms;
+                if self.kept.get(&input.definition, end_ms).is_none() {
+                    let span = missing.entry(&input.definition).or_insert((end_ms, end_ms));
+                    *span = (span.0.min(end_ms), span.1.max(end_ms));
+                }
+            }
+        }
+        for (definition, (first_end_ms, last_end_ms)) in missing {
+            let build = self.kept_build(definition);
+            ranges.push(RawRange {
+                node: build.definition.raw_input,
+                metric: build.scan.metric.clone(),
+                start_ms: first_end_ms - build.definition.pane_ms,
+                end_ms: last_end_ms,
+            });
+        }
+        Ok((root, ranges))
+    }
+
+    /// Runs `root` at each of `steps`, in order, as [`Self::evaluate`] does,
+    /// each over its slice of `raw` (the samples of each
+    /// [`Self::raw_ranges_for_steps`] range, by node). A kept pane built at
+    /// one step is reused by the later ones. `results[k]` answers
+    /// `steps[k]`; any step that fails fails the whole call. Every step
+    /// keeps a pane only if it is closed at `watermark_ms`, so a pane still
+    /// open is recomputed at each step that reads it.
+    pub fn evaluate_steps(
+        &mut self,
+        root: usize,
+        steps: &[i64],
+        store: &SummaryStore<Batch>,
+        watermark_ms: Option<i64>,
+        raw: &BTreeMap<u64, Vec<RawSample>>,
+    ) -> Result<Vec<Vec<ResultSample>>, Unanswered> {
+        let program = self.roots[root]
+            .1
+            .as_ref()
+            .map_err(|reason| Unanswered::Unsupported(reason.clone()))?;
+        // Each query-time raw range: its node, offset and range.
+        let raw_inputs: Vec<(u64, i64, i64)> = program
+            .raw
+            .iter()
+            .map(|input| (input.node, input.offset_ms, input.range_ms))
+            .collect();
+        // Each kept output: its definition and offset, the node its pane's
+        // samples feed, and the node its definition's samples were fetched for.
+        let kept_inputs: Vec<(DefinitionId, i64, u64, u64, i64)> = program
+            .kept
+            .iter()
+            .map(|input| {
+                let definition = &self.kept_build(&input.definition).definition;
+                (
+                    input.definition.clone(),
+                    input.offset_ms,
+                    input.raw_input,
+                    definition.raw_input,
+                    definition.pane_ms,
+                )
+            })
+            .collect();
+        let series: BTreeMap<u64, Vec<&[RawSample]>> = raw
+            .iter()
+            .map(|(node, samples)| (*node, series_runs(samples)))
+            .collect();
+        let mut results = Vec::with_capacity(steps.len());
+        for &time_ms in steps {
+            let mut step_raw = BTreeMap::new();
+            for &(node, offset_ms, range_ms) in &raw_inputs {
+                if let Some(runs) = series.get(&node) {
+                    let end_ms = time_ms - offset_ms;
+                    step_raw.insert(node, slice(runs, end_ms - range_ms, end_ms));
+                }
+            }
+            for (definition, offset_ms, node, fetched, pane_ms) in &kept_inputs {
+                let end_ms = time_ms - offset_ms;
+                if self.kept.get(definition, end_ms).is_none() {
+                    if let Some(runs) = series.get(fetched) {
+                        step_raw.insert(*node, slice(runs, end_ms - pane_ms, end_ms));
+                    }
+                }
+            }
+            results.push(self.evaluate(root, time_ms, store, watermark_ms, &step_raw)?);
+        }
+        Ok(results)
+    }
+
     /// The build of a kept definition a compiled root reads; roots whose
     /// kept builds failed are not compiled.
     fn kept_build(&self, definition: &DefinitionId) -> &PaneBuild {
@@ -297,6 +423,28 @@ impl QueryEngine {
             Err(reason) => Err(Unanswered::Unsupported(reason.clone())),
         }
     }
+}
+
+/// `samples` split into runs of one series in time order, as Prometheus
+/// returns them.
+fn series_runs(samples: &[RawSample]) -> Vec<&[RawSample]> {
+    samples
+        .chunk_by(|a, b| {
+            (Arc::ptr_eq(&a.labels, &b.labels) || a.labels == b.labels)
+                && a.timestamp_ms <= b.timestamp_ms
+        })
+        .collect()
+}
+
+/// The samples of `runs` in `(start_ms, end_ms]`, in their order.
+fn slice(runs: &[&[RawSample]], start_ms: i64, end_ms: i64) -> Vec<RawSample> {
+    let mut samples = Vec::new();
+    for run in runs {
+        let from = run.partition_point(|s| s.timestamp_ms <= start_ms);
+        let to = run.partition_point(|s| s.timestamp_ms <= end_ms);
+        samples.extend_from_slice(&run[from..to]);
+    }
+    samples
 }
 
 /// The stored pane `input` reads at `time_ms`.
