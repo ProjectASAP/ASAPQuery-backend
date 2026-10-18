@@ -67,16 +67,27 @@ fn fetch(ranges: &[RawRange], all: &[RawSample]) -> BTreeMap<u64, Vec<RawSample>
         .collect()
 }
 
-/// Answers `P99` at `time_ms`, returning the answer and the raw ranges it read.
+/// Answers `P99` at `time_ms` once every sample in `all` has arrived (every
+/// pane is closed), returning the answer and the raw ranges it read.
 fn answer(
     engine: &mut QueryEngine,
     time_ms: i64,
     all: &[RawSample],
 ) -> (Vec<ResultSample>, Vec<RawRange>) {
+    answer_at_watermark(engine, time_ms, Some(30 * MINUTE), all)
+}
+
+/// Answers `P99` at `time_ms` when the watermark is `watermark_ms`.
+fn answer_at_watermark(
+    engine: &mut QueryEngine,
+    time_ms: i64,
+    watermark_ms: Option<i64>,
+    all: &[RawSample],
+) -> (Vec<ResultSample>, Vec<RawRange>) {
     let store = SummaryStore::new();
     let (root, ranges) = engine.raw_ranges(P99, time_ms, &store).unwrap();
     let mut result = engine
-        .evaluate(root, time_ms, &store, &fetch(&ranges, all))
+        .evaluate(root, time_ms, &store, watermark_ms, &fetch(&ranges, all))
         .unwrap();
     result.sort_by(|a, b| a.labels.cmp(&b.labels));
     (result, ranges)
@@ -191,4 +202,64 @@ fn kept_panes_are_evicted_like_stored_panes() {
     assert_eq!(old.len(), 2);
     assert_eq!(ends(&kept), vec![16, 17, 18, 19, 20]);
     assert_eq!(kept.kept.len(), 5);
+}
+
+/// A pane is kept only once it is closed (its end at or before the
+/// watermark). A pane read before then is computed for that evaluation but
+/// not kept, so a later evaluation computes it again and includes a sample
+/// that arrived late, before the pane closed.
+#[test]
+fn panes_are_kept_only_once_closed() {
+    let (plan, reference_plan) = plans();
+    let dag = &plan.dag.dag;
+    let sds = Sds::from_dag(dag, &frontier_from_timing(dag).unwrap()).unwrap();
+    let definition = sds.kept_definitions.keys().next().unwrap().clone();
+    let mut all = samples();
+    let mut kept = engine(&plan);
+    let mut reference = engine(&reference_plan);
+    let ends = |engine: &QueryEngine| {
+        (0..=30)
+            .map(|m| m * MINUTE)
+            .filter(|end| engine.kept.get(&definition, *end).is_some())
+            .map(|end| end / MINUTE)
+            .collect::<Vec<_>>()
+    };
+
+    // Watermark at 9.5 min: the pane ending at 10 min is still open.
+    let (first, ranges) = answer_at_watermark(&mut kept, 10 * MINUTE, Some(570_000), &all);
+    assert_eq!(ranges.len(), 5);
+    assert_eq!(first, answer(&mut reference, 10 * MINUTE, &all).0);
+    assert_eq!(ends(&kept), vec![6, 7, 8, 9], "the open pane is not kept");
+
+    // A late sample for the open pane arrives before it closes.
+    let late = RawSample {
+        timestamp_ms: 10 * MINUTE - 1_000,
+        value: 1_000.0,
+        ..all
+            .iter()
+            .find(|s| s.labels["service"] == "a")
+            .unwrap()
+            .clone()
+    };
+    all.push(late);
+    let (again, ranges) = answer_at_watermark(&mut kept, 10 * MINUTE, Some(585_000), &all);
+    assert_eq!(
+        ranges
+            .iter()
+            .map(|r| (r.start_ms, r.end_ms))
+            .collect::<Vec<_>>(),
+        vec![(9 * MINUTE, 10 * MINUTE)],
+        "the open pane is computed again"
+    );
+    assert_eq!(again, answer(&mut reference, 10 * MINUTE, &all).0);
+    assert_ne!(again, first, "the late sample is included");
+
+    // Once the watermark reaches 10 min, the pane is kept.
+    let (_, ranges) = answer_at_watermark(&mut kept, 11 * MINUTE, Some(10 * MINUTE), &all);
+    assert_eq!(ranges.len(), 2, "the 10- and 11-minute panes: {ranges:?}");
+    assert_eq!(ends(&kept), vec![6, 7, 8, 9, 10]);
+    // Without any sample there is no watermark, and nothing is kept.
+    let mut fresh = engine(&plan);
+    answer_at_watermark(&mut fresh, 10 * MINUTE, None, &all);
+    assert!(fresh.kept.is_empty());
 }

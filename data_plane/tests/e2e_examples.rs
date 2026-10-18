@@ -98,7 +98,7 @@ fn reference(
             (range.node, samples)
         })
         .collect();
-    sorted(engine.evaluate(root, time_ms, &store, &raw).unwrap())
+    sorted(engine.evaluate(root, time_ms, &store, None, &raw).unwrap())
 }
 
 fn sorted(mut samples: Vec<ResultSample>) -> Vec<ResultSample> {
@@ -451,7 +451,8 @@ async fn example4b() {
 /// millisecond, where the Planner keeps five 1-minute KLL panes built at
 /// query time across evaluations. Three evaluations a minute apart match
 /// the reference; the first reads all five panes' raw samples from
-/// Prometheus, each later one only its newest pane.
+/// Prometheus, each later one only its newest pane. Samples run to 13 min,
+/// so every pane read is closed and kept.
 #[tokio::test]
 async fn example4_b3() {
     let series = [

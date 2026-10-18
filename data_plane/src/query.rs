@@ -7,8 +7,9 @@
 //! - kept outputs (`MatAtQueryKeptAcrossEvaluations`): bound to the kept
 //!   pane of their definition ending at `T - offset`. A missing one is built
 //!   from its pane's raw samples, which the caller fetches, and kept for the
-//!   next evaluations; kept panes are evicted like stored ones, measured
-//!   from the newest evaluation;
+//!   next evaluations once it is closed (its end at or before the
+//!   precompute engine's watermark); kept panes are evicted like stored
+//!   ones, measured from the newest evaluation;
 //! - query-time raw ranges, `TimeRange(range) <- TimeShift(offset)* <- Scan`:
 //!   bound to the samples in `(T - offset - range, T - offset]`, which the
 //!   caller fetches, filtered by the plan's `Scan`.
@@ -96,7 +97,8 @@ struct Program {
 /// What happened to the kept panes evaluations read.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct KeptResultStats {
-    /// Kept panes computed and kept, because no evaluation had kept them.
+    /// Kept panes computed from raw samples, because no evaluation had kept
+    /// them; kept if closed.
     pub built: u64,
     /// Kept panes read from an earlier evaluation instead of recomputed.
     pub reused: u64,
@@ -188,13 +190,16 @@ impl QueryEngine {
 
     /// Runs `root` at `time_ms` over stored panes, kept panes and `raw`, the
     /// samples of each of its [`RawRange`]s by node. A kept pane that is
-    /// missing is built from its raw samples and kept; then kept panes no
-    /// evaluation after the newest one reads are evicted.
+    /// missing is built from its raw samples, and kept if it is closed: its
+    /// end is at or before `watermark_ms`, the precompute engine's watermark
+    /// (`None` before any sample). Then kept panes no evaluation after the
+    /// newest one reads are evicted.
     pub fn evaluate(
         &mut self,
         root: usize,
         time_ms: i64,
         store: &SummaryStore<Batch>,
+        watermark_ms: Option<i64>,
         raw: &BTreeMap<u64, Vec<RawSample>>,
     ) -> Result<Vec<ResultSample>, Unanswered> {
         let program = self.roots[root]
@@ -239,8 +244,12 @@ impl QueryEngine {
                         .kept_build(&input.definition)
                         .run(&self.dag, samples, pane_scope)
                         .map_err(|e| Unanswered::Execution(e.to_string()))?;
-                    self.kept.insert(&input.definition, end_ms, pane.clone());
                     self.kept_stats.built += 1;
+                    // Kept only once closed, as the precompute engine closes
+                    // panes: a sample may still arrive for an open one.
+                    if watermark_ms.is_some_and(|watermark| end_ms <= watermark) {
+                        self.kept.insert(&input.definition, end_ms, pane.clone());
+                    }
                     pane
                 }
             };

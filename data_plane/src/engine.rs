@@ -174,6 +174,7 @@ impl Engine {
                         root,
                         time_ms,
                         &self.precompute.store,
+                        self.precompute.watermark_ms(),
                         &raw,
                     ));
                 }

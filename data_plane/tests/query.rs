@@ -84,7 +84,13 @@ fn answer(f: &mut Fixture, query: &str, time_ms: i64, all: &[RawSample]) -> Vec<
         .unwrap();
     let mut result = f
         .query
-        .evaluate(root, time_ms, &f.precompute.store, &fetch(&ranges, all))
+        .evaluate(
+            root,
+            time_ms,
+            &f.precompute.store,
+            f.precompute.watermark_ms(),
+            &fetch(&ranges, all),
+        )
         .unwrap();
     result.sort_by(|a, b| a.labels.cmp(&b.labels));
     result

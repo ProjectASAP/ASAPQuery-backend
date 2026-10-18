@@ -46,9 +46,12 @@ plan (`x-asap-execution: plan`). Its stored inputs read the panes ending at
 `T - offset`, so `T` must be on the pane grid and those panes stored; its
 query-time raw ranges are read from Prometheus. An input the plan keeps
 across evaluations (`MatAtQueryKeptAcrossEvaluations`) is computed from its
-pane's raw samples the first time an evaluation reads it, kept in memory by
-definition and pane end, and reused by later evaluations; it is evicted like
-a stored pane, measured from the newest evaluation. Anything else is forwarded
+pane's raw samples when an evaluation reads it and no evaluation has kept
+it. It is kept in memory, by definition and pane end, once the pane is
+closed by the precompute engine's rule (its end at or before the newest
+sample minus `--allowed-lateness-ms`), and later evaluations reuse it; a pane
+read before it closes is computed again by later evaluations. Kept panes are
+evicted like stored ones, measured from the newest evaluation. Anything else is forwarded
 to Prometheus (`x-asap-execution: forwarded`); a planned query that could not
 be answered also says why in `x-asap-forward-reason`. Range queries, SQL and
 ClickHouse are not supported yet.
