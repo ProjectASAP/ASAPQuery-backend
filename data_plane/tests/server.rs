@@ -1,3 +1,5 @@
+mod common;
+
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +10,7 @@ use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::routing::get;
 use axum::Router;
 use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
-use data_plane::{router, DataPlane, DEFAULT_FORWARD_TIMEOUT, EXECUTION_HEADER};
+use data_plane::{router, DataPlane, EXECUTION_HEADER};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
@@ -38,6 +40,11 @@ async fn serve(app: Router) -> String {
     url
 }
 
+/// A data plane for #509 Example 1 that forwards to `prometheus_url`.
+fn data_plane(prometheus_url: String) -> Arc<DataPlane> {
+    Arc::new(DataPlane::new(common::plan_json("example1", true), prometheus_url, 0).unwrap())
+}
+
 async fn send(app: &Router, request: Request<Body>) -> (StatusCode, Option<String>, String) {
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
@@ -53,11 +60,7 @@ async fn send(app: &Router, request: Request<Body>) -> (StatusCode, Option<Strin
 /// unchanged, and the response says it was forwarded.
 #[tokio::test]
 async fn forwards_queries_to_prometheus() {
-    let state = Arc::new(DataPlane::new(
-        vec![],
-        fake_prometheus().await,
-        DEFAULT_FORWARD_TIMEOUT,
-    ));
+    let state = data_plane(fake_prometheus().await);
     let app = router(state);
     let (status, execution, body) = send(
         &app,
@@ -85,11 +88,7 @@ async fn forwards_queries_to_prometheus() {
 /// rejected with 400.
 #[tokio::test]
 async fn accepts_remote_write() {
-    let state = Arc::new(DataPlane::new(
-        vec![],
-        "http://unused".into(),
-        DEFAULT_FORWARD_TIMEOUT,
-    ));
+    let state = data_plane("http://unused".into());
     let app = router(state.clone());
     let request = WriteRequest {
         timeseries: vec![TimeSeries {
@@ -133,11 +132,7 @@ async fn accepts_remote_write() {
 /// `Limits::max_compressed_bytes` are accepted; larger ones get 413.
 #[tokio::test]
 async fn accepts_remote_write_up_to_the_compressed_limit() {
-    let state = Arc::new(DataPlane::new(
-        vec![],
-        "http://unused".into(),
-        DEFAULT_FORWARD_TIMEOUT,
-    ));
+    let state = data_plane("http://unused".into());
     let app = router(state.clone());
     // Pseudo-random hex label values do not compress, so the encoded body
     // stays near its decoded size.
@@ -208,11 +203,7 @@ async fn forwards_auth_and_tenancy_headers() {
         names.join("\n")
     }
     let url = serve(Router::new().route("/api/v1/query", get(headers))).await;
-    let app = router(Arc::new(DataPlane::new(
-        vec![],
-        url,
-        DEFAULT_FORWARD_TIMEOUT,
-    )));
+    let app = router(data_plane(url));
     let (status, _, body) = send(
         &app,
         Request::get("/api/v1/query?query=up")
@@ -247,11 +238,11 @@ async fn forwarded_query_times_out() {
         "late"
     }
     let url = serve(Router::new().route("/api/v1/query", get(slow))).await;
-    let app = router(Arc::new(DataPlane::new(
-        vec![],
-        url,
-        Duration::from_millis(100),
-    )));
+    let app = router(Arc::new(
+        DataPlane::new(common::plan_json("example1", true), url, 0)
+            .unwrap()
+            .with_forward_timeout(Duration::from_millis(100)),
+    ));
     let (status, _, body) = send(
         &app,
         Request::get("/api/v1/query?query=up")

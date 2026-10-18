@@ -11,14 +11,16 @@
 //! frontier node <- ... <- TimeRange(width) <- TimeShift(offset)* <- Scan
 //! ```
 //!
-//! At evaluation time `T` it covers `[T - offset - width, T - offset)`.
+//! At evaluation time `T` it covers `(T - offset - width, T - offset]`, the
+//! PromQL range convention.
 //! Outputs that differ only in `offset` compute the same thing over different
 //! panes, so they share one [`SummaryDefinition`]: the data plane builds each
 //! pane of a definition once, and every output reads the pane it needs.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use planner_types::ir::physical_export::{PhysicalASAPDAG, PhysicalASAPDAGNode};
+use planner_types::ir::properties::ExecutionTiming::IngestionTime;
 use planner_types::ir::schema::Schema;
 use planner_types::ir::{NonASAPOp, Operator};
 use planner_types::physical::Materialization;
@@ -33,7 +35,7 @@ pub struct DefinitionId(pub String);
 #[derive(Debug, Clone, PartialEq)]
 pub struct SummaryDefinition {
     pub id: DefinitionId,
-    /// Pane width: each stored summary covers `[end - pane_ms, end)`.
+    /// Pane width: each stored summary covers `(end - pane_ms, end]`.
     pub pane_ms: i64,
     /// The frontier output that builds a pane; any output of the definition
     /// computes the same, and this is the first in node order.
@@ -69,9 +71,50 @@ pub enum SdsError {
     /// not select such a plan.
     #[error("node {0} is kept across evaluations (MatAtQueryKeptAcrossEvaluations), which the data plane does not support")]
     KeptAcrossEvaluations(u64),
+    #[error("ingestion-time node {0} reads a query-time node")]
+    QueryTimeFeedsIngestion(u64),
 }
 
 impl Sds {
+    /// The plan's materialization frontier: every node computed at ingestion
+    /// time whose output is read at query time, by a query-time node or as a
+    /// query's answer (a root, or a node a scalar root reads). In node order.
+    pub fn ingestion_frontier(dag: &PhysicalASAPDAG) -> Result<Vec<u64>, SdsError> {
+        let at_ingestion: HashMap<u64, bool> = dag
+            .nodes
+            .iter()
+            .map(|n| (n.id as u64, n.output_state.timing == IngestionTime))
+            .collect();
+        let timing = |id: u64| {
+            at_ingestion
+                .get(&id)
+                .copied()
+                .ok_or(SdsError::UnknownNode(id))
+        };
+        let mut frontier = BTreeSet::new();
+        let roots = dag.roots.iter().copied().chain(
+            dag.scalar_roots
+                .iter()
+                .flat_map(|(_, expr)| expr.operator_refs().into_iter().copied()),
+        );
+        for root in roots {
+            if timing(root as u64)? {
+                frontier.insert(root as u64);
+            }
+        }
+        for edge in &dag.edges {
+            let (producer, consumer) = (edge.producer as u64, edge.consumer as u64);
+            match (timing(producer)?, timing(consumer)?) {
+                (true, false) => {
+                    frontier.insert(producer);
+                }
+                (false, true) => return Err(SdsError::QueryTimeFeedsIngestion(consumer)),
+                _ => {}
+            }
+        }
+        Ok(frontier.into_iter().collect())
+    }
+
     /// The definitions behind `frontier`, the DAG outputs computed at
     /// ingestion time and read at query time.
     pub fn from_dag(dag: &PhysicalASAPDAG, frontier: &[u64]) -> Result<Self, SdsError> {
@@ -216,9 +259,15 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Built panes, by definition and pane end. A pane is stored once, when it
 /// is complete, and never changes.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SummaryStore<S> {
-    panes: BTreeMap<(DefinitionId, i64), S>,
+    panes: BTreeMap<DefinitionId, BTreeMap<i64, S>>,
+}
+
+impl<S> Default for SummaryStore<S> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<S> SummaryStore<S> {
@@ -229,24 +278,33 @@ impl<S> SummaryStore<S> {
     }
 
     pub fn insert(&mut self, definition: &DefinitionId, end_ms: i64, state: S) {
-        self.panes.insert((definition.clone(), end_ms), state);
+        match self.panes.get_mut(definition) {
+            Some(panes) => {
+                panes.insert(end_ms, state);
+            }
+            None => {
+                self.panes
+                    .insert(definition.clone(), BTreeMap::from([(end_ms, state)]));
+            }
+        }
     }
 
     pub fn get(&self, definition: &DefinitionId, end_ms: i64) -> Option<&S> {
-        self.panes.get(&(definition.clone(), end_ms))
+        self.panes.get(definition)?.get(&end_ms)
     }
 
     /// Drops the panes of `definition` that end at or before `end_ms`.
     pub fn evict_through(&mut self, definition: &DefinitionId, end_ms: i64) {
-        self.panes
-            .retain(|(id, end), _| id != definition || *end > end_ms);
+        if let Some(panes) = self.panes.get_mut(definition) {
+            *panes = panes.split_off(&end_ms.saturating_add(1));
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.panes.len()
+        self.panes.values().map(BTreeMap::len).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.panes.is_empty()
+        self.panes.values().all(BTreeMap::is_empty)
     }
 }

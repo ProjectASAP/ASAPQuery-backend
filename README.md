@@ -31,18 +31,19 @@ The backend is being rebuilt on the Planner's physical DAG:
 | Part | State |
 |---|---|
 | Control plane: plan a PromQL workload, write `plan.json` | done |
-| Data plane: load and validate `plan.json`; accept, count and drop Remote Write samples | done |
-| Stored summaries (SDS) | next |
-| Precompute engine: run ingestion-time nodes per pane | planned |
+| Data plane: load and validate `plan.json`, accept Remote Write | done |
+| Stored summaries (SDS): one definition per computation, panes by end time | done |
+| Precompute engine: build ingestion-time outputs once per tumbling pane | done |
 | Query engine: run query-time nodes over stored panes and raw data | planned |
 
-Until the precompute engine lands, the data plane validates and counts Remote
-Write samples, then drops them: Prometheus must receive Remote Write itself
-(for example, configure the sender with both endpoints). Until the query engine
-lands, the data plane forwards every query to Prometheus, with its
-end-to-end headers such as `Authorization` and `X-Scope-OrgID`, and marks the
-response `x-asap-execution: forwarded`. SQL and ClickHouse are not supported
-yet.
+Panes close `--allowed-lateness-ms` (default 15 s) after the newest sample
+passes their end; later samples for them are dropped. The first pane after
+startup is skipped because it may be partial.
+
+Until the query engine lands, the data plane forwards every query to
+Prometheus, with its end-to-end headers such as `Authorization` and
+`X-Scope-OrgID`, and marks the response `x-asap-execution: forwarded`. SQL and
+ClickHouse are not supported yet.
 
 ## Running
 
@@ -51,8 +52,7 @@ yet.
 cargo run -p control_plane -- \
   --workload examples/planner-layering-example1.json --out plan.json
 
-# Serve Remote Write on /api/v1/write (samples are counted and dropped for now)
-# and the query API on /api/v1/query[_range], forwarded to Prometheus.
+# Serve Remote Write on /api/v1/write and the query API on /api/v1/query[_range].
 cargo run -p data_plane -- --plan plan.json --prometheus-url http://localhost:9090
 ```
 

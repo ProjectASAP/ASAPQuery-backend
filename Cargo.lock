@@ -679,6 +679,7 @@ dependencies = [
  "axum",
  "clap",
  "control_plane",
+ "futures",
  "http-body-util",
  "prost",
  "reqwest",
