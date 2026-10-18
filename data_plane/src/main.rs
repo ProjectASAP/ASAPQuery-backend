@@ -18,6 +18,10 @@ struct Args {
     /// How long after the newest sample passes a pane's end it is built.
     #[arg(long, default_value_t = 15_000)]
     allowed_lateness_ms: i64,
+    /// Working memory one query or pane build may hold, in MiB (the
+    /// executor's default is 64); an evaluation over it is forwarded.
+    #[arg(long, default_value_t = 64)]
+    execution_memory_limit_mib: usize,
 }
 
 #[tokio::main]
@@ -26,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let args = Args::parse();
+    data_plane::precompute::set_execution_memory_limit(args.execution_memory_limit_mib << 20);
     let plan = std::fs::read_to_string(&args.plan)?;
     let state = Arc::new(DataPlane::new(
         plan,
