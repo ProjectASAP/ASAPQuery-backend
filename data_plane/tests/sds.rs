@@ -107,17 +107,52 @@ fn rejects_outputs_without_a_pane() {
     );
 }
 
-/// A plan that keeps a query-time result across evaluations is not
-/// installed: the data plane declares it cannot keep one.
+/// B3's five query-time KLL panes kept across evaluations are one kept
+/// definition, keyed like ingestion-time panes: a 1-minute pane, each output
+/// reading the pane `i * 1min` before evaluation. Nothing is built at
+/// ingestion time.
 #[test]
-fn rejects_results_kept_across_evaluations() {
-    let mut dag = plan("example4b", true).dag.dag;
-    let node = &mut dag.nodes[0];
-    node.materialization = Materialization::MatAtQueryKeptAcrossEvaluations(Medium::Memory);
-    let id = node.id as u64;
+fn kept_panes_share_one_definition() {
+    let plan = plan("example4-b3", true);
+    let dag = &plan.dag.dag;
+    assert!(dag.nodes.iter().any(|n| matches!(
+        n.materialization,
+        Materialization::MatAtQueryKeptAcrossEvaluations(_)
+    )));
+    let sds = sds_of(dag).unwrap();
+    assert!(sds.definitions.is_empty() && sds.outputs.is_empty());
+    assert_eq!(sds.kept_definitions.len(), 1);
+    let definition = sds.kept_definitions.values().next().unwrap();
+    assert_eq!(definition.pane_ms, 60_000);
+    let mut offsets: Vec<i64> = sds
+        .kept_outputs
+        .values()
+        .map(|(id, binding)| {
+            assert_eq!(id, &definition.id);
+            binding.offset_ms
+        })
+        .collect();
+    offsets.sort();
+    assert_eq!(offsets, (0..5).map(|i| i * 60_000).collect::<Vec<_>>());
+}
+
+/// A kept output must read one pane of raw samples, like a stored one.
+#[test]
+fn rejects_kept_outputs_without_a_pane() {
+    let mut dag = plan("example4-b3", true).dag.dag;
+    let scan = dag
+        .nodes
+        .iter_mut()
+        .find(|n| matches!(n.payload, Operator::NonASAP(NonASAPOp::Scan { .. })))
+        .unwrap();
+    scan.materialization = Materialization::MatAtQueryKeptAcrossEvaluations(Medium::Memory);
+    let scan = scan.id as u64;
     assert_eq!(
-        Sds::from_dag(&dag, &[]),
-        Err(SdsError::KeptAcrossEvaluations(id))
+        sds_of(&dag),
+        Err(SdsError::UnsupportedShape {
+            node: scan,
+            reason: "no TimeRange".into()
+        })
     );
 }
 

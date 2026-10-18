@@ -16,6 +16,11 @@
 //! Outputs that differ only in `offset` compute the same thing over different
 //! panes, so they share one [`SummaryDefinition`]: the data plane builds each
 //! pane of a definition once, and every output reads the pane it needs.
+//!
+//! A `MatAtQueryKeptAcrossEvaluations` output (#509 Example 4's B3) is
+//! computed at query time and kept for the next evaluations. It has the same
+//! pane shape and is described the same way, in [`Sds::kept_definitions`]:
+//! the query engine keeps each of its panes by definition and pane end.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -36,45 +41,50 @@ pub struct SummaryDefinition {
     pub id: DefinitionId,
     /// Pane width: each stored summary covers `(end - pane_ms, end]`.
     pub pane_ms: i64,
-    /// The frontier output that builds a pane; any output of the definition
-    /// computes the same, and this is the first in node order.
+    /// The output that builds a pane; any output of the definition computes
+    /// the same, and this is the first in node order.
     pub builder: u64,
     /// The raw input of the build: the `TimeRange` node fed one pane's samples.
     pub raw_input: u64,
     pub output_schema: Schema,
 }
 
-/// How one frontier output reads its definition: at evaluation time `T`, the
-/// pane ending at `T - offset_ms`.
+/// How one output reads its definition: at evaluation time `T`, the pane
+/// ending at `T - offset_ms`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneBinding {
     pub offset_ms: i64,
+    /// The output's own `TimeRange` node: where that pane's raw samples
+    /// feed when the output is computed at query time.
+    pub raw_input: u64,
 }
 
 /// The stored summaries of one plan.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Sds {
+    /// Definitions built at ingestion time, by identity.
     pub definitions: BTreeMap<DefinitionId, SummaryDefinition>,
     /// Every frontier output, with its definition and pane.
     pub outputs: BTreeMap<u64, (DefinitionId, PaneBinding)>,
+    /// Definitions of the outputs computed at query time and kept across
+    /// evaluations, by identity.
+    pub kept_definitions: BTreeMap<DefinitionId, SummaryDefinition>,
+    /// Every output kept across evaluations, with its definition and pane.
+    pub kept_outputs: BTreeMap<u64, (DefinitionId, PaneBinding)>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum SdsError {
     #[error("node {0} is not in the DAG")]
     UnknownNode(u64),
-    #[error("ingestion-time output {node} does not read one pane of one Scan: {reason}")]
+    #[error("output {node} does not read one pane of one Scan: {reason}")]
     UnsupportedShape { node: u64, reason: String },
-    /// The data plane keeps no query-time result across evaluations; it
-    /// declares `query_time_results_retained: false`, so the Planner should
-    /// not select such a plan.
-    #[error("node {0} is kept across evaluations (MatAtQueryKeptAcrossEvaluations), which the data plane does not support")]
-    KeptAcrossEvaluations(u64),
 }
 
 impl Sds {
     /// The definitions behind `frontier`, the DAG outputs computed at
-    /// ingestion time and read at query time.
+    /// ingestion time and read at query time, and behind the outputs kept
+    /// across evaluations (`MatAtQueryKeptAcrossEvaluations`).
     pub fn from_dag(dag: &PhysicalASAPDAG, frontier: &[u64]) -> Result<Self, SdsError> {
         let nodes: HashMap<u64, &PhysicalASAPDAGNode> =
             dag.nodes.iter().map(|n| (n.id as u64, n)).collect();
@@ -85,38 +95,61 @@ impl Sds {
                 .or_default()
                 .push(edge.producer as u64);
         }
-        if let Some(node) = dag.nodes.iter().find(|n| {
-            matches!(
-                n.materialization,
-                Materialization::MatAtQueryKeptAcrossEvaluations(_)
-            )
-        }) {
-            return Err(SdsError::KeptAcrossEvaluations(node.id as u64));
-        }
         let mut sds = Sds::default();
         let mut hashes = HashMap::new();
         for &node in frontier {
-            let (raw_input, pane_ms, offset_ms) = pane_of(node, &nodes, &inputs)?;
-            let id = DefinitionId(hex(&identity(node, &nodes, &inputs, &mut hashes)?));
-            let output_schema = nodes[&node].output_schema.clone();
-            let definition =
-                sds.definitions
-                    .entry(id.clone())
-                    .or_insert_with(|| SummaryDefinition {
-                        id: id.clone(),
-                        pane_ms,
-                        builder: node,
-                        raw_input,
-                        output_schema,
-                    });
-            if node < definition.builder {
-                definition.builder = node;
-                definition.raw_input = raw_input;
+            let (definitions, outputs) = (&mut sds.definitions, &mut sds.outputs);
+            add_output(node, &nodes, &inputs, &mut hashes, definitions, outputs)?;
+        }
+        for node in &dag.nodes {
+            if let Materialization::MatAtQueryKeptAcrossEvaluations(_) = node.materialization {
+                let (definitions, outputs) = (&mut sds.kept_definitions, &mut sds.kept_outputs);
+                add_output(
+                    node.id as u64,
+                    &nodes,
+                    &inputs,
+                    &mut hashes,
+                    definitions,
+                    outputs,
+                )?;
             }
-            sds.outputs.insert(node, (id, PaneBinding { offset_ms }));
         }
         Ok(sds)
     }
+}
+
+/// Adds `node`, which must read one pane, to `outputs`, and its definition
+/// to `definitions` if it is new.
+fn add_output(
+    node: u64,
+    nodes: &HashMap<u64, &PhysicalASAPDAGNode>,
+    inputs: &HashMap<u64, Vec<u64>>,
+    hashes: &mut HashMap<u64, [u8; 32]>,
+    definitions: &mut BTreeMap<DefinitionId, SummaryDefinition>,
+    outputs: &mut BTreeMap<u64, (DefinitionId, PaneBinding)>,
+) -> Result<(), SdsError> {
+    let (raw_input, pane_ms, offset_ms) = pane_of(node, nodes, inputs)?;
+    let id = DefinitionId(hex(&identity(node, nodes, inputs, hashes)?));
+    let output_schema = nodes[&node].output_schema.clone();
+    let definition = definitions
+        .entry(id.clone())
+        .or_insert_with(|| SummaryDefinition {
+            id: id.clone(),
+            pane_ms,
+            builder: node,
+            raw_input,
+            output_schema,
+        });
+    if node < definition.builder {
+        definition.builder = node;
+        definition.raw_input = raw_input;
+    }
+    let binding = PaneBinding {
+        offset_ms,
+        raw_input,
+    };
+    outputs.insert(node, (id, binding));
+    Ok(())
 }
 
 /// `(raw input, pane width, offset)` of a frontier output: follow its single

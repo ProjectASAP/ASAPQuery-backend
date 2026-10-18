@@ -224,14 +224,14 @@ pub fn plan_selected_at_query_time(
 }
 
 /// What this backend's data plane can execute and keep: every summary the
-/// Planner executor builds, raw samples kept in Prometheus, and no
-/// query-time result kept across evaluations (the data plane does not
-/// implement `MatAtQueryKeptAcrossEvaluations`).
+/// Planner executor builds, raw samples kept in Prometheus, and query-time
+/// results kept across evaluations in memory
+/// (`MatAtQueryKeptAcrossEvaluations`).
 pub fn backend_capabilities() -> DeploymentCapabilities {
     DeploymentCapabilities {
         supported_summaries: None,
         raw_data_retained: true,
-        query_time_results_retained: false,
+        query_time_results_retained: true,
     }
 }
 

@@ -77,7 +77,7 @@ fn fetch(ranges: &[RawRange], all: &[RawSample]) -> BTreeMap<u64, Vec<RawSample>
         .collect()
 }
 
-fn answer(f: &Fixture, query: &str, time_ms: i64, all: &[RawSample]) -> Vec<ResultSample> {
+fn answer(f: &mut Fixture, query: &str, time_ms: i64, all: &[RawSample]) -> Vec<ResultSample> {
     let (root, ranges) = f
         .query
         .raw_ranges(query, time_ms, &f.precompute.store)
@@ -118,9 +118,9 @@ fn stored_panes_answer_like_a_single_build() {
         .raw_ranges(P99, 70 * MINUTE, &panes.precompute.store)
         .unwrap();
     assert!(ranges.is_empty(), "every input is a stored pane");
-    let from_panes = answer(&panes, P99, 70 * MINUTE, &all);
+    let from_panes = answer(&mut panes, P99, 70 * MINUTE, &all);
 
-    let single = fixture(common::plan("example4b", true));
+    let mut single = fixture(common::plan("example4b", true));
     let (_, ranges) = single
         .query
         .raw_ranges(P99, 70 * MINUTE, &single.precompute.store)
@@ -133,7 +133,7 @@ fn stored_panes_answer_like_a_single_build() {
         vec![(10 * MINUTE, 70 * MINUTE)],
         "one raw hour, left-open"
     );
-    let from_raw = answer(&single, P99, 70 * MINUTE, &all);
+    let from_raw = answer(&mut single, P99, 70 * MINUTE, &all);
 
     assert_eq!(from_panes, from_raw);
     assert_eq!(from_panes.len(), 2);
@@ -155,9 +155,9 @@ fn query_time_plans_read_raw_ranges() {
         ("http_requests_total", &[("job", "b"), ("instance", "1")]),
     ];
     let all = samples(series, 0, 10 * MINUTE, |_, t| t as f64 / 1000.0);
-    let f = fixture(common::plan("example1", true));
+    let mut f = fixture(common::plan("example1", true));
     let result = answer(
-        &f,
+        &mut f,
         "sum by (job) (rate(http_requests_total[1m]))",
         5 * MINUTE,
         &all,
@@ -173,7 +173,7 @@ fn query_time_plans_read_raw_ranges() {
     assert!((by_job[1].1 - 1.0).abs() < 1e-9, "{by_job:?}");
 
     let topk = answer(
-        &f,
+        &mut f,
         "topk by (job) (10, sum_over_time(http_requests_total[1m]))",
         5 * MINUTE,
         &all,

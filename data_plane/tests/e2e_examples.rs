@@ -9,6 +9,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -79,7 +80,7 @@ fn reference(
 ) -> Vec<ResultSample> {
     let sds = Sds::from_dag(&plan.dag.dag, &frontier_from_timing(&plan.dag.dag).unwrap()).unwrap();
     assert!(sds.definitions.is_empty());
-    let engine = QueryEngine::new(plan, &sds);
+    let mut engine = QueryEngine::new(plan, &sds);
     let store = SummaryStore::new();
     let (root, ranges) = engine.raw_ranges(query, time_ms, &store).unwrap();
     let raw = ranges
@@ -107,10 +108,14 @@ fn sorted(mut samples: Vec<ResultSample>) -> Vec<ResultSample> {
 
 /// A Prometheus holding `all`: range selectors `{__name__="m"}[Nms]` at
 /// `time` return the samples in `[time - N, time]`, as Prometheus 2 does;
-/// every other query returns an empty vector.
-async fn prometheus(all: Arc<Vec<RawSample>>) -> String {
+/// every other query returns an empty vector. Returns its URL and how many
+/// range selectors it has answered.
+async fn prometheus(all: Arc<Vec<RawSample>>) -> (String, Arc<AtomicUsize>) {
+    let range_reads = Arc::new(AtomicUsize::new(0));
+    let reads = range_reads.clone();
     let handler = move |Query(params): Query<BTreeMap<String, String>>| {
         let all = all.clone();
+        let reads = reads.clone();
         async move {
             let query = &params["query"];
             // Anything but a raw range is a query the data plane forwarded
@@ -125,6 +130,7 @@ async fn prometheus(all: Arc<Vec<RawSample>>) -> String {
                 );
             };
             let range: i64 = rest.strip_suffix("ms]").unwrap().parse().unwrap();
+            reads.fetch_add(1, Ordering::SeqCst);
             let time = (params["time"].parse::<f64>().unwrap() * 1000.0).round() as i64;
             let mut by_series: BTreeMap<&BTreeMap<String, String>, Vec<Value>> = BTreeMap::new();
             for s in all.iter() {
@@ -149,7 +155,7 @@ async fn prometheus(all: Arc<Vec<RawSample>>) -> String {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let app = Router::new().route("/api/v1/query", get(handler));
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    url
+    (url, range_reads)
 }
 
 /// The `data_plane` binary serving `plan`, killed on drop.
@@ -331,7 +337,7 @@ async fn check_example(
     let plan = plan_workload(&workload, inputs).unwrap();
     let at_query_time = plan_selected_at_query_time(&workload, inputs).unwrap();
     let all = Arc::new(all);
-    let process = start(&plan, &prometheus(all.clone()).await).await;
+    let process = start(&plan, &prometheus(all.clone()).await.0).await;
     remote_write(&process.url, &all).await;
     for query in &plan.queries {
         let expected = reference(&at_query_time, query, time_ms, &all);
@@ -439,4 +445,42 @@ async fn example4b() {
     });
     let definitions = check_example("example4b", &without_raw_data(), all, 70 * MINUTE, 0.0).await;
     assert_eq!(definitions, 1);
+}
+
+/// #509 Example 4's B3: Example 3b's p99 panel over ten series sampled every
+/// millisecond, where the Planner keeps five 1-minute KLL panes built at
+/// query time across evaluations. Three evaluations a minute apart match
+/// the reference; the first reads all five panes' raw samples from
+/// Prometheus, each later one only its newest pane.
+#[tokio::test]
+async fn example4_b3() {
+    let series = [
+        series("latency_ms", &[("service", "a")]),
+        series("latency_ms", &[("service", "b")]),
+    ];
+    let all = samples(&series, 0, 13 * MINUTE, 15_000, |i, t| {
+        (i * 100) as f64 + (t / 15_000 * 25 % 101) as f64
+    });
+    let workload = workload("example4-b3");
+    let inputs = DeploymentInputs::default();
+    let plan = plan_workload(&workload, &inputs).unwrap();
+    let at_query_time = plan_selected_at_query_time(&workload, &inputs).unwrap();
+    let dag = &plan.dag.dag;
+    let sds = Sds::from_dag(dag, &frontier_from_timing(dag).unwrap()).unwrap();
+    assert_eq!((sds.definitions.len(), sds.kept_definitions.len()), (0, 1));
+    let all = Arc::new(all);
+    let (prometheus_url, range_reads) = prometheus(all.clone()).await;
+    let process = start(&plan, &prometheus_url).await;
+    remote_write(&process.url, &all).await;
+    let query = &plan.queries[0];
+    let mut reads = Vec::new();
+    for minute in [10, 11, 12] {
+        let before = range_reads.load(Ordering::SeqCst);
+        let expected = reference(&at_query_time, query, minute * MINUTE, &all);
+        let actual = planned_answer(&process.url, query, minute * MINUTE).await;
+        assert_same(query, &actual, &expected, 0.0);
+        reads.push(range_reads.load(Ordering::SeqCst) - before);
+    }
+    eprintln!("{query}: raw ranges read per evaluation {reads:?}");
+    assert_eq!(reads, vec![5, 1, 1]);
 }

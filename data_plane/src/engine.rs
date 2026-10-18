@@ -135,6 +135,8 @@ impl Engine {
         tracing::info!(
             definitions = sds.definitions.len(),
             outputs = sds.outputs.len(),
+            kept_definitions = sds.kept_definitions.len(),
+            kept_outputs = sds.kept_outputs.len(),
             "stored summaries"
         );
         let query = QueryEngine::new(&plan, &sds);

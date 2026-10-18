@@ -29,7 +29,7 @@ use planner_types::ir::operator::operator_properties::Source as ScanSource;
 use planner_types::ir::physical_export::PhysicalASAPDAG;
 use planner_types::ir::{NonASAPOp, Operator as IrOperator};
 
-use crate::sds::{DefinitionId, Sds, SummaryDefinition, SummaryStore};
+use crate::sds::{DefinitionId, PaneBinding, Sds, SummaryDefinition, SummaryStore};
 
 /// One raw sample: its series' full label set (including `__name__`), time
 /// and value.
@@ -69,13 +69,75 @@ pub struct ScanInput {
     pub schema: SchemaRef,
 }
 
-struct Builder {
-    definition: SummaryDefinition,
-    scan: ScanInput,
+/// How the panes of one definition are built from raw samples. The
+/// precompute engine builds stored panes with it, and the query engine kept
+/// ones.
+pub(crate) struct PaneBuild {
+    pub(crate) definition: SummaryDefinition,
+    pub(crate) scan: ScanInput,
     build: CompiledPhysicalDAG,
-    /// Oldest pane offset any output reads, plus one pane: panes ending
-    /// before `watermark - retention_ms` are no longer read.
-    retention_ms: i64,
+    /// Largest offset any output of the definition reads, plus two panes:
+    /// panes ending at or before `newest - retention_ms` are no longer read.
+    pub(crate) retention_ms: i64,
+}
+
+impl PaneBuild {
+    /// Compiles `definition`'s build from its `TimeRange` up to its builder;
+    /// `outputs` are the outputs that read it.
+    pub(crate) fn new(
+        dag: &PhysicalASAPDAG,
+        definition: &SummaryDefinition,
+        outputs: &BTreeMap<u64, (DefinitionId, PaneBinding)>,
+    ) -> Result<Self, PrecomputeError> {
+        let error =
+            |message: &str| PrecomputeError::Definition(definition.id.clone(), message.into());
+        let scan = scan_below(dag, definition.raw_input)
+            .ok_or_else(|| error("no time-series Scan below its TimeRange"))?;
+        let raw_schema = Arc::new(output_schema(dag, definition.raw_input).clone());
+        if raw_schema != scan.schema {
+            return Err(error("TimeRange rows differ from its Scan's"));
+        }
+        let build = compile(
+            dag,
+            BTreeMap::from([(definition.raw_input, InputContract::bounded(raw_schema))]),
+            &[definition.builder],
+        )?;
+        let max_offset = outputs
+            .values()
+            .filter(|(id, _)| id == &definition.id)
+            .map(|(_, binding)| binding.offset_ms)
+            .max()
+            .unwrap_or(0);
+        Ok(Self {
+            definition: definition.clone(),
+            scan,
+            build,
+            retention_ms: max_offset + 2 * definition.pane_ms,
+        })
+    }
+
+    /// Runs the plan's `Scan` over `samples`, then the build over the rows
+    /// it selects, under `scope`.
+    pub(crate) fn run(
+        &self,
+        dag: &PhysicalASAPDAG,
+        samples: &[RawSample],
+        scope: Scope,
+    ) -> Result<Batch, PrecomputeError> {
+        let selected = select(dag, &self.scan, samples, scope.clone())?;
+        let input: Source<'_> =
+            Box::new(Operator::source(self.scan.schema.clone(), vec![selected])?);
+        let build = self
+            .build
+            .instantiate(BTreeMap::from([(self.definition.raw_input, input)]))?;
+        let rows = run(&build, self.build.roots(), scope)?;
+        let schema = Arc::new(self.definition.output_schema.clone());
+        Ok(Batch::try_new(schema, rows)?)
+    }
+}
+
+struct Builder {
+    pane: PaneBuild,
     /// Samples of open panes, by pane end.
     open: BTreeMap<i64, Vec<RawSample>>,
     /// End of the newest pane built or skipped; samples in it or before it
@@ -99,37 +161,17 @@ impl Precompute {
         sds: &Sds,
         allowed_lateness_ms: i64,
     ) -> Result<Self, PrecomputeError> {
-        let mut builders = Vec::new();
-        for definition in sds.definitions.values() {
-            let error =
-                |message: String| PrecomputeError::Definition(definition.id.clone(), message);
-            let scan = scan_below(&dag, definition.raw_input)
-                .ok_or_else(|| error("no time-series Scan below its TimeRange".into()))?;
-            let raw_schema = Arc::new(output_schema(&dag, definition.raw_input).clone());
-            if raw_schema != scan.schema {
-                return Err(error("TimeRange rows differ from its Scan's".into()));
-            }
-            let build = compile(
-                &dag,
-                BTreeMap::from([(definition.raw_input, InputContract::bounded(raw_schema))]),
-                &[definition.builder],
-            )?;
-            let max_offset = sds
-                .outputs
-                .values()
-                .filter(|(id, _)| id == &definition.id)
-                .map(|(_, binding)| binding.offset_ms)
-                .max()
-                .unwrap_or(0);
-            builders.push(Builder {
-                definition: definition.clone(),
-                scan,
-                build,
-                retention_ms: max_offset + 2 * definition.pane_ms,
-                open: BTreeMap::new(),
-                built_through: None,
-            });
-        }
+        let builders = sds
+            .definitions
+            .values()
+            .map(|definition| {
+                Ok(Builder {
+                    pane: PaneBuild::new(&dag, definition, &sds.outputs)?,
+                    open: BTreeMap::new(),
+                    built_through: None,
+                })
+            })
+            .collect::<Result<_, PrecomputeError>>()?;
         Ok(Self {
             dag,
             builders,
@@ -153,10 +195,10 @@ impl Precompute {
             let metric = sample.labels.get("__name__").map(String::as_str);
             let mut accepted = false;
             for builder in &mut self.builders {
-                if metric != Some(builder.scan.metric.as_str()) {
+                if metric != Some(builder.pane.scan.metric.as_str()) {
                     continue;
                 }
-                let end = pane_end(sample.timestamp_ms, builder.definition.pane_ms);
+                let end = pane_end(sample.timestamp_ms, builder.pane.definition.pane_ms);
                 // The first pane seen may be partial: skip it.
                 let built = *builder.built_through.get_or_insert(end);
                 if end <= built {
@@ -182,27 +224,33 @@ impl Precompute {
             let Some(built) = builder.built_through else {
                 continue;
             };
-            let pane_ms = builder.definition.pane_ms;
+            let pane_ms = builder.pane.definition.pane_ms;
             // Every pane after the first through the watermark is built, so
             // a pane without samples is stored as empty, not missing.
             let mut end = built + pane_ms;
             while end <= watermark {
                 let samples = builder.open.remove(&end).unwrap_or_default();
-                match build_pane(&self.dag, builder, end, &samples) {
+                let scope = Scope::Ingestion {
+                    window_start_ms: end - pane_ms,
+                    window_end_ms: end,
+                    revision: 1,
+                };
+                match builder.pane.run(&self.dag, &samples, scope) {
                     Ok(state) => {
-                        self.store.insert(&builder.definition.id, end, state);
+                        self.store.insert(&builder.pane.definition.id, end, state);
                         self.stats.panes_built += 1;
                     }
                     Err(error) => {
-                        tracing::error!(definition = ?builder.definition.id, end, %error, "pane build failed");
+                        tracing::error!(definition = ?builder.pane.definition.id, end, %error, "pane build failed");
                         self.stats.panes_failed += 1;
                     }
                 }
                 builder.built_through = Some(end);
                 end += pane_ms;
             }
+            let definition = &builder.pane.definition.id;
             self.store
-                .evict_through(&builder.definition.id, watermark - builder.retention_ms);
+                .evict_through(definition, watermark - builder.pane.retention_ms);
         }
     }
 }
@@ -212,33 +260,6 @@ impl Precompute {
 /// boundary belongs to the pane it ends.
 pub fn pane_end(timestamp_ms: i64, pane_ms: i64) -> i64 {
     -(-timestamp_ms).div_euclid(pane_ms) * pane_ms
-}
-
-/// Runs the plan's `Scan` over `samples`, then the definition's build over
-/// the rows it selects, for the pane ending at `end`.
-fn build_pane(
-    dag: &PhysicalASAPDAG,
-    builder: &Builder,
-    end: i64,
-    samples: &[RawSample],
-) -> Result<Batch, PrecomputeError> {
-    let start = end - builder.definition.pane_ms;
-    let scope = Scope::Ingestion {
-        window_start_ms: start,
-        window_end_ms: end,
-        revision: 1,
-    };
-    let selected = select(dag, &builder.scan, samples, scope.clone())?;
-    let input: Source<'_> = Box::new(Operator::source(
-        builder.scan.schema.clone(),
-        vec![selected],
-    )?);
-    let build = builder
-        .build
-        .instantiate(BTreeMap::from([(builder.definition.raw_input, input)]))?;
-    let rows = run(&build, builder.build.roots(), scope)?;
-    let schema = Arc::new(builder.definition.output_schema.clone());
-    Ok(Batch::try_new(schema, rows)?)
 }
 
 /// The rows of `samples` the plan's `scan` selects: its label matchers

@@ -35,6 +35,7 @@ The backend is being rebuilt on the Planner's physical DAG:
 | Stored summaries (SDS): one definition per computation, panes by end time | done |
 | Precompute engine: build ingestion-time outputs once per tumbling pane | done |
 | Query engine: answer planned instant queries from stored panes and raw samples | done |
+| Query engine: keep query-time panes across evaluations (`MatAtQueryKeptAcrossEvaluations`) | done |
 
 Panes close `--allowed-lateness-ms` (default 15 s) after the newest sample
 passes their end; later samples for them are dropped. The first pane after
@@ -43,7 +44,11 @@ startup is skipped because it may be partial.
 An instant query whose text is one of the plan's queries is answered by the
 plan (`x-asap-execution: plan`). Its stored inputs read the panes ending at
 `T - offset`, so `T` must be on the pane grid and those panes stored; its
-query-time raw ranges are read from Prometheus. Anything else is forwarded
+query-time raw ranges are read from Prometheus. An input the plan keeps
+across evaluations (`MatAtQueryKeptAcrossEvaluations`) is computed from its
+pane's raw samples the first time an evaluation reads it, kept in memory by
+definition and pane end, and reused by later evaluations; it is evicted like
+a stored pane, measured from the newest evaluation. Anything else is forwarded
 to Prometheus (`x-asap-execution: forwarded`); a planned query that could not
 be answered also says why in `x-asap-forward-reason`. Range queries, SQL and
 ClickHouse are not supported yet.
@@ -61,8 +66,7 @@ cargo run -p data_plane -- --plan plan.json --prometheus-url http://localhost:90
 
 `--deployment-capabilities caps.json` replaces the default
 `DeploymentCapabilities`: every summary the Planner can build, raw data kept
-in Prometheus, and no query-time result kept across evaluations
-(`MatAtQueryKeptAcrossEvaluations` is not implemented). For example
+in Prometheus, and query-time results kept across evaluations. For example
 `{"raw_data_retained": false}` makes the Planner build every input at
 ingestion time. `--measured-operation-costs costs.json` gives Stage 3 the
 deployment's measured sketch operation costs; otherwise it prices every node
@@ -70,8 +74,10 @@ with cost model 1 and illustrative unit costs.
 
 ## Examples
 
-`examples/` holds #509's PromQL example workloads (1, 3a, 3b, 4a, 4b) as
-Planner `PlanningWorkload`s. `data_plane/tests/e2e_examples.rs` plans each
+`examples/` holds #509's PromQL example workloads (1, 3a, 3b, 4a, 4b, and
+`4-b3`: Example 3b's panel over ten series sampled every millisecond, for
+which the Planner keeps query-time panes across evaluations) as Planner
+`PlanningWorkload`s. `data_plane/tests/e2e_examples.rs` plans each
 one, runs the `data_plane` binary against a Prometheus holding generated
 samples, Remote Writes the same samples, and checks every planned query
 against the Planner executor running the selected plan with nothing

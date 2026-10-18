@@ -99,3 +99,37 @@ fn reference_plan_materializes_nothing() {
     assert_eq!(materialized(&reference), 0);
     assert_eq!(reference.queries, installed.queries);
 }
+
+/// The backend keeps query-time results across evaluations, so for a few
+/// series sampled every millisecond the Planner selects #509 Example 4's
+/// B3: five 1-minute KLL panes built at query time and kept, installed as
+/// plain panes.
+#[test]
+fn selects_panes_kept_across_evaluations() {
+    let inputs = DeploymentInputs::default();
+    assert!(inputs.deployment_capabilities.query_time_results_retained);
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/planner-layering-example4-b3.json");
+    let workload: PlanningWorkload =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let plan = plan_workload(&workload, &inputs).unwrap();
+    let kept = plan
+        .dag
+        .dag
+        .nodes
+        .iter()
+        .filter(|n| {
+            matches!(
+                n.materialization,
+                Materialization::MatAtQueryKeptAcrossEvaluations(_)
+            )
+        })
+        .inspect(|n| {
+            assert!(matches!(
+                n.payload,
+                Operator::ASAP(ASAPOp::SummaryAgg { .. })
+            ))
+        })
+        .count();
+    assert_eq!(kept, 5, "five one-minute panes");
+}
