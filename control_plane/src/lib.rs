@@ -11,13 +11,14 @@ use std::rc::Rc;
 
 use asap_logical_asap_optimization::DeploymentCapabilities;
 use asap_plan_selection::{
-    run_stage1_to_stage3, PlanSelectionSettings, PlanningModels, Stage1ToStage3Run,
+    resize_for_failure_probability, run_stage1_to_stage3, with_confirmed_weights,
+    PlanSelectionSettings, PlanningModels, Stage1ToStage3Run,
 };
 use planner_types::ir::operator::pane_chain::expand_pane_chains;
 use planner_types::ir::physical_export::{compile_physical_asap_workload, PhysicalASAPDAGDocument};
 use planner_types::ir::schema::schema_support::with_promql_series_identity;
 use planner_types::ir::QueryRoot;
-use planner_types::workload::{PlanningWorkload, QueryLanguage, QueryWorkloadEntry};
+use planner_types::workload::{DataWorkload, PlanningWorkload, QueryLanguage, QueryWorkloadEntry};
 use serde::{Deserialize, Serialize};
 
 /// The plan the data plane installs: the Planner's selected physical DAG and
@@ -123,9 +124,11 @@ impl InstalledPlan {
     }
 }
 
-/// One planned workload: its queries and what Stages 1–3 returned.
+/// One planned workload: what Stages 1–3 returned and the inputs they read.
 struct Planned {
     queries: Vec<String>,
+    entries: Vec<QueryWorkloadEntry>,
+    data: DataWorkload,
     run: Stage1ToStage3Run<usize>,
 }
 
@@ -161,7 +164,9 @@ fn plan(workload: &PlanningWorkload, inputs: &DeploymentInputs) -> Result<Planne
     let run = run_stage1_to_stage3(roots, &entries, &data, models)
         .map_err(|e| PlanError::Planning(e.to_string()))?;
     Ok(Planned {
-        queries: entries.into_iter().map(|e| e.query.0).collect(),
+        queries: entries.iter().map(|e| e.query.0.clone()).collect(),
+        entries,
+        data,
         run,
     })
 }
@@ -180,6 +185,42 @@ pub fn plan_workload(
         .map_err(|e| PlanError::Planning(e.to_string()))?;
     tracing::info!(candidate = %selection.selected, "selected physical plan");
     InstalledPlan::from_roots(planned.queries, &selection.plan)
+}
+
+/// The selected plan with nothing materialized: the Stage 2 candidate that
+/// implements the same logical candidate with every summary built at query
+/// time, sized as Stage 3 sizes the selected one. Its answers are what the
+/// installed plan's must equal, so tests use it as the reference.
+pub fn plan_selected_at_query_time(
+    workload: &PlanningWorkload,
+    inputs: &DeploymentInputs,
+) -> Result<InstalledPlan, PlanError> {
+    let planned = plan(workload, inputs)?;
+    let run = &planned.run;
+    let missing = |what: &str| PlanError::Planning(format!("no {what} in the planner's run"));
+    let selected = run
+        .selected()
+        .ok_or_else(|| missing("selected candidate"))?;
+    // Stage 2 numbers `L<n>`'s candidates `P<n>` (nothing materialized),
+    // then `P<n>-m<k>`.
+    let number = selected
+        .from_logical
+        .strip_prefix('L')
+        .ok_or_else(|| missing("logical candidate number"))?;
+    let unmaterialized = run
+        .stage2_physical_asap_optimization
+        .iter()
+        .find(|p| p.id == format!("P{number}"))
+        .ok_or_else(|| missing("unmaterialized candidate"))?;
+    let targets: Vec<_> = planned
+        .entries
+        .iter()
+        .map(|e| e.requirements.accuracy.clone())
+        .collect();
+    let sized = resize_for_failure_probability(&unmaterialized.roots, &targets, &planned.data)
+        .map_err(|e| PlanError::Planning(e.to_string()))?;
+    let roots = with_confirmed_weights(&sized, &planned.data);
+    InstalledPlan::from_roots(planned.queries, &roots)
 }
 
 /// What this backend's data plane can execute and keep: every summary the
