@@ -61,11 +61,17 @@ pub struct PrecomputeStats {
     pub panes_failed: u64,
 }
 
+/// A time-series `Scan` of the plan: its node, metric and row schema.
+#[derive(Debug, Clone)]
+pub struct ScanInput {
+    pub node: u64,
+    pub metric: String,
+    pub schema: SchemaRef,
+}
+
 struct Builder {
     definition: SummaryDefinition,
-    metric: String,
-    scan: u64,
-    scan_schema: SchemaRef,
+    scan: ScanInput,
     build: CompiledPhysicalDAG,
     /// Oldest pane offset any output reads, plus one pane: panes ending
     /// before `watermark - retention_ms` are no longer read.
@@ -97,10 +103,10 @@ impl Precompute {
         for definition in sds.definitions.values() {
             let error =
                 |message: String| PrecomputeError::Definition(definition.id.clone(), message);
-            let (scan, metric, scan_schema) = scan_below(&dag, definition.raw_input)
+            let scan = scan_below(&dag, definition.raw_input)
                 .ok_or_else(|| error("no time-series Scan below its TimeRange".into()))?;
             let raw_schema = Arc::new(output_schema(&dag, definition.raw_input).clone());
-            if raw_schema != scan_schema {
+            if raw_schema != scan.schema {
                 return Err(error("TimeRange rows differ from its Scan's".into()));
             }
             let build = compile(
@@ -117,9 +123,7 @@ impl Precompute {
                 .unwrap_or(0);
             builders.push(Builder {
                 definition: definition.clone(),
-                metric,
                 scan,
-                scan_schema,
                 build,
                 retention_ms: max_offset + 2 * definition.pane_ms,
                 open: BTreeMap::new(),
@@ -149,7 +153,7 @@ impl Precompute {
             let metric = sample.labels.get("__name__").map(String::as_str);
             let mut accepted = false;
             for builder in &mut self.builders {
-                if metric != Some(builder.metric.as_str()) {
+                if metric != Some(builder.scan.metric.as_str()) {
                     continue;
                 }
                 let end = pane_end(sample.timestamp_ms, builder.definition.pane_ms);
@@ -224,23 +228,9 @@ fn build_pane(
         window_end_ms: end,
         revision: 1,
     };
-    let rows = samples
-        .iter()
-        .map(|s| series_row(&builder.scan_schema, &s.labels, s.timestamp_ms, s.value))
-        .collect::<Result<Vec<_>, _>>()?;
-    let raw = Batch::try_new(builder.scan_schema.clone(), rows)?;
-    let mut sources = DataSources::default();
-    sources.register(
-        ScanSource::TimeSeries {
-            metric: builder.metric.clone(),
-        },
-        Arc::new(MemorySource::new(builder.scan_schema.clone(), vec![raw])?),
-    )?;
-    let scan = bind_with_data_sources(dag, BTreeMap::new(), &[builder.scan], &sources)?;
-    let selected = run(&scan, &[builder.scan], scope.clone())?;
-    let selected = Batch::try_new(builder.scan_schema.clone(), selected)?;
+    let selected = select(dag, &builder.scan, samples, scope.clone())?;
     let input: Source<'_> = Box::new(Operator::source(
-        builder.scan_schema.clone(),
+        builder.scan.schema.clone(),
         vec![selected],
     )?);
     let build = builder
@@ -249,6 +239,31 @@ fn build_pane(
     let rows = run(&build, builder.build.roots(), scope)?;
     let schema = Arc::new(builder.definition.output_schema.clone());
     Ok(Batch::try_new(schema, rows)?)
+}
+
+/// The rows of `samples` the plan's `scan` selects: its label matchers
+/// applied by the executor's `Scan`.
+pub fn select(
+    dag: &PhysicalASAPDAG,
+    scan: &ScanInput,
+    samples: &[RawSample],
+    scope: Scope,
+) -> Result<Batch, asap_executor::Error> {
+    let rows = samples
+        .iter()
+        .map(|s| series_row(&scan.schema, &s.labels, s.timestamp_ms, s.value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let raw = Batch::try_new(scan.schema.clone(), rows)?;
+    let mut sources = DataSources::default();
+    sources.register(
+        ScanSource::TimeSeries {
+            metric: scan.metric.clone(),
+        },
+        Arc::new(MemorySource::new(scan.schema.clone(), vec![raw])?),
+    )?;
+    let dag = bind_with_data_sources(dag, BTreeMap::new(), &[scan.node], &sources)?;
+    let selected = run(&dag, &[scan.node], scope)?;
+    Batch::try_new(scan.schema.clone(), selected)
 }
 
 /// Executes `dag`'s single root to completion and returns its rows.
@@ -276,8 +291,8 @@ fn output_schema(dag: &PhysicalASAPDAG, id: u64) -> &planner_types::ir::schema::
         .output_schema
 }
 
-/// The time-series `Scan` that `id` reads: its node id, metric and row schema.
-fn scan_below(dag: &PhysicalASAPDAG, id: u64) -> Option<(u64, String, SchemaRef)> {
+/// The time-series `Scan` that `id` reads through single-input operators.
+pub fn scan_below(dag: &PhysicalASAPDAG, id: u64) -> Option<ScanInput> {
     let inputs: HashMap<u64, u64> = dag
         .edges
         .iter()
@@ -291,11 +306,11 @@ fn scan_below(dag: &PhysicalASAPDAG, id: u64) -> Option<(u64, String, SchemaRef)
             ..
         }) = &node.payload
         {
-            return Some((
-                current,
-                metric.clone(),
-                Arc::new(node.output_schema.clone()),
-            ));
+            return Some(ScanInput {
+                node: current,
+                metric: metric.clone(),
+                schema: Arc::new(node.output_schema.clone()),
+            });
         }
         current = *inputs.get(&current)?;
     }

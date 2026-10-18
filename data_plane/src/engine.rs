@@ -2,6 +2,7 @@
 //! it. Planner IR holds `Rc`s, so the plan cannot be shared across the HTTP
 //! server's threads; handlers send the engine commands instead.
 
+use std::collections::BTreeMap;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 
 use asap_executor::physical_planner::frontier_from_timing;
@@ -9,14 +10,28 @@ use control_plane::InstalledPlan;
 use tokio::sync::oneshot;
 
 use crate::precompute::{Precompute, PrecomputeStats, RawSample};
+use crate::query::{QueryEngine, RawRange, ResultSample, Unanswered};
 use crate::sds::Sds;
 
 /// Commands queued for the engine before ingestion pushes back.
 const QUEUE: usize = 1024;
 
+type Reply<T> = oneshot::Sender<Result<T, Unanswered>>;
+
 pub enum Command {
     Ingest(Vec<RawSample>),
     Stats(oneshot::Sender<PrecomputeStats>),
+    RawRanges {
+        query: String,
+        time_ms: i64,
+        reply: Reply<(usize, Vec<RawRange>)>,
+    },
+    Evaluate {
+        root: usize,
+        time_ms: i64,
+        raw: BTreeMap<u64, Vec<RawSample>>,
+        reply: Reply<Vec<ResultSample>>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -58,32 +73,74 @@ impl EngineHandle {
         }
     }
 
+    /// The plan root answering `query` at `time_ms` and the raw samples it
+    /// needs; see [`QueryEngine::raw_ranges`].
+    pub async fn raw_ranges(
+        &self,
+        query: String,
+        time_ms: i64,
+    ) -> Result<(usize, Vec<RawRange>), Unanswered> {
+        self.ask(|reply| Command::RawRanges {
+            query,
+            time_ms,
+            reply,
+        })
+        .await
+    }
+
+    /// Runs a root over stored panes and `raw`; see [`QueryEngine::evaluate`].
+    pub async fn evaluate(
+        &self,
+        root: usize,
+        time_ms: i64,
+        raw: BTreeMap<u64, Vec<RawSample>>,
+    ) -> Result<Vec<ResultSample>, Unanswered> {
+        self.ask(|reply| Command::Evaluate {
+            root,
+            time_ms,
+            raw,
+            reply,
+        })
+        .await
+    }
+
+    async fn ask<T>(&self, command: impl FnOnce(Reply<T>) -> Command) -> Result<T, Unanswered> {
+        let busy = || Unanswered::Execution("the engine is busy".into());
+        let (reply, answer) = oneshot::channel();
+        self.commands.try_send(command(reply)).map_err(|_| busy())?;
+        answer.await.map_err(|_| busy())?
+    }
+
     /// Precompute counters, once every command queued before has run.
     pub async fn stats(&self) -> PrecomputeStats {
         let (reply, stats) = oneshot::channel();
-        let _ = self.commands.send(Command::Stats(reply));
+        if self.commands.try_send(Command::Stats(reply)).is_err() {
+            return PrecomputeStats::default();
+        }
         stats.await.unwrap_or_default()
     }
 }
 
 struct Engine {
     precompute: Precompute,
+    query: QueryEngine,
 }
 
 impl Engine {
     fn new(plan_json: &str, allowed_lateness_ms: i64) -> anyhow::Result<Self> {
         let plan: InstalledPlan = serde_json::from_str(plan_json)?;
         plan.validate()?;
-        let dag = plan.dag.dag;
-        let frontier = frontier_from_timing(&dag)?;
-        let sds = Sds::from_dag(&dag, &frontier)?;
+        let frontier = frontier_from_timing(&plan.dag.dag)?;
+        let sds = Sds::from_dag(&plan.dag.dag, &frontier)?;
         tracing::info!(
             definitions = sds.definitions.len(),
             outputs = sds.outputs.len(),
             "stored summaries"
         );
+        let query = QueryEngine::new(&plan, &sds);
         Ok(Self {
-            precompute: Precompute::new(dag, &sds, allowed_lateness_ms)?,
+            precompute: Precompute::new(plan.dag.dag, &sds, allowed_lateness_ms)?,
+            query,
         })
     }
 
@@ -93,6 +150,30 @@ impl Engine {
                 Command::Ingest(samples) => self.precompute.ingest(&samples),
                 Command::Stats(reply) => {
                     let _ = reply.send(self.precompute.stats);
+                }
+                Command::RawRanges {
+                    query,
+                    time_ms,
+                    reply,
+                } => {
+                    let _ = reply.send(self.query.raw_ranges(
+                        &query,
+                        time_ms,
+                        &self.precompute.store,
+                    ));
+                }
+                Command::Evaluate {
+                    root,
+                    time_ms,
+                    raw,
+                    reply,
+                } => {
+                    let _ = reply.send(self.query.evaluate(
+                        root,
+                        time_ms,
+                        &self.precompute.store,
+                        &raw,
+                    ));
                 }
             }
         }

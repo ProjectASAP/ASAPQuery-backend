@@ -34,14 +34,18 @@ The backend is being rebuilt on the Planner's physical DAG:
 | Data plane: load and validate `plan.json`, accept Remote Write | done |
 | Stored summaries (SDS): one definition per computation, panes by end time | done |
 | Precompute engine: build ingestion-time outputs once per tumbling pane | done |
-| Query engine: run query-time nodes over stored panes and raw data | planned |
+| Query engine: answer planned instant queries from stored panes and raw samples | done |
 
 Panes close `--allowed-lateness-ms` (default 15 s) after the newest sample
 passes their end; later samples for them are dropped. The first pane after
 startup is skipped because it may be partial.
 
-Until the query engine lands, the data plane forwards every query to
-Prometheus and marks the response `x-asap-execution: forwarded`. SQL and
+An instant query whose text is one of the plan's queries is answered by the
+plan (`x-asap-execution: plan`). Its stored inputs read the panes ending at
+`T - offset`, so `T` must be on the pane grid and those panes stored; its
+query-time raw ranges are read from Prometheus. Anything else is forwarded
+to Prometheus (`x-asap-execution: forwarded`); a planned query that could not
+be answered also says why in `x-asap-forward-reason`. Range queries, SQL and
 ClickHouse are not supported yet.
 
 ## Running
