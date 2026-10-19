@@ -98,3 +98,42 @@ fn selects_panes_kept_across_evaluations() {
     assert_eq!(kept.len(), 5, "five one-minute panes");
     assert!(kept.iter().all(|output| output.pane.width_ms == 60_000));
 }
+
+/// Stage 3's prediction is for the plan installed: the same candidate. With
+/// a measured cost for the selected KLL's configuration, the nodes that
+/// build or read it are priced from the measurement, not the formulas.
+#[test]
+fn predicts_the_installed_plan_and_prices_from_measured_costs() {
+    let mut inputs = DeploymentInputs::default();
+    inputs.deployment_capabilities.raw_data_retained = false;
+    let workload = example("example4b");
+    let plan = plan_workload(&workload, &inputs).unwrap();
+    let before = control_plane::predict(&workload, &inputs).unwrap();
+    assert_eq!(
+        Some(&before.selected_candidate_id),
+        plan.selection.as_ref().map(|s| &s.selected_candidate_id)
+    );
+    assert_eq!(before.nodes_priced_by_measurement, 0);
+    assert!(before.cpu_core_seconds_per_second > 0.0);
+    let kll = serde_json::to_value(&plan.dag.dag)
+        .unwrap()
+        .pointer("/nodes")
+        .and_then(|nodes| {
+            nodes.as_array().unwrap().iter().find_map(|n| {
+                n.pointer("/payload/ASAP/SummaryAgg/family/Sketch/0/params")
+                    .cloned()
+            })
+        })
+        .expect("a KLL build");
+    inputs.plan_selection.measured_operation_costs = ["update", "merge", "estimate"]
+        .iter()
+        .map(|operation| {
+            serde_json::from_value(serde_json::json!({
+                "sketch": kll, "operation": operation, "cpu_ns_per_operation": 1000.0
+            }))
+            .unwrap()
+        })
+        .collect();
+    let after = control_plane::predict(&workload, &inputs).unwrap();
+    assert!(after.nodes_priced_by_measurement > 0, "{after:?}");
+}

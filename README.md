@@ -107,6 +107,17 @@ operation costs). `--measured-operation-costs costs.json` gives Stage 3 the
 deployment's measured sketch operation costs; otherwise it prices every node
 with cost model 1 and illustrative unit costs.
 
+## Measured costs (Stage E)
+
+`scripts/bench/cost_feedback.sh` measures what the data plane's
+operations cost on this machine (`measure_costs`: the executor's own
+summary build, merge and estimate operators, per row or state) and writes
+them as the Planner's `measured_operation_costs`, then re-plans with them.
+`control_plane --prediction <file>` writes Stage 3's predicted CPU and
+memory for the selected plan, to compare with a measured run.
+`measure_costs --report` also records the costs the table cannot hold
+(exact accumulators, per-sample ingestion updates, raw windows end to end).
+
 ## Examples
 
 `examples/` holds #509's PromQL example workloads (1, 3a, 3b, 4a, 4b, and

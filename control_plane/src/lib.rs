@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use asap_planner::{
-    plan_installable, DeploymentCapabilities, FrontendInput, InstallablePlan,
+    e2e_plan, plan_installable, DeploymentCapabilities, FrontendInput, InstallablePlan,
     PlanSelectionSettings, PlanningModels, PlanningWorkload, UserInput,
 };
 
@@ -53,6 +53,72 @@ pub fn plan_workload(
         tracing::info!(candidate = %selection.selected_candidate_id, "selected physical plan");
     }
     Ok(plan)
+}
+
+/// Stage 3's prediction for the plan it selects: its price and its
+/// resource usage per second of the workload, and where its nodes' prices
+/// came from. For comparing with a measured run.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Prediction {
+    pub selected_candidate_id: String,
+    pub cost_per_second: Option<f64>,
+    /// CPU core-seconds per second: CPU operations and scanned bytes at the
+    /// settings' resource speed.
+    pub cpu_core_seconds_per_second: f64,
+    pub average_memory_bytes: f64,
+    pub peak_memory_bytes: u64,
+    /// How many of the selected plan's nodes were priced from measured
+    /// operation costs, and how many from the Planner's formulas.
+    pub nodes_priced_by_measurement: usize,
+    pub nodes_priced_by_formula: usize,
+}
+
+/// Stage 3's [`Prediction`] for the plan [`plan_workload`] selects for
+/// `workload` under `inputs`.
+pub fn predict(
+    workload: &PlanningWorkload,
+    inputs: &DeploymentInputs,
+) -> Result<Prediction, PlanError> {
+    // `plan_installable` restricts unrestricted summaries to the executor's
+    // families; plan over the same candidates.
+    let mut capabilities = inputs.deployment_capabilities.clone();
+    if capabilities.supported_summaries.is_none() {
+        capabilities.supported_summaries = Some(asap_executor::supported_summary_families());
+    }
+    let models = PlanningModels::builtin()
+        .with_deployment_capabilities(&capabilities)
+        .with_plan_selection(&inputs.plan_selection);
+    let input = UserInput::new(workload, FrontendInput::Promql { histograms: None }, models);
+    let output = futures::executor::block_on(e2e_plan(input))?;
+    let missing = || PlanError::File {
+        path: "Stage 3 selection".into(),
+        message: "the planning pass selected no priced candidate".into(),
+    };
+    let selection = output.selection.ok_or_else(missing)?;
+    let cost = selection
+        .costs
+        .get(&selection.selected)
+        .ok_or_else(missing)?;
+    let speed = inputs.plan_selection.resource_speed;
+    let usage = &cost.usage;
+    let measured = cost
+        .per_node
+        .values()
+        .filter(|node| {
+            serde_json::to_value(node.price_source).ok() == Some(serde_json::json!("measured"))
+        })
+        .count();
+    Ok(Prediction {
+        selected_candidate_id: selection.selected.clone(),
+        cost_per_second: cost.cost_per_second,
+        cpu_core_seconds_per_second: (usage.cpu_ops_per_second * speed.ms_per_cpu_op
+            + usage.scanned_bytes_per_second * speed.ms_per_scanned_byte)
+            / 1000.0,
+        average_memory_bytes: usage.average_memory_bytes,
+        peak_memory_bytes: usage.peak_memory_bytes,
+        nodes_priced_by_measurement: measured,
+        nodes_priced_by_formula: cost.per_node.len() - measured,
+    })
 }
 
 /// Writes `plan` as the plan file the data plane installs.
