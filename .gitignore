@@ -13,3 +13,4 @@ uuid
 
 # Generated evaluation archives stay outside version control.
 /docs/evaluation/**/*.gz
+__pycache__/
