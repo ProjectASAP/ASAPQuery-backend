@@ -13,6 +13,8 @@ mod per_sample;
 pub mod precompute;
 pub mod prometheus;
 pub mod query;
+pub mod raw_buffer;
+pub mod remote_read;
 pub mod remote_write;
 pub mod sds;
 
@@ -27,7 +29,7 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use engine::{EngineHandle, Threads};
+use engine::{EngineHandle, EngineOptions};
 use precompute::{shard_of, RawSample};
 use prometheus::{InstantQuery, RangeQuery};
 use query::Unanswered;
@@ -54,7 +56,7 @@ pub struct DataPlane {
 
 impl DataPlane {
     /// Installs the plan serialized in `plan_json` (an [`InstallablePlan`])
-    /// with [`Threads::default`]. Panes close `allowed_lateness_ms` after
+    /// with [`EngineOptions::default`]. Panes close `allowed_lateness_ms` after
     /// every ingestion worker's newest sample passes them.
     pub fn new(
         plan_json: String,
@@ -65,22 +67,22 @@ impl DataPlane {
             plan_json,
             prometheus_url,
             allowed_lateness_ms,
-            Threads::default(),
+            EngineOptions::default(),
         )
     }
 
-    /// [`Self::new`] with `threads` ingestion workers and query threads.
+    /// [`Self::new`] with `options`' threads and raw buffer.
     pub fn with_threads(
         plan_json: String,
         prometheus_url: String,
         allowed_lateness_ms: i64,
-        threads: Threads,
+        options: EngineOptions,
     ) -> anyhow::Result<Self> {
         let plan: InstallablePlan = serde_json::from_str(&plan_json)?;
         plan.validate()?;
         Ok(Self {
             queries: plan.queries.into_iter().map(|q| q.query).collect(),
-            engine: EngineHandle::spawn(plan_json, allowed_lateness_ms, threads)?,
+            engine: EngineHandle::spawn(plan_json, allowed_lateness_ms, options)?,
             prometheus_url: prometheus_url.trim_end_matches('/').to_string(),
             limits: remote_write::Limits::default(),
             samples: AtomicU64::new(0),
@@ -235,16 +237,40 @@ async fn answer_range(
     Ok(prometheus::matrix_response(&steps, &results))
 }
 
-/// The samples of each of `ranges` from Prometheus, by node.
+/// The samples of each of `ranges`, by node: from the local raw buffer, and
+/// before it from Prometheus remote read.
 async fn fetch(
     state: &DataPlane,
     ranges: &[query::RawRange],
 ) -> Result<BTreeMap<u64, Vec<RawSample>>, Unanswered> {
     let mut raw = BTreeMap::new();
     for range in ranges {
-        let samples = prometheus::fetch(&state.client, &state.prometheus_url, range)
+        // The local raw buffer holds the recent part; anything before it
+        // comes from Prometheus remote read.
+        let (mut samples, local) = match state.engine.raw_buffer() {
+            Some(buffer) => {
+                let read = buffer.read(&range.metric, range.start_ms, range.end_ms);
+                (Vec::new(), Some(read))
+            }
+            None => (Vec::new(), None),
+        };
+        let older_than_ms = local
+            .as_ref()
+            .map_or(range.end_ms, |read| read.older_than_ms);
+        if older_than_ms > range.start_ms {
+            samples = remote_read::read(
+                &state.client,
+                &state.prometheus_url,
+                &range.metric,
+                range.start_ms,
+                older_than_ms,
+            )
             .await
-            .map_err(|e| Unanswered::Execution(format!("fetching raw samples: {e}")))?;
+            .map_err(|e| Unanswered::Execution(format!("reading raw samples: {e}")))?;
+        }
+        if let Some(read) = local {
+            samples.extend(read.samples);
+        }
         raw.insert(range.node, samples);
     }
     Ok(raw)

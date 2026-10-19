@@ -1,0 +1,103 @@
+//! The local raw buffer holds the recent samples query-time raw windows
+//! read, and says from when a read must come from Prometheus instead.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use data_plane::precompute::{shard_of, RawSample};
+use data_plane::raw_buffer::RawBuffer;
+
+const MINUTE: i64 = 60_000;
+
+/// Samples every 15 s in `[from, to)` of `metric` for each of `series`.
+fn samples(metric: &str, series: usize, from: i64, to: i64) -> Vec<RawSample> {
+    let labels: Vec<_> = (0..series)
+        .map(|i| {
+            Arc::new(BTreeMap::from([
+                ("__name__".to_string(), metric.to_string()),
+                ("instance".to_string(), i.to_string()),
+            ]))
+        })
+        .collect();
+    labels
+        .iter()
+        .flat_map(|labels| {
+            (from..to).step_by(15_000).map(move |t| RawSample {
+                labels: labels.clone(),
+                timestamp_ms: t,
+                value: t as f64,
+            })
+        })
+        .collect()
+}
+
+/// `samples` appended as the ingestion workers would: each series to its
+/// shard, in request order.
+fn append(buffer: &RawBuffer, shards: usize, samples: &[RawSample]) {
+    let mut by_shard = vec![Vec::new(); shards];
+    for sample in samples {
+        by_shard[shard_of(&sample.labels, shards)].push(sample.clone());
+    }
+    for (shard, samples) in by_shard.iter().enumerate() {
+        buffer.append(shard, samples);
+    }
+}
+
+fn sorted(mut samples: Vec<RawSample>) -> Vec<(BTreeMap<String, String>, i64)> {
+    let mut points: Vec<_> = samples
+        .drain(..)
+        .map(|s| ((*s.labels).clone(), s.timestamp_ms))
+        .collect();
+    points.sort();
+    points
+}
+
+/// A read inside the horizon is the buffer's alone and equals the samples
+/// of the metric in `(start, end]`; another metric's are not returned.
+#[test]
+fn reads_recent_samples_of_one_metric() {
+    let buffer = RawBuffer::new(10 * MINUTE, 3);
+    let all = samples("m", 5, 0, 20 * MINUTE + 1);
+    append(&buffer, 3, &all);
+    append(&buffer, 3, &samples("other", 2, 0, 20 * MINUTE + 1));
+    let read = buffer.read("m", 15 * MINUTE, 20 * MINUTE);
+    assert_eq!(read.older_than_ms, 15 * MINUTE, "nothing from Prometheus");
+    let expected: Vec<_> = all
+        .iter()
+        .filter(|s| 15 * MINUTE < s.timestamp_ms && s.timestamp_ms <= 20 * MINUTE)
+        .cloned()
+        .collect();
+    assert_eq!(sorted(read.samples), sorted(expected));
+}
+
+/// The buffer keeps its horizon back from the newest sample: a read that
+/// starts earlier gets the samples after the cut from the buffer, and must
+/// read the rest, up to the cut, from Prometheus.
+#[test]
+fn reads_past_the_horizon_split_at_the_cut() {
+    let buffer = RawBuffer::new(5 * MINUTE, 2);
+    let all = samples("m", 4, 0, 20 * MINUTE + 1);
+    append(&buffer, 2, &all);
+    let read = buffer.read("m", 10 * MINUTE, 20 * MINUTE);
+    assert_eq!(read.older_than_ms, 15 * MINUTE);
+    assert!(read.samples.iter().all(|s| s.timestamp_ms > 15 * MINUTE));
+    assert_eq!(read.samples.len(), 4 * 20);
+    let (series, held) = buffer.size();
+    assert_eq!((series, held), (4, 4 * 20), "older samples are dropped");
+}
+
+/// Before its first sample the buffer holds nothing: a read of earlier
+/// times comes from Prometheus up to that sample.
+#[test]
+fn samples_before_startup_come_from_prometheus() {
+    let buffer = RawBuffer::new(30 * MINUTE, 1);
+    assert_eq!(buffer.read("m", 0, MINUTE).older_than_ms, MINUTE);
+    append(
+        &buffer,
+        1,
+        &samples("m", 1, 4 * MINUTE + 30_000, 5 * MINUTE + 1),
+    );
+    let read = buffer.read("m", 4 * MINUTE, 5 * MINUTE);
+    assert_eq!(read.older_than_ms, 4 * MINUTE + 30_000);
+    assert_eq!(read.samples.len(), 2, "4:45 and 5:00");
+}

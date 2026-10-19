@@ -21,6 +21,7 @@ use axum::{Json, Router};
 use control_plane::{plan_workload, save_plan, DeploymentInputs};
 use data_plane::precompute::RawSample;
 use data_plane::query::{QueryEngine, ResultSample};
+use data_plane::remote_read::{self, QueryResult, ReadRequest, ReadResponse};
 use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use data_plane::sds::{Sds, SummaryStore};
 use serde_json::{json, Value};
@@ -106,14 +107,25 @@ fn sorted(mut samples: Vec<ResultSample>) -> Vec<ResultSample> {
     samples
 }
 
+/// A Prometheus holding `all`, and how many raw reads it has answered.
+struct Prometheus {
+    url: String,
+    /// Range selectors read through the JSON query API.
+    json_reads: Arc<AtomicUsize>,
+    /// Remote read requests.
+    remote_reads: Arc<AtomicUsize>,
+}
+
 /// A Prometheus holding `all`: range selectors `{__name__="m"}[Nms]` at
 /// `time` return the samples in `[time - N, time]`, as Prometheus 2 does;
+/// remote read returns each metric's samples in its inclusive bounds;
 /// every other query returns an empty vector, and every range query an
-/// empty matrix. Returns its URL and how many range selectors it has
-/// answered.
-async fn prometheus(all: Arc<Vec<RawSample>>) -> (String, Arc<AtomicUsize>) {
+/// empty matrix.
+async fn prometheus(all: Arc<Vec<RawSample>>) -> Prometheus {
     let range_reads = Arc::new(AtomicUsize::new(0));
+    let remote_reads = Arc::new(AtomicUsize::new(0));
     let reads = range_reads.clone();
+    let all_for_read = all.clone();
     let handler = move |Query(params): Query<BTreeMap<String, String>>| {
         let all = all.clone();
         let reads = reads.clone();
@@ -157,11 +169,64 @@ async fn prometheus(all: Arc<Vec<RawSample>>) -> (String, Arc<AtomicUsize>) {
     let empty_matrix = || async {
         Json(json!({"status": "success", "data": {"resultType": "matrix", "result": []}}))
     };
+    let read = {
+        let (all, reads) = (all_for_read, remote_reads.clone());
+        move |body: axum::body::Bytes| {
+            let (all, reads) = (all.clone(), reads.clone());
+            async move {
+                reads.fetch_add(1, Ordering::SeqCst);
+                let request: ReadRequest = remote_read::decode(&body).unwrap();
+                let results = request
+                    .queries
+                    .iter()
+                    .map(|query| {
+                        let [matcher] = query.matchers.as_slice() else {
+                            panic!("one matcher: {query:?}")
+                        };
+                        assert_eq!((matcher.r#type, matcher.name.as_str()), (0, "__name__"));
+                        let mut by_series: BTreeMap<&BTreeMap<String, String>, Vec<Sample>> =
+                            BTreeMap::new();
+                        for s in all.iter().filter(|s| {
+                            s.labels["__name__"] == matcher.value
+                                && query.start_timestamp_ms <= s.timestamp_ms
+                                && s.timestamp_ms <= query.end_timestamp_ms
+                        }) {
+                            by_series.entry(&s.labels).or_default().push(Sample {
+                                value: s.value,
+                                timestamp: s.timestamp_ms,
+                            });
+                        }
+                        QueryResult {
+                            timeseries: by_series
+                                .into_iter()
+                                .map(|(labels, samples)| TimeSeries {
+                                    labels: labels
+                                        .iter()
+                                        .map(|(name, value)| Label {
+                                            name: name.clone(),
+                                            value: value.clone(),
+                                        })
+                                        .collect(),
+                                    samples,
+                                })
+                                .collect(),
+                        }
+                    })
+                    .collect();
+                remote_read::encode(&ReadResponse { results })
+            }
+        }
+    };
     let app = Router::new()
         .route("/api/v1/query", get(handler))
-        .route("/api/v1/query_range", get(empty_matrix));
+        .route("/api/v1/query_range", get(empty_matrix))
+        .route("/api/v1/read", axum::routing::post(read));
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (url, range_reads)
+    Prometheus {
+        url,
+        json_reads: range_reads,
+        remote_reads,
+    }
 }
 
 /// The `data_plane` binary serving `plan`, killed on drop.
@@ -186,7 +251,8 @@ impl Drop for TempDir {
     }
 }
 
-async fn start(plan: &InstallablePlan, prometheus_url: &str) -> DataPlaneProcess {
+/// The `data_plane` binary serving `plan` with `args` added.
+async fn start(plan: &InstallablePlan, prometheus_url: &str, args: &[&str]) -> DataPlaneProcess {
     let dir = std::env::temp_dir().join(format!(
         "data-plane-e2e-{}-{}",
         std::process::id(),
@@ -205,6 +271,7 @@ async fn start(plan: &InstallablePlan, prometheus_url: &str) -> DataPlaneProcess
         .args(["--prometheus-url", prometheus_url])
         .args(["--listen", &format!("127.0.0.1:{port}")])
         .args(["--allowed-lateness-ms", "0"])
+        .args(args)
         .spawn()
         .unwrap();
     let process = DataPlaneProcess {
@@ -426,7 +493,8 @@ async fn check_example(
     let plan = plan_workload(&workload, inputs).unwrap();
     let at_query_time = plan.query_time_reference().unwrap();
     let all = Arc::new(all);
-    let process = start(&plan, &prometheus(all.clone()).await.0).await;
+    let prometheus = prometheus(all.clone()).await;
+    let process = start(&plan, &prometheus.url, &[]).await;
     remote_write(&process.url, &all).await;
     for query in plan.queries.iter().map(|q| &q.query) {
         let expected = reference(&at_query_time, query, time_ms, &all);
@@ -557,8 +625,10 @@ async fn example4_b3() {
     let sds = Sds::from_plan(&plan).unwrap();
     assert_eq!((sds.definitions.len(), sds.kept_definitions.len()), (0, 1));
     let all = Arc::new(all);
-    let (prometheus_url, range_reads) = prometheus(all.clone()).await;
-    let process = start(&plan, &prometheus_url).await;
+    // Without the local raw buffer, every raw read is a remote read.
+    let prometheus = prometheus(all.clone()).await;
+    let range_reads = prometheus.remote_reads.clone();
+    let process = start(&plan, &prometheus.url, &["--raw-buffer-ms", "0"]).await;
     remote_write(&process.url, &all).await;
     let query = &plan.queries[0].query;
     let mut reads = Vec::new();
@@ -592,8 +662,10 @@ async fn example1_range() {
     let plan = plan_workload(&workload, &inputs).unwrap();
     let at_query_time = plan.query_time_reference().unwrap();
     let all = Arc::new(all);
-    let (prometheus_url, reads) = prometheus(all.clone()).await;
-    let process = start(&plan, &prometheus_url).await;
+    // Without the local raw buffer, every raw read is a remote read.
+    let prometheus = prometheus(all.clone()).await;
+    let reads = prometheus.remote_reads.clone();
+    let process = start(&plan, &prometheus.url, &["--raw-buffer-ms", "0"]).await;
     remote_write(&process.url, &all).await;
     for query in plan.queries.iter().map(|q| &q.query) {
         let range = (3 * MINUTE, 6 * MINUTE, "30s");
@@ -633,8 +705,10 @@ async fn example4b_range() {
     let plan = plan_workload(&workload, &inputs).unwrap();
     let at_query_time = plan.query_time_reference().unwrap();
     let all = Arc::new(all);
-    let (prometheus_url, reads) = prometheus(all.clone()).await;
-    let process = start(&plan, &prometheus_url).await;
+    // Without the local raw buffer, every raw read is a remote read.
+    let prometheus = prometheus(all.clone()).await;
+    let reads = prometheus.remote_reads.clone();
+    let process = start(&plan, &prometheus.url, &["--raw-buffer-ms", "0"]).await;
     remote_write(&process.url, &all).await;
     let query = &plan.queries[0].query;
     let range = (90 * MINUTE, 100 * MINUTE, "10m");
@@ -672,8 +746,10 @@ async fn example4_b3_range() {
     let plan = plan_workload(&workload, &inputs).unwrap();
     let at_query_time = plan.query_time_reference().unwrap();
     let all = Arc::new(all);
-    let (prometheus_url, reads) = prometheus(all.clone()).await;
-    let process = start(&plan, &prometheus_url).await;
+    // Without the local raw buffer, every raw read is a remote read.
+    let prometheus = prometheus(all.clone()).await;
+    let reads = prometheus.remote_reads.clone();
+    let process = start(&plan, &prometheus.url, &["--raw-buffer-ms", "0"]).await;
     remote_write(&process.url, &all).await;
     let query = &plan.queries[0].query;
     let range = (10 * MINUTE, 14 * MINUTE, "60");
@@ -699,4 +775,56 @@ async fn example4_b3_range() {
     )
     .await;
     assert_eq!(read, 1, "the evicted panes");
+}
+
+/// Example 1's raw windows read from the local raw buffer and, before its
+/// first sample, from Prometheus remote read; never from the JSON query
+/// API. The data plane receives samples from 4:45 on while Prometheus holds
+/// them from 0: at 5 min the 1-minute window takes 4:15..4:45 from remote
+/// read and 5:00 from the buffer; at 10 min, the whole window is the
+/// buffer's. Every answer equals the Planner executor's over all samples.
+#[tokio::test]
+async fn example1_raw_windows_from_the_buffer_and_remote_read() {
+    let series = [
+        series("http_requests_total", &[("job", "api"), ("instance", "1")]),
+        series("http_requests_total", &[("job", "api"), ("instance", "2")]),
+        series("http_requests_total", &[("job", "web"), ("instance", "1")]),
+    ];
+    let all = samples(&series, 0, 10 * MINUTE + 1, 15_000, |i, t| {
+        (i as f64 + 1.0) * (t as f64 / 1000.0).powi(2)
+    });
+    let plan = plan_workload(&workload("example1"), &DeploymentInputs::default()).unwrap();
+    assert!(!plan.query_time_raw_windows.is_empty());
+    let at_query_time = plan.query_time_reference().unwrap();
+    let all = Arc::new(all);
+    let prometheus = prometheus(all.clone()).await;
+    let process = start(&plan, &prometheus.url, &[]).await;
+    let written = |from: i64, to: i64| -> Vec<RawSample> {
+        all.iter()
+            .filter(|s| from <= s.timestamp_ms && s.timestamp_ms <= to)
+            .cloned()
+            .collect()
+    };
+    remote_write(&process.url, &written(4 * MINUTE + 45_000, 5 * MINUTE)).await;
+    for query in plan.queries.iter().map(|q| &q.query) {
+        let before = prometheus.remote_reads.load(Ordering::SeqCst);
+        let expected = reference(&at_query_time, query, 5 * MINUTE, &all);
+        let actual = planned_answer(&process.url, query, 5 * MINUTE).await;
+        assert_same(query, &actual, &expected, 0.0);
+        let reads = prometheus.remote_reads.load(Ordering::SeqCst) - before;
+        assert!(
+            reads >= 1,
+            "{query}: the part before the buffer's first sample"
+        );
+    }
+    remote_write(&process.url, &written(5 * MINUTE + 1, 10 * MINUTE)).await;
+    for query in plan.queries.iter().map(|q| &q.query) {
+        let before = prometheus.remote_reads.load(Ordering::SeqCst);
+        let expected = reference(&at_query_time, query, 10 * MINUTE, &all);
+        let actual = planned_answer(&process.url, query, 10 * MINUTE).await;
+        assert_same(query, &actual, &expected, 0.0);
+        let reads = prometheus.remote_reads.load(Ordering::SeqCst) - before;
+        assert_eq!(reads, 0, "{query}: the window is the buffer's");
+    }
+    assert_eq!(prometheus.json_reads.load(Ordering::SeqCst), 0);
 }

@@ -24,6 +24,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::precompute::{PrecomputeStats, RawSample, ShardWorker, Shared};
 use crate::query::{KeptResults, QueryEngine, RawRange, ResultSample, Unanswered};
+use crate::raw_buffer::RawBuffer;
 use crate::sds::Sds;
 
 /// Messages queued for each ingestion worker, and queries for the pool,
@@ -69,22 +70,28 @@ enum QueryJob {
 #[error("the engine is busy")]
 pub struct Busy;
 
-/// How many threads the engine runs.
+/// How the engine runs: its threads and its local raw buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Threads {
+pub struct EngineOptions {
     /// Ingestion workers; series are sharded across them.
     pub ingestion_workers: usize,
     /// Query threads; each runs one query at a time.
     pub query_threads: usize,
+    /// How far back from the newest sample the local raw buffer keeps
+    /// samples, in ms; `None` for the plan's longest query-time raw read
+    /// ([`RawBuffer::horizon_ms`]). 0 keeps none: every raw read is a
+    /// Prometheus remote read.
+    pub raw_buffer_ms: Option<i64>,
 }
 
-impl Default for Threads {
-    /// One of each per available core.
+impl Default for EngineOptions {
+    /// One thread of each kind per available core, and the plan's buffer.
     fn default() -> Self {
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
         Self {
             ingestion_workers: cores,
             query_threads: cores,
+            raw_buffer_ms: None,
         }
     }
 }
@@ -95,6 +102,7 @@ pub struct EngineHandle {
     workers: Vec<mpsc::Sender<WorkerCommand>>,
     queries: SyncSender<QueryJob>,
     precompute: Arc<Shared>,
+    raw_buffer: Option<Arc<RawBuffer>>,
 }
 
 /// Reads and validates the plan serialized in `plan_json`, and its stored
@@ -125,8 +133,9 @@ impl EngineHandle {
     pub fn spawn(
         plan_json: String,
         allowed_lateness_ms: i64,
-        threads: Threads,
+        options: EngineOptions,
     ) -> anyhow::Result<Self> {
+        let threads = options;
         let (plan, sds) = install(&plan_json)?;
         tracing::info!(
             definitions = sds.definitions.len(),
@@ -136,7 +145,13 @@ impl EngineHandle {
             ?threads,
             "stored summaries"
         );
+        let raw_buffer_ms = options
+            .raw_buffer_ms
+            .unwrap_or_else(|| RawBuffer::horizon_ms(&plan));
+        tracing::info!(raw_buffer_ms, "local raw buffer");
         drop(plan);
+        let raw_buffer = (raw_buffer_ms > 0)
+            .then(|| Arc::new(RawBuffer::new(raw_buffer_ms, threads.ingestion_workers)));
         let plan_json = Arc::new(plan_json);
         let precompute = Arc::new(Shared::new(threads.ingestion_workers, allowed_lateness_ms));
         let (senders, receivers): (Vec<_>, Vec<_>) = (0..precompute.workers())
@@ -146,10 +161,16 @@ impl EngineHandle {
         // senders let the channels close when the handle is dropped.
         let peers: Vec<_> = senders.iter().map(mpsc::Sender::downgrade).collect();
         for (index, mut commands) in receivers.into_iter().enumerate() {
-            let (plan_json, shared, peers) = (plan_json.clone(), precompute.clone(), peers.clone());
+            let (plan_json, shared, peers, raw_buffer) = (
+                plan_json.clone(),
+                precompute.clone(),
+                peers.clone(),
+                raw_buffer.clone(),
+            );
             spawn(format!("ingest-{index}"), move |ready| {
                 let started = install(&plan_json).and_then(|(plan, sds)| {
-                    Ok(ShardWorker::new(&plan, &sds, index, shared, true)?)
+                    Ok(ShardWorker::new(&plan, &sds, index, shared, true)?
+                        .with_raw_buffer(raw_buffer))
                 });
                 let mut worker = match started {
                     Ok(worker) => {
@@ -210,7 +231,13 @@ impl EngineHandle {
             workers: senders,
             queries,
             precompute,
+            raw_buffer,
         })
+    }
+
+    /// The local raw buffer, if the plan reads raw samples at query time.
+    pub fn raw_buffer(&self) -> Option<&RawBuffer> {
+        self.raw_buffer.as_deref()
     }
 
     /// How many ingestion workers series are sharded across.

@@ -30,6 +30,7 @@ use futures::executor::block_on;
 use futures::StreamExt;
 
 use crate::per_sample::PerSampleBuild;
+use crate::raw_buffer::RawBuffer;
 use crate::sds::{DefinitionId, Sds, SummaryDefinition, SummaryStore};
 
 /// One raw sample: its series' full label set (including `__name__`), time
@@ -312,6 +313,9 @@ pub struct ShardWorker {
     shared: Arc<Shared>,
     /// The global watermark this worker has built its parts through.
     closed_through_ms: Option<i64>,
+    /// The local raw buffer, which keeps this worker's recent samples for
+    /// query-time raw windows; `None` when the plan reads none.
+    raw_buffer: Option<Arc<RawBuffer>>,
 }
 
 impl ShardWorker {
@@ -350,7 +354,15 @@ impl ShardWorker {
             builders,
             shared,
             closed_through_ms: None,
+            raw_buffer: None,
         })
+    }
+
+    /// Also keeps this worker's samples in `raw_buffer`, its shard
+    /// [`Self::new`]'s `index`.
+    pub fn with_raw_buffer(mut self, raw_buffer: Option<Arc<RawBuffer>>) -> Self {
+        self.raw_buffer = raw_buffer;
+        self
     }
 
     /// Buffers `samples`, all of this worker's shard, into their panes, then
@@ -362,6 +374,9 @@ impl ShardWorker {
         let Some(first) = samples.iter().map(|s| s.timestamp_ms).min() else {
             return false;
         };
+        if let Some(raw_buffer) = &self.raw_buffer {
+            raw_buffer.append(self.index, samples);
+        }
         let shared = self.shared.clone();
         let _ = shared
             .start_ms
