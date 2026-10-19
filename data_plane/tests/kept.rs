@@ -115,7 +115,7 @@ fn kept_panes_answer_like_the_reference_and_are_reused() {
     assert_eq!(first, answer(&mut reference, 10 * MINUTE, &all).0);
     assert_eq!(first.len(), 2);
     assert_eq!(
-        kept.kept_stats,
+        kept.kept.stats(),
         KeptResultStats {
             built: 5,
             reused: 0
@@ -134,7 +134,7 @@ fn kept_panes_answer_like_the_reference_and_are_reused() {
     assert_eq!(second, answer(&mut reference, 11 * MINUTE, &all).0);
     assert_ne!(second, first, "the answer moves with the window");
     assert_eq!(
-        kept.kept_stats,
+        kept.kept.stats(),
         KeptResultStats {
             built: 6,
             reused: 4
@@ -146,14 +146,14 @@ fn kept_panes_answer_like_the_reference_and_are_reused() {
     assert!(ranges.is_empty());
     assert_eq!(again, second);
     assert_eq!(
-        kept.kept_stats,
+        kept.kept.stats(),
         KeptResultStats {
             built: 6,
             reused: 9
         }
     );
     assert_eq!(
-        reference.kept_stats,
+        reference.kept.stats(),
         KeptResultStats::default(),
         "the reference keeps nothing"
     );
@@ -172,7 +172,7 @@ fn kept_panes_are_evicted_like_stored_panes() {
     let ends = |engine: &QueryEngine| {
         (0..=30)
             .map(|m| m * MINUTE)
-            .filter(|end| engine.kept.get(&definition, *end).is_some())
+            .filter(|end| engine.kept.panes.get(&definition, *end).is_some())
             .map(|end| end / MINUTE)
             .collect::<Vec<_>>()
     };
@@ -195,7 +195,7 @@ fn kept_panes_are_evicted_like_stored_panes() {
     assert_eq!(ranges.len(), 5);
     assert_eq!(old.len(), 2);
     assert_eq!(ends(&kept), vec![16, 17, 18, 19, 20]);
-    assert_eq!(kept.kept.len(), 5);
+    assert_eq!(kept.kept.panes.len(), 5);
 }
 
 /// A pane is kept only once it is closed (its end at or before the
@@ -213,7 +213,7 @@ fn panes_are_kept_only_once_closed() {
     let ends = |engine: &QueryEngine| {
         (0..=30)
             .map(|m| m * MINUTE)
-            .filter(|end| engine.kept.get(&definition, *end).is_some())
+            .filter(|end| engine.kept.panes.get(&definition, *end).is_some())
             .map(|end| end / MINUTE)
             .collect::<Vec<_>>()
     };
@@ -254,5 +254,5 @@ fn panes_are_kept_only_once_closed() {
     // Without any sample there is no watermark, and nothing is kept.
     let mut fresh = engine(&plan);
     answer_at_watermark(&mut fresh, 10 * MINUTE, None, &all);
-    assert!(fresh.kept.is_empty());
+    assert!(fresh.kept.panes.is_empty());
 }

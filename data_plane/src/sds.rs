@@ -15,6 +15,7 @@
 //! node computes, not which nodes are equal.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, RwLock};
 
 use asap_executor::planner::ir::physical_export::{
     PhysicalASAPDAG, PhysicalASAPDAGNode, RawSampleWindow,
@@ -188,39 +189,56 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Built panes, by definition and pane end. A pane is stored once, when it
-/// is complete, and never changes.
-#[derive(Debug, Default)]
+/// Built panes, by definition and pane end, shared by every thread that
+/// reads or builds them. A pane is stored once, when it is complete, and
+/// never changes: a read takes the read lock only to clone the pane's `Arc`,
+/// so readers share it without copying and hold no lock while they compute.
+/// Inserts and evictions take the write lock briefly.
+#[derive(Debug)]
 pub struct SummaryStore<S> {
-    panes: BTreeMap<(DefinitionId, i64), S>,
+    panes: RwLock<HashMap<(DefinitionId, i64), Arc<S>>>,
+}
+
+impl<S> Default for SummaryStore<S> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<S> SummaryStore<S> {
     pub fn new() -> Self {
         Self {
-            panes: BTreeMap::new(),
+            panes: RwLock::new(HashMap::new()),
         }
     }
 
-    pub fn insert(&mut self, definition: &DefinitionId, end_ms: i64, state: S) {
-        self.panes.insert((definition.clone(), end_ms), state);
+    /// Stores the pane ending at `end_ms` unless it is already stored, and
+    /// returns the stored pane: a pane is never rewritten.
+    pub fn insert(&self, definition: &DefinitionId, end_ms: i64, state: S) -> Arc<S> {
+        let mut panes = self.panes.write().expect("store lock");
+        Arc::clone(
+            panes
+                .entry((definition.clone(), end_ms))
+                .or_insert_with(|| Arc::new(state)),
+        )
     }
 
-    pub fn get(&self, definition: &DefinitionId, end_ms: i64) -> Option<&S> {
-        self.panes.get(&(definition.clone(), end_ms))
+    pub fn get(&self, definition: &DefinitionId, end_ms: i64) -> Option<Arc<S>> {
+        let panes = self.panes.read().expect("store lock");
+        panes.get(&(definition.clone(), end_ms)).cloned()
     }
 
     /// Drops the panes of `definition` that end before `end_ms`.
-    pub fn evict_before(&mut self, definition: &DefinitionId, end_ms: i64) {
-        self.panes
-            .retain(|(id, end), _| id != definition || *end >= end_ms);
+    pub fn evict_before(&self, definition: &DefinitionId, end_ms: i64) {
+        let mut panes = self.panes.write().expect("store lock");
+        panes.retain(|(id, end), _| id != definition || *end >= end_ms);
     }
 
     pub fn len(&self) -> usize {
-        self.panes.len()
+        self.panes.read().expect("store lock").len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.panes.is_empty()
+        self.len() == 0
     }
 }

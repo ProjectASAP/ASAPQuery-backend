@@ -78,14 +78,14 @@ fn fetch(ranges: &[RawRange], all: &[RawSample]) -> BTreeMap<u64, Vec<RawSample>
 fn answer(f: &mut Fixture, query: &str, time_ms: i64, all: &[RawSample]) -> Vec<ResultSample> {
     let (root, ranges) = f
         .query
-        .raw_ranges(query, time_ms, &f.precompute.store)
+        .raw_ranges(query, time_ms, f.precompute.store())
         .unwrap();
     let mut result = f
         .query
         .evaluate(
             root,
             time_ms,
-            &f.precompute.store,
+            f.precompute.store(),
             f.precompute.watermark_ms(),
             &fetch(&ranges, all),
         )
@@ -112,14 +112,14 @@ fn stored_panes_answer_like_a_single_build() {
     assert!(
         panes
             .query
-            .raw_ranges(P99, 70 * MINUTE, &panes.precompute.store)
+            .raw_ranges(P99, 70 * MINUTE, panes.precompute.store())
             .is_err(),
         "no panes before ingestion"
     );
     panes.precompute.ingest(&all);
     let (_, ranges) = panes
         .query
-        .raw_ranges(P99, 70 * MINUTE, &panes.precompute.store)
+        .raw_ranges(P99, 70 * MINUTE, panes.precompute.store())
         .unwrap();
     assert!(ranges.is_empty(), "every input is a stored pane");
     let from_panes = answer(&mut panes, P99, 70 * MINUTE, &all);
@@ -127,7 +127,7 @@ fn stored_panes_answer_like_a_single_build() {
     let mut single = fixture(common::plan("example4b", true));
     let (_, ranges) = single
         .query
-        .raw_ranges(P99, 70 * MINUTE, &single.precompute.store)
+        .raw_ranges(P99, 70 * MINUTE, single.precompute.store())
         .unwrap();
     assert_eq!(
         ranges
@@ -194,7 +194,7 @@ fn query_time_plans_read_raw_ranges() {
 #[test]
 fn reports_what_it_cannot_answer() {
     let mut f = fixture(common::plan("example4b", false));
-    let store = &f.precompute.store;
+    let store = f.precompute.store();
     assert!(matches!(
         f.query.raw_ranges("up", 70 * MINUTE, store),
         Err(Unanswered::NotPlanned(_))
@@ -205,7 +205,7 @@ fn reports_what_it_cannot_answer() {
     ));
     let all = samples(&[("latency_ms", &[])], MINUTE, 75 * MINUTE, |_, t| t as f64);
     f.precompute.ingest(&all);
-    let store = &f.precompute.store;
+    let store = f.precompute.store();
     assert!(f.query.raw_ranges(P99, 70 * MINUTE, store).is_ok());
     assert!(matches!(
         f.query.raw_ranges(P99, 70 * MINUTE + 1, store),

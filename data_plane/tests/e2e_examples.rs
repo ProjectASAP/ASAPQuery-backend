@@ -80,7 +80,7 @@ fn reference(
 ) -> Vec<ResultSample> {
     let sds = Sds::from_plan(plan).unwrap();
     assert!(sds.definitions.is_empty());
-    let mut engine = QueryEngine::new(plan, &sds);
+    let engine = QueryEngine::new(plan, &sds);
     let store = SummaryStore::new();
     let (root, ranges) = engine.raw_ranges(query, time_ms, &store).unwrap();
     let raw = ranges

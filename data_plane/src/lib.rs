@@ -2,10 +2,11 @@
 //! the Prometheus query API for an installed plan.
 //!
 //! The installed plan is ASAPPlanner's `InstallablePlan`: its selected
-//! physical DAG, the outputs it stores and the raw windows it reads. The
-//! engine thread builds its ingestion-time outputs pane by pane and answers
-//! the plan's instant and range queries from them; every other query, and
-//! any planned query it cannot answer, is forwarded to Prometheus.
+//! physical DAG, the outputs it stores and the raw windows it reads.
+//! Ingestion workers build its ingestion-time outputs pane by pane, and a
+//! pool of query threads answers the plan's instant and range queries from
+//! them ([`engine`]); every other query, and any planned query it cannot
+//! answer, is forwarded to Prometheus.
 
 pub mod engine;
 pub mod precompute;
@@ -25,8 +26,8 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use engine::EngineHandle;
-use precompute::RawSample;
+use engine::{EngineHandle, Threads};
+use precompute::{shard_of, RawSample};
 use prometheus::{InstantQuery, RangeQuery};
 use query::Unanswered;
 
@@ -51,18 +52,34 @@ pub struct DataPlane {
 }
 
 impl DataPlane {
-    /// Installs the plan serialized in `plan_json` (an [`InstallablePlan`]).
-    /// Panes close `allowed_lateness_ms` after the newest sample passes them.
+    /// Installs the plan serialized in `plan_json` (an [`InstallablePlan`])
+    /// with [`Threads::default`]. Panes close `allowed_lateness_ms` after
+    /// every ingestion worker's newest sample passes them.
     pub fn new(
         plan_json: String,
         prometheus_url: String,
         allowed_lateness_ms: i64,
     ) -> anyhow::Result<Self> {
+        Self::with_threads(
+            plan_json,
+            prometheus_url,
+            allowed_lateness_ms,
+            Threads::default(),
+        )
+    }
+
+    /// [`Self::new`] with `threads` ingestion workers and query threads.
+    pub fn with_threads(
+        plan_json: String,
+        prometheus_url: String,
+        allowed_lateness_ms: i64,
+        threads: Threads,
+    ) -> anyhow::Result<Self> {
         let plan: InstallablePlan = serde_json::from_str(&plan_json)?;
         plan.validate()?;
         Ok(Self {
             queries: plan.queries.into_iter().map(|q| q.query).collect(),
-            engine: EngineHandle::spawn(plan_json, allowed_lateness_ms)?,
+            engine: EngineHandle::spawn(plan_json, allowed_lateness_ms, threads)?,
             prometheus_url: prometheus_url.trim_end_matches('/').to_string(),
             limits: remote_write::Limits::default(),
             samples: AtomicU64::new(0),
@@ -83,7 +100,9 @@ pub fn router(state: Arc<DataPlane>) -> Router {
 async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
     match remote_write::decode(&body, &state.limits) {
         Ok(request) => {
-            let mut samples = Vec::new();
+            let workers = state.engine.ingestion_workers();
+            let mut shards = vec![Vec::new(); workers];
+            let mut count = 0;
             for series in request.timeseries {
                 let labels: Arc<BTreeMap<String, String>> = Arc::new(
                     series
@@ -92,7 +111,9 @@ async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
                         .map(|label| (label.name, label.value))
                         .collect(),
                 );
-                samples.extend(
+                let shard = &mut shards[shard_of(&labels, workers)];
+                let before = shard.len();
+                shard.extend(
                     series
                         .samples
                         .into_iter()
@@ -103,9 +124,9 @@ async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
                             value: s.value,
                         }),
                 );
+                count += (shard.len() - before) as u64;
             }
-            let count = samples.len() as u64;
-            match state.engine.try_ingest(samples) {
+            match state.engine.try_ingest(shards) {
                 Ok(()) => {
                     state.samples.fetch_add(count, Ordering::Relaxed);
                     StatusCode::NO_CONTENT.into_response()

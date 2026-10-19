@@ -39,9 +39,15 @@ The backend is being rebuilt on the Planner's physical DAG:
 | Query engine: answer planned instant queries from stored panes and raw samples | done |
 | Query engine: keep query-time panes across evaluations (`MatAtQueryKeptAcrossEvaluations`) | done |
 
-Panes close `--allowed-lateness-ms` (default 15 s) after the newest sample
-passes their end; later samples for them are dropped. The first pane after
-startup is skipped because it may be partial.
+Ingestion runs on `--ingestion-workers` threads and queries on
+`--query-threads` threads (each default one per core). Series are sharded
+across the ingestion workers by a hash of their label set; a pane closes
+`--allowed-lateness-ms` (default 15 s) after every worker's newest sample
+passes its end, and later samples for it are dropped. The first pane after
+startup is skipped because it may be partial. Each query, including every
+step of a range query, runs on one query thread; queries read the stored
+panes concurrently, by shared reference. The data plane uses jemalloc as its
+allocator.
 
 An instant query whose text is one of the plan's queries is answered by the
 plan (`x-asap-execution: plan`). Its stored inputs read the panes ending at

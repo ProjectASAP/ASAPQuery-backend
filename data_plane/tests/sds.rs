@@ -149,16 +149,76 @@ fn kept_panes_share_one_definition() {
 #[test]
 fn store_finds_and_evicts_panes() {
     let (a, b) = (DefinitionId("a".into()), DefinitionId("b".into()));
-    let mut store = SummaryStore::new();
+    let store = SummaryStore::new();
     for end in [60, 120, 180] {
         store.insert(&a, end, format!("a{end}"));
     }
     store.insert(&b, 60, "b60".to_string());
-    assert_eq!(store.get(&a, 120).map(String::as_str), Some("a120"));
+    assert_eq!(
+        store.get(&a, 120).as_deref().map(String::as_str),
+        Some("a120")
+    );
     assert_eq!(store.get(&a, 90), None);
     store.evict_before(&a, 180);
     assert_eq!(store.get(&a, 120), None);
-    assert_eq!(store.get(&a, 180).map(String::as_str), Some("a180"));
-    assert_eq!(store.get(&b, 60).map(String::as_str), Some("b60"));
+    assert_eq!(
+        store.get(&a, 180).as_deref().map(String::as_str),
+        Some("a180")
+    );
+    assert_eq!(
+        store.get(&b, 60).as_deref().map(String::as_str),
+        Some("b60")
+    );
     assert_eq!(store.len(), 2);
+}
+
+/// A read shares the stored pane instead of copying it, and a pane never
+/// changes once stored: a second insert for the same pane keeps the first.
+#[test]
+fn store_shares_panes_and_never_rewrites_them() {
+    let a = DefinitionId("a".into());
+    let store = SummaryStore::new();
+    let stored = store.insert(&a, 60, vec![1.0, 2.0]);
+    let first = store.get(&a, 60).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&stored, &first));
+    let again = store.insert(&a, 60, vec![9.0]);
+    assert!(
+        std::sync::Arc::ptr_eq(&again, &first),
+        "the first pane stays"
+    );
+    assert_eq!(*store.get(&a, 60).unwrap(), vec![1.0, 2.0]);
+}
+
+/// Readers on many threads read the store while a writer inserts and
+/// evicts, each read seeing a whole pane.
+#[test]
+fn store_is_read_concurrently() {
+    let a = DefinitionId("a".into());
+    let store = std::sync::Arc::new(SummaryStore::new());
+    let writer = {
+        let (store, a) = (store.clone(), a.clone());
+        std::thread::spawn(move || {
+            for end in 0..1_000 {
+                store.insert(&a, end, vec![end; 16]);
+                store.evict_before(&a, end - 10);
+            }
+        })
+    };
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let (store, a) = (store.clone(), a.clone());
+            std::thread::spawn(move || {
+                for end in 0..1_000 {
+                    if let Some(pane) = store.get(&a, end) {
+                        assert_eq!(*pane, vec![end; 16]);
+                    }
+                }
+            })
+        })
+        .collect();
+    writer.join().unwrap();
+    for reader in readers {
+        reader.join().unwrap();
+    }
+    assert_eq!(store.len(), 11);
 }

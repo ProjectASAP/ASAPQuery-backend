@@ -25,17 +25,20 @@
 //! forwards it to Prometheus.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use asap_executor::operators::Operator;
 use asap_executor::physical_planner::{compile, CompiledPhysicalDAG, InputContract, Source};
+use asap_executor::plan::{Boundedness, Emission, PhysicalOperator, PlanProperties};
 use asap_executor::planner::ir::physical_export::RawSampleWindow;
 use asap_executor::planner::ir::schema::{DataType, FieldDataType, Schema};
 use asap_executor::planner::ir::{NonASAPOp, Operator as IrOperator};
-use asap_executor::runtime::Scope;
-use asap_executor::values::{Batch, Value};
+use asap_executor::runtime::{Input, OutputStream, RunContext, Scope};
+use asap_executor::values::{Batch, SchemaRef, Value};
 use asap_executor::{series_labels_of_output_row, RawSampleSelector, Sample};
 use asap_planner::{InstallablePlan, PhysicalASAPDAG};
+use futures::StreamExt;
 
 use crate::precompute::{output_schema, run, PaneBuild, RawSample};
 use crate::sds::{DefinitionId, Sds, SummaryStore};
@@ -109,14 +112,45 @@ pub struct KeptResultStats {
     pub reused: u64,
 }
 
-pub struct QueryEngine {
+/// The query-time results kept across evaluations, shared by every query
+/// thread: a pane one evaluation builds is reused by the next, whichever
+/// thread runs it.
+#[derive(Default)]
+pub struct KeptResults {
     /// Kept panes (`MatAtQueryKeptAcrossEvaluations`), by definition and
     /// pane end, in memory.
-    pub kept: SummaryStore<Batch>,
+    pub panes: SummaryStore<Batch>,
+    built: AtomicU64,
+    reused: AtomicU64,
+    /// Newest evaluation time, from which kept panes are evicted; `None`
+    /// before the first.
+    newest_evaluation_ms: Mutex<Option<i64>>,
+}
+
+impl KeptResults {
     /// How many kept panes evaluations built and reused.
-    pub kept_stats: KeptResultStats,
-    /// Newest evaluation time, from which kept panes are evicted.
-    newest_evaluation_ms: Option<i64>,
+    pub fn stats(&self) -> KeptResultStats {
+        KeptResultStats {
+            built: self.built.load(Ordering::Relaxed),
+            reused: self.reused.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The newest evaluation time, with `time_ms` evaluated.
+    fn newest_evaluation(&self, time_ms: i64) -> i64 {
+        let mut newest = self.newest_evaluation_ms.lock().expect("kept lock");
+        let value = newest.map_or(time_ms, |n| n.max(time_ms));
+        *newest = Some(value);
+        value
+    }
+}
+
+/// One thread's compiled roots of the plan. The executor's compiled plans
+/// are not `Send`, so each query thread builds its own; they share the
+/// stored panes and the [`KeptResults`].
+pub struct QueryEngine {
+    /// Results kept across evaluations, shared with the other query threads.
+    pub kept: Arc<KeptResults>,
     /// How each kept definition's panes are built, or why they cannot be.
     kept_builds: BTreeMap<DefinitionId, Result<PaneBuild, String>>,
     /// Each query, with its compiled root or why it cannot run.
@@ -124,7 +158,13 @@ pub struct QueryEngine {
 }
 
 impl QueryEngine {
+    /// Compiles every root of `plan`, with its own kept results.
     pub fn new(plan: &InstallablePlan, sds: &Sds) -> Self {
+        Self::with_kept(plan, sds, Arc::default())
+    }
+
+    /// Compiles every root of `plan`, keeping query-time results in `kept`.
+    pub fn with_kept(plan: &InstallablePlan, sds: &Sds, kept: Arc<KeptResults>) -> Self {
         let dag = &plan.dag.dag;
         let kept_builds: BTreeMap<_, _> = sds
             .kept_definitions
@@ -149,9 +189,7 @@ impl QueryEngine {
             })
             .collect();
         Self {
-            kept: SummaryStore::new(),
-            kept_stats: KeptResultStats::default(),
-            newest_evaluation_ms: None,
+            kept,
             kept_builds,
             roots,
         }
@@ -186,7 +224,7 @@ impl QueryEngine {
             .collect();
         for input in &program.kept {
             let end_ms = time_ms - input.offset_ms;
-            if self.kept.get(&input.definition, end_ms).is_none() {
+            if self.kept.panes.get(&input.definition, end_ms).is_none() {
                 let build = self.kept_build(&input.definition);
                 ranges.push(RawRange {
                     node: input.raw_input,
@@ -206,7 +244,7 @@ impl QueryEngine {
     /// (`None` before any sample). Then kept panes no evaluation after the
     /// newest one reads are evicted.
     pub fn evaluate(
-        &mut self,
+        &self,
         root: usize,
         time_ms: i64,
         store: &SummaryStore<Batch>,
@@ -224,17 +262,17 @@ impl QueryEngine {
         };
         let mut sources: BTreeMap<u64, Source<'_>> = BTreeMap::new();
         for input in &program.stored {
-            let pane = pane(input, time_ms, store)?;
-            let source =
-                Operator::source(pane.schema().clone(), vec![pane.clone()]).map_err(failed)?;
-            sources.insert(input.node, Box::new(source));
+            sources.insert(
+                input.node,
+                Box::new(PaneSource(pane(input, time_ms, store)?)),
+            );
         }
         for input in &program.kept {
             let end_ms = time_ms - input.offset_ms;
-            let pane = match self.kept.get(&input.definition, end_ms) {
+            let pane = match self.kept.panes.get(&input.definition, end_ms) {
                 Some(pane) => {
-                    self.kept_stats.reused += 1;
-                    pane.clone()
+                    self.kept.reused.fetch_add(1, Ordering::Relaxed);
+                    pane
                 }
                 None => {
                     // `raw_ranges` asked for these samples unless the pane
@@ -255,17 +293,17 @@ impl QueryEngine {
                         .kept_build(&input.definition)
                         .run(&samples_of(samples), end_ms, pane_scope)
                         .map_err(|e| Unanswered::Execution(e.to_string()))?;
-                    self.kept_stats.built += 1;
+                    self.kept.built.fetch_add(1, Ordering::Relaxed);
                     // Kept only once closed, as the precompute engine closes
                     // panes: a sample may still arrive for an open one.
                     if watermark_ms.is_some_and(|watermark| end_ms <= watermark) {
-                        self.kept.insert(&input.definition, end_ms, pane.clone());
+                        self.kept.panes.insert(&input.definition, end_ms, pane)
+                    } else {
+                        Arc::new(pane)
                     }
-                    pane
                 }
             };
-            let source = Operator::source(pane.schema().clone(), vec![pane]).map_err(failed)?;
-            sources.insert(input.node, Box::new(source));
+            sources.insert(input.node, Box::new(PaneSource(pane)));
         }
         for input in &program.raw {
             let samples = raw.get(&input.node).map(Vec::as_slice).unwrap_or_default();
@@ -279,12 +317,11 @@ impl QueryEngine {
         }
         // Evict the kept panes older than each definition's retention
         // before the newest evaluation, this one or a later one.
-        let newest = time_ms.max(self.newest_evaluation_ms.unwrap_or(time_ms));
-        self.newest_evaluation_ms = Some(newest);
+        let newest = self.kept.newest_evaluation(time_ms);
         for (definition, build) in &self.kept_builds {
             if let Ok(build) = build {
                 let oldest = build.definition.oldest_kept_end_ms(newest);
-                self.kept.evict_before(definition, oldest);
+                self.kept.panes.evict_before(definition, oldest);
             }
         }
         let dag = program.compiled.instantiate(sources).map_err(failed)?;
@@ -328,7 +365,7 @@ impl QueryEngine {
         for &time_ms in steps {
             for input in &program.kept {
                 let end_ms = time_ms - input.offset_ms;
-                if self.kept.get(&input.definition, end_ms).is_none() {
+                if self.kept.panes.get(&input.definition, end_ms).is_none() {
                     let span = missing.entry(&input.definition).or_insert((end_ms, end_ms));
                     *span = (span.0.min(end_ms), span.1.max(end_ms));
                 }
@@ -354,7 +391,7 @@ impl QueryEngine {
     /// keeps a pane only if it is closed at `watermark_ms`, so a pane still
     /// open is recomputed at each step that reads it.
     pub fn evaluate_steps(
-        &mut self,
+        &self,
         root: usize,
         steps: &[i64],
         store: &SummaryStore<Batch>,
@@ -408,7 +445,7 @@ impl QueryEngine {
             }
             for (definition, offset_ms, node, fetched, pane_ms) in &kept_inputs {
                 let end_ms = time_ms - offset_ms;
-                if self.kept.get(definition, end_ms).is_none() {
+                if self.kept.panes.get(definition, end_ms).is_none() {
                     if let Some(runs) = series.get(fetched) {
                         step_raw.insert(*node, slice(runs, end_ms - pane_ms, end_ms));
                     }
@@ -468,12 +505,51 @@ fn samples_of(samples: &[RawSample]) -> Vec<Sample> {
     samples.iter().map(RawSample::to_sample).collect()
 }
 
+/// A stored or kept pane bound as a source of a compiled root. The pane is
+/// shared, not copied into the source; the executor's sources emit owned
+/// batches, so each run takes one copy of its rows.
+struct PaneSource(Arc<Batch>);
+
+impl PhysicalOperator<Batch, SchemaRef> for PaneSource {
+    fn name(&self) -> &str {
+        "StoredPane"
+    }
+
+    fn properties(&self, _inputs: &[PlanProperties]) -> PlanProperties {
+        PlanProperties {
+            boundedness: Boundedness::Bounded,
+            emission: Emission::Incremental,
+        }
+    }
+
+    fn input_schemas(&self) -> Vec<SchemaRef> {
+        Vec::new()
+    }
+
+    fn output_schema(&self) -> SchemaRef {
+        self.0.schema().clone()
+    }
+
+    fn start<'a>(
+        &'a self,
+        _inputs: Vec<Input<'a, Batch>>,
+        _context: RunContext,
+    ) -> Result<OutputStream<'a, Batch>, asap_executor::Error> {
+        let batch = (*self.0).clone();
+        Ok(futures::stream::once(async move { Ok(batch) }).boxed_local())
+    }
+
+    fn output_bytes(&self, value: &Batch) -> usize {
+        value.bytes()
+    }
+}
+
 /// The stored pane `input` reads at `time_ms`.
-fn pane<'a>(
+fn pane(
     input: &StoredInput,
     time_ms: i64,
-    store: &'a SummaryStore<Batch>,
-) -> Result<&'a Batch, Unanswered> {
+    store: &SummaryStore<Batch>,
+) -> Result<Arc<Batch>, Unanswered> {
     let end = time_ms - input.offset_ms;
     if end.rem_euclid(input.pane_ms) != 0 {
         return Err(Unanswered::MissingPane(format!(

@@ -195,7 +195,7 @@ fn every_step_reads_stored_panes() {
         (i * 1000) as f64 + (t / 15_000) as f64
     });
     precompute.ingest(&all);
-    let store = &precompute.store;
+    let store = precompute.store();
     let mut engine = QueryEngine::new(&plan, &sds);
     let steps = minutes(9..=10)
         .into_iter()
@@ -272,7 +272,7 @@ fn kept_panes_are_shared_across_steps() {
     // Panes ending at 6..14 min are built once; each step after the first
     // reuses four of its five.
     assert_eq!(
-        engine.kept_stats,
+        engine.kept.stats(),
         KeptResultStats {
             built: 9,
             reused: 16
@@ -293,7 +293,7 @@ fn kept_panes_are_shared_across_steps() {
     // minus 5), so each step reading one rebuilds it: 4 at 10 min, 3 at 11,
     // 2 at 12, 1 at 13.
     assert_eq!(
-        engine.kept_stats,
+        engine.kept.stats(),
         KeptResultStats {
             built: 19,
             reused: 31
@@ -331,7 +331,7 @@ fn open_panes_are_recomputed_at_each_step() {
     // Panes 6..12 are built once and kept; 13 is built at 13 and 14 min, 14
     // at 14 min. Reused: four panes at 11, 12 and 13 min, three at 14.
     assert_eq!(
-        engine.kept_stats,
+        engine.kept.stats(),
         KeptResultStats {
             built: 10,
             reused: 15
@@ -339,7 +339,7 @@ fn open_panes_are_recomputed_at_each_step() {
     );
     let definition = sds(&plan).kept_definitions.keys().next().unwrap().clone();
     let kept_ends: Vec<i64> = (0..=30)
-        .filter(|m| engine.kept.get(&definition, m * MINUTE).is_some())
+        .filter(|m| engine.kept.panes.get(&definition, m * MINUTE).is_some())
         .collect();
     // 6..9 are evicted: they start before the newest step (14 min) minus
     // the plan's 5-minute retention.

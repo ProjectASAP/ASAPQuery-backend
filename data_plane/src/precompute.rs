@@ -13,12 +13,15 @@
 //! did, so it is never built: queries that need it are not answered from
 //! stored panes.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock};
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use asap_executor::operators::Operator;
 use asap_executor::physical_planner::{compile, CompiledPhysicalDAG, InputContract, Source};
 use asap_executor::plan::PhysicalDAG;
+use asap_executor::planner::ir::schema::FieldDataType;
 use asap_executor::runtime::{Limits, RunContext, Scope};
 use asap_executor::values::{Batch, SchemaRef, Value};
 use asap_executor::{RawSampleSelector, Sample};
@@ -120,30 +123,198 @@ impl PaneBuild {
     }
 }
 
+/// One worker's part of a pane, or why its build failed.
+type PanePart = Result<Batch, String>;
+
+/// No value yet in an `AtomicI64` slot.
+const UNSET: i64 = i64::MIN;
+
+/// Precompute state every ingestion worker and query thread shares: the
+/// stored panes, each worker's watermark, and the per-worker partial panes
+/// not yet complete.
+pub struct Shared {
+    /// Stored panes, by definition and pane end.
+    pub store: SummaryStore<Batch>,
+    allowed_lateness_ms: i64,
+    /// Each worker's newest sample time, `UNSET` before its first.
+    newest_sample_ms: Vec<AtomicI64>,
+    /// The first sample's time: every worker skips the pane it falls in, so
+    /// all workers build the same panes.
+    start_ms: AtomicI64,
+    /// The newest global watermark any worker has announced to the others.
+    announced_ms: AtomicI64,
+    /// Partial panes by definition and end, until every worker has built
+    /// its part.
+    pending: Mutex<HashMap<(DefinitionId, i64), Vec<PanePart>>>,
+    accepted: AtomicU64,
+    dropped: AtomicU64,
+    panes_built: AtomicU64,
+    panes_failed: AtomicU64,
+}
+
+impl Shared {
+    pub fn new(workers: usize, allowed_lateness_ms: i64) -> Self {
+        Self {
+            store: SummaryStore::new(),
+            allowed_lateness_ms,
+            newest_sample_ms: (0..workers.max(1)).map(|_| AtomicI64::new(UNSET)).collect(),
+            start_ms: AtomicI64::new(UNSET),
+            announced_ms: AtomicI64::new(UNSET),
+            pending: Mutex::new(HashMap::new()),
+            accepted: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            panes_built: AtomicU64::new(0),
+            panes_failed: AtomicU64::new(0),
+        }
+    }
+
+    pub fn workers(&self) -> usize {
+        self.newest_sample_ms.len()
+    }
+
+    /// The global watermark: no sample older than this is expected any
+    /// more. It is the minimum over the workers that have seen a sample of
+    /// their newest sample time, minus the allowed lateness; `None` before
+    /// any sample.
+    pub fn watermark_ms(&self) -> Option<i64> {
+        self.newest_sample_ms
+            .iter()
+            .map(|newest| newest.load(Ordering::Acquire))
+            .filter(|&newest| newest != UNSET)
+            .min()
+            .map(|newest| newest - self.allowed_lateness_ms)
+    }
+
+    pub fn stats(&self) -> PrecomputeStats {
+        PrecomputeStats {
+            accepted: self.accepted.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
+            panes_built: self.panes_built.load(Ordering::Relaxed),
+            panes_failed: self.panes_failed.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Adds one worker's part of the pane of `definition` ending at `end_ms`.
+    /// The worker that adds the last part merges them and stores the pane.
+    fn add_part(&self, definition: &SummaryDefinition, end_ms: i64, part: Result<Batch, String>) {
+        let parts = {
+            let mut pending = self.pending.lock().expect("pending panes lock");
+            let key = (definition.id.clone(), end_ms);
+            let parts = pending.entry(key.clone()).or_default();
+            parts.push(part);
+            if parts.len() < self.workers() {
+                return;
+            }
+            pending.remove(&key).expect("present")
+        };
+        match parts
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .and_then(|parts| merge_parts(definition, parts))
+        {
+            Ok(pane) => {
+                self.store.insert(&definition.id, end_ms, pane);
+                self.panes_built.fetch_add(1, Ordering::Relaxed);
+                // The newest evaluation that reads stored panes is at most
+                // the newest stored pane's end, so retention is measured
+                // from it, not from the watermark, which may be past it.
+                self.store
+                    .evict_before(&definition.id, definition.oldest_kept_end_ms(end_ms));
+            }
+            Err(error) => {
+                tracing::error!(definition = ?definition.id, end_ms, %error, "pane build failed");
+                self.panes_failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// One pane from the parts the workers built over their own series: their
+/// rows, with the states of a group several workers saw merged by the
+/// family's merge. Each worker's part has one row per group, so a group
+/// present in one part only is kept as built.
+fn merge_parts(definition: &SummaryDefinition, parts: Vec<Batch>) -> Result<Batch, String> {
+    let schema = Arc::new(definition.output_schema.clone());
+    let state = definition
+        .output_schema
+        .fields
+        .iter()
+        .position(|f| !matches!(f.dtype, FieldDataType::Plain(_)));
+    let mut rows: BTreeMap<Vec<Vec<u8>>, Vec<Value>> = BTreeMap::new();
+    for part in &parts {
+        for row in part.rows() {
+            let key = row
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| Some(*i) != state)
+                .map(|(_, value)| value.key())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            match (rows.get_mut(&key), state) {
+                (Some(existing), Some(state)) => {
+                    let (
+                        Value::Summary { state: left, .. },
+                        Value::Summary {
+                            family,
+                            state: right,
+                        },
+                    ) = (&existing[state], &row[state])
+                    else {
+                        return Err("summary state column without a state".into());
+                    };
+                    let merged = left.merge_with(right.as_ref()).map_err(|e| e.to_string())?;
+                    existing[state] = Value::Summary {
+                        family: family.clone(),
+                        state: Arc::from(merged),
+                    };
+                }
+                (Some(_), None) => return Err("duplicate group without a state".into()),
+                (None, _) => {
+                    rows.insert(key, row.clone());
+                }
+            }
+        }
+    }
+    Batch::try_new(schema, rows.into_values().collect()).map_err(|e| e.to_string())
+}
+
+/// The ingestion worker of `workers` that owns the series with `labels`.
+pub fn shard_of(labels: &BTreeMap<String, String>, workers: usize) -> usize {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    labels.hash(&mut hasher);
+    (hasher.finish() % workers.max(1) as u64) as usize
+}
+
 struct Builder {
     pane: PaneBuild,
-    /// Samples of open panes, by pane end.
+    /// This worker's samples of open panes, by pane end.
     open: BTreeMap<i64, Vec<Sample>>,
-    /// End of the newest pane built or skipped; samples in it or before it
-    /// are dropped. `None` until the first sample.
+    /// End of the newest pane this worker built its part of, or skipped;
+    /// samples in it or before it are dropped. `None` before the first
+    /// sample anywhere.
     built_through: Option<i64>,
 }
 
-pub struct Precompute {
+/// One ingestion worker: buffers the samples of its shard of the series and
+/// builds its part of each pane once the global watermark passes it. It
+/// holds the plan's compiled builds, which are not `Send`, so each worker
+/// thread compiles its own.
+pub struct ShardWorker {
+    index: usize,
     builders: Vec<Builder>,
-    allowed_lateness_ms: i64,
-    newest_sample_ms: Option<i64>,
-    pub store: SummaryStore<Batch>,
-    pub stats: PrecomputeStats,
+    shared: Arc<Shared>,
+    /// The global watermark this worker has built its parts through.
+    closed_through_ms: Option<i64>,
 }
 
-impl Precompute {
-    /// Compiles one build per ingestion-time definition of `sds`, the
-    /// stored summaries of `plan`.
+impl ShardWorker {
+    /// Worker `index` of `shared`'s workers, with one build per
+    /// ingestion-time definition of `sds`, the stored summaries of `plan`.
     pub fn new(
         plan: &InstallablePlan,
         sds: &Sds,
-        allowed_lateness_ms: i64,
+        index: usize,
+        shared: Arc<Shared>,
     ) -> Result<Self, PrecomputeError> {
         let builders = sds
             .definitions
@@ -157,35 +328,43 @@ impl Precompute {
             })
             .collect::<Result<_, PrecomputeError>>()?;
         Ok(Self {
+            index,
             builders,
-            allowed_lateness_ms,
-            newest_sample_ms: None,
-            store: SummaryStore::new(),
-            stats: PrecomputeStats::default(),
+            shared,
+            closed_through_ms: None,
         })
     }
 
-    /// The watermark: no sample older than this is expected any more.
-    pub fn watermark_ms(&self) -> Option<i64> {
-        self.newest_sample_ms
-            .map(|newest| newest - self.allowed_lateness_ms)
-    }
-
-    /// Buffers `samples` into their panes, then builds every pane the
-    /// watermark has passed.
-    pub fn ingest(&mut self, samples: &[RawSample]) {
+    /// Buffers `samples`, all of this worker's shard, into their panes, then
+    /// builds this worker's part of every pane the global watermark has
+    /// passed. Returns whether this moved the global watermark past what
+    /// was announced, so the caller tells the other workers to
+    /// [`Self::advance`].
+    pub fn ingest(&mut self, samples: &[RawSample]) -> bool {
+        let Some(first) = samples.iter().map(|s| s.timestamp_ms).min() else {
+            return false;
+        };
+        let shared = self.shared.clone();
+        let _ = shared
+            .start_ms
+            .compare_exchange(UNSET, first, Ordering::AcqRel, Ordering::Acquire);
+        let start_ms = shared.start_ms.load(Ordering::Acquire);
+        let (mut accepted, mut dropped) = (0, 0);
         for sample in samples {
             let metric = sample.labels.get("__name__").map(String::as_str);
-            let mut accepted = false;
+            let mut buffered = false;
             for builder in &mut self.builders {
                 if metric != Some(builder.pane.selector.metric()) {
                     continue;
                 }
-                let end = pane_end(sample.timestamp_ms, builder.pane.definition.pane_ms);
-                // The first pane seen may be partial: skip it.
-                let built = *builder.built_through.get_or_insert(end);
+                let pane_ms = builder.pane.definition.pane_ms;
+                let end = pane_end(sample.timestamp_ms, pane_ms);
+                // The pane of the first sample may be partial: skip it.
+                let built = *builder
+                    .built_through
+                    .get_or_insert(pane_end(start_ms, pane_ms));
                 if end <= built {
-                    self.stats.dropped += 1;
+                    dropped += 1;
                     continue;
                 }
                 builder
@@ -193,27 +372,48 @@ impl Precompute {
                     .entry(end)
                     .or_default()
                     .push(sample.to_sample());
-                accepted = true;
+                buffered = true;
             }
-            if accepted {
-                self.stats.accepted += 1;
-            }
-            self.newest_sample_ms = self.newest_sample_ms.max(Some(sample.timestamp_ms));
+            accepted += u64::from(buffered);
         }
-        self.close_panes();
+        shared.accepted.fetch_add(accepted, Ordering::Relaxed);
+        shared.dropped.fetch_add(dropped, Ordering::Relaxed);
+        let newest = samples
+            .iter()
+            .map(|s| s.timestamp_ms)
+            .max()
+            .expect("nonempty");
+        shared.newest_sample_ms[self.index].fetch_max(newest, Ordering::AcqRel);
+        self.advance();
+        match shared.watermark_ms() {
+            Some(watermark) => {
+                shared.announced_ms.fetch_max(watermark, Ordering::AcqRel) < watermark
+            }
+            None => false,
+        }
     }
 
-    fn close_panes(&mut self) {
-        let Some(watermark) = self.watermark_ms() else {
+    /// Builds this worker's part of every pane the global watermark has
+    /// passed: from its buffered samples, or empty. Every worker builds every
+    /// pane after the first, so a pane without samples is stored as empty,
+    /// not missing.
+    pub fn advance(&mut self) {
+        let Some(watermark) = self.shared.watermark_ms() else {
             return;
         };
+        if self
+            .closed_through_ms
+            .is_some_and(|closed| watermark <= closed)
+        {
+            return;
+        }
+        self.closed_through_ms = Some(watermark);
+        let start_ms = self.shared.start_ms.load(Ordering::Acquire);
         for builder in &mut self.builders {
-            let Some(built) = builder.built_through else {
-                continue;
-            };
             let pane_ms = builder.pane.definition.pane_ms;
-            // Every pane after the first through the watermark is built, so
-            // a pane without samples is stored as empty, not missing.
+            let built = *builder
+                .built_through
+                .get_or_insert(pane_end(start_ms, pane_ms));
             let mut end = built + pane_ms;
             while end <= watermark {
                 let samples = builder.open.remove(&end).unwrap_or_default();
@@ -222,28 +422,74 @@ impl Precompute {
                     window_end_ms: end,
                     revision: 1,
                 };
-                match builder.pane.run(&samples, end, scope) {
-                    Ok(state) => {
-                        self.store.insert(&builder.pane.definition.id, end, state);
-                        self.stats.panes_built += 1;
-                    }
-                    Err(error) => {
-                        tracing::error!(definition = ?builder.pane.definition.id, end, %error, "pane build failed");
-                        self.stats.panes_failed += 1;
-                    }
-                }
+                let part = builder
+                    .pane
+                    .run(&samples, end, scope)
+                    .map_err(|e| e.to_string());
+                self.shared.add_part(&builder.pane.definition, end, part);
                 builder.built_through = Some(end);
                 end += pane_ms;
             }
-            // The newest evaluation that reads stored panes is at most the
-            // newest closed pane's end, so retention is measured from it,
-            // not from the watermark, which may already be past it.
-            let definition = &builder.pane.definition;
-            if let Some(newest) = builder.built_through {
-                self.store
-                    .evict_before(&definition.id, definition.oldest_kept_end_ms(newest));
-            }
         }
+    }
+}
+
+/// Every ingestion worker of a plan on the caller's thread, each fed its
+/// shard of the series: the threaded engine's precompute without threads.
+pub struct Precompute {
+    shared: Arc<Shared>,
+    workers: Vec<ShardWorker>,
+}
+
+impl Precompute {
+    /// One worker for every series.
+    pub fn new(
+        plan: &InstallablePlan,
+        sds: &Sds,
+        allowed_lateness_ms: i64,
+    ) -> Result<Self, PrecomputeError> {
+        Self::with_shards(plan, sds, allowed_lateness_ms, 1)
+    }
+
+    /// `shards` workers, each owning the series [`shard_of`] assigns it.
+    pub fn with_shards(
+        plan: &InstallablePlan,
+        sds: &Sds,
+        allowed_lateness_ms: i64,
+        shards: usize,
+    ) -> Result<Self, PrecomputeError> {
+        let shared = Arc::new(Shared::new(shards, allowed_lateness_ms));
+        let workers = (0..shared.workers())
+            .map(|index| ShardWorker::new(plan, sds, index, shared.clone()))
+            .collect::<Result<_, _>>()?;
+        Ok(Self { shared, workers })
+    }
+
+    /// Routes `samples` to their workers, then lets every worker build the
+    /// panes the global watermark has passed.
+    pub fn ingest(&mut self, samples: &[RawSample]) {
+        let mut shards = vec![Vec::new(); self.workers.len()];
+        for sample in samples {
+            shards[shard_of(&sample.labels, self.workers.len())].push(sample.clone());
+        }
+        for (worker, samples) in self.workers.iter_mut().zip(&shards) {
+            worker.ingest(samples);
+        }
+        for worker in &mut self.workers {
+            worker.advance();
+        }
+    }
+
+    pub fn watermark_ms(&self) -> Option<i64> {
+        self.shared.watermark_ms()
+    }
+
+    pub fn store(&self) -> &SummaryStore<Batch> {
+        &self.shared.store
+    }
+
+    pub fn stats(&self) -> PrecomputeStats {
+        self.shared.stats()
     }
 }
 

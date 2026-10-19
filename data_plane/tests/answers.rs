@@ -401,3 +401,28 @@ async fn forwards_unplanned_and_invalid_range_queries_unchanged() {
         assert_eq!(response.body, json!({ "forwarded_range": expected }));
     }
 }
+
+/// Planned queries sent at once run in parallel on the query threads, each
+/// reading the same stored panes, and every one answers as the same query
+/// sent alone.
+#[tokio::test]
+async fn answers_concurrent_queries_like_one_at_a_time() {
+    let (_, app) = example4b(101 * MINUTE).await;
+    let times = [90 * MINUTE, 100 * MINUTE];
+    let mut alone = Vec::new();
+    for &t in &times {
+        let response = instant(&app, P99, t).await;
+        assert_eq!(response.execution.as_deref(), Some("plan"), "{t}");
+        alone.push(response.body);
+    }
+    // Polled together, the requests wait on the query threads at once.
+    let concurrent = futures::future::join_all((0..32).map(|i| {
+        let (app, t) = (app.clone(), times[i % times.len()]);
+        async move { (i, instant(&app, P99, t).await) }
+    }))
+    .await;
+    for (i, response) in concurrent {
+        assert_eq!(response.execution.as_deref(), Some("plan"));
+        assert_eq!(response.body, alone[i % times.len()]);
+    }
+}
