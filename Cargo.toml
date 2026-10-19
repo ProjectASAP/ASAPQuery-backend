@@ -13,7 +13,6 @@ planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/
 asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "58999df294fc9b0326341c1f20be62ecc8c2975e" }
 asap-logical-asap-optimization = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "58999df294fc9b0326341c1f20be62ecc8c2975e" }
 asap-plan-selection = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "58999df294fc9b0326341c1f20be62ecc8c2975e" }
-asap-executor = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "58999df294fc9b0326341c1f20be62ecc8c2975e" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

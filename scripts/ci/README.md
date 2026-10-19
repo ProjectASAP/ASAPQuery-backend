@@ -2,7 +2,7 @@
 
 The backend keeps reproducible Planner revisions in `Cargo.toml` and `Cargo.lock`.
 `Sync ASAPPlanner main` checks upstream main daily (or on manual dispatch), updates
-all five Planner dependencies together, and opens or refreshes
+all four Planner dependencies together, and opens or refreshes
 `automation/sync-asapplanner-main` against backend main. GitHub scheduled runs can be delayed.
 
 The existing `ASAP_CI_REPO_TOKEN` secret must have read access to private dependency
