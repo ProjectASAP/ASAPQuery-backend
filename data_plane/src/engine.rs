@@ -239,12 +239,14 @@ impl EngineHandle {
     }
 
     /// The plan root answering `query` at `time_ms` and the raw samples it
-    /// needs; see [`QueryEngine::raw_ranges`].
+    /// needs, once the writes answered before are ingested; see
+    /// [`QueryEngine::raw_ranges`].
     pub async fn raw_ranges(
         &self,
         query: String,
         time_ms: i64,
     ) -> Result<(usize, Vec<RawRange>), Unanswered> {
+        self.sync().await;
         self.ask(|reply| QueryJob::RawRanges {
             query,
             time_ms,
@@ -276,6 +278,7 @@ impl EngineHandle {
         query: String,
         steps: Vec<i64>,
     ) -> Result<(usize, Vec<RawRange>), Unanswered> {
+        self.sync().await;
         self.ask(|reply| QueryJob::RawRangesForSteps {
             query,
             steps,
@@ -311,6 +314,14 @@ impl EngineHandle {
     /// Precompute counters, once every sample queued before has been
     /// ingested and every pane it closed has been built.
     pub async fn stats(&self) -> PrecomputeStats {
+        self.sync().await;
+        self.precompute.stats()
+    }
+
+    /// Returns once every sample queued before has been ingested and every
+    /// pane it closed has been built, so a query sees the writes answered
+    /// before it.
+    pub async fn sync(&self) {
         // The first round runs every queued ingest, which may tell other
         // workers to advance; the second runs those advances.
         for _ in 0..2 {
@@ -325,7 +336,6 @@ impl EngineHandle {
                 let _ = done.await;
             }
         }
-        self.precompute.stats()
     }
 }
 

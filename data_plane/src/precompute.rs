@@ -384,13 +384,13 @@ impl ShardWorker {
             .max()
             .expect("nonempty");
         shared.newest_sample_ms[self.index].fetch_max(newest, Ordering::AcqRel);
-        self.advance();
-        match shared.watermark_ms() {
-            Some(watermark) => {
-                shared.announced_ms.fetch_max(watermark, Ordering::AcqRel) < watermark
-            }
-            None => false,
-        }
+        // Close and announce the same watermark: announced, it is closed
+        // here, and the other workers close it on `advance`.
+        let Some(watermark) = shared.watermark_ms() else {
+            return false;
+        };
+        self.advance_to(watermark);
+        shared.announced_ms.fetch_max(watermark, Ordering::AcqRel) < watermark
     }
 
     /// Builds this worker's part of every pane the global watermark has
@@ -398,9 +398,12 @@ impl ShardWorker {
     /// pane after the first, so a pane without samples is stored as empty,
     /// not missing.
     pub fn advance(&mut self) {
-        let Some(watermark) = self.shared.watermark_ms() else {
-            return;
-        };
+        if let Some(watermark) = self.shared.watermark_ms() {
+            self.advance_to(watermark);
+        }
+    }
+
+    fn advance_to(&mut self, watermark: i64) {
         if self
             .closed_through_ms
             .is_some_and(|closed| watermark <= closed)

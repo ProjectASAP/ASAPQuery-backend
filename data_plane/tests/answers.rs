@@ -426,3 +426,64 @@ async fn answers_concurrent_queries_like_one_at_a_time() {
         assert_eq!(response.body, alone[i % times.len()]);
     }
 }
+
+/// A planned query sees every Remote Write request answered before it: the
+/// pane its newest sample closes is stored by the time the query reads it,
+/// although ingestion runs on other threads.
+#[tokio::test]
+async fn a_query_reads_the_panes_of_the_writes_before_it() {
+    let workload = common::with_range_evaluation(&common::workload("example4b"), 600_000, 600_000);
+    let plan = control_plane::plan_workload(&workload, &common::inputs(false)).unwrap();
+    let state = Arc::new(
+        DataPlane::new(
+            serde_json::to_string(&plan).unwrap(),
+            fake_prometheus(vec![]).await,
+            0,
+        )
+        .unwrap(),
+    );
+    let app = router(state.clone());
+    // One request per 10-minute pane, then at once the query that reads it.
+    for pane in 1..=12 {
+        let timeseries = (0..50)
+            .map(|i| TimeSeries {
+                labels: vec![
+                    Label {
+                        name: "__name__".into(),
+                        value: "latency_ms".into(),
+                    },
+                    Label {
+                        name: "job".into(),
+                        value: format!("job{i}"),
+                    },
+                ],
+                samples: ((pane - 1) * 10 * MINUTE + 15_000..=pane * 10 * MINUTE)
+                    .step_by(15_000)
+                    .map(|t| Sample {
+                        timestamp: t,
+                        value: (t / 15_000) as f64,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let write = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/write")
+                    .body(Body::from(encode(&WriteRequest { timeseries })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(write.status(), StatusCode::NO_CONTENT);
+        if pane >= 8 {
+            let response = instant(&app, P99, pane * 10 * MINUTE).await;
+            assert_eq!(
+                response.execution.as_deref(),
+                Some("plan"),
+                "pane {pane}: {:?}",
+                response.reason
+            );
+        }
+    }
+}
