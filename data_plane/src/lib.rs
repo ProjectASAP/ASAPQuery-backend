@@ -17,6 +17,7 @@ pub mod raw_buffer;
 pub mod remote_read;
 pub mod remote_write;
 pub mod sds;
+mod series;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};

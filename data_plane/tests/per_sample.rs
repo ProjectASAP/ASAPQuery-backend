@@ -1,6 +1,6 @@
 //! Ingestion updates each open pane's summary state per sample, through the
-//! executor's own updater; the panes it stores equal the executor's batch
-//! build of the same samples.
+//! executor's `StateColumnUpdater`, and builds the pane from columns; the
+//! panes it stores equal the plan's own build over the same samples.
 
 mod common;
 
@@ -61,10 +61,13 @@ fn state_of(value: &Value) -> Vec<u8> {
         .collect()
 }
 
-/// Every cell of `pane` as comparable data, rows in order.
-fn cells(pane: &Batch) -> Vec<Vec<Vec<u8>>> {
-    pane.rows()
+/// Every cell of `pane` as comparable data, its rows sorted: a pane built
+/// on several workers holds one batch per worker. (Tests read rows to
+/// compare them; the data plane does not.)
+fn cells(pane: &[Batch]) -> Vec<Vec<Vec<u8>>> {
+    let mut rows: Vec<Vec<Vec<u8>>> = pane
         .iter()
+        .flat_map(Batch::to_rows)
         .map(|row| {
             row.iter()
                 .map(|value| match value {
@@ -73,7 +76,9 @@ fn cells(pane: &Batch) -> Vec<Vec<Vec<u8>>> {
                 })
                 .collect()
         })
-        .collect()
+        .collect();
+    rows.sort();
+    rows
 }
 
 /// For Example 1's counter rates and sums over 10 s panes, Example 3b's
@@ -110,9 +115,11 @@ fn per_sample_panes_equal_the_batch_build() {
                     let actual = per_sample.store().get(&definition.id, end);
                     assert_eq!(actual.is_some(), expected.is_some(), "{example} pane {end}");
                     if let (Some(actual), Some(expected)) = (actual, expected) {
-                        assert_eq!(actual.schema(), expected.schema());
+                        for batch in actual.iter().chain(expected.iter()) {
+                            assert_eq!(**batch.schema(), definition.output_schema);
+                        }
                         assert_eq!(cells(&actual), cells(&expected), "{example} pane {end}");
-                        compared += usize::from(!expected.rows().is_empty());
+                        compared += usize::from(expected.iter().any(|b| b.num_rows() > 0));
                     }
                     end += definition.pane_ms;
                 }
@@ -144,6 +151,6 @@ fn per_sample_panes_apply_label_matchers() {
         per_sample.store().get(&id, 20 * MINUTE).unwrap(),
         batch.store().get(&id, 20 * MINUTE).unwrap(),
     );
-    assert_eq!(expected.rows().len(), 2, "jobs 1 and 4 are instance 1");
+    assert_eq!(cells(&expected).len(), 2, "jobs 1 and 4 are instance 1");
     assert_eq!(cells(&actual), cells(&expected));
 }

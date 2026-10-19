@@ -364,7 +364,7 @@ async fn answers_planned_range_queries() {
 #[tokio::test]
 async fn forwards_whole_range_queries_a_step_cannot_answer() {
     let (_, app) = example4b(101 * MINUTE).await;
-    for (start, step, reason) in [("5400", "5m", "pane grid"), ("4800", "10m", "not stored")] {
+    for (start, step, reason) in [("5400", "5m", "pane grid"), ("4200", "10m", "not stored")] {
         let params = [
             ("query", P99),
             ("start", start),

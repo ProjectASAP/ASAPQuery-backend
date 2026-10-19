@@ -1,10 +1,10 @@
 //! The data plane's threads: ingestion workers that build stored panes, and
 //! a pool of query threads that answer planned queries.
 //!
-//! Planner IR and the executor's compiled plans hold `Rc`s, so they cannot
-//! be shared across threads: every worker and query thread reads the plan
-//! and compiles its own. What threads share is plain data: the stored panes,
-//! the kept query-time results, and the watermarks.
+//! The plan is compiled once, when it is installed: its ingestion side
+//! ([`Ingestion`]) and its query roots ([`QueryEngine`]). Every thread
+//! shares them, with the stored panes, the kept query-time results and the
+//! watermarks.
 //!
 //! - **Ingestion.** Series are sharded by a hash of their label set; each
 //!   worker owns the open panes of its shard. A worker's watermark is its
@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use asap_planner::InstallablePlan;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::precompute::{PrecomputeStats, RawSample, ShardWorker, Shared};
+use crate::precompute::{Ingestion, PrecomputeStats, RawSample, ShardWorker, Shared};
 use crate::query::{KeptResults, QueryEngine, RawRange, ResultSample, Unanswered};
 use crate::raw_buffer::RawBuffer;
 use crate::sds::Sds;
@@ -152,6 +152,9 @@ impl EngineHandle {
             horizons.values_mut().for_each(|ms| *ms = override_ms);
         }
         tracing::info!(?horizons, "local raw buffer");
+        let ingestion = Arc::new(Ingestion::new(&plan, &sds, true)?);
+        let kept = Arc::new(KeptResults::default());
+        let queries_engine = Arc::new(QueryEngine::with_kept(&plan, &sds, kept));
         drop(plan);
         let raw_buffer = (!horizons.is_empty()).then(|| {
             Arc::new(RawBuffer::with_horizons(
@@ -159,7 +162,6 @@ impl EngineHandle {
                 threads.ingestion_workers,
             ))
         });
-        let plan_json = Arc::new(plan_json);
         let precompute = Arc::new(Shared::new(threads.ingestion_workers, allowed_lateness_ms));
         let (senders, receivers): (Vec<_>, Vec<_>) = (0..precompute.workers())
             .map(|_| mpsc::channel(QUEUE))
@@ -168,27 +170,11 @@ impl EngineHandle {
         // senders let the channels close when the handle is dropped.
         let peers: Vec<_> = senders.iter().map(mpsc::Sender::downgrade).collect();
         for (index, mut commands) in receivers.into_iter().enumerate() {
-            let (plan_json, shared, peers, raw_buffer) = (
-                plan_json.clone(),
-                precompute.clone(),
-                peers.clone(),
-                raw_buffer.clone(),
-            );
+            let mut worker = ShardWorker::new(index, ingestion.clone(), precompute.clone())
+                .with_raw_buffer(raw_buffer.clone());
+            let peers = peers.clone();
             spawn(format!("ingest-{index}"), move |ready| {
-                let started = install(&plan_json).and_then(|(plan, sds)| {
-                    Ok(ShardWorker::new(&plan, &sds, index, shared, true)?
-                        .with_raw_buffer(raw_buffer))
-                });
-                let mut worker = match started {
-                    Ok(worker) => {
-                        let _ = ready.send(Ok(()));
-                        worker
-                    }
-                    Err(error) => {
-                        let _ = ready.send(Err(error));
-                        return;
-                    }
-                };
+                let _ = ready.send(Ok(()));
                 while let Some(command) = commands.blocking_recv() {
                     match command {
                         WorkerCommand::Ingest(samples) => {
@@ -214,22 +200,9 @@ impl EngineHandle {
         }
         let (queries, jobs) = sync_channel(QUEUE);
         let jobs = Arc::new(Mutex::new(jobs));
-        let kept = Arc::new(KeptResults::default());
         for index in 0..threads.query_threads.max(1) {
-            let (plan_json, shared, kept, jobs) = (
-                plan_json.clone(),
-                precompute.clone(),
-                kept.clone(),
-                jobs.clone(),
-            );
+            let (engine, shared, jobs) = (queries_engine.clone(), precompute.clone(), jobs.clone());
             spawn(format!("query-{index}"), move |ready| {
-                let engine = match install(&plan_json) {
-                    Ok((plan, sds)) => QueryEngine::with_kept(&plan, &sds, kept),
-                    Err(error) => {
-                        let _ = ready.send(Err(error));
-                        return;
-                    }
-                };
                 let _ = ready.send(Ok(()));
                 serve_queries(&engine, &shared, &jobs);
             })?;

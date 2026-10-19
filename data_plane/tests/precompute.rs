@@ -52,7 +52,11 @@ fn builds_panes_after_the_first_as_the_watermark_passes() {
     );
     for end in [2 * PANE, 3 * PANE] {
         let pane = engine.store().get(&id, end).expect("built pane");
-        assert_eq!(pane.rows().len(), 2, "one state per series");
+        assert_eq!(
+            pane.iter().map(|b| b.num_rows()).sum::<usize>(),
+            2,
+            "one state per series"
+        );
     }
     assert_eq!(
         engine.store().get(&id, 4 * PANE).map(|_| ()),
@@ -87,9 +91,36 @@ fn stores_empty_panes() {
     let id = sds.definitions.keys().next().unwrap().clone();
     engine.ingest(&samples("latency_ms", &["a"], 0, 20 * MINUTE));
     engine.ingest(&[sample("latency_ms", "a", 45 * MINUTE, 1.0)]);
-    assert_eq!(engine.store().get(&id, 2 * PANE).unwrap().rows().len(), 1);
-    assert_eq!(engine.store().get(&id, 3 * PANE).unwrap().rows().len(), 0);
-    assert_eq!(engine.store().get(&id, 4 * PANE).unwrap().rows().len(), 0);
+    assert_eq!(
+        engine
+            .store()
+            .get(&id, 2 * PANE)
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum::<usize>(),
+        1
+    );
+    assert_eq!(
+        engine
+            .store()
+            .get(&id, 3 * PANE)
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum::<usize>(),
+        0
+    );
+    assert_eq!(
+        engine
+            .store()
+            .get(&id, 4 * PANE)
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum::<usize>(),
+        0
+    );
 }
 
 /// The plan's label matchers select which series a pane summarizes.
@@ -104,7 +135,16 @@ fn applies_label_matchers() {
     let (mut engine, sds) = precompute(plan_workload(&workload, &common::inputs(false)).unwrap());
     let id = sds.definitions.keys().next().unwrap().clone();
     engine.ingest(&samples("latency_ms", &["a", "b"], 0, 25 * MINUTE));
-    assert_eq!(engine.store().get(&id, 2 * PANE).unwrap().rows().len(), 1);
+    assert_eq!(
+        engine
+            .store()
+            .get(&id, 2 * PANE)
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum::<usize>(),
+        1
+    );
 }
 
 /// Panes are `(end - width, end]`, like PromQL ranges: a sample at a
@@ -119,10 +159,11 @@ fn panes_are_left_open() {
     assert_eq!(pane_end(-PANE, PANE), -PANE);
 }
 
-/// A pane stays stored while an output reads it: Example 4b's oldest output
-/// reads the pane ending 50 min before the evaluation, so with the watermark
-/// at 90 min the pane ending at 40 min is kept and the one at 30 min, which
-/// starts before the plan's 60-minute retention, is evicted.
+/// A pane stays stored while an output reads it, plus one pane width for an
+/// evaluation behind the newest pane: Example 4b's oldest output reads the
+/// pane ending 50 min before the evaluation, so with the newest pane ending
+/// at 90 min the panes ending at 40 and 30 min are kept and the one at 20
+/// min, before the plan's 60-minute retention and the margin, is evicted.
 #[test]
 fn keeps_panes_for_the_plans_retention() {
     let (mut engine, sds) = precompute(common::plan("example4b", false));
@@ -134,9 +175,10 @@ fn keeps_panes_for_the_plans_retention() {
         engine.store().get(&id, 4 * PANE).is_some(),
         "read at offset 50 min"
     );
+    assert!(engine.store().get(&id, 3 * PANE).is_some(), "the margin");
     assert!(
-        engine.store().get(&id, 3 * PANE).is_none(),
-        "older than the retention"
+        engine.store().get(&id, 2 * PANE).is_none(),
+        "older than the retention and the margin"
     );
 }
 
@@ -179,7 +221,7 @@ fn a_pane_closes_once_every_shard_has_passed_it() {
         .get(&id, 2 * PANE)
         .expect("both shards passed 20 min");
     assert_eq!(
-        pane.rows().len(),
+        pane.iter().map(|b| b.num_rows()).sum::<usize>(),
         2,
         "one state per series, from both shards"
     );
@@ -229,5 +271,32 @@ fn sharded_panes_answer_like_one_shard() {
             assert!(!single.is_empty(), "{example}: {planned}");
             assert_eq!(answer(&four), single, "{example}: {planned}");
         }
+    }
+}
+
+/// An evaluation at T runs once samples just after T have arrived, so the
+/// newest stored pane can be past T. Example 1 without raw data stores
+/// 10-second panes for 60 s: with samples every 15 s through 10:15, an
+/// evaluation at 10:00 still finds the pane ending at 9:10, which it reads
+/// at offset 50 s, though the newest pane ends at 10:10.
+#[test]
+fn keeps_the_panes_of_an_evaluation_behind_the_newest_pane() {
+    let (mut engine, sds) = precompute(common::plan("example1", false));
+    let all = samples(
+        "http_requests_total",
+        &["a", "b"],
+        MINUTE,
+        10 * MINUTE + 15_001,
+    );
+    engine.ingest(&all);
+    for definition in sds.definitions.values() {
+        assert_eq!(definition.pane_ms, 10_000);
+        assert!(
+            engine
+                .store()
+                .get(&definition.id, 9 * MINUTE + 10_000)
+                .is_some(),
+            "read by the evaluation at 10:00"
+        );
     }
 }
