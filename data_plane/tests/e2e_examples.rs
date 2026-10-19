@@ -46,7 +46,7 @@ fn samples(
     step: i64,
     f: impl Fn(usize, i64) -> f64,
 ) -> Vec<RawSample> {
-    let series: Vec<_> = series.iter().cloned().map(Arc::new).collect();
+    let series: Vec<_> = series.iter().map(data_plane::series_ids::intern).collect();
     (from..to)
         .step_by(step as usize)
         .flat_map(|t| {

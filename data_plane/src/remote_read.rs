@@ -1,9 +1,6 @@
 //! Prometheus remote read (protobuf, sampled responses): raw samples older
 //! than the local raw buffer holds.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
-
 use prost::Message;
 
 use crate::precompute::RawSample;
@@ -106,13 +103,12 @@ pub async fn read(
     let response: ReadResponse = decode(&body)?;
     let mut samples = Vec::new();
     for series in response.results.into_iter().flat_map(|r| r.timeseries) {
-        let labels: Arc<BTreeMap<String, String>> = Arc::new(
-            series
-                .labels
-                .into_iter()
-                .map(|label| (label.name, label.value))
-                .collect(),
-        );
+        let pairs: Vec<(&str, &str)> = series
+            .labels
+            .iter()
+            .map(|label| (label.name.as_str(), label.value.as_str()))
+            .collect();
+        let labels = crate::series_ids::intern_pairs(&pairs);
         samples.extend(
             series
                 .samples

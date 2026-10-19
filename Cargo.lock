@@ -1037,6 +1037,7 @@ dependencies = [
 name = "data_plane"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "anyhow",
  "asap-executor",
  "asap-planner",

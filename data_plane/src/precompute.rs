@@ -16,7 +16,6 @@
 //! are not answered from stored panes.
 
 use std::collections::{BTreeMap, HashMap};
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -33,12 +32,13 @@ use crate::per_sample::{OpenPanes, PerSampleSpec};
 use crate::raw_buffer::RawBuffer;
 use crate::sds::{DefinitionId, Sds, SummaryDefinition, SummaryStore};
 use crate::series::SeriesWindow;
+use crate::series_ids::Series;
 
-/// One raw sample: its series' full label set (including `__name__`), time
-/// and value. Samples of one series share their labels.
+/// One raw sample: its series (interned: its id and full label set,
+/// `__name__` included), time and value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawSample {
-    pub labels: Arc<BTreeMap<String, String>>,
+    pub labels: Arc<Series>,
     pub timestamp_ms: i64,
     pub value: f64,
 }
@@ -307,11 +307,10 @@ impl Shared {
     }
 }
 
-/// The ingestion worker of `workers` that owns the series with `labels`.
-pub fn shard_of(labels: &BTreeMap<String, String>, workers: usize) -> usize {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    labels.hash(&mut hasher);
-    (hasher.finish() % workers.max(1) as u64) as usize
+/// The ingestion worker of `workers` that owns `series`: by a hash of its
+/// label set, computed once when it was interned.
+pub fn shard_of(series: &Series, workers: usize) -> usize {
+    (series.hash % workers.max(1) as u64) as usize
 }
 
 /// One worker's open panes of one definition.
@@ -392,7 +391,7 @@ impl ShardWorker {
         // series up once per run.
         let mut offset = 0;
         for run in samples.chunk_by(|a, b| Arc::ptr_eq(&a.labels, &b.labels)) {
-            let metric = run[0].labels.get("__name__").map(String::as_str);
+            let metric = Some(&*run[0].labels.metric);
             for (build, open) in ingestion.builds.iter().zip(&mut self.open) {
                 if metric != Some(build.pane.window.metric()) {
                     continue;

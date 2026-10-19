@@ -18,6 +18,7 @@ pub mod remote_read;
 pub mod remote_write;
 pub mod sds;
 mod series;
+pub mod series_ids;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -108,13 +109,12 @@ async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
             let mut shards = vec![Vec::new(); workers];
             let mut count = 0;
             for series in request.timeseries {
-                let labels: Arc<BTreeMap<String, String>> = Arc::new(
-                    series
-                        .labels
-                        .into_iter()
-                        .map(|label| (label.name, label.value))
-                        .collect(),
-                );
+                let pairs: Vec<(&str, &str)> = series
+                    .labels
+                    .iter()
+                    .map(|label| (label.name.as_str(), label.value.as_str()))
+                    .collect();
+                let labels = series_ids::intern_pairs(&pairs);
                 let shard = &mut shards[shard_of(&labels, workers)];
                 let before = shard.len();
                 shard.extend(

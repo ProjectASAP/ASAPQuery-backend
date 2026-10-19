@@ -6,7 +6,6 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use asap_planner::InstallablePlan;
 use data_plane::precompute::RawSample;
@@ -29,7 +28,7 @@ fn samples() -> Vec<RawSample> {
     let series: Vec<_> = ["a", "b"]
         .iter()
         .map(|service| {
-            Arc::new(BTreeMap::from([
+            data_plane::series_ids::intern(&BTreeMap::from([
                 ("__name__".to_string(), "latency_ms".to_string()),
                 ("service".to_string(), service.to_string()),
             ]))

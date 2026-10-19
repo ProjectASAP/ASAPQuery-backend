@@ -2,7 +2,6 @@
 //! read, and says from when a read must come from Prometheus instead.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use data_plane::precompute::{shard_of, RawSample};
 use data_plane::raw_buffer::RawBuffer;
@@ -13,7 +12,7 @@ const MINUTE: i64 = 60_000;
 fn samples(metric: &str, series: usize, from: i64, to: i64) -> Vec<RawSample> {
     let labels: Vec<_> = (0..series)
         .map(|i| {
-            Arc::new(BTreeMap::from([
+            data_plane::series_ids::intern(&BTreeMap::from([
                 ("__name__".to_string(), metric.to_string()),
                 ("instance".to_string(), i.to_string()),
             ]))

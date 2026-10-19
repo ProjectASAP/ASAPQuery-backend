@@ -23,7 +23,7 @@
 //! time, or groups that are not series (which could span workers). The
 //! Planner places no such build at ingestion time for the PromQL examples.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 use asap_executor::arrow::array::{Array, TimestampMillisecondArray, UInt32Array};
@@ -50,7 +50,7 @@ type GroupKey = Arc<[Arc<str>]>;
 /// Groups numbered `0..`, in the order they are first seen.
 #[derive(Default)]
 struct GroupNumbers {
-    numbers: HashMap<GroupKey, u32>,
+    numbers: ahash::HashMap<GroupKey, u32>,
     keys: Vec<GroupKey>,
 }
 
@@ -88,9 +88,8 @@ pub(crate) struct PerSampleSpec {
 pub(crate) struct OpenPanes {
     /// This worker's numbers for its groups (its series).
     numbers: GroupNumbers,
-    /// Each series' group key, or `None` when the `Scan` drops it, by the
-    /// address of its cached cells.
-    series_groups: HashMap<usize, Option<(GroupKey, u32)>>,
+    /// Each series' group key and number, by series id.
+    series_groups: ahash::HashMap<u32, (GroupKey, u32)>,
     /// By pane end: its states and the groups that took a sample, or why it
     /// failed.
     panes: BTreeMap<i64, Result<(StateColumnUpdater, Vec<bool>), String>>,
@@ -208,9 +207,9 @@ impl PerSampleSpec {
         sample: &RawSample,
         end_ms: i64,
     ) {
-        let address = Arc::as_ptr(cells) as usize;
-        let group = match open.series_groups.get(&address) {
-            Some(group) => group.clone(),
+        let id = sample.labels.id;
+        let group = match open.series_groups.get(&id) {
+            Some(group) => Some(group.clone()),
             None => {
                 let key: GroupKey = self
                     .groups
@@ -218,11 +217,8 @@ impl PerSampleSpec {
                     .map(|&c| cells.texts[c].clone().unwrap_or_else(|| Arc::from("")))
                     .collect();
                 let number = open.numbers.number(&key);
-                // The cells stay cached by the window, so the address is
-                // never reused for another series.
-                let group = Some((key, number));
-                open.series_groups.insert(address, group.clone());
-                group
+                open.series_groups.insert(id, (key.clone(), number));
+                Some((key, number))
             }
         };
         let Some((_, number)) = group else { return };

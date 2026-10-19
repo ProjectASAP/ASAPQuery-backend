@@ -9,7 +9,6 @@
 //! columns (`Batch::try_from_columns`): the same columns the selector
 //! builds, without making a `Sample` or a row per sample.
 
-use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 use asap_executor::arrow::array::{
@@ -23,11 +22,12 @@ use asap_executor::{series_identity, RawSampleSelector, Sample};
 use asap_planner::PhysicalASAPDAG;
 
 use crate::precompute::RawSample;
+use crate::series_ids::Series;
 
 /// The `Scan` schema's column that holds a series' full identity.
 const SERIES_IDENTITY_COLUMN: &str = "$promql_series_identity";
 
-pub(crate) type Labels = Arc<BTreeMap<String, String>>;
+pub(crate) type Labels = Arc<Series>;
 
 /// What one column of a window's input holds.
 #[derive(Debug, Clone, PartialEq)]
@@ -55,8 +55,9 @@ pub(crate) struct SeriesWindow {
     width_ms: i64,
     /// An instant selector keeps only each series' latest sample.
     latest_sample_per_series: bool,
-    /// Each series' cells, or `None` when the `Scan` does not select it.
-    series: RwLock<HashMap<Labels, Option<Arc<SeriesCells>>>>,
+    /// Each series' cells, or `None` when the `Scan` does not select it, by
+    /// series id.
+    series: RwLock<ahash::HashMap<u32, Option<Arc<SeriesCells>>>>,
 }
 
 impl SeriesWindow {
@@ -100,7 +101,7 @@ impl SeriesWindow {
             kinds,
             width_ms: window.width_ms,
             latest_sample_per_series: *kind == TimeRangeKind::Instant,
-            series: RwLock::new(HashMap::new()),
+            series: RwLock::new(ahash::HashMap::default()),
         })
     }
 
@@ -112,20 +113,21 @@ impl SeriesWindow {
     /// The cells of `sample`'s series, or `None` when the `Scan` does not
     /// select it; computed once per series.
     pub(crate) fn cells(&self, sample: &RawSample) -> Option<Arc<SeriesCells>> {
-        if let Some(cells) = self.series.read().expect("series lock").get(&sample.labels) {
+        let id = sample.labels.id;
+        if let Some(cells) = self.series.read().expect("series lock").get(&id) {
             return cells.clone();
         }
         let cells = self.series_cells(sample);
         self.series
             .write()
             .expect("series lock")
-            .insert(sample.labels.clone(), cells.clone());
+            .insert(id, cells.clone());
         cells
     }
 
     fn series_cells(&self, sample: &RawSample) -> Option<Arc<SeriesCells>> {
         let one = Sample {
-            labels: (*sample.labels).clone(),
+            labels: (**sample.labels).clone(),
             timestamp_ms: sample.timestamp_ms,
             value: sample.value,
         };
@@ -171,14 +173,17 @@ impl SeriesWindow {
             .filter(|s| start_ms < s.timestamp_ms && s.timestamp_ms <= end_ms);
         let mut points: Vec<(Arc<SeriesCells>, i64, f64)> = Vec::new();
         if self.latest_sample_per_series {
-            let mut latest: BTreeMap<&Labels, &RawSample> = BTreeMap::new();
+            let mut latest: ahash::HashMap<u32, &RawSample> = ahash::HashMap::default();
             for sample in in_window {
-                let entry = latest.entry(&sample.labels).or_insert(sample);
+                let entry = latest.entry(sample.labels.id).or_insert(sample);
                 if sample.timestamp_ms >= entry.timestamp_ms {
                     *entry = sample;
                 }
             }
-            for sample in latest.into_values() {
+            // In label order, as the selector emits them.
+            let mut latest: Vec<&RawSample> = latest.into_values().collect();
+            latest.sort_unstable_by(|a, b| a.labels.cmp(&b.labels));
+            for sample in latest {
                 if let Some(cells) = self.cells(sample) {
                     points.push((cells, sample.timestamp_ms, sample.value));
                 }
@@ -238,7 +243,7 @@ impl SeriesWindow {
 pub(crate) fn text_column<'a>(
     texts: impl Iterator<Item = &'a str>,
 ) -> Result<ArrayRef, asap_executor::Error> {
-    let mut codes: HashMap<&str, u32> = HashMap::new();
+    let mut codes: ahash::HashMap<&str, u32> = ahash::HashMap::default();
     let mut values: Vec<&str> = Vec::new();
     let keys: UInt32Array = texts
         .map(|text| {

@@ -5,7 +5,6 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use asap_planner::InstallablePlan;
 use data_plane::precompute::{Pane, Precompute, RawSample};
@@ -30,7 +29,7 @@ fn samples(
     let series: Vec<_> = services
         .iter()
         .map(|service| {
-            Arc::new(BTreeMap::from([
+            data_plane::series_ids::intern(&BTreeMap::from([
                 ("__name__".to_string(), metric.to_string()),
                 ("service".to_string(), service.to_string()),
             ]))
@@ -134,7 +133,7 @@ fn raw_samples_are_fetched_once_and_sliced_per_step() {
     let series: Vec<_> = [("a", "1"), ("a", "2"), ("b", "1")]
         .into_iter()
         .map(|(job, instance)| {
-            Arc::new(BTreeMap::from([
+            data_plane::series_ids::intern(&BTreeMap::from([
                 ("__name__".to_string(), "http_requests_total".to_string()),
                 ("job".to_string(), job.to_string()),
                 ("instance".to_string(), instance.to_string()),

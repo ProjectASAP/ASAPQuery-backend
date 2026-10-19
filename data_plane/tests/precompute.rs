@@ -1,7 +1,6 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use asap_executor::planner::workload::{PlanningWorkload, Query};
 use asap_planner::InstallablePlan;
@@ -20,7 +19,7 @@ fn precompute(plan: InstallablePlan) -> (Precompute, Sds) {
 
 fn sample(metric: &str, job: &str, timestamp_ms: i64, value: f64) -> RawSample {
     RawSample {
-        labels: Arc::new(BTreeMap::from([
+        labels: data_plane::series_ids::intern(&BTreeMap::from([
             ("__name__".to_string(), metric.to_string()),
             ("job".to_string(), job.to_string()),
         ])),

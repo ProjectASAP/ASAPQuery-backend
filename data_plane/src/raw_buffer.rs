@@ -16,18 +16,20 @@ use asap_executor::planner::ir::{NonASAPOp, Operator};
 use asap_planner::{InstallablePlan, StoredOutputBuild};
 
 use crate::precompute::RawSample;
-
-type Labels = Arc<BTreeMap<String, String>>;
+use crate::series_ids::Series;
 
 /// No value yet in an `AtomicI64` slot.
 const UNSET: i64 = i64::MIN;
 
+/// One series and its samples in time order.
+type SeriesSamples = (Arc<Series>, VecDeque<(i64, f64)>);
+
 #[derive(Default)]
 struct Shard {
-    /// Each series' samples in time order, by metric and label set.
-    series: HashMap<String, HashMap<Labels, VecDeque<(i64, f64)>>>,
+    /// Each series' samples in time order, by metric and series id.
+    series: ahash::HashMap<Arc<str>, ahash::HashMap<u32, SeriesSamples>>,
     /// By metric: samples at or before this time may have been dropped.
-    trimmed_through_ms: HashMap<String, i64>,
+    trimmed_through_ms: ahash::HashMap<Arc<str>, i64>,
     samples: usize,
 }
 
@@ -158,19 +160,18 @@ impl RawBuffer {
         // Samples of one series arrive together: look each series up once.
         for run in samples.chunk_by(|a, b| Arc::ptr_eq(&a.labels, &b.labels)) {
             let labels = &run[0].labels;
-            let metric = labels.get("__name__").cloned().unwrap_or_default();
-            let Some(horizon_ms) = self.horizons.of(&metric) else {
+            let Some(horizon_ms) = self.horizons.of(&labels.metric) else {
                 continue;
             };
             let trim_through = newest - horizon_ms;
             if run.iter().all(|s| s.timestamp_ms <= trim_through) {
                 continue;
             }
-            let points = series
-                .entry(metric)
+            let (_, points) = series
+                .entry(labels.metric.clone())
                 .or_default()
-                .entry(labels.clone())
-                .or_default();
+                .entry(labels.id)
+                .or_insert_with(|| (labels.clone(), VecDeque::new()));
             for sample in run.iter().filter(|s| s.timestamp_ms > trim_through) {
                 let point = (sample.timestamp_ms, sample.value);
                 match points.back() {
@@ -196,7 +197,7 @@ impl RawBuffer {
                 continue;
             }
             *trimmed = trim_through;
-            by_labels.retain(|_, points| {
+            by_labels.retain(|_, (_, points)| {
                 let old = points.partition_point(|&(t, _)| t <= trim_through);
                 *held -= old;
                 points.drain(..old);
@@ -223,7 +224,12 @@ impl RawBuffer {
                 older_than_ms = older_than_ms.max(trimmed);
             }
             let mut samples = Vec::new();
-            for (labels, points) in shard.series.get(metric).into_iter().flatten() {
+            for (labels, points) in shard
+                .series
+                .get(metric)
+                .into_iter()
+                .flat_map(|m| m.values())
+            {
                 let from = points.partition_point(|&(t, _)| t <= start_ms);
                 let to = points.partition_point(|&(t, _)| t <= end_ms);
                 samples.extend(

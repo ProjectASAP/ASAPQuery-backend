@@ -484,10 +484,7 @@ impl QueryEngine {
 /// returns them.
 fn series_runs(samples: &[RawSample]) -> Vec<&[RawSample]> {
     samples
-        .chunk_by(|a, b| {
-            (Arc::ptr_eq(&a.labels, &b.labels) || a.labels == b.labels)
-                && a.timestamp_ms <= b.timestamp_ms
-        })
+        .chunk_by(|a, b| a.labels == b.labels && a.timestamp_ms <= b.timestamp_ms)
         .collect()
 }
 
