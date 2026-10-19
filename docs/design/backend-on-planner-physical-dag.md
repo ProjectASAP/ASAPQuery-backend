@@ -60,7 +60,7 @@ ASAPPlanner decides **what** to compute, when, and for how long. ASAPQuery-backe
 | Store layout, retention, eviction | States each output's required retention only | SDS: keeps each definition for the largest retention among its outputs and evicts it after that; memory now, S3 later |
 | Ingestion | None | Remote Write, watermark, pane close, late samples |
 | Selecting a window's samples | `RawSampleSelector`: the metric to route, the window bounds, the Scan's label matchers, and the latest-sample rule for instant selectors | Routes samples by metric and buffers them per pane |
-| Computing a pane or a query | The executor compiles and runs any plan node | Calls the executor at the right time and scope |
+| Computing a pane or a query | The physical operator library (`asap-executor`): one columnar operator per plan-node kind, plus per-sample summary updaters | The execution engine: runs the installed DAG node by node with those operators, at the right time, scope and thread |
 | Time binding | States pane windows and offsets relative to an evaluation time | Picks `T`, binds stored panes and raw ranges, fetches raw samples from Prometheus |
 | Unplanned queries | None | Forwards them to Prometheus |
 | Deployment inputs | Consumes them | Supplies them: capabilities, AWS Fargate prices, measured costs, data facts |
@@ -270,6 +270,101 @@ ASAPQuery's store interns label sets to `u32` ids and keeps windows, ids and sta
 | Concurrency | One engine thread runs everything; HTTP runs on tokio. | `num_workers` precompute threads (4 by default), plus HTTP and query tasks that read the store concurrently. |
 | What the planner decides | ASAPPlanner chooses, for each query: exact or summary, the sketch and its parameters for the accuracy target, the materialization (ingestion, query time, or query time kept across evaluations), pane chains and retention. It picks the plan by cost and accuracy (Stage 3) and checks it against a query-time reference. | `asap-planner` maps each query pattern to one aggregation config: accumulator type and parameters, window and slide, grouping and aggregated labels, cleanup, and punting. An optional MILP optimizer works from measured atomic costs. Everything is built at ingestion. |
 
+## Execution engine: a columnar DAG executor
+
+The data plane always executes the installed DAG, node by node, for every query shape. It never pattern-matches whole query shapes and never runs a hand-written path beside the DAG. What changes is how each node runs: every operator works on column batches instead of one `Vec<Value>` per row. The measured overhead (68–75% of data-plane CPU in row allocation, cloning, per-row grouping keys and per-row memory accounting) is the cost of the row layout, not of the DAG.
+
+### Where it lives
+
+ASAPPlanner provides a **physical operator library**; ASAPQuery-backend's **execution engine** runs the DAG with it.
+
+- **ASAPPlanner (`asap-executor`) is the operator library:** one columnar implementation per physical operator kind, the compile step from a plan node to its operator, the per-sample summary updaters, `RawSampleSelector`, and the batch and state-column types. These define each operator's semantics, so there is exactly one implementation of every operator, used by the Planner's own tests, by the correctness reference and by the data plane. It also keeps a minimal single-threaded DAG runner for those tests and for `query_time_reference`.
+- **ASAPQuery-backend is the execution engine:** it walks the installed DAG in topological order and calls the library's operator for each node; it decides scopes (ingestion run or query run), threads, the SDS, data sources, time binding and scheduling.
+
+### Batch format
+
+A batch is a set of equal-length columns for one operator's output, with a shared selection vector. A filter marks rows instead of copying them.
+
+| Column kind | Layout | Used for |
+| --- | --- | --- |
+| Numeric | `Vec<f64>` or `Vec<i64>` plus a validity bitmap | sample values, timestamps, exact aggregates, estimates |
+| Series id | `Vec<u32>` into the run's series table | which series a row belongs to |
+| Group id | `Vec<u32>` into the operator's group table | grouped aggregates and their states |
+| Label / string | dictionary-encoded: `Vec<u32>` codes plus one dictionary | label values, item columns (e.g. top-k items) |
+| Summary state | one state per row, see below | sketch and exact-accumulator state |
+
+- **Series table:** each label set is interned once per run, as an `Arc<LabelSet>` with a `u32` id. Batches carry ids; labels are decoded only when results leave the engine.
+- **Group table:** maps a group key to a `u32` group id. For a `Scan` input, the group of each series is computed once and cached by series id. A grouped operator therefore hashes a key per series, not per row.
+- **Batch size:** whole windows or panes up to a fixed row limit (e.g. 8,192), so per-batch overheads such as memory accounting, validation and schema checks are paid once per batch.
+
+### How sketch state is columnar
+
+A sketch is not split into columns. A state column holds one sketch per group, contiguously, and every operator processes the whole column in one call.
+
+- **State column:** `StateColumn { family, params, states: Vec<State> }`, where row `i` is group `i`'s state. All states in a column share one family and one set of parameters, from the plan, so no per-row type checks or dispatch.
+- **Exact accumulators are plain numeric columns.** A sum, count, min, max or last becomes one `f64` column (plus a count column where needed). A grouped `rate` or `sum` is then a tight loop over arrays.
+- **Fixed-size sketches can share one flat buffer.** Count-Min, Count Sketch and HLL registers have a fixed size per row, so a column can store `groups × size` cells in one `Vec`. Merging two columns is an element-wise loop and estimating is a loop per row.
+- **Variable-size sketches stay one object per row.** KLL, DDSketch, the top-k heaps and UnivMon are stored as `Vec<SketchObject>` from asap_sketchlib, indexed by group id, without the per-row `Value` wrapper.
+- **Stored panes are state columns.** An SDS pane is an immutable `Arc<StateBatch>` (group ids, state column, the definition's output columns). A query reads it by reference; nothing is copied.
+
+| Operator on state | Columnar behaviour |
+| --- | --- |
+| `SummaryAgg` (build) | At query time: one pass over the input batch, `group id → state` updated in place. At ingestion: per sample, below. |
+| `SummaryMerge` over N panes | For each group id present, merge the N states with the library's merge, into one output state column. Panes are read through `Arc`; the output is new. |
+| `SummaryEstimate` | One call per row of the state column, producing a numeric column (e.g. a quantile) or an item and value column (top-k). |
+| `FinalizeExactAccumulator` | Arithmetic over the accumulator's numeric columns, e.g. a rate from first/last and timestamps. |
+
+### Operators
+
+Every operator kind in the physical DAG gets a columnar implementation. There are no partial paths.
+
+| Operator | Columnar implementation |
+| --- | --- |
+| `Scan` | Emits sample batches (series id, timestamp, value) from the SDS, the ring buffer or remote read. The label matchers are evaluated once per series id and cached. |
+| `TimeRange`, `TimeShift` | Time bounds become a selection over the timestamp column; a shift adjusts the bound, not the data. Instant lookback keeps the latest row per series id. |
+| `Filter` | Vectorized predicate evaluation into the selection vector. |
+| `Project` | Vectorized expression evaluation, producing new columns; label edits produce new series ids through the series table. |
+| `Aggregate` (exact) | Group id per row from the cached series-to-group map, then accumulation into numeric columns. |
+| `SummaryAgg`, `SummaryMerge`, `SummaryEstimate`, `FinalizeExactAccumulator` | As in the state-operator table above. |
+| `Join`, `SemiJoin` | Hash join on group or series ids. |
+| `Sort`, `Limit`, `TopK` | Sort a permutation vector; a heap for top-k. |
+| `PaneChain` (expanded) | Its panes are ordinary nodes; the merge is a `SummaryMerge`. |
+
+**Evaluation of a DAG:** nodes run in topological order. Each node's output batch is computed once per evaluation and shared by all its consumers through `Arc`, the same sharing the Planner's CSE put into the plan.
+
+### Ingestion: the DAG run per sample
+
+The ingestion side of the DAG, `Scan → TimeShift* → TimeRange(pane) → [Filter/Project] → SummaryAgg`, is still executed as that DAG. It is compiled into a per-sample pipeline:
+
+1. **Per series:** the first time a series id is seen, the stateless prefix is run once: the Scan's matchers, filters on labels, label projections, and the group id per stored definition. The result is cached by series id.
+2. **Per sample:** the value goes through the cached per-series result. Value filters and projections are evaluated on it, then it updates the open pane's state for its (definition, group, pane end) in place, through the executor's updater for that family. That is the same code the batch `SummaryAgg` uses, so the state is byte-identical to a batch build.
+3. **At pane close:** each worker seals its partial state column. The partials of all shards are merged per group with the family's merge, and the result is inserted into the SDS once as an immutable `Arc<StateBatch>`.
+
+### Precompute engine threads
+
+- **Workers:** N workers, configured. A sample goes to worker `hash(series id) mod N`, as ASAPQuery shards by series.
+- **State:** each worker owns the open-pane states of its series, so updates take no lock.
+- **Watermark:** each worker tracks its own watermark. The global watermark is the minimum over the workers, and a pane closes when the global watermark passes its end.
+- **Close:** the closing step merges the workers' partial states per group, as above. Every stored definition is mergeable: the Planner only places a build at ingestion time when its family's merge is sound.
+
+### Query engine
+
+- **One query per thread.** Queries run on a fixed pool, configured. One query evaluation, and all steps of a range query, run on one thread. Different queries run in parallel.
+- **Reads take references, never copies.** The SDS is `RwLock<HashMap<(definition, pane end), Arc<StateBatch>>>`. A query takes the read lock only to clone the `Arc`s of the panes it needs, then releases it and computes. Panes are never modified after insert, so there are no deep copies and no lock is held during computation.
+- **Writes are short.** Inserting a sealed pane, inserting a kept query-time result once its pane is closed, and evicting past a definition's retention each take the write lock briefly.
+- **Per-thread compiled plan.** The Planner's DAG types are not `Send`. Each pool thread compiles its own executor objects from `plan.json` once at install, and reuses them for every evaluation.
+- **Range queries.** Steps run in order on the query's thread. Raw windows are cut from one fetch, and stored panes and kept results are shared by reference across steps.
+- **Raw data.** Query-time raw windows come from the local ring buffer. Anything older comes from Prometheus remote read.
+
+### What is measured to accept it
+
+- Correctness: the columnar executor passes all of the Planner's existing executor tests unchanged, and the backend e2e tests (examples, kept results, range queries) still match the reference.
+- Performance, on the harness's examples configs, as absolute numbers:
+  - summary construction in µs per sample;
+  - stored-state query latency;
+  - data-plane CPU core-seconds and peak RSS.
+- Targets: per-sample construction at ASAPQuery's measured 2.3 µs/sample, and stored-state queries at ASAPQuery's measured 4.1 / 24.8 / 33.5 ms on the same data.
+
 ## Merging with ASAPQuery: benefits and features
 
 The merged runtime keeps ASAPQuery's low-overhead data path and the backend's single-planner correctness and coverage. ASAPPlanner decides what to compute. The runtime and its SDS decide how. All work below happens in ASAPQuery-backend. The backend later merges into ASAPQuery, replacing `asap-query-engine`'s precompute, store and query internals and `asap-planner`. ASAPPlanner stays a separate, pinned library.
@@ -281,9 +376,9 @@ The merged runtime keeps ASAPQuery's low-overhead data path and the backend's si
 | Planner | `asap-planner` (pattern rules, optional MILP) | ASAPPlanner Stages 1–3 | ASAPPlanner only |
 | Materialization choice: ingestion, query time, kept across evaluations | Ingestion only | All three | All three |
 | Query-time raw windows | No | Yes, fetched from Prometheus | Yes, from a local buffer, else remote read |
-| Query shapes | Fixed patterns, binary arithmetic, top-k, quantile, rollup | Any root the Planner emits (merge, estimate, sort, limit, project, grouped top-k) | Any root; common shapes on a fast evaluator |
+| Query shapes | Fixed patterns, binary arithmetic, top-k, quantile, rollup | Any root the Planner emits (merge, estimate, sort, limit, project, grouped top-k) | Any root; every node runs on the columnar operator library |
 | Accuracy targets | `accuracy_sla` per query group | Error metric, bound and failure probability per query, checked by Stage 3 | Backend's |
-| Correctness reference | Docker differential matrix and PromQL compliance suite | End-to-end equality with the executor running every node at query time | Backend's, plus a parity test of each fast path |
+| Correctness reference | Docker differential matrix and PromQL compliance suite | End-to-end equality with the executor running every node at query time | Backend's |
 | Summary sharing across offsets | Pane sharing inside one sliding aggregation | SDS definition identity shared across outputs and offsets | Backend's |
 | Ingestion protocols | Prometheus Remote Write, VictoriaMetrics, OTLP, CSV/JSON files | Prometheus Remote Write | ASAPQuery's drivers |
 | Query languages | PromQL, SQL, Elastic DSL, ClickHouse adapters | PromQL | PromQL now; others as ASAPPlanner frontends land |
@@ -303,18 +398,17 @@ The merged runtime keeps ASAPQuery's low-overhead data path and the backend's si
 | Installed plan, root per query, stored outputs, retention | Backend (from ASAPPlanner) | Unchanged contract. |
 | SDS definition identity, dedup and retention | Backend | Unchanged. |
 | Ingestion drivers, decode, sharded router, per-worker watermark | ASAPQuery | Labels are interned to series ids at decode. |
-| Pane construction | ASAPQuery's direct per-sample update | Uses the executor's kernel factory, so states are the ones the executor builds. |
-| Store layout and concurrency | ASAPQuery's columnar epochs | Holds executor `AggregateCore` states keyed by (definition, pane end, group id). |
-| Query evaluation | Backend's plan roots | Common shapes run on a state-column evaluator; everything else runs on `asap-executor`. |
+| Pane construction | ASAPQuery's direct per-sample update, as the DAG's ingestion side compiled per sample | Uses the operator library's per-sample updaters, so states are the ones a batch `SummaryAgg` builds. |
+| Store layout and concurrency | ASAPQuery's concurrency model; immutable `Arc<StateBatch>` panes under an `RwLock` | Panes are state columns keyed by (definition, pane end); queries read them by reference. |
+| Query evaluation | Backend's execution engine over ASAPPlanner's columnar operator library | Every node of every root, one query per thread. |
 | Query-time raw windows | New, in the backend | A ring buffer per `Scan` metric, filled from Remote Write and sized by the plan's widest raw window. |
 | HTTP adapters, fallback forwarders, tracker, drop-in | ASAPQuery | Brought over at the merge. |
 | Planner | ASAPPlanner | `asap-planner` is retired at the merge. |
 
 **Boundary with ASAPPlanner.** The rule is unchanged. ASAPPlanner fixes each output's computation: payload, schema, pane window, materialization and retention. The runtime may run that computation on any path that gives the same result.
 
-- At install, the runtime lowers each stored definition and each root either to a fast path or to the executor, and logs which.
-- A shape the fast path does not cover runs on the executor. It is never refused or approximated.
-- The executor stays the reference. Each fast path has a parity test against it on the same samples: equal for exact states, within the end-to-end KLL tolerance for KLL.
+- The data plane executes the installed DAG node by node for every query shape, with the operators from ASAPPlanner's library. There is no second execution path to keep in step.
+- The per-sample ingestion pipeline is the DAG's ingestion side compiled per sample with the library's updaters; a parity test checks it against the batch `SummaryAgg` on the same samples.
 - The runtime's measured costs go to the Planner as a deployment input (`MeasuredOperationCost`), never as a plan change.
 
 **Staged plan.** Each stage reruns the benefit harness at 2,000 and 10,000 series and reports absolute numbers next to the ones above.
@@ -322,8 +416,8 @@ The merged runtime keeps ASAPQuery's low-overhead data path and the backend's si
 | Stage | Change | Target, from the measurements above |
 | --- | --- | --- |
 | A. Cheap runtime fixes | jemalloc as the global allocator. The SDS stores `Arc<Batch>` and sources share it instead of deep-copying. Add the in-process driver and `perf` profiling to the bench crate. | −23% CPU (measured in-process), plus the 4% spent copying panes. |
-| B. Ingestion fast path | Lower `Scan(matchers) → TimeShift* → TimeRange(pane) → SummaryAgg` to per-sample updates. Each sample is checked against the Scan's matchers once, mapped to a group id, and folded into the updater from `create_planner_accumulator` for its (definition, group, pane end). At close, the states are written to the SDS in the definition's output schema, with the backend's pane rules: left-open panes, first pane skipped, lateness. This covers all 23 ingestion-time outputs of the no-raw example plan. | Summary construction from 10.5 to about 2.3 µs/sample, ASAPQuery's figure on the same data. |
-| C. Query fast path | Evaluate `SummaryMerge → FinalizeExactAccumulator`/`SummaryEstimate → grouped SummaryAgg → Sort/Limit → Project` over (group id, state) columns: merge with `AggregateCore::merge_with`, take grouped top-k with a heap, and decode labels once per output series. Other roots stay on the executor. | Stored-state queries move toward ASAPQuery's 4.1 / 24.8 / 33.5 ms, from 15.4 / 31.1 / 62.2 ms. |
+| B. Per-sample ingestion | Compile the DAG's ingestion side (`Scan(matchers) → TimeShift* → TimeRange(pane) → SummaryAgg`) into per-sample updates. Each sample is checked against the Scan's matchers once, mapped to a group id, and folded into the updater from `create_planner_accumulator` for its (definition, group, pane end). At close, the states are written to the SDS in the definition's output schema, with the backend's pane rules: left-open panes, first pane skipped, lateness. This covers all 23 ingestion-time outputs of the no-raw example plan. | Summary construction from 10.5 to about 2.3 µs/sample, ASAPQuery's figure on the same data. |
+| C. Columnar DAG executor | Make every operator of `asap-executor` columnar, as in "Execution engine: a columnar DAG executor": column batches with selection vectors, interned series and group ids, state columns (exact accumulators as numeric columns, fixed-size sketches in flat buffers, variable-size sketches one object per group). The data plane keeps executing the DAG node by node for every query shape. | Stored-state queries toward ASAPQuery's 4.1 / 24.8 / 33.5 ms, from 15.4 / 31.1 / 62.2 ms, and removal of the 68–75% row-layout overhead. |
 | D. Concurrency and local raw windows | The lowered program is plain `Send` data. Ingestion is sharded across N workers, with the global watermark taken as the minimum of the workers'. Queries run on a pool and read sealed panes concurrently. Each thread that runs executor-path roots compiles its own copy from `plan.json`. Query-time raw windows are read from the local ring buffer; Prometheus remote read (protobuf) covers anything older. The ring buffer costs 16 bytes per sample, so a 60-minute window over 10,000 series is about 38 MB. | Removes the 15.5% of CPU spent on JSON and HTTP, and stops long queries from blocking ingestion and other queries. |
 | E. Cost feedback | The harness writes the runtime's measured per-operation costs, at each stage, as ASAPPlanner `MeasuredOperationCost` input. It plans again and checks Stage 3's predictions against the measured run. | Prediction and measurement agree to within a factor the harness reports; today they differ by 740× (0.072 vs 53). |
 | F. ASAPQuery features | Port OTLP and VictoriaMetrics ingestion, the idle-window close, the query tracker (feeding ASAPPlanner), plan swap at runtime, the Grafana runtime-info endpoint and the PromQL compliance suite. | Feature parity for the PromQL drop-in. |
@@ -331,8 +425,8 @@ The merged runtime keeps ASAPQuery's low-overhead data path and the backend's si
 
 **Risks**
 
-- *Two execution paths can drift.* Mitigated by parity tests per definition and per root, the end-to-end equality suite, and the executor as the reference. The fast paths cover only the shapes that dominate measured cost.
-- *Kernel or state changes on a Planner pin move.* The fast path calls the executor's kernel factory, so it changes with the pin. Parity tests run on every pin move.
+- *A columnar rewrite of every operator is large.* It lands operator by operator in ASAPPlanner behind the existing executor tests, which must pass unchanged; the backend moves its pin once all operators are columnar.
+- *Kernel or state changes on a Planner pin move.* The per-sample updaters come from the operator library, so they change with the pin; the per-sample parity test runs on every pin move.
 - *Sharded watermarks.* A pane closes only when every worker's watermark passes it, as in ASAPQuery. One silent shard holds panes open until the wall-clock policy closes them.
 - *Local raw buffer memory.* It adds memory the Planner does not price. Stage E reports it as a measured cost, and the buffer never holds more than the plan's widest raw window.
 - *Stage 3 keeps choosing query-time plans until Stage E lands.* The harness reports predicted and measured cost side by side, so this stays visible.
@@ -359,8 +453,8 @@ The merged runtime keeps ASAPQuery's low-overhead data path and the backend's si
 | Re-pin the backend to the Planner handoff API and drop its own chain expansion, frontier search and reference rebuild | To build | New PR |
 | Benefit experiment harness and generator | In progress | New PR |
 | A. jemalloc, shared stored panes, in-process driver and profiling in the bench crate | To build | New PR |
-| B. Ingestion fast path: per-sample updates through the executor's kernel factory, with parity tests | To build | New PR |
-| C. Query fast path over state columns for the common root shapes, with parity tests | To build | New PR |
+| B. Per-sample ingestion: the DAG's ingestion side compiled per sample with the library's updaters, with parity tests | To build | New PR |
+| C. Columnar DAG executor in ASAPPlanner (`asap-executor`), all operators, passing the existing executor tests | To build | ASAPPlanner PR |
 | D. Sharded ingestion, concurrent queries, local raw windows and Prometheus remote read | To build | New PR |
 | E. Runtime-measured operation costs fed to the Planner; prediction check in the harness | To build | New PR |
 | F. ASAPQuery features: OTLP, VictoriaMetrics, idle-window close, query tracker, plan swap, compliance suite | To build | New PRs |
