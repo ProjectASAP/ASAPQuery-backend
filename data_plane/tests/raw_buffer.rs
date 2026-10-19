@@ -101,3 +101,45 @@ fn samples_before_startup_come_from_prometheus() {
     assert_eq!(read.older_than_ms, 4 * MINUTE + 30_000);
     assert_eq!(read.samples.len(), 2, "4:45 and 5:00");
 }
+
+/// Each metric is kept for its own longest read, and a metric no raw
+/// window reads is not kept at all.
+#[test]
+fn keeps_each_metric_for_its_own_horizon() {
+    let horizons = BTreeMap::from([
+        ("short".to_string(), MINUTE),
+        ("long".to_string(), 10 * MINUTE),
+    ]);
+    let buffer = RawBuffer::with_horizons(horizons, 2);
+    for metric in ["short", "long", "unread"] {
+        append(&buffer, 2, &samples(metric, 3, 0, 20 * MINUTE + 1));
+    }
+    assert_eq!(
+        buffer.read("short", 0, 20 * MINUTE).older_than_ms,
+        19 * MINUTE
+    );
+    assert_eq!(
+        buffer.read("long", 0, 20 * MINUTE).older_than_ms,
+        10 * MINUTE
+    );
+    assert_eq!(
+        buffer.size(),
+        (6, 3 * 4 + 3 * 40),
+        "unread samples are not kept"
+    );
+}
+
+/// The plan's horizons: Example 1 reads its counter at query time over
+/// 1-minute windows, nothing else.
+#[test]
+fn horizons_come_from_the_plans_query_time_reads() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../examples/planner-layering-example1.json");
+    let workload = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let plan = control_plane::plan_workload(&workload, &control_plane::DeploymentInputs::default())
+        .unwrap();
+    assert_eq!(
+        RawBuffer::horizons(&plan),
+        BTreeMap::from([("http_requests_total".to_string(), MINUTE)])
+    );
+}

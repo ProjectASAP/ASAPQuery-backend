@@ -77,9 +77,10 @@ pub struct EngineOptions {
     pub ingestion_workers: usize,
     /// Query threads; each runs one query at a time.
     pub query_threads: usize,
-    /// How far back from the newest sample the local raw buffer keeps
-    /// samples, in ms; `None` for the plan's longest query-time raw read
-    /// ([`RawBuffer::horizon_ms`]). 0 keeps none: every raw read is a
+    /// How far back from the newest sample the local raw buffer keeps the
+    /// samples of each metric the plan reads at query time, in ms; `None`
+    /// for each metric's longest query-time raw read
+    /// ([`RawBuffer::horizons`]). 0 keeps none: every raw read is a
     /// Prometheus remote read.
     pub raw_buffer_ms: Option<i64>,
 }
@@ -145,13 +146,19 @@ impl EngineHandle {
             ?threads,
             "stored summaries"
         );
-        let raw_buffer_ms = options
-            .raw_buffer_ms
-            .unwrap_or_else(|| RawBuffer::horizon_ms(&plan));
-        tracing::info!(raw_buffer_ms, "local raw buffer");
+        let mut horizons = RawBuffer::horizons(&plan);
+        if let Some(override_ms) = options.raw_buffer_ms {
+            horizons.retain(|_, _| override_ms > 0);
+            horizons.values_mut().for_each(|ms| *ms = override_ms);
+        }
+        tracing::info!(?horizons, "local raw buffer");
         drop(plan);
-        let raw_buffer = (raw_buffer_ms > 0)
-            .then(|| Arc::new(RawBuffer::new(raw_buffer_ms, threads.ingestion_workers)));
+        let raw_buffer = (!horizons.is_empty()).then(|| {
+            Arc::new(RawBuffer::with_horizons(
+                horizons,
+                threads.ingestion_workers,
+            ))
+        });
         let plan_json = Arc::new(plan_json);
         let precompute = Arc::new(Shared::new(threads.ingestion_workers, allowed_lateness_ms));
         let (senders, receivers): (Vec<_>, Vec<_>) = (0..precompute.workers())

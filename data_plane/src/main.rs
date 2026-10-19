@@ -34,9 +34,10 @@ struct Args {
     /// Query threads, each running one query at a time; default one per core.
     #[arg(long)]
     query_threads: Option<usize>,
-    /// How far back from the newest sample to keep raw samples for
-    /// query-time raw windows, in ms; default the plan's longest such read.
-    /// 0 reads every raw window from Prometheus remote read.
+    /// How far back from the newest sample to keep the raw samples of each
+    /// metric read at query time, in ms; default each metric's longest
+    /// query-time read in the plan. 0 reads every raw window from
+    /// Prometheus remote read.
     #[arg(long)]
     raw_buffer_ms: Option<i64>,
 }
