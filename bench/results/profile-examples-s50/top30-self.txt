@@ -1,0 +1,30 @@
+  9.64%  libc.so.6  [.] _int_malloc
+  7.32%  libc.so.6  [.] malloc
+  7.20%  data_plane  [.] <alloc::vec::Vec<asap_executor::values::Value> as core::clone::Clone>::clone
+  7.18%  libc.so.6  [.] _int_free
+  4.63%  libc.so.6  [.] __memcmp_avx2_movbe
+  4.10%  data_plane  [.] <alloc::vec::Vec<asap_executor::values::Value> as core::clone::Clone>::clone
+  3.87%  data_plane  [.] <futures_util::stream::once::Once<asap_executor::operators::summary::execute::{closure#1}> as futures_core::stream::Stream>::poll_next
+  3.17%  libc.so.6  [.] unlink_chunk.constprop.0
+  3.13%  data_plane  [.] _RINvNtCsgxBkk5gSRhY_4core3ptr9drop_glueNtNtCsecISFFU5czm_13asap_executor6values5ValueEBF_.llvm.267838696463950523
+  2.89%  data_plane  [.] <futures_util::stream::once::Once<asap_executor::operators::summary::execute_merge::{closure#1}> as futures_core::stream::Stream>::poll_next
+  2.34%  data_plane  [.] _RINvNtCsgxBkk5gSRhY_4core3ptr9drop_glueNtNtCsecISFFU5czm_13asap_executor6values5ValueECshJlOJ5Kwnsg_10data_plane.llvm.1718860842304579170
+  2.30%  libc.so.6  [.] __memmove_avx_unaligned_erms
+  2.26%  libc.so.6  [.] cfree@GLIBC_2.2.5
+  2.20%  libc.so.6  [.] malloc_consolidate
+  1.81%  data_plane  [.] <asap_executor::values::Value>::bytes
+  1.24%  data_plane  [.] _RNvXs0_NtNtNtCsgxBkk5gSRhY_4core4iter8adapters10filter_mapINtB5_9FilterMapINtNtB7_7flatten7FlatMapINtNtNtBb_5slice4iter4IterINtNtCs6i54tJFfzR_5alloc3vec3VecNtNtCsecISFFU5czm_13asap_executor6values5ValueEEIB1z_B2u_ENCNvMs0_B2w_NtB2w_5Batch5bytes0ENCB3s_s_0ENtNtNtB9_6traits8iterator8Iterator4nextB2y_.llvm.267838696463950523
+  1.15%  data_plane  [.] <alloc::collections::btree::map::Iter<alloc::string::String, alloc::string::String> as core::iter::traits::iterator::Iterator>::cmp_by::<alloc::collections::btree::map::Iter<alloc::string::String, alloc::string::String>, <alloc::collections::btree::map::Iter<alloc::string::String, alloc::string::String> as core::iter::traits::iterator::Iterator>::cmp<alloc::collections::btree::map::Iter<alloc::string::String, alloc::string::String>>::{closure#0}>
+  1.14%  data_plane  [.] <asap_executor::values::Value>::key
+  1.01%  data_plane  [.] _RINvXNtNtCsbFJn7J1gGCs_10serde_json5value2deNtB5_5ValueNtNtCsbvRavrjvCwp_10serde_core2de11Deserialize11deserializeQINtNtB7_2de12DeserializerNtNtB7_4read9SliceReadEECshJlOJ5Kwnsg_10data_plane.llvm.9443396730061063440
+  0.99%  data_plane  [.] <core::iter::adapters::map::Map<core::slice::iter::Iter<core::option::Option<usize>>, asap_executor::operators::scope_timestamp::execute::{closure#1}::{closure#0}::{closure#0}> as core::iter::traits::iterator::Iterator>::fold::<(), core::iter::traits::iterator::Iterator::for_each::call<asap_executor::values::Value, <alloc::vec::Vec<asap_executor::values::Value>>::extend_trusted<core::iter::adapters::map::Map<core::slice::iter::Iter<core::option::Option<usize>>, asap_executor::operators::scope_timestamp::execute::{closure#1}::{closure#0}::{closure#0}>>::{closure#0}>::{closure#0}>
+  0.93%  data_plane  [.] <asap_executor::summary_kernels::exact::ExactAccumulator as asap_executor::summary_kernels::traits::AggregateCore>::approx_memory_bytes
+  0.92%  data_plane  [.] <&mut serde_json::ser::Serializer<&mut alloc::vec::Vec<u8>> as serde_core::ser::Serializer>::serialize_str
+  0.86%  data_plane  [.] <asap_executor::values::Value>::matches
+  0.68%  libc.so.6  [.] realloc
+  0.67%  data_plane  [.] <core::iter::adapters::map::Map<core::slice::iter::Iter<usize>, asap_executor::values::group_key::{closure#0}> as core::iter::traits::iterator::Iterator>::try_fold::<(), <core::iter::adapters::GenericShunt<core::iter::adapters::map::Map<core::slice::iter::Iter<usize>, asap_executor::values::group_key::{closure#0}>, core::result::Result<core::convert::Infallible, asap_executor::error::Error>> as core::iter::traits::iterator::Iterator>::try_fold<(), core::iter::traits::iterator::Iterator::try_for_each::call<alloc::vec::Vec<u8>, core::ops::control_flow::ControlFlow<alloc::vec::Vec<u8>>, core::ops::control_flow::ControlFlow<alloc::vec::Vec<u8>>::Break>::{closure#0}, core::ops::control_flow::ControlFlow<alloc::vec::Vec<u8>>>::{closure#0}, core::ops::control_flow::ControlFlow<core::ops::control_flow::ControlFlow<alloc::vec::Vec<u8>>>>
+  0.59%  data_plane  [.] <alloc::vec::Vec<alloc::vec::Vec<asap_executor::values::Value>> as core::clone::Clone>::clone
+  0.56%  data_plane  [.] <alloc::collections::btree::map::BTreeMap<alloc::vec::Vec<alloc::vec::Vec<u8>>, (alloc::vec::Vec<asap_executor::values::Value>, asap_types::ir::schema::FieldDataType, alloc::sync::Arc<dyn asap_executor::summary_kernels::traits::AggregateCore>)>>::insert
+  0.56%  data_plane  [.] <alloc::vec::Vec<alloc::vec::Vec<asap_executor::values::Value>> as core::ops::drop::Drop>::drop
+  0.55%  data_plane  [.] <alloc::vec::Vec<asap_executor::values::Value> as alloc::vec::spec_from_iter::SpecFromIter<asap_executor::values::Value, core::iter::adapters::GenericShunt<core::iter::adapters::map::Map<core::iter::adapters::enumerate::Enumerate<core::slice::iter::Iter<asap_types::ir::schema::Field>>, asap_executor::physical_planner::promql_rows::series_row::{closure#0}>, core::result::Result<core::convert::Infallible, asap_executor::error::Error>>>>::from_iter
+  0.54%  libc.so.6  [.] _int_realloc

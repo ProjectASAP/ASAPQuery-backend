@@ -43,6 +43,9 @@ pub struct RunConfig {
     pub execution_memory_limit_mib: usize,
 }
 
+/// Series per Remote Write request.
+const WRITE_BATCH: usize = 10_000;
+
 /// One evaluation of one query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Evaluation {
@@ -371,10 +374,16 @@ pub async fn run(
     for t in ticks {
         let samples = generator.step(t);
         samples_written += samples.len() as u64;
-        let body = encode(&write_request(samples, t));
-        post_write(&client, &format!("{prometheus_url}/api/v1/write"), &body).await?;
-        if config.mode == Mode::Asap {
-            post_write(&client, &format!("{data_plane_url}/api/v1/write"), &body).await?;
+        // Requests of at most WRITE_BATCH series stay under the data
+        // plane's request body limit.
+        let mut samples = samples;
+        while !samples.is_empty() {
+            let rest = samples.split_off(samples.len().min(WRITE_BATCH));
+            let body = encode(&write_request(std::mem::replace(&mut samples, rest), t));
+            post_write(&client, &format!("{prometheus_url}/api/v1/write"), &body).await?;
+            if config.mode == Mode::Asap {
+                post_write(&client, &format!("{data_plane_url}/api/v1/write"), &body).await?;
+            }
         }
         // Every evaluation time in (previous tick, t]: its data has arrived.
         let from = previous_tick.map_or(t, |p| p + 1);

@@ -1,0 +1,1436 @@
+[
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 3,
+        "heap_size": 32
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 72.2164
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 3,
+        "heap_size": 32
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 5333.333333333334
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 3,
+        "heap_size": 32
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 457.421875
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 3,
+        "heap_size": 128
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 71.181
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 3,
+        "heap_size": 128
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 21000.0
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 3,
+        "heap_size": 128
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 830.6640625
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 3,
+        "heap_size": 512
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 75.71979999999999
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 3,
+        "heap_size": 512
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 86253.33333333333
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 3,
+        "heap_size": 512
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 1938.2812499999998
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 3,
+        "heap_size": 2048
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 82.47440000000002
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 3,
+        "heap_size": 2048
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 383719.99999999994
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 3,
+        "heap_size": 2048
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 7745.703125
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 3,
+        "heap_size": 32
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 71.16040000000001
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 3,
+        "heap_size": 32
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 5999.999999999999
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 3,
+        "heap_size": 32
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 466.9921875
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 3,
+        "heap_size": 128
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 71.66019999999999
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 3,
+        "heap_size": 128
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 21066.666666666664
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 3,
+        "heap_size": 128
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 946.2890625
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 3,
+        "heap_size": 512
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 73.891
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 3,
+        "heap_size": 512
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 86853.33333333333
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 3,
+        "heap_size": 512
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 1572.265625
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 3,
+        "heap_size": 2048
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 79.60720000000003
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 3,
+        "heap_size": 2048
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 396813.3333333333
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 3,
+        "heap_size": 2048
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 8205.46875
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 3,
+        "heap_size": 32
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 71.354
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 3,
+        "heap_size": 32
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 9266.666666666668
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 3,
+        "heap_size": 32
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 482.6171875
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 3,
+        "heap_size": 128
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 70.93
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 3,
+        "heap_size": 128
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 24413.333333333332
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 3,
+        "heap_size": 128
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 852.734375
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 3,
+        "heap_size": 512
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 71.00260000000002
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 3,
+        "heap_size": 512
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 92453.33333333334
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 3,
+        "heap_size": 512
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 1455.2734375
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 3,
+        "heap_size": 2048
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 79.0268
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 3,
+        "heap_size": 2048
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 423106.66666666674
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 3,
+        "heap_size": 2048
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 7331.4453125
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 3,
+        "heap_size": 32
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 72.9358
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 3,
+        "heap_size": 32
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 33346.666666666664
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 3,
+        "heap_size": 32
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 464.0625
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 3,
+        "heap_size": 128
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 73.02919999999999
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 3,
+        "heap_size": 128
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 49960.0
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 3,
+        "heap_size": 128
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 842.7734375
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 3,
+        "heap_size": 512
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 74.3208
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 3,
+        "heap_size": 512
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 128253.33333333331
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 3,
+        "heap_size": 512
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 1658.203125
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 3,
+        "heap_size": 2048
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 84.23740000000002
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 3,
+        "heap_size": 2048
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 470226.66666666657
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 3,
+        "heap_size": 2048
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 6307.8125
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 5,
+        "heap_size": 32
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 81.79780000000001
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 5,
+        "heap_size": 32
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 6226.666666666667
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 5,
+        "heap_size": 32
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 584.765625
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 5,
+        "heap_size": 128
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 81.91180000000001
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 5,
+        "heap_size": 128
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 22840.0
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 5,
+        "heap_size": 128
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 760.5468750000001
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 5,
+        "heap_size": 512
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 86.2514
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 5,
+        "heap_size": 512
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 96573.33333333331
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 5,
+        "heap_size": 512
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 1604.2968749999998
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 5,
+        "heap_size": 2048
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 94.3994
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 5,
+        "heap_size": 2048
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 416813.33333333343
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 256,
+        "depth": 5,
+        "heap_size": 2048
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 6813.476562500002
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 5,
+        "heap_size": 32
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 81.75540000000001
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 5,
+        "heap_size": 32
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 7666.666666666667
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 5,
+        "heap_size": 32
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 461.5234375
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 5,
+        "heap_size": 128
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 81.6606
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 5,
+        "heap_size": 128
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 25040.0
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 5,
+        "heap_size": 128
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 851.9531250000001
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 5,
+        "heap_size": 512
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 82.4466
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 5,
+        "heap_size": 512
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 94880.0
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 5,
+        "heap_size": 512
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 1637.5000000000002
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 5,
+        "heap_size": 2048
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 92.53800000000001
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 5,
+        "heap_size": 2048
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 437080.0
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 1024,
+        "depth": 5,
+        "heap_size": 2048
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 7335.742187499999
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 5,
+        "heap_size": 32
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 105.611
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 5,
+        "heap_size": 32
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 12253.333333333332
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 5,
+        "heap_size": 32
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 468.16406249999994
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 5,
+        "heap_size": 128
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 105.44960000000002
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 5,
+        "heap_size": 128
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 29906.666666666668
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 5,
+        "heap_size": 128
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 853.1250000000001
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 5,
+        "heap_size": 512
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 105.39419999999997
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 5,
+        "heap_size": 512
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 108760.0
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 5,
+        "heap_size": 512
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 1635.7421875
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 5,
+        "heap_size": 2048
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 114.95240000000003
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 5,
+        "heap_size": 2048
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 483853.3333333333
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 4096,
+        "depth": 5,
+        "heap_size": 2048
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 7136.914062499999
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 5,
+        "heap_size": 32
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 110.7778
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 5,
+        "heap_size": 32
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 72840.0
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 5,
+        "heap_size": 32
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 471.2890625
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 5,
+        "heap_size": 128
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 111.33360000000002
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 5,
+        "heap_size": 128
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 86840.0
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 5,
+        "heap_size": 128
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 851.5624999999999
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 5,
+        "heap_size": 512
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 113.9292
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 5,
+        "heap_size": 512
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 164880.0
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 5,
+        "heap_size": 512
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 1645.3124999999998
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 5,
+        "heap_size": 2048
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 122.47040000000001
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 5,
+        "heap_size": 2048
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 593493.3333333334
+  },
+  {
+    "sketch": {
+      "CmsWithHeap": {
+        "width": 16384,
+        "depth": 5,
+        "heap_size": 2048
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 6960.546875
+  },
+  {
+    "sketch": {
+      "Hll": {
+        "precision": 12
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 3.8462
+  },
+  {
+    "sketch": {
+      "Hll": {
+        "precision": 12
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 3346.666666666666
+  },
+  {
+    "sketch": {
+      "Hll": {
+        "precision": 12
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 49015.72265625
+  },
+  {
+    "sketch": {
+      "Hll": {
+        "precision": 14
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 3.8986000000000005
+  },
+  {
+    "sketch": {
+      "Hll": {
+        "precision": 14
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 13333.333333333332
+  },
+  {
+    "sketch": {
+      "Hll": {
+        "precision": 14
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 156898.19335937497
+  },
+  {
+    "sketch": {
+      "Hll": {
+        "precision": 16
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 3.9890000000000003
+  },
+  {
+    "sketch": {
+      "Hll": {
+        "precision": 16
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 55306.666666666664
+  },
+  {
+    "sketch": {
+      "Hll": {
+        "precision": 16
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 337410.44921875
+  },
+  {
+    "sketch": {
+      "Kll": {
+        "k": 50
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 30.086199999999998
+  },
+  {
+    "sketch": {
+      "Kll": {
+        "k": 50
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 3386.6666666666665
+  },
+  {
+    "sketch": {
+      "Kll": {
+        "k": 50
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 2780.19801980198
+  },
+  {
+    "sketch": {
+      "Kll": {
+        "k": 200
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 30.5292
+  },
+  {
+    "sketch": {
+      "Kll": {
+        "k": 200
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 6253.333333333332
+  },
+  {
+    "sketch": {
+      "Kll": {
+        "k": 200
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 6835.6435643564355
+  },
+  {
+    "sketch": {
+      "Kll": {
+        "k": 800
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 29.3842
+  },
+  {
+    "sketch": {
+      "Kll": {
+        "k": 800
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 11146.666666666666
+  },
+  {
+    "sketch": {
+      "Kll": {
+        "k": 800
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 48895.04950495049
+  },
+  {
+    "sketch": {
+      "DDSketch": {
+        "alpha": 0.005
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 18.953
+  },
+  {
+    "sketch": {
+      "DDSketch": {
+        "alpha": 0.005
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 8213.333333333336
+  },
+  {
+    "sketch": {
+      "DDSketch": {
+        "alpha": 0.005
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 176.23762376237627
+  },
+  {
+    "sketch": {
+      "DDSketch": {
+        "alpha": 0.01
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 18.9298
+  },
+  {
+    "sketch": {
+      "DDSketch": {
+        "alpha": 0.01
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 866.6666666666669
+  },
+  {
+    "sketch": {
+      "DDSketch": {
+        "alpha": 0.01
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 148.51485148514848
+  },
+  {
+    "sketch": {
+      "DDSketch": {
+        "alpha": 0.02
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 18.850399999999997
+  },
+  {
+    "sketch": {
+      "DDSketch": {
+        "alpha": 0.02
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 546.6666666666667
+  },
+  {
+    "sketch": {
+      "DDSketch": {
+        "alpha": 0.02
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 136.6336633663367
+  },
+  {
+    "sketch": {
+      "DDSketch": {
+        "alpha": 0.05
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 20.864600000000003
+  },
+  {
+    "sketch": {
+      "DDSketch": {
+        "alpha": 0.05
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 453.3333333333333
+  },
+  {
+    "sketch": {
+      "DDSketch": {
+        "alpha": 0.05
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 120.79207920792079
+  },
+  {
+    "sketch": {
+      "Kll": {
+        "k": 25
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 29.846799999999998
+  },
+  {
+    "sketch": {
+      "Kll": {
+        "k": 25
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 3480.0
+  },
+  {
+    "sketch": {
+      "Kll": {
+        "k": 25
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 2671.287128712871
+  },
+  {
+    "sketch": {
+      "Kll": {
+        "k": 100
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 30.1354
+  },
+  {
+    "sketch": {
+      "Kll": {
+        "k": 100
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 4640.000000000001
+  },
+  {
+    "sketch": {
+      "Kll": {
+        "k": 100
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 3843.5643564356433
+  },
+  {
+    "sketch": {
+      "Kll": {
+        "k": 400
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 30.938399999999998
+  },
+  {
+    "sketch": {
+      "Kll": {
+        "k": 400
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 11346.666666666668
+  },
+  {
+    "sketch": {
+      "Kll": {
+        "k": 400
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 13297.029702970296
+  },
+  {
+    "sketch": {
+      "DDSketch": {
+        "alpha": 0.1
+      }
+    },
+    "operation": "update",
+    "cpu_ns_per_operation": 18.831000000000003
+  },
+  {
+    "sketch": {
+      "DDSketch": {
+        "alpha": 0.1
+      }
+    },
+    "operation": "merge",
+    "cpu_ns_per_operation": 413.33333333333337
+  },
+  {
+    "sketch": {
+      "DDSketch": {
+        "alpha": 0.1
+      }
+    },
+    "operation": "estimate",
+    "cpu_ns_per_operation": 118.8118811881188
+  }
+]

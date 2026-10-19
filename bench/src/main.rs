@@ -121,6 +121,10 @@ struct WorkloadArgs {
     /// Accuracy target of every rule (for `--workload kube`).
     #[arg(long, default_value = EXACT)]
     accuracy: String,
+    /// Only these kept rules, by name (for `--workload kube`): the Planner
+    /// cannot plan every kept rule at once.
+    #[arg(long, value_delimiter = ',')]
+    only_rules: Vec<String>,
     #[command(flatten)]
     scale: ScaleArgs,
 }
@@ -137,7 +141,10 @@ impl WorkloadArgs {
                     .rules
                     .as_ref()
                     .context("--rules is required for --workload kube")?;
-                let survey: Vec<rules::SurveyedRule> = read_json(path)?;
+                let mut survey: Vec<rules::SurveyedRule> = read_json(path)?;
+                if !self.only_rules.is_empty() {
+                    survey.retain(|r| self.only_rules.contains(&r.rule.name));
+                }
                 workloads::kube_rules(
                     &survey,
                     self.scale.scale(),

@@ -1,0 +1,844 @@
+[
+  {
+    "name": "etcdMembersDown",
+    "query": "max without (endpoint) (sum without (instance, pod) (up{job=~\".*etcd.*\"} == bool 0) or count without (To) (sum without (instance, pod) (rate(etcd_network_peer_sent_failures_total{job=~\".*etcd.*\"}[2m])) > 0.01)) > 0",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "etcd",
+    "metrics": [
+      "etcd_network_peer_sent_failures_total",
+      "up"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 19: invalid DAG: grouping without requires resolved label columns"
+  },
+  {
+    "name": "etcdInsufficientMembers",
+    "query": "sum without (instance, pod) (up{job=~\".*etcd.*\"} == bool 1) < ((count without (instance, pod) (up{job=~\".*etcd.*\"}) + 1) / 2)",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "etcd",
+    "metrics": [
+      "up"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 5: invalid DAG: grouping without requires resolved label columns"
+  },
+  {
+    "name": "etcdNoLeader",
+    "query": "etcd_server_has_leader{job=~\".*etcd.*\"} == 0",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "etcd",
+    "metrics": [
+      "etcd_server_has_leader"
+    ],
+    "dropped": "data plane (evaluation over generated samples): execution failed: invalid DAG: unsupported scalar expression: Compare { left: Column(2), op: Regex, right: Literal(Utf8(\".*etcd.*\")), semantics: Promql }"
+  },
+  {
+    "name": "etcdHighNumberOfLeaderChanges",
+    "query": "increase((max without (instance, pod) (etcd_server_leader_changes_seen_total{job=~\".*etcd.*\"}) or 0 * absent(etcd_server_leader_changes_seen_total{job=~\".*etcd.*\"}))[15m:1m]) >= 4",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "etcd",
+    "metrics": [
+      "etcd_server_leader_changes_seen_total"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 6: per-entity aggregate requires an explicit entity binding"
+  },
+  {
+    "name": "etcdHighNumberOfFailedGRPCRequests",
+    "query": "100 * sum without (grpc_type, grpc_code) (rate(grpc_server_handled_total{grpc_code=~\"Unknown|FailedPrecondition|ResourceExhausted|Internal|Unavailable|DataLoss|DeadlineExceeded\",job=~\".*etcd.*\"}[5m])) / sum without (grpc_type, grpc_code) (rate(grpc_server_handled_total{job=~\".*etcd.*\"}[5m])) > 1",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "etcd",
+    "metrics": [
+      "grpc_server_handled_total"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 11: invalid DAG: grouping without requires resolved label columns"
+  },
+  {
+    "name": "etcdHighNumberOfFailedGRPCRequests",
+    "query": "100 * sum without (grpc_type, grpc_code) (rate(grpc_server_handled_total{grpc_code=~\"Unknown|FailedPrecondition|ResourceExhausted|Internal|Unavailable|DataLoss|DeadlineExceeded\",job=~\".*etcd.*\"}[5m])) / sum without (grpc_type, grpc_code) (rate(grpc_server_handled_total{job=~\".*etcd.*\"}[5m])) > 5",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "etcd",
+    "metrics": [
+      "grpc_server_handled_total"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 11: invalid DAG: grouping without requires resolved label columns"
+  },
+  {
+    "name": "etcdGRPCRequestsSlow",
+    "query": "histogram_quantile(0.99, sum without (grpc_type) (rate(grpc_server_handling_seconds_bucket{grpc_method!=\"Defragment\",grpc_type=\"unary\",job=~\".*etcd.*\"}[5m]))) > 0.15",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "etcd",
+    "metrics": [
+      "grpc_server_handling_seconds_bucket"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 4: invalid DAG: grouping without requires resolved label columns"
+  },
+  {
+    "name": "etcdMemberCommunicationSlow",
+    "query": "histogram_quantile(0.99, rate(etcd_network_peer_round_trip_time_seconds_bucket{job=~\".*etcd.*\"}[5m])) > 0.15",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "etcd",
+    "metrics": [
+      "etcd_network_peer_round_trip_time_seconds_bucket"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 4: invalid DAG: aggregate intent has no native implementation"
+  },
+  {
+    "name": "etcdHighNumberOfFailedProposals",
+    "query": "rate(etcd_server_proposals_failed_total{job=~\".*etcd.*\"}[15m]) > 5",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "etcd",
+    "metrics": [
+      "etcd_server_proposals_failed_total"
+    ],
+    "dropped": "data plane (evaluation over generated samples): execution failed: invalid DAG: unsupported scalar expression: Compare { left: Column(2), op: Regex, right: Literal(Utf8(\".*etcd.*\")), semantics: Promql }"
+  },
+  {
+    "name": "etcdHighFsyncDurations",
+    "query": "histogram_quantile(0.99, rate(etcd_disk_wal_fsync_duration_seconds_bucket{job=~\".*etcd.*\"}[5m])) > 0.5",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "etcd",
+    "metrics": [
+      "etcd_disk_wal_fsync_duration_seconds_bucket"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 4: invalid DAG: aggregate intent has no native implementation"
+  },
+  {
+    "name": "etcdHighFsyncDurations",
+    "query": "histogram_quantile(0.99, rate(etcd_disk_wal_fsync_duration_seconds_bucket{job=~\".*etcd.*\"}[5m])) > 1",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "etcd",
+    "metrics": [
+      "etcd_disk_wal_fsync_duration_seconds_bucket"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 4: invalid DAG: aggregate intent has no native implementation"
+  },
+  {
+    "name": "etcdHighCommitDurations",
+    "query": "histogram_quantile(0.99, rate(etcd_disk_backend_commit_duration_seconds_bucket{job=~\".*etcd.*\"}[5m])) > 0.25",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "etcd",
+    "metrics": [
+      "etcd_disk_backend_commit_duration_seconds_bucket"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 4: invalid DAG: aggregate intent has no native implementation"
+  },
+  {
+    "name": "etcdDatabaseQuotaLowSpace",
+    "query": "(last_over_time(etcd_mvcc_db_total_size_in_bytes{job=~\".*etcd.*\"}[5m]) / last_over_time(etcd_server_quota_backend_bytes{job=~\".*etcd.*\"}[5m])) * 100 > 95",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "etcd",
+    "metrics": [
+      "etcd_mvcc_db_total_size_in_bytes",
+      "etcd_server_quota_backend_bytes"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 5: per-entity aggregate requires an explicit entity binding"
+  },
+  {
+    "name": "etcdExcessiveDatabaseGrowth",
+    "query": "predict_linear(etcd_mvcc_db_total_size_in_bytes{job=~\".*etcd.*\"}[4h], 4 * 60 * 60) > etcd_server_quota_backend_bytes{job=~\".*etcd.*\"}",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "etcd",
+    "metrics": [
+      "etcd_mvcc_db_total_size_in_bytes",
+      "etcd_server_quota_backend_bytes"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 2: per-entity aggregate requires an explicit entity binding"
+  },
+  {
+    "name": "etcdDatabaseHighFragmentationRatio",
+    "query": "(last_over_time(etcd_mvcc_db_total_size_in_use_in_bytes{job=~\".*etcd.*\"}[5m]) / last_over_time(etcd_mvcc_db_total_size_in_bytes{job=~\".*etcd.*\"}[5m])) < 0.5 and etcd_mvcc_db_total_size_in_use_in_bytes{job=~\".*etcd.*\"} > 104857600",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "etcd",
+    "metrics": [
+      "etcd_mvcc_db_total_size_in_bytes",
+      "etcd_mvcc_db_total_size_in_use_in_bytes"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 5: per-entity aggregate requires an explicit entity binding"
+  },
+  {
+    "name": "code_verb:apiserver_request_total:increase30d",
+    "query": "avg_over_time(code_verb:apiserver_request_total:increase1h[30d]) * 24 * 30",
+    "interval_seconds": 180,
+    "type": "recording",
+    "group": "kube-apiserver-availability.rules",
+    "metrics": [],
+    "dropped": "reads recording-rule output code_verb:apiserver_request_total:increase1h; the generator writes raw series only"
+  },
+  {
+    "name": "code:apiserver_request_total:increase30d",
+    "query": "sum by (cluster, code) (code_verb:apiserver_request_total:increase30d{verb=~\"LIST|GET\"})",
+    "interval_seconds": 180,
+    "type": "recording",
+    "group": "kube-apiserver-availability.rules",
+    "metrics": [],
+    "dropped": "reads recording-rule output code_verb:apiserver_request_total:increase30d; the generator writes raw series only"
+  },
+  {
+    "name": "code:apiserver_request_total:increase30d",
+    "query": "sum by (cluster, code) (code_verb:apiserver_request_total:increase30d{verb=~\"POST|PUT|PATCH|DELETE\"})",
+    "interval_seconds": 180,
+    "type": "recording",
+    "group": "kube-apiserver-availability.rules",
+    "metrics": [],
+    "dropped": "reads recording-rule output code_verb:apiserver_request_total:increase30d; the generator writes raw series only"
+  },
+  {
+    "name": "cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase1h",
+    "query": "sum by (cluster, verb, scope, le) (increase(apiserver_request_sli_duration_seconds_bucket[1h]))",
+    "interval_seconds": 180,
+    "type": "recording",
+    "group": "kube-apiserver-availability.rules",
+    "metrics": [
+      "apiserver_request_sli_duration_seconds_bucket"
+    ],
+    "dropped": null
+  },
+  {
+    "name": "cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase30d",
+    "query": "sum by (cluster, verb, scope, le) (avg_over_time(cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase1h[30d]) * 24 * 30)",
+    "interval_seconds": 180,
+    "type": "recording",
+    "group": "kube-apiserver-availability.rules",
+    "metrics": [],
+    "dropped": "reads recording-rule output cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase1h; the generator writes raw series only"
+  },
+  {
+    "name": "cluster_verb_scope:apiserver_request_sli_duration_seconds_count:increase1h",
+    "query": "sum by (cluster, verb, scope) (cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase1h{le=\"+Inf\"})",
+    "interval_seconds": 180,
+    "type": "recording",
+    "group": "kube-apiserver-availability.rules",
+    "metrics": [],
+    "dropped": "reads recording-rule output cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase1h; the generator writes raw series only"
+  },
+  {
+    "name": "cluster_verb_scope:apiserver_request_sli_duration_seconds_count:increase30d",
+    "query": "sum by (cluster, verb, scope) (cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase30d{le=\"+Inf\"})",
+    "interval_seconds": 180,
+    "type": "recording",
+    "group": "kube-apiserver-availability.rules",
+    "metrics": [],
+    "dropped": "reads recording-rule output cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase30d; the generator writes raw series only"
+  },
+  {
+    "name": "apiserver_request:availability30d",
+    "query": "1 - ((sum by (cluster) (cluster_verb_scope:apiserver_request_sli_duration_seconds_count:increase30d{verb=~\"POST|PUT|PATCH|DELETE\"}) - sum by (cluster) (cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase30d{le=~\"1(\\\\.0)?\",verb=~\"POST|PUT|PATCH|DELETE\"} or vector(0))) + (sum by (cluster) (cluster_verb_scope:apiserver_request_sli_duration_seconds_count:increase30d{verb=~\"LIST|GET\"}) - (sum by (cluster) (cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase30d{le=~\"1(\\\\.0)?\",scope=~\"resource|\",verb=~\"LIST|GET\"} or vector(0)) + sum by (cluster) (cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase30d{le=~\"5(\\\\.0)?\",scope=\"namespace\",verb=~\"LIST|GET\"} or vector(0)) + sum by (cluster) (cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase30d{le=~\"30(\\\\.0)?\",scope=\"cluster\",verb=~\"LIST|GET\"} or vector(0)))) + sum by (cluster) (code:apiserver_request_total:increase30d{code=~\"5..\"} or vector(0))) / sum by (cluster) (code:apiserver_request_total:increase30d)",
+    "interval_seconds": 180,
+    "type": "recording",
+    "group": "kube-apiserver-availability.rules",
+    "metrics": [],
+    "dropped": "reads recording-rule output cluster_verb_scope:apiserver_request_sli_duration_seconds_count:increase30d, cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase30d, code:apiserver_request_total:increase30d; the generator writes raw series only"
+  },
+  {
+    "name": "apiserver_request:availability30d",
+    "query": "1 - (sum by (cluster) (cluster_verb_scope:apiserver_request_sli_duration_seconds_count:increase30d{verb=~\"LIST|GET\"}) - (sum by (cluster) (cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase30d{le=~\"1(\\\\.0)?\",scope=~\"resource|\",verb=~\"LIST|GET\"} or vector(0)) + sum by (cluster) (cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase30d{le=~\"5(\\\\.0)?\",scope=\"namespace\",verb=~\"LIST|GET\"} or vector(0)) + sum by (cluster) (cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase30d{le=~\"30(\\\\.0)?\",scope=\"cluster\",verb=~\"LIST|GET\"} or vector(0))) + sum by (cluster) (code:apiserver_request_total:increase30d{code=~\"5..\",verb=\"read\"} or vector(0))) / sum by (cluster) (code:apiserver_request_total:increase30d{verb=\"read\"})",
+    "interval_seconds": 180,
+    "type": "recording",
+    "group": "kube-apiserver-availability.rules",
+    "metrics": [],
+    "dropped": "reads recording-rule output cluster_verb_scope:apiserver_request_sli_duration_seconds_count:increase30d, cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase30d, code:apiserver_request_total:increase30d; the generator writes raw series only"
+  },
+  {
+    "name": "apiserver_request:availability30d",
+    "query": "1 - ((sum by (cluster) (cluster_verb_scope:apiserver_request_sli_duration_seconds_count:increase30d{verb=~\"POST|PUT|PATCH|DELETE\"}) - sum by (cluster) (cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase30d{le=~\"1(\\\\.0)?\",verb=~\"POST|PUT|PATCH|DELETE\"} or vector(0))) + sum by (cluster) (code:apiserver_request_total:increase30d{code=~\"5..\",verb=\"write\"} or vector(0))) / sum by (cluster) (code:apiserver_request_total:increase30d{verb=\"write\"})",
+    "interval_seconds": 180,
+    "type": "recording",
+    "group": "kube-apiserver-availability.rules",
+    "metrics": [],
+    "dropped": "reads recording-rule output cluster_verb_scope:apiserver_request_sli_duration_seconds_count:increase30d, cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase30d, code:apiserver_request_total:increase30d; the generator writes raw series only"
+  },
+  {
+    "name": "code_resource:apiserver_request_total:rate5m",
+    "query": "sum by (cluster, code, resource) (rate(apiserver_request_total{job=\"apiserver\",verb=~\"LIST|GET\"}[5m]))",
+    "interval_seconds": 180,
+    "type": "recording",
+    "group": "kube-apiserver-availability.rules",
+    "metrics": [
+      "apiserver_request_total"
+    ],
+    "dropped": "data plane (evaluation over generated samples): execution failed: invalid DAG: unsupported scalar expression: Compare { left: Column(6), op: Regex, right: Literal(Utf8(\"LIST|GET\")), semantics: Promql }"
+  },
+  {
+    "name": "code_resource:apiserver_request_total:rate5m",
+    "query": "sum by (cluster, code, resource) (rate(apiserver_request_total{job=\"apiserver\",verb=~\"POST|PUT|PATCH|DELETE\"}[5m]))",
+    "interval_seconds": 180,
+    "type": "recording",
+    "group": "kube-apiserver-availability.rules",
+    "metrics": [
+      "apiserver_request_total"
+    ],
+    "dropped": "data plane (evaluation over generated samples): execution failed: invalid DAG: unsupported scalar expression: Compare { left: Column(6), op: Regex, right: Literal(Utf8(\"POST|PUT|PATCH|DELETE\")), semantics: Promql }"
+  },
+  {
+    "name": "code_verb:apiserver_request_total:increase1h",
+    "query": "sum by (cluster, code, verb) (increase(apiserver_request_total{code=~\"2..\",job=\"apiserver\",verb=~\"LIST|GET|POST|PUT|PATCH|DELETE\"}[1h]))",
+    "interval_seconds": 180,
+    "type": "recording",
+    "group": "kube-apiserver-availability.rules",
+    "metrics": [
+      "apiserver_request_total"
+    ],
+    "dropped": "data plane (evaluation over generated samples): execution failed: invalid DAG: unsupported scalar expression: Compare { left: Column(3), op: Regex, right: Literal(Utf8(\"2..\")), semantics: Promql }"
+  },
+  {
+    "name": "code_verb:apiserver_request_total:increase1h",
+    "query": "sum by (cluster, code, verb) (increase(apiserver_request_total{code=~\"3..\",job=\"apiserver\",verb=~\"LIST|GET|POST|PUT|PATCH|DELETE\"}[1h]))",
+    "interval_seconds": 180,
+    "type": "recording",
+    "group": "kube-apiserver-availability.rules",
+    "metrics": [
+      "apiserver_request_total"
+    ],
+    "dropped": "data plane (evaluation over generated samples): execution failed: invalid DAG: unsupported scalar expression: Compare { left: Column(3), op: Regex, right: Literal(Utf8(\"3..\")), semantics: Promql }"
+  },
+  {
+    "name": "code_verb:apiserver_request_total:increase1h",
+    "query": "sum by (cluster, code, verb) (increase(apiserver_request_total{code=~\"4..\",job=\"apiserver\",verb=~\"LIST|GET|POST|PUT|PATCH|DELETE\"}[1h]))",
+    "interval_seconds": 180,
+    "type": "recording",
+    "group": "kube-apiserver-availability.rules",
+    "metrics": [
+      "apiserver_request_total"
+    ],
+    "dropped": "data plane (evaluation over generated samples): execution failed: invalid DAG: unsupported scalar expression: Compare { left: Column(3), op: Regex, right: Literal(Utf8(\"4..\")), semantics: Promql }"
+  },
+  {
+    "name": "code_verb:apiserver_request_total:increase1h",
+    "query": "sum by (cluster, code, verb) (increase(apiserver_request_total{code=~\"5..\",job=\"apiserver\",verb=~\"LIST|GET|POST|PUT|PATCH|DELETE\"}[1h]))",
+    "interval_seconds": 180,
+    "type": "recording",
+    "group": "kube-apiserver-availability.rules",
+    "metrics": [
+      "apiserver_request_total"
+    ],
+    "dropped": "data plane (evaluation over generated samples): execution failed: invalid DAG: unsupported scalar expression: Compare { left: Column(3), op: Regex, right: Literal(Utf8(\"5..\")), semantics: Promql }"
+  },
+  {
+    "name": "apiserver_request:burnrate1d",
+    "query": "((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_count{job=\"apiserver\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[1d])) - ((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"1(\\\\.0)?\",scope=~\"resource|\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[1d])) or vector(0)) + sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"5(\\\\.0)?\",scope=\"namespace\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[1d])) + sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"30(\\\\.0)?\",scope=\"cluster\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[1d])))) + sum by (cluster) (rate(apiserver_request_total{code=~\"5..\",job=\"apiserver\",verb=~\"LIST|GET\"}[1d]))) / sum by (cluster) (rate(apiserver_request_total{job=\"apiserver\",verb=~\"LIST|GET\"}[1d]))",
+    "interval_seconds": 30,
+    "type": "recording",
+    "group": "kube-apiserver-burnrate.rules",
+    "metrics": [
+      "apiserver_request_sli_duration_seconds_bucket",
+      "apiserver_request_sli_duration_seconds_count",
+      "apiserver_request_total"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 17288: invalid DAG: native Planner binding currently requires a unary operation or an explicit source"
+  },
+  {
+    "name": "apiserver_request:burnrate1h",
+    "query": "((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_count{job=\"apiserver\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[1h])) - ((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"1(\\\\.0)?\",scope=~\"resource|\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[1h])) or vector(0)) + sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"5(\\\\.0)?\",scope=\"namespace\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[1h])) + sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"30(\\\\.0)?\",scope=\"cluster\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[1h])))) + sum by (cluster) (rate(apiserver_request_total{code=~\"5..\",job=\"apiserver\",verb=~\"LIST|GET\"}[1h]))) / sum by (cluster) (rate(apiserver_request_total{job=\"apiserver\",verb=~\"LIST|GET\"}[1h]))",
+    "interval_seconds": 30,
+    "type": "recording",
+    "group": "kube-apiserver-burnrate.rules",
+    "metrics": [
+      "apiserver_request_sli_duration_seconds_bucket",
+      "apiserver_request_sli_duration_seconds_count",
+      "apiserver_request_total"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 728: invalid DAG: native Planner binding currently requires a unary operation or an explicit source"
+  },
+  {
+    "name": "apiserver_request:burnrate2h",
+    "query": "((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_count{job=\"apiserver\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[2h])) - ((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"1(\\\\.0)?\",scope=~\"resource|\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[2h])) or vector(0)) + sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"5(\\\\.0)?\",scope=\"namespace\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[2h])) + sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"30(\\\\.0)?\",scope=\"cluster\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[2h])))) + sum by (cluster) (rate(apiserver_request_total{code=~\"5..\",job=\"apiserver\",verb=~\"LIST|GET\"}[2h]))) / sum by (cluster) (rate(apiserver_request_total{job=\"apiserver\",verb=~\"LIST|GET\"}[2h]))",
+    "interval_seconds": 30,
+    "type": "recording",
+    "group": "kube-apiserver-burnrate.rules",
+    "metrics": [
+      "apiserver_request_sli_duration_seconds_bucket",
+      "apiserver_request_sli_duration_seconds_count",
+      "apiserver_request_total"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 1448: invalid DAG: native Planner binding currently requires a unary operation or an explicit source"
+  },
+  {
+    "name": "apiserver_request:burnrate30m",
+    "query": "((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_count{job=\"apiserver\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[30m])) - ((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"1(\\\\.0)?\",scope=~\"resource|\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[30m])) or vector(0)) + sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"5(\\\\.0)?\",scope=\"namespace\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[30m])) + sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"30(\\\\.0)?\",scope=\"cluster\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[30m])))) + sum by (cluster) (rate(apiserver_request_total{code=~\"5..\",job=\"apiserver\",verb=~\"LIST|GET\"}[30m]))) / sum by (cluster) (rate(apiserver_request_total{job=\"apiserver\",verb=~\"LIST|GET\"}[30m]))",
+    "interval_seconds": 30,
+    "type": "recording",
+    "group": "kube-apiserver-burnrate.rules",
+    "metrics": [
+      "apiserver_request_sli_duration_seconds_bucket",
+      "apiserver_request_sli_duration_seconds_count",
+      "apiserver_request_total"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 368: invalid DAG: native Planner binding currently requires a unary operation or an explicit source"
+  },
+  {
+    "name": "apiserver_request:burnrate3d",
+    "query": "((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_count{job=\"apiserver\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[3d])) - ((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"1(\\\\.0)?\",scope=~\"resource|\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[3d])) or vector(0)) + sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"5(\\\\.0)?\",scope=\"namespace\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[3d])) + sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"30(\\\\.0)?\",scope=\"cluster\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[3d])))) + sum by (cluster) (rate(apiserver_request_total{code=~\"5..\",job=\"apiserver\",verb=~\"LIST|GET\"}[3d]))) / sum by (cluster) (rate(apiserver_request_total{job=\"apiserver\",verb=~\"LIST|GET\"}[3d]))",
+    "interval_seconds": 30,
+    "type": "recording",
+    "group": "kube-apiserver-burnrate.rules",
+    "metrics": [
+      "apiserver_request_sli_duration_seconds_bucket",
+      "apiserver_request_sli_duration_seconds_count",
+      "apiserver_request_total"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 51848: invalid DAG: native Planner binding currently requires a unary operation or an explicit source"
+  },
+  {
+    "name": "apiserver_request:burnrate5m",
+    "query": "((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_count{job=\"apiserver\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[5m])) - ((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"1(\\\\.0)?\",scope=~\"resource|\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[5m])) or vector(0)) + sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"5(\\\\.0)?\",scope=\"namespace\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[5m])) + sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"30(\\\\.0)?\",scope=\"cluster\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[5m])))) + sum by (cluster) (rate(apiserver_request_total{code=~\"5..\",job=\"apiserver\",verb=~\"LIST|GET\"}[5m]))) / sum by (cluster) (rate(apiserver_request_total{job=\"apiserver\",verb=~\"LIST|GET\"}[5m]))",
+    "interval_seconds": 30,
+    "type": "recording",
+    "group": "kube-apiserver-burnrate.rules",
+    "metrics": [
+      "apiserver_request_sli_duration_seconds_bucket",
+      "apiserver_request_sli_duration_seconds_count",
+      "apiserver_request_total"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 68: invalid DAG: native Planner binding currently requires a unary operation or an explicit source"
+  },
+  {
+    "name": "apiserver_request:burnrate6h",
+    "query": "((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_count{job=\"apiserver\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[6h])) - ((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"1(\\\\.0)?\",scope=~\"resource|\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[6h])) or vector(0)) + sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"5(\\\\.0)?\",scope=\"namespace\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[6h])) + sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"30(\\\\.0)?\",scope=\"cluster\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[6h])))) + sum by (cluster) (rate(apiserver_request_total{code=~\"5..\",job=\"apiserver\",verb=~\"LIST|GET\"}[6h]))) / sum by (cluster) (rate(apiserver_request_total{job=\"apiserver\",verb=~\"LIST|GET\"}[6h]))",
+    "interval_seconds": 30,
+    "type": "recording",
+    "group": "kube-apiserver-burnrate.rules",
+    "metrics": [
+      "apiserver_request_sli_duration_seconds_bucket",
+      "apiserver_request_sli_duration_seconds_count",
+      "apiserver_request_total"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 4328: invalid DAG: native Planner binding currently requires a unary operation or an explicit source"
+  },
+  {
+    "name": "apiserver_request:burnrate1d",
+    "query": "((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_count{job=\"apiserver\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"POST|PUT|PATCH|DELETE\"}[1d])) - sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"1(\\\\.0)?\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"POST|PUT|PATCH|DELETE\"}[1d]))) + sum by (cluster) (rate(apiserver_request_total{code=~\"5..\",job=\"apiserver\",verb=~\"POST|PUT|PATCH|DELETE\"}[1d]))) / sum by (cluster) (rate(apiserver_request_total{job=\"apiserver\",verb=~\"POST|PUT|PATCH|DELETE\"}[1d]))",
+    "interval_seconds": 30,
+    "type": "recording",
+    "group": "kube-apiserver-burnrate.rules",
+    "metrics": [
+      "apiserver_request_sli_duration_seconds_bucket",
+      "apiserver_request_sli_duration_seconds_count",
+      "apiserver_request_total"
+    ],
+    "dropped": "data plane (evaluation over generated samples): execution failed: invalid DAG: unsupported scalar expression: Compare { left: Column(4), op: Regex, right: Literal(Utf8(\"POST|PUT|PATCH|DELETE\")), semantics: Promql }"
+  },
+  {
+    "name": "apiserver_request:burnrate1h",
+    "query": "((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_count{job=\"apiserver\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"POST|PUT|PATCH|DELETE\"}[1h])) - sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"1(\\\\.0)?\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"POST|PUT|PATCH|DELETE\"}[1h]))) + sum by (cluster) (rate(apiserver_request_total{code=~\"5..\",job=\"apiserver\",verb=~\"POST|PUT|PATCH|DELETE\"}[1h]))) / sum by (cluster) (rate(apiserver_request_total{job=\"apiserver\",verb=~\"POST|PUT|PATCH|DELETE\"}[1h]))",
+    "interval_seconds": 30,
+    "type": "recording",
+    "group": "kube-apiserver-burnrate.rules",
+    "metrics": [
+      "apiserver_request_sli_duration_seconds_bucket",
+      "apiserver_request_sli_duration_seconds_count",
+      "apiserver_request_total"
+    ],
+    "dropped": "data plane (evaluation over generated samples): execution failed: invalid DAG: unsupported scalar expression: Compare { left: Column(4), op: Regex, right: Literal(Utf8(\"POST|PUT|PATCH|DELETE\")), semantics: Promql }"
+  },
+  {
+    "name": "apiserver_request:burnrate2h",
+    "query": "((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_count{job=\"apiserver\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"POST|PUT|PATCH|DELETE\"}[2h])) - sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"1(\\\\.0)?\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"POST|PUT|PATCH|DELETE\"}[2h]))) + sum by (cluster) (rate(apiserver_request_total{code=~\"5..\",job=\"apiserver\",verb=~\"POST|PUT|PATCH|DELETE\"}[2h]))) / sum by (cluster) (rate(apiserver_request_total{job=\"apiserver\",verb=~\"POST|PUT|PATCH|DELETE\"}[2h]))",
+    "interval_seconds": 30,
+    "type": "recording",
+    "group": "kube-apiserver-burnrate.rules",
+    "metrics": [
+      "apiserver_request_sli_duration_seconds_bucket",
+      "apiserver_request_sli_duration_seconds_count",
+      "apiserver_request_total"
+    ],
+    "dropped": "data plane (evaluation over generated samples): execution failed: invalid DAG: unsupported scalar expression: Compare { left: Column(4), op: Regex, right: Literal(Utf8(\"POST|PUT|PATCH|DELETE\")), semantics: Promql }"
+  },
+  {
+    "name": "apiserver_request:burnrate30m",
+    "query": "((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_count{job=\"apiserver\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"POST|PUT|PATCH|DELETE\"}[30m])) - sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"1(\\\\.0)?\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"POST|PUT|PATCH|DELETE\"}[30m]))) + sum by (cluster) (rate(apiserver_request_total{code=~\"5..\",job=\"apiserver\",verb=~\"POST|PUT|PATCH|DELETE\"}[30m]))) / sum by (cluster) (rate(apiserver_request_total{job=\"apiserver\",verb=~\"POST|PUT|PATCH|DELETE\"}[30m]))",
+    "interval_seconds": 30,
+    "type": "recording",
+    "group": "kube-apiserver-burnrate.rules",
+    "metrics": [
+      "apiserver_request_sli_duration_seconds_bucket",
+      "apiserver_request_sli_duration_seconds_count",
+      "apiserver_request_total"
+    ],
+    "dropped": "data plane (evaluation over generated samples): execution failed: invalid DAG: unsupported scalar expression: Compare { left: Column(4), op: Regex, right: Literal(Utf8(\"POST|PUT|PATCH|DELETE\")), semantics: Promql }"
+  },
+  {
+    "name": "apiserver_request:burnrate3d",
+    "query": "((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_count{job=\"apiserver\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"POST|PUT|PATCH|DELETE\"}[3d])) - sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"1(\\\\.0)?\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"POST|PUT|PATCH|DELETE\"}[3d]))) + sum by (cluster) (rate(apiserver_request_total{code=~\"5..\",job=\"apiserver\",verb=~\"POST|PUT|PATCH|DELETE\"}[3d]))) / sum by (cluster) (rate(apiserver_request_total{job=\"apiserver\",verb=~\"POST|PUT|PATCH|DELETE\"}[3d]))",
+    "interval_seconds": 30,
+    "type": "recording",
+    "group": "kube-apiserver-burnrate.rules",
+    "metrics": [
+      "apiserver_request_sli_duration_seconds_bucket",
+      "apiserver_request_sli_duration_seconds_count",
+      "apiserver_request_total"
+    ],
+    "dropped": "data plane (evaluation over generated samples): execution failed: invalid DAG: unsupported scalar expression: Compare { left: Column(4), op: Regex, right: Literal(Utf8(\"POST|PUT|PATCH|DELETE\")), semantics: Promql }"
+  },
+  {
+    "name": "apiserver_request:burnrate5m",
+    "query": "((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_count{job=\"apiserver\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"POST|PUT|PATCH|DELETE\"}[5m])) - sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"1(\\\\.0)?\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"POST|PUT|PATCH|DELETE\"}[5m]))) + sum by (cluster) (rate(apiserver_request_total{code=~\"5..\",job=\"apiserver\",verb=~\"POST|PUT|PATCH|DELETE\"}[5m]))) / sum by (cluster) (rate(apiserver_request_total{job=\"apiserver\",verb=~\"POST|PUT|PATCH|DELETE\"}[5m]))",
+    "interval_seconds": 30,
+    "type": "recording",
+    "group": "kube-apiserver-burnrate.rules",
+    "metrics": [
+      "apiserver_request_sli_duration_seconds_bucket",
+      "apiserver_request_sli_duration_seconds_count",
+      "apiserver_request_total"
+    ],
+    "dropped": "data plane (evaluation over generated samples): execution failed: invalid DAG: unsupported scalar expression: Compare { left: Column(4), op: Regex, right: Literal(Utf8(\"POST|PUT|PATCH|DELETE\")), semantics: Promql }"
+  },
+  {
+    "name": "apiserver_request:burnrate6h",
+    "query": "((sum by (cluster) (rate(apiserver_request_sli_duration_seconds_count{job=\"apiserver\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"POST|PUT|PATCH|DELETE\"}[6h])) - sum by (cluster) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",le=~\"1(\\\\.0)?\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"POST|PUT|PATCH|DELETE\"}[6h]))) + sum by (cluster) (rate(apiserver_request_total{code=~\"5..\",job=\"apiserver\",verb=~\"POST|PUT|PATCH|DELETE\"}[6h]))) / sum by (cluster) (rate(apiserver_request_total{job=\"apiserver\",verb=~\"POST|PUT|PATCH|DELETE\"}[6h]))",
+    "interval_seconds": 30,
+    "type": "recording",
+    "group": "kube-apiserver-burnrate.rules",
+    "metrics": [
+      "apiserver_request_sli_duration_seconds_bucket",
+      "apiserver_request_sli_duration_seconds_count",
+      "apiserver_request_total"
+    ],
+    "dropped": "data plane (evaluation over generated samples): execution failed: invalid DAG: unsupported scalar expression: Compare { left: Column(4), op: Regex, right: Literal(Utf8(\"POST|PUT|PATCH|DELETE\")), semantics: Promql }"
+  },
+  {
+    "name": "cluster_quantile:apiserver_request_sli_duration_seconds:histogram_quantile",
+    "query": "histogram_quantile(0.99, sum by (cluster, le, resource) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"LIST|GET\"}[5m]))) > 0",
+    "interval_seconds": 30,
+    "type": "recording",
+    "group": "kube-apiserver-histogram.rules",
+    "metrics": [
+      "apiserver_request_sli_duration_seconds_bucket"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 34: invalid DAG: aggregate intent has no native implementation"
+  },
+  {
+    "name": "cluster_quantile:apiserver_request_sli_duration_seconds:histogram_quantile",
+    "query": "histogram_quantile(0.99, sum by (cluster, le, resource) (rate(apiserver_request_sli_duration_seconds_bucket{job=\"apiserver\",subresource!~\"proxy|attach|log|exec|portforward\",verb=~\"POST|PUT|PATCH|DELETE\"}[5m]))) > 0",
+    "interval_seconds": 30,
+    "type": "recording",
+    "group": "kube-apiserver-histogram.rules",
+    "metrics": [
+      "apiserver_request_sli_duration_seconds_bucket"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 34: invalid DAG: aggregate intent has no native implementation"
+  },
+  {
+    "name": "KubeAPIErrorBudgetBurn",
+    "query": "sum by (cluster) (apiserver_request:burnrate1h) > (14.4 * 0.01) and on (cluster) sum by (cluster) (apiserver_request:burnrate5m) > (14.4 * 0.01)",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kube-apiserver-slos",
+    "metrics": [],
+    "dropped": "reads recording-rule output apiserver_request:burnrate1h, apiserver_request:burnrate5m; the generator writes raw series only"
+  },
+  {
+    "name": "KubeAPIErrorBudgetBurn",
+    "query": "sum by (cluster) (apiserver_request:burnrate6h) > (6 * 0.01) and on (cluster) sum by (cluster) (apiserver_request:burnrate30m) > (6 * 0.01)",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kube-apiserver-slos",
+    "metrics": [],
+    "dropped": "reads recording-rule output apiserver_request:burnrate30m, apiserver_request:burnrate6h; the generator writes raw series only"
+  },
+  {
+    "name": "KubeAPIErrorBudgetBurn",
+    "query": "sum by (cluster) (apiserver_request:burnrate1d) > (3 * 0.01) and on (cluster) sum by (cluster) (apiserver_request:burnrate2h) > (3 * 0.01)",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kube-apiserver-slos",
+    "metrics": [],
+    "dropped": "reads recording-rule output apiserver_request:burnrate1d, apiserver_request:burnrate2h; the generator writes raw series only"
+  },
+  {
+    "name": "KubeAPIErrorBudgetBurn",
+    "query": "sum by (cluster) (apiserver_request:burnrate3d) > (1 * 0.01) and on (cluster) sum by (cluster) (apiserver_request:burnrate6h) > (1 * 0.01)",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kube-apiserver-slos",
+    "metrics": [],
+    "dropped": "reads recording-rule output apiserver_request:burnrate3d, apiserver_request:burnrate6h; the generator writes raw series only"
+  },
+  {
+    "name": "node_quantile:kubelet_pleg_relist_duration_seconds:histogram_quantile",
+    "query": "histogram_quantile(0.99, sum by (cluster, instance, le) (rate(kubelet_pleg_relist_duration_seconds_bucket{job=\"kubelet\",metrics_path=\"/metrics\"}[5m])) * on (cluster, instance) group_left (node) kubelet_node_name{job=\"kubelet\",metrics_path=\"/metrics\"})",
+    "interval_seconds": 30,
+    "type": "recording",
+    "group": "kubelet.rules",
+    "metrics": [
+      "kubelet_node_name",
+      "kubelet_pleg_relist_duration_seconds_bucket"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 37: invalid DAG: aggregate intent has no native implementation"
+  },
+  {
+    "name": "node_quantile:kubelet_pleg_relist_duration_seconds:histogram_quantile",
+    "query": "histogram_quantile(0.9, sum by (cluster, instance, le) (rate(kubelet_pleg_relist_duration_seconds_bucket{job=\"kubelet\",metrics_path=\"/metrics\"}[5m])) * on (cluster, instance) group_left (node) kubelet_node_name{job=\"kubelet\",metrics_path=\"/metrics\"})",
+    "interval_seconds": 30,
+    "type": "recording",
+    "group": "kubelet.rules",
+    "metrics": [
+      "kubelet_node_name",
+      "kubelet_pleg_relist_duration_seconds_bucket"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 37: invalid DAG: aggregate intent has no native implementation"
+  },
+  {
+    "name": "node_quantile:kubelet_pleg_relist_duration_seconds:histogram_quantile",
+    "query": "histogram_quantile(0.5, sum by (cluster, instance, le) (rate(kubelet_pleg_relist_duration_seconds_bucket{job=\"kubelet\",metrics_path=\"/metrics\"}[5m])) * on (cluster, instance) group_left (node) kubelet_node_name{job=\"kubelet\",metrics_path=\"/metrics\"})",
+    "interval_seconds": 30,
+    "type": "recording",
+    "group": "kubelet.rules",
+    "metrics": [
+      "kubelet_node_name",
+      "kubelet_pleg_relist_duration_seconds_bucket"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 37: invalid DAG: aggregate intent has no native implementation"
+  },
+  {
+    "name": "KubeClientCertificateExpiration",
+    "query": "histogram_quantile(0.01, sum without (namespace, service, endpoint) (rate(apiserver_client_certificate_expiration_seconds_bucket{job=\"apiserver\"}[5m]))) < 604800 and on (job, cluster, instance) apiserver_client_certificate_expiration_seconds_count{job=\"apiserver\"} > 0",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-apiserver",
+    "metrics": [
+      "apiserver_client_certificate_expiration_seconds_bucket",
+      "apiserver_client_certificate_expiration_seconds_count"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 32: invalid DAG: grouping without requires resolved label columns"
+  },
+  {
+    "name": "KubeClientCertificateExpiration",
+    "query": "histogram_quantile(0.01, sum without (namespace, service, endpoint) (rate(apiserver_client_certificate_expiration_seconds_bucket{job=\"apiserver\"}[5m]))) < 86400 and on (job, cluster, instance) apiserver_client_certificate_expiration_seconds_count{job=\"apiserver\"} > 0",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-apiserver",
+    "metrics": [
+      "apiserver_client_certificate_expiration_seconds_bucket",
+      "apiserver_client_certificate_expiration_seconds_count"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 32: invalid DAG: grouping without requires resolved label columns"
+  },
+  {
+    "name": "KubeAggregatedAPIErrors",
+    "query": "sum by (cluster, instance, name, reason) (increase(aggregator_unavailable_apiservice_total{job=\"apiserver\"}[1m])) > 0",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-apiserver",
+    "metrics": [
+      "aggregator_unavailable_apiservice_total"
+    ],
+    "dropped": null
+  },
+  {
+    "name": "KubeAggregatedAPIDown",
+    "query": "(1 - max by (name, namespace, cluster) (avg_over_time(aggregator_unavailable_apiservice{job=\"apiserver\"}[10m]))) * 100 < 85",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-apiserver",
+    "metrics": [
+      "aggregator_unavailable_apiservice"
+    ],
+    "dropped": null
+  },
+  {
+    "name": "KubeAPIDown",
+    "query": "absent(up{job=\"apiserver\"} == 1)",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-apiserver",
+    "metrics": [
+      "up"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 3: per-entity aggregate requires an explicit entity binding"
+  },
+  {
+    "name": "KubeAPITerminatedRequests",
+    "query": "sum by (cluster) (rate(apiserver_request_terminations_total{job=\"apiserver\"}[10m])) / (sum by (cluster) (rate(apiserver_request_total{job=\"apiserver\"}[10m])) + sum by (cluster) (rate(apiserver_request_terminations_total{job=\"apiserver\"}[10m]))) > 0.2",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-apiserver",
+    "metrics": [
+      "apiserver_request_terminations_total",
+      "apiserver_request_total"
+    ],
+    "dropped": null
+  },
+  {
+    "name": "KubeNodeNotReady",
+    "query": "kube_node_status_condition{condition=\"Ready\",job=\"kube-state-metrics\",status=\"true\"} == 0 and on (cluster, node) kube_node_spec_unschedulable{job=\"kube-state-metrics\"} == 0",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-kubelet",
+    "metrics": [
+      "kube_node_spec_unschedulable",
+      "kube_node_status_condition"
+    ],
+    "dropped": null
+  },
+  {
+    "name": "KubeNodePressure",
+    "query": "kube_node_status_condition{condition=~\"(MemoryPressure|DiskPressure|PIDPressure)\",job=\"kube-state-metrics\",status=\"true\"} == 1 and on (cluster, node) kube_node_spec_unschedulable{job=\"kube-state-metrics\"} == 0",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-kubelet",
+    "metrics": [
+      "kube_node_spec_unschedulable",
+      "kube_node_status_condition"
+    ],
+    "dropped": "data plane (evaluation over generated samples): execution failed: invalid DAG: unsupported scalar expression: Compare { left: Column(2), op: Regex, right: Literal(Utf8(\"(MemoryPressure|DiskPressure|PIDPressure)\")), semantics: Promql }"
+  },
+  {
+    "name": "KubeNodeUnreachable",
+    "query": "(kube_node_spec_taint{effect=\"NoSchedule\",job=\"kube-state-metrics\",key=\"node.kubernetes.io/unreachable\"} unless ignoring (key, value) kube_node_spec_taint{job=\"kube-state-metrics\",key=~\"ToBeDeletedByClusterAutoscaler|cloud.google.com/impending-node-termination|aws-node-termination-handler/spot-itn\"}) == 1",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-kubelet",
+    "metrics": [
+      "kube_node_spec_taint"
+    ],
+    "dropped": "data plane (evaluation over generated samples): execution failed: invalid DAG: unsupported scalar expression: Compare { left: Column(3), op: Regex, right: Literal(Utf8(\"ToBeDeletedByClusterAutoscaler|cloud.google.com/impending-node-termination|aws-node-termination-handler/spot-itn\")), semantics: Promql }"
+  },
+  {
+    "name": "KubeletTooManyPods",
+    "query": "(max by (cluster, instance) (kubelet_running_pods{job=\"kubelet\",metrics_path=\"/metrics\"} > 1) * on (cluster, instance) group_left (node) max by (cluster, instance, node) (kubelet_node_name{job=\"kubelet\",metrics_path=\"/metrics\"})) / on (cluster, node) group_left () max by (cluster, node) (kube_node_status_capacity{job=\"kube-state-metrics\",resource=\"pods\"} != 1) > 0.95",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-kubelet",
+    "metrics": [
+      "kube_node_status_capacity",
+      "kubelet_node_name",
+      "kubelet_running_pods"
+    ],
+    "dropped": null
+  },
+  {
+    "name": "KubeNodeReadinessFlapping",
+    "query": "sum by (cluster, node) (changes(kube_node_status_condition{condition=\"Ready\",job=\"kube-state-metrics\",status=\"true\"}[15m])) > 2 and on (cluster, node) kube_node_spec_unschedulable{job=\"kube-state-metrics\"} == 0",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-kubelet",
+    "metrics": [
+      "kube_node_spec_unschedulable",
+      "kube_node_status_condition"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 2: per-entity aggregate requires an explicit entity binding"
+  },
+  {
+    "name": "KubeNodeEviction",
+    "query": "sum by (cluster, eviction_signal, instance) (rate(kubelet_evictions{job=\"kubelet\",metrics_path=\"/metrics\"}[15m])) * on (cluster, instance) group_left (node) max by (cluster, instance, node) (kubelet_node_name{job=\"kubelet\",metrics_path=\"/metrics\"}) > 0",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-kubelet",
+    "metrics": [
+      "kubelet_evictions",
+      "kubelet_node_name"
+    ],
+    "dropped": null
+  },
+  {
+    "name": "KubeletPlegDurationHigh",
+    "query": "node_quantile:kubelet_pleg_relist_duration_seconds:histogram_quantile{quantile=\"0.99\"} >= 10",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-kubelet",
+    "metrics": [],
+    "dropped": "reads recording-rule output node_quantile:kubelet_pleg_relist_duration_seconds:histogram_quantile; the generator writes raw series only"
+  },
+  {
+    "name": "KubeletPodStartUpLatencyHigh",
+    "query": "histogram_quantile(0.99, sum by (cluster, instance, le) (rate(kubelet_pod_worker_duration_seconds_bucket{job=\"kubelet\",metrics_path=\"/metrics\"}[5m]))) * on (cluster, instance) group_left (node) kubelet_node_name{job=\"kubelet\",metrics_path=\"/metrics\"} > 60",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-kubelet",
+    "metrics": [
+      "kubelet_node_name",
+      "kubelet_pod_worker_duration_seconds_bucket"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 34: invalid DAG: aggregate intent has no native implementation"
+  },
+  {
+    "name": "KubeletClientCertificateExpiration",
+    "query": "kubelet_certificate_manager_client_ttl_seconds < 604800",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-kubelet",
+    "metrics": [
+      "kubelet_certificate_manager_client_ttl_seconds"
+    ],
+    "dropped": null
+  },
+  {
+    "name": "KubeletClientCertificateExpiration",
+    "query": "kubelet_certificate_manager_client_ttl_seconds < 86400",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-kubelet",
+    "metrics": [
+      "kubelet_certificate_manager_client_ttl_seconds"
+    ],
+    "dropped": null
+  },
+  {
+    "name": "KubeletServerCertificateExpiration",
+    "query": "kubelet_certificate_manager_server_ttl_seconds < 604800",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-kubelet",
+    "metrics": [
+      "kubelet_certificate_manager_server_ttl_seconds"
+    ],
+    "dropped": null
+  },
+  {
+    "name": "KubeletServerCertificateExpiration",
+    "query": "kubelet_certificate_manager_server_ttl_seconds < 86400",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-kubelet",
+    "metrics": [
+      "kubelet_certificate_manager_server_ttl_seconds"
+    ],
+    "dropped": null
+  },
+  {
+    "name": "KubeletClientCertificateRenewalErrors",
+    "query": "increase(kubelet_certificate_manager_client_expiration_renew_errors[5m]) > 0",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-kubelet",
+    "metrics": [
+      "kubelet_certificate_manager_client_expiration_renew_errors"
+    ],
+    "dropped": null
+  },
+  {
+    "name": "KubeletServerCertificateRenewalErrors",
+    "query": "increase(kubelet_server_expiration_renew_errors[5m]) > 0",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-kubelet",
+    "metrics": [
+      "kubelet_server_expiration_renew_errors"
+    ],
+    "dropped": null
+  },
+  {
+    "name": "KubeletDown",
+    "query": "absent(up{job=\"kubelet\",metrics_path=\"/metrics\"} == 1)",
+    "interval_seconds": 30,
+    "type": "alerting",
+    "group": "kubernetes-system-kubelet",
+    "metrics": [
+      "up"
+    ],
+    "dropped": "data plane (query engine): invalid DAG: node 3: per-entity aggregate requires an explicit entity binding"
+  }
+]

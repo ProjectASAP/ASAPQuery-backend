@@ -1,0 +1,17 @@
+{
+  "mode": "baseline",
+  "wall_seconds": 119.870888872,
+  "samples_written": 8252460,
+  "evaluations": 832,
+  "processes": [
+    {
+      "name": "prometheus",
+      "cores": "0-3",
+      "cpu_core_seconds": 144.59,
+      "peak_rss_gib": 0.2351226806640625,
+      "mean_rss_gib": 0.19979954560597737,
+      "samples": 480
+    }
+  ],
+  "prometheus_version": "prometheus, version 3.5.0 (branch: HEAD, revision: 8be3a9560fbdd18a94dedec4b747c35178177202)"
+}

@@ -1,0 +1,25 @@
+{
+  "note": "Joint planning of the kept rules, ASAPPlanner 58999df, cost model 1 with AWS Fargate us-east-1 prices and the sketch-bench measured operation costs, scale 1. Groups: A = the 4 certificate-expiration and 2 renewal-error alerts; B = KubeAggregatedAPIErrors, KubeAggregatedAPIDown, KubeNodeNotReady, KubeletTooManyPods, KubeNodeEviction; C = KubeAPITerminatedRequests; D = cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase1h. Memory capped at 60 GB (A+B) or 40 GB (others) with ulimit -v.",
+  "runs": [
+    {"rules": "A", "valid_candidates": 144, "seconds": 2.38, "peak_rss_kb": 22220, "selected": "P28-m8"},
+    {"rules": "B", "valid_candidates": 1792, "seconds": 6.10, "peak_rss_kb": 513824, "selected": "P79-m161"},
+    {"rules": "C", "valid_candidates": 208, "seconds": 0.16, "peak_rss_kb": 28320, "selected": "P27-m2"},
+    {"rules": "D", "valid_candidates": 4, "seconds": 0.02, "peak_rss_kb": 16412, "selected": "P2-m2"},
+    {"rules": "A+D", "valid_candidates": 576, "seconds": 0.52, "peak_rss_kb": 73520, "selected": "P64-m26"},
+    {"rules": "C+D", "valid_candidates": 832, "seconds": 0.76, "peak_rss_kb": 104300, "selected": "P72-m26"},
+    {"rules": "B+D", "valid_candidates": 7168, "seconds": 19.45, "peak_rss_kb": 2229364, "selected": "P159-m485"},
+    {"rules": "A+C", "valid_candidates": 29952, "seconds": 41.06, "peak_rss_kb": 4561284, "selected": "P964-m26"},
+    {"rules": "B+C", "outcome": "out of memory (40 GB cap)", "seconds": 76.96},
+    {"rules": "A+B", "outcome": "out of memory (60 GB cap)", "seconds": 111.89},
+    {"rules": "all 13 kept rules", "outcome": "killed by the kernel at 222 GB RSS after 3 h (illustrative prices); a second run with Fargate prices and measured costs reached 35 GB after 3 h and was stopped"}
+  ],
+  "per_rule_vs_joint_burnrate_illustrative": {
+    "note": "Before the regex-matcher check dropped them: the 7 POST|PUT|PATCH|DELETE burn-rate rules, illustrative prices, no measured costs. Cost per second (illustrative units).",
+    "planned_alone_selected_sum": 50.945,
+    "planned_alone_nothing_materialized_sum": 124.249,
+    "planned_jointly_selected": 122.607,
+    "planned_jointly_valid_candidates": 16,
+    "planned_alone": "each selects MatAtQueryKeptAcrossEvaluations (P16-m80)",
+    "planned_jointly": "selects P1, nothing materialized"
+  }
+}
