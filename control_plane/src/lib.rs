@@ -7,7 +7,6 @@
 //! root of the selected `PhysicalASAPDAG` answers.
 
 use std::path::Path;
-use std::rc::Rc;
 
 use asap_logical_asap_optimization::DeploymentCapabilities;
 use asap_plan_selection::{
@@ -53,6 +52,8 @@ pub enum PlanError {
     ScalarRoot(usize),
     #[error("PromQL lowering: {0}")]
     Lowering(String),
+    #[error("query {query}: series identity: {message}")]
+    SeriesIdentity { query: usize, message: String },
     #[error("planning: {0}")]
     Planning(String),
     #[error("invalid physical DAG: {0}")]
@@ -129,6 +130,22 @@ struct Planned {
     run: Stage1ToStage3Run<usize>,
 }
 
+/// Numbers the lowered PromQL roots and makes their rows carry each
+/// series' full identity, the representation per-series state needs at
+/// runtime.
+fn with_series_identity(roots: Vec<QueryRoot>) -> Result<Vec<(usize, QueryRoot)>, PlanError> {
+    roots
+        .into_iter()
+        .enumerate()
+        .map(|(i, root)| match root {
+            QueryRoot::Operator(node) => with_promql_series_identity(&node)
+                .map(|node| (i, QueryRoot::Operator(node)))
+                .map_err(|message| PlanError::SeriesIdentity { query: i, message }),
+            QueryRoot::Scalar(_) => Err(PlanError::ScalarRoot(i)),
+        })
+        .collect()
+}
+
 /// Lowers `workload` (Stage 0) and runs Stages 1–3 under `inputs`.
 fn plan(workload: &PlanningWorkload, inputs: &DeploymentInputs) -> Result<Planned, PlanError> {
     let language = &workload.query_workload.language;
@@ -139,20 +156,8 @@ fn plan(workload: &PlanningWorkload, inputs: &DeploymentInputs) -> Result<Planne
         .validate()
         .map_err(|e| PlanError::Workload(e.to_string()))?;
     let roots = asap_frontend_promql::lower_promql_query_workload(workload)
-        .map_err(|e| PlanError::Lowering(e.to_string()))?
-        .into_iter()
-        .enumerate()
-        .map(|(i, root)| match root {
-            // Rows carry each series' full identity, the representation
-            // per-series state needs at runtime, as the Planner's own pass
-            // prepares PromQL roots.
-            QueryRoot::Operator(node) => {
-                let node = with_promql_series_identity(&node).unwrap_or_else(|_| Rc::clone(&node));
-                Ok((i, QueryRoot::Operator(node)))
-            }
-            QueryRoot::Scalar(_) => Err(PlanError::ScalarRoot(i)),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        .map_err(|e| PlanError::Lowering(e.to_string()))?;
+    let roots = with_series_identity(roots)?;
     let entries: Vec<QueryWorkloadEntry> = workload.query_workload.entries().collect();
     let data = workload.data_workload.clone().unwrap_or_default();
     let models = PlanningModels::builtin()
@@ -202,5 +207,29 @@ impl Default for DeploymentInputs {
             deployment_capabilities: backend_capabilities(),
             plan_selection: PlanSelectionSettings::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use planner_types::ir::schema::Schema;
+    use planner_types::ir::{NonASAPOp, Operator, OperatorNode};
+
+    /// A root whose rows cannot carry the full series identity is rejected
+    /// rather than planned without it.
+    #[test]
+    fn rejects_a_root_without_a_series_identity_realization() {
+        let values = OperatorNode::new_shared(Operator::NonASAP(NonASAPOp::Values {
+            rows: vec![],
+            schema: Schema::default(),
+        }))
+        .unwrap();
+        let error = with_series_identity(vec![QueryRoot::Operator(values)])
+            .expect_err("the identity rewrite must fail");
+        assert_eq!(
+            error.to_string(),
+            "query 0: series identity: operator has no dynamic series-identity realization"
+        );
     }
 }
