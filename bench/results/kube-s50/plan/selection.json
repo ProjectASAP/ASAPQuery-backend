@@ -1,0 +1,176 @@
+{
+  "accepted_accuracy": [
+    "metric not set; accepted exact",
+    "metric not set; accepted exact",
+    "metric not set; accepted exact",
+    "metric not set; accepted exact",
+    "metric not set; accepted exact",
+    "metric not set; accepted exact"
+  ],
+  "cheapest_materialized_candidate": {
+    "average_memory_bytes": 13714800.109475734,
+    "candidate": "P159-m485",
+    "cost_per_second": 2.269891141980925e-8,
+    "cost_source": "analytical-cost-v2 (illustrative statistics)",
+    "cpu_core_seconds_per_second": 0.0006158285555555555,
+    "cpu_ops_per_second": 130980.55555555552,
+    "latency_ms_per_query": [
+      17.005779999999998,
+      2.8403599999999996,
+      2.95048,
+      1.50202,
+      3.3442600000000002,
+      4.105339999999999
+    ],
+    "peak_cpu_cores": 6,
+    "peak_memory_bytes": 15165144,
+    "scanned_bytes_per_second": 4848480.0
+  },
+  "cheapest_valid_candidates": [
+    {
+      "average_memory_bytes": 13714800.109475734,
+      "candidate": "P159-m485",
+      "cost_per_second": 2.269891141980925e-8,
+      "cost_source": "analytical-cost-v2 (illustrative statistics)",
+      "cpu_core_seconds_per_second": 0.0006158285555555555,
+      "cpu_ops_per_second": 130980.55555555552,
+      "latency_ms_per_query": [
+        17.005779999999998,
+        2.8403599999999996,
+        2.95048,
+        1.50202,
+        3.3442600000000002,
+        4.105339999999999
+      ],
+      "peak_cpu_cores": 6,
+      "peak_memory_bytes": 15165144,
+      "scanned_bytes_per_second": 4848480.0
+    },
+    {
+      "average_memory_bytes": 13714800.109475734,
+      "candidate": "P160-m485",
+      "cost_per_second": 2.269891141980925e-8,
+      "cost_source": "analytical-cost-v2 (illustrative statistics)",
+      "cpu_core_seconds_per_second": 0.0006158285555555555,
+      "cpu_ops_per_second": 130980.55555555553,
+      "latency_ms_per_query": [
+        17.005779999999998,
+        2.8403599999999996,
+        2.95048,
+        1.50202,
+        3.3442600000000002,
+        4.105339999999999
+      ],
+      "peak_cpu_cores": 6,
+      "peak_memory_bytes": 15165144,
+      "scanned_bytes_per_second": 4848480.0
+    },
+    {
+      "average_memory_bytes": 13726800.109475734,
+      "candidate": "P159-m431",
+      "cost_per_second": 2.2712713620365052e-8,
+      "cost_source": "analytical-cost-v2 (illustrative statistics)",
+      "cpu_core_seconds_per_second": 0.0006158285555555555,
+      "cpu_ops_per_second": 130980.55555555552,
+      "latency_ms_per_query": [
+        17.005779999999998,
+        0.0032,
+        2.95048,
+        1.50202,
+        3.3442600000000002,
+        4.105339999999999
+      ],
+      "peak_cpu_cores": 7,
+      "peak_memory_bytes": 15171144,
+      "scanned_bytes_per_second": 4848480.0
+    },
+    {
+      "average_memory_bytes": 13726800.109475734,
+      "candidate": "P159-m467",
+      "cost_per_second": 2.2712713620365052e-8,
+      "cost_source": "analytical-cost-v2 (illustrative statistics)",
+      "cpu_core_seconds_per_second": 0.0006158285555555555,
+      "cpu_ops_per_second": 130980.55555555552,
+      "latency_ms_per_query": [
+        17.005779999999998,
+        2.8403599999999996,
+        2.5508800000000003,
+        1.50202,
+        3.3442600000000002,
+        4.105339999999999
+      ],
+      "peak_cpu_cores": 7,
+      "peak_memory_bytes": 15171144,
+      "scanned_bytes_per_second": 4848480.0
+    },
+    {
+      "average_memory_bytes": 13726800.109475734,
+      "candidate": "P159-m479",
+      "cost_per_second": 2.2712713620365052e-8,
+      "cost_source": "analytical-cost-v2 (illustrative statistics)",
+      "cpu_core_seconds_per_second": 0.0006158285555555555,
+      "cpu_ops_per_second": 130980.55555555552,
+      "latency_ms_per_query": [
+        17.005779999999998,
+        2.8403599999999996,
+        2.55088,
+        1.50202,
+        3.3442600000000002,
+        4.105339999999999
+      ],
+      "peak_cpu_cores": 7,
+      "peak_memory_bytes": 15171144,
+      "scanned_bytes_per_second": 4848480.0
+    }
+  ],
+  "node_materializations": {
+    "MatAtQuery": 1,
+    "MatAtQueryKeptAcrossEvaluations": 92,
+    "NotMaterialized": 232
+  },
+  "planning_seconds": 11.445277739,
+  "predicted_nothing_materialized": {
+    "average_memory_bytes": 0.0,
+    "candidate": "P159",
+    "cost_per_second": 7.718938411066662e-8,
+    "cost_source": "analytical-cost-v2 (illustrative statistics)",
+    "cpu_core_seconds_per_second": 0.006864939888888887,
+    "cpu_ops_per_second": 1739403.888888888,
+    "latency_ms_per_query": [
+      303.9985,
+      5.677519999999999,
+      58.37499999999999,
+      1.50202,
+      3.3442600000000002,
+      86.38298
+    ],
+    "peak_cpu_cores": 6,
+    "peak_memory_bytes": 15166072,
+    "scanned_bytes_per_second": 51255360.0
+  },
+  "predicted_selected": {
+    "average_memory_bytes": 13714800.109475734,
+    "candidate": "P159-m485",
+    "cost_per_second": 2.269891141980925e-8,
+    "cost_source": "analytical-cost-v2 (illustrative statistics)",
+    "cpu_core_seconds_per_second": 0.0006158285555555555,
+    "cpu_ops_per_second": 130980.55555555552,
+    "latency_ms_per_query": [
+      17.005779999999998,
+      2.8403599999999996,
+      2.95048,
+      1.50202,
+      3.3442600000000002,
+      4.105339999999999
+    ],
+    "peak_cpu_cores": 6,
+    "peak_memory_bytes": 15165144,
+    "scanned_bytes_per_second": 4848480.0
+  },
+  "rejections_by_cause": {
+    "costlier": 7166,
+    "tied_lost_on_enumeration_order": 1
+  },
+  "selected": "P159-m485",
+  "valid_candidates": 7168
+}

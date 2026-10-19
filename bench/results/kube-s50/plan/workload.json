@@ -1,0 +1,194 @@
+{
+  "query_workload": {
+    "language": "promql",
+    "query_batch": null,
+    "repeating_queries": [
+      {
+        "query": "sum by (cluster, verb, scope, le) (increase(apiserver_request_sli_duration_seconds_bucket[1h]))",
+        "demand": {
+          "fixed_interval": 180000
+        },
+        "requirements": {
+          "accuracy": {
+            "max_error": 0.0,
+            "failure_probability": 0.0,
+            "accuracy_scope": "whole_result"
+          },
+          "max_latency_ms": null
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "sum by (cluster, instance, name, reason) (increase(aggregator_unavailable_apiservice_total{job=\"apiserver\"}[1m])) > 0",
+        "demand": {
+          "fixed_interval": 30000
+        },
+        "requirements": {
+          "accuracy": {
+            "max_error": 0.0,
+            "failure_probability": 0.0,
+            "accuracy_scope": "whole_result"
+          },
+          "max_latency_ms": null
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "(1 - max by (name, namespace, cluster) (avg_over_time(aggregator_unavailable_apiservice{job=\"apiserver\"}[10m]))) * 100 < 85",
+        "demand": {
+          "fixed_interval": 30000
+        },
+        "requirements": {
+          "accuracy": {
+            "max_error": 0.0,
+            "failure_probability": 0.0,
+            "accuracy_scope": "whole_result"
+          },
+          "max_latency_ms": null
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "kube_node_status_condition{condition=\"Ready\",job=\"kube-state-metrics\",status=\"true\"} == 0 and on (cluster, node) kube_node_spec_unschedulable{job=\"kube-state-metrics\"} == 0",
+        "demand": {
+          "fixed_interval": 30000
+        },
+        "requirements": {
+          "accuracy": {
+            "max_error": 0.0,
+            "failure_probability": 0.0,
+            "accuracy_scope": "whole_result"
+          },
+          "max_latency_ms": null
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "(max by (cluster, instance) (kubelet_running_pods{job=\"kubelet\",metrics_path=\"/metrics\"} > 1) * on (cluster, instance) group_left (node) max by (cluster, instance, node) (kubelet_node_name{job=\"kubelet\",metrics_path=\"/metrics\"})) / on (cluster, node) group_left () max by (cluster, node) (kube_node_status_capacity{job=\"kube-state-metrics\",resource=\"pods\"} != 1) > 0.95",
+        "demand": {
+          "fixed_interval": 30000
+        },
+        "requirements": {
+          "accuracy": {
+            "max_error": 0.0,
+            "failure_probability": 0.0,
+            "accuracy_scope": "whole_result"
+          },
+          "max_latency_ms": null
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "sum by (cluster, eviction_signal, instance) (rate(kubelet_evictions{job=\"kubelet\",metrics_path=\"/metrics\"}[15m])) * on (cluster, instance) group_left (node) max by (cluster, instance, node) (kubelet_node_name{job=\"kubelet\",metrics_path=\"/metrics\"}) > 0",
+        "demand": {
+          "fixed_interval": 30000
+        },
+        "requirements": {
+          "accuracy": {
+            "max_error": 0.0,
+            "failure_probability": 0.0,
+            "accuracy_scope": "whole_result"
+          },
+          "max_latency_ms": null
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      }
+    ]
+  },
+  "data_workload": {
+    "arrival": {
+      "ingesting": {
+        "rows_per_second": 6660.0
+      }
+    },
+    "sources": {
+      "aggregator_unavailable_apiservice": {
+        "series_count": 750,
+        "metric_type": "gauge",
+        "sample_interval": 15000,
+        "stream_norms": null,
+        "max_distinct_per_evaluation": 750
+      },
+      "aggregator_unavailable_apiservice_total": {
+        "series_count": 750,
+        "metric_type": "counter",
+        "sample_interval": 15000,
+        "stream_norms": null,
+        "max_distinct_per_evaluation": 750
+      },
+      "apiserver_request_sli_duration_seconds_bucket": {
+        "series_count": 86400,
+        "metric_type": "counter",
+        "sample_interval": 15000,
+        "stream_norms": null,
+        "max_distinct_per_evaluation": 86400
+      },
+      "kube_node_spec_unschedulable": {
+        "series_count": 500,
+        "metric_type": "gauge",
+        "sample_interval": 15000,
+        "stream_norms": null,
+        "max_distinct_per_evaluation": 500
+      },
+      "kube_node_status_capacity": {
+        "series_count": 1500,
+        "metric_type": "gauge",
+        "sample_interval": 15000,
+        "stream_norms": null,
+        "max_distinct_per_evaluation": 1500
+      },
+      "kube_node_status_condition": {
+        "series_count": 7500,
+        "metric_type": "gauge",
+        "sample_interval": 15000,
+        "stream_norms": null,
+        "max_distinct_per_evaluation": 7500
+      },
+      "kubelet_evictions": {
+        "series_count": 1500,
+        "metric_type": "counter",
+        "sample_interval": 15000,
+        "stream_norms": null,
+        "max_distinct_per_evaluation": 1500
+      },
+      "kubelet_node_name": {
+        "series_count": 500,
+        "metric_type": "gauge",
+        "sample_interval": 15000,
+        "stream_norms": null,
+        "max_distinct_per_evaluation": 500
+      },
+      "kubelet_running_pods": {
+        "series_count": 500,
+        "metric_type": "gauge",
+        "sample_interval": 15000,
+        "stream_norms": null,
+        "max_distinct_per_evaluation": 500
+      }
+    }
+  }
+}
