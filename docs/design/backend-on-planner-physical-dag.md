@@ -454,7 +454,7 @@ The merged runtime keeps ASAPQuery's low-overhead data path and the backend's si
 | Benefit experiment harness and generator | In progress | New PR |
 | A. jemalloc, shared stored panes, in-process driver and profiling in the bench crate | To build | New PR |
 | B. Per-sample ingestion: the DAG's ingestion side compiled per sample with the library's updaters, with parity tests | To build | New PR |
-| C. Columnar DAG executor in ASAPPlanner (`asap-executor`), all operators, passing the existing executor tests | To build | ASAPPlanner PR |
+| C. Columnar DAG executor in ASAPPlanner (`asap-executor`), all operators, passing the existing executor tests | To build | ASAPPlanner #762 |
 | D. Sharded ingestion, concurrent queries, local raw windows and Prometheus remote read | To build | New PR |
 | E. Runtime-measured operation costs fed to the Planner; prediction check in the harness | To build | New PR |
 | F. ASAPQuery features: OTLP, VictoriaMetrics, idle-window close, query tracker, plan swap, compliance suite | To build | New PRs |
