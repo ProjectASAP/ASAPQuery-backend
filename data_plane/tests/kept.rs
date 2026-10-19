@@ -8,8 +8,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use asap_executor::physical_planner::frontier_from_timing;
-use control_plane::{plan_selected_at_query_time, InstalledPlan};
+use asap_planner::InstallablePlan;
 use data_plane::precompute::RawSample;
 use data_plane::query::{KeptResultStats, QueryEngine, RawRange, ResultSample};
 use data_plane::sds::{Sds, SummaryStore};
@@ -17,9 +16,8 @@ use data_plane::sds::{Sds, SummaryStore};
 const MINUTE: i64 = 60_000;
 const P99: &str = "quantile_over_time(0.99, latency_ms[5m])";
 
-fn engine(plan: &InstalledPlan) -> QueryEngine {
-    let dag = &plan.dag.dag;
-    let sds = Sds::from_dag(dag, &frontier_from_timing(dag).unwrap()).unwrap();
+fn engine(plan: &InstallablePlan) -> QueryEngine {
+    let sds = Sds::from_plan(plan).unwrap();
     assert!(sds.definitions.is_empty(), "nothing is built at ingestion");
     QueryEngine::new(plan, &sds)
 }
@@ -95,13 +93,10 @@ fn answer_at_watermark(
 
 /// The installed B3 plan and the Planner executor's reference for it: the
 /// same selection with nothing materialized.
-fn plans() -> (InstalledPlan, InstalledPlan) {
-    let workload = common::workload("example4-b3");
-    let inputs = common::inputs(true);
-    (
-        control_plane::plan_workload(&workload, &inputs).unwrap(),
-        plan_selected_at_query_time(&workload, &inputs).unwrap(),
-    )
+fn plans() -> (InstallablePlan, InstallablePlan) {
+    let plan = common::plan("example4-b3", true);
+    let reference = plan.query_time_reference().unwrap();
+    (plan, reference)
 }
 
 /// The first evaluation builds all five kept panes and answers like the
@@ -164,14 +159,13 @@ fn kept_panes_answer_like_the_reference_and_are_reused() {
     );
 }
 
-/// A kept pane is dropped once it is older than the largest offset any
-/// output reads (4 min) plus two pane widths, measured from the newest
-/// evaluation: 6 min.
+/// A kept pane is dropped once it starts before the plan's retention (5
+/// min: the oldest output's offset, 4 min, plus its 1-minute pane), measured
+/// from the newest evaluation.
 #[test]
 fn kept_panes_are_evicted_like_stored_panes() {
     let (plan, _) = plans();
-    let dag = &plan.dag.dag;
-    let sds = Sds::from_dag(dag, &frontier_from_timing(dag).unwrap()).unwrap();
+    let sds = Sds::from_plan(&plan).unwrap();
     let definition = sds.kept_definitions.keys().next().unwrap().clone();
     let all = samples();
     let mut kept = engine(&plan);
@@ -188,11 +182,11 @@ fn kept_panes_are_evicted_like_stored_panes() {
     answer(&mut kept, 11 * MINUTE, &all);
     assert_eq!(
         ends(&kept),
-        vec![6, 7, 8, 9, 10, 11],
-        "6 is not older than 11 - 6"
+        vec![7, 8, 9, 10, 11],
+        "the pane ending at 6 min starts before 11 - 5"
     );
     answer(&mut kept, 12 * MINUTE, &all);
-    assert_eq!(ends(&kept), vec![7, 8, 9, 10, 11, 12]);
+    assert_eq!(ends(&kept), vec![8, 9, 10, 11, 12]);
     // An evaluation far ahead builds its own five panes and drops the rest.
     answer(&mut kept, 20 * MINUTE, &all);
     assert_eq!(ends(&kept), vec![16, 17, 18, 19, 20]);
@@ -211,8 +205,7 @@ fn kept_panes_are_evicted_like_stored_panes() {
 #[test]
 fn panes_are_kept_only_once_closed() {
     let (plan, reference_plan) = plans();
-    let dag = &plan.dag.dag;
-    let sds = Sds::from_dag(dag, &frontier_from_timing(dag).unwrap()).unwrap();
+    let sds = Sds::from_plan(&plan).unwrap();
     let definition = sds.kept_definitions.keys().next().unwrap().clone();
     let mut all = samples();
     let mut kept = engine(&plan);
@@ -257,7 +250,7 @@ fn panes_are_kept_only_once_closed() {
     // Once the watermark reaches 10 min, the pane is kept.
     let (_, ranges) = answer_at_watermark(&mut kept, 11 * MINUTE, Some(10 * MINUTE), &all);
     assert_eq!(ranges.len(), 2, "the 10- and 11-minute panes: {ranges:?}");
-    assert_eq!(ends(&kept), vec![6, 7, 8, 9, 10]);
+    assert_eq!(ends(&kept), vec![7, 8, 9, 10], "6 starts before 11 - 5");
     // Without any sample there is no watermark, and nothing is kept.
     let mut fresh = engine(&plan);
     answer_at_watermark(&mut fresh, 10 * MINUTE, None, &all);

@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use asap_planner::PlanningWorkload;
 use clap::Parser;
-use control_plane::{plan_workload, DeploymentInputs};
-use planner_types::workload::PlanningWorkload;
+use control_plane::{plan_workload, save_plan, DeploymentInputs};
 
 /// Plan a workload with ASAPPlanner and write the selected plan.
 #[derive(Parser)]
@@ -15,6 +15,10 @@ struct Args {
     /// backend's data plane executes and keeps.
     #[arg(long)]
     deployment_capabilities: Option<PathBuf>,
+    /// Planner `PlanSelectionSettings` (JSON): cost model and unit prices,
+    /// resource speed, measured operation costs. Defaults to the Planner's.
+    #[arg(long)]
+    plan_selection_settings: Option<PathBuf>,
     /// Planner `MeasuredOperationCost` list (JSON) that Stage 3 prices
     /// sketch operations from; by default every node is priced from the
     /// Planner's formulas.
@@ -41,11 +45,14 @@ fn main() -> anyhow::Result<()> {
     if let Some(path) = &args.deployment_capabilities {
         inputs.deployment_capabilities = read_json(path)?;
     }
+    if let Some(path) = &args.plan_selection_settings {
+        inputs.plan_selection = read_json(path)?;
+    }
     if let Some(path) = &args.measured_operation_costs {
         inputs.plan_selection.measured_operation_costs = read_json(path)?;
     }
     let plan = plan_workload(&workload, &inputs)?;
-    plan.save(&args.out)?;
+    save_plan(&plan, &args.out)?;
     println!(
         "wrote {} ({} queries, {} nodes)",
         args.out.display(),

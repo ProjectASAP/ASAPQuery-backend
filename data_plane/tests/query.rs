@@ -3,8 +3,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use asap_executor::physical_planner::frontier_from_timing;
-use control_plane::InstalledPlan;
+use asap_planner::InstallablePlan;
 use data_plane::precompute::{Precompute, RawSample};
 use data_plane::query::{QueryEngine, RawRange, ResultSample, Unanswered};
 use data_plane::sds::Sds;
@@ -16,11 +15,10 @@ struct Fixture {
     query: QueryEngine,
 }
 
-fn fixture(plan: InstalledPlan) -> Fixture {
-    let dag = &plan.dag.dag;
-    let sds = Sds::from_dag(dag, &frontier_from_timing(dag).unwrap()).unwrap();
+fn fixture(plan: InstallablePlan) -> Fixture {
+    let sds = Sds::from_plan(&plan).unwrap();
     Fixture {
-        precompute: Precompute::new(dag.clone(), &sds, 0).unwrap(),
+        precompute: Precompute::new(&plan, &sds, 0).unwrap(),
         query: QueryEngine::new(&plan, &sds),
     }
 }

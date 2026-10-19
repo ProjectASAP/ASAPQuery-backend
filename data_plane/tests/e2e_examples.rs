@@ -13,16 +13,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use asap_executor::physical_planner::frontier_from_timing;
+use asap_executor::planner::workload::PlanningWorkload;
+use asap_planner::InstallablePlan;
 use axum::extract::Query;
 use axum::routing::get;
 use axum::{Json, Router};
-use control_plane::{plan_selected_at_query_time, plan_workload, DeploymentInputs, InstalledPlan};
+use control_plane::{plan_workload, save_plan, DeploymentInputs};
 use data_plane::precompute::RawSample;
 use data_plane::query::{QueryEngine, ResultSample};
 use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use data_plane::sds::{Sds, SummaryStore};
-use planner_types::workload::PlanningWorkload;
 use serde_json::{json, Value};
 
 const MINUTE: i64 = 60_000;
@@ -71,14 +71,14 @@ fn series(metric: &str, labels: &[(&str, &str)]) -> BTreeMap<String, String> {
 /// The answer of the Planner executor for `query` at `time_ms` when the
 /// selected plan runs with nothing materialized: every input is a raw range
 /// over `all`.
-/// `plan` is [`plan_selected_at_query_time`]'s plan.
+/// `plan` is the installed plan's `InstallablePlan::query_time_reference`.
 fn reference(
-    plan: &InstalledPlan,
+    plan: &InstallablePlan,
     query: &str,
     time_ms: i64,
     all: &[RawSample],
 ) -> Vec<ResultSample> {
-    let sds = Sds::from_dag(&plan.dag.dag, &frontier_from_timing(&plan.dag.dag).unwrap()).unwrap();
+    let sds = Sds::from_plan(plan).unwrap();
     assert!(sds.definitions.is_empty());
     let mut engine = QueryEngine::new(plan, &sds);
     let store = SummaryStore::new();
@@ -186,7 +186,7 @@ impl Drop for TempDir {
     }
 }
 
-async fn start(plan: &InstalledPlan, prometheus_url: &str) -> DataPlaneProcess {
+async fn start(plan: &InstallablePlan, prometheus_url: &str) -> DataPlaneProcess {
     let dir = std::env::temp_dir().join(format!(
         "data-plane-e2e-{}-{}",
         std::process::id(),
@@ -194,7 +194,7 @@ async fn start(plan: &InstalledPlan, prometheus_url: &str) -> DataPlaneProcess {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("plan.json");
-    plan.save(&path).unwrap();
+    save_plan(plan, &path).unwrap();
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -360,7 +360,7 @@ async fn planned_range_answer(
 async fn check_range(
     url: &str,
     reads: &AtomicUsize,
-    at_query_time: &InstalledPlan,
+    at_query_time: &InstallablePlan,
     query: &str,
     (start_ms, end_ms, step): (i64, i64, &str),
     step_ms: i64,
@@ -424,17 +424,16 @@ async fn check_example(
 ) -> usize {
     let workload = workload(example);
     let plan = plan_workload(&workload, inputs).unwrap();
-    let at_query_time = plan_selected_at_query_time(&workload, inputs).unwrap();
+    let at_query_time = plan.query_time_reference().unwrap();
     let all = Arc::new(all);
     let process = start(&plan, &prometheus(all.clone()).await.0).await;
     remote_write(&process.url, &all).await;
-    for query in &plan.queries {
+    for query in plan.queries.iter().map(|q| &q.query) {
         let expected = reference(&at_query_time, query, time_ms, &all);
         let actual = planned_answer(&process.url, query, time_ms).await;
         assert_same(query, &actual, &expected, tolerance);
     }
-    let dag = &plan.dag.dag;
-    let sds = Sds::from_dag(dag, &frontier_from_timing(dag).unwrap()).unwrap();
+    let sds = Sds::from_plan(&plan).unwrap();
     sds.definitions.len()
 }
 
@@ -506,8 +505,8 @@ async fn example4a() {
 /// Example 3b: a p99 panel over the last 5 minutes, every minute; KLL is
 /// exact below k. With raw data kept the Planner selects a query-time
 /// build; without, tumbling panes built from Remote Write. Samples end at
-/// the evaluation time, as for a live panel: panes more than the window
-/// plus one pane older than the newest sample are evicted.
+/// the evaluation time, as for a live panel: panes that start more than the
+/// plan's retention before the newest closed pane are evicted.
 #[tokio::test]
 async fn example3b() {
     let series = [series("latency_ms", &[("service", "a")])];
@@ -554,15 +553,14 @@ async fn example4_b3() {
     let workload = workload("example4-b3");
     let inputs = DeploymentInputs::default();
     let plan = plan_workload(&workload, &inputs).unwrap();
-    let at_query_time = plan_selected_at_query_time(&workload, &inputs).unwrap();
-    let dag = &plan.dag.dag;
-    let sds = Sds::from_dag(dag, &frontier_from_timing(dag).unwrap()).unwrap();
+    let at_query_time = plan.query_time_reference().unwrap();
+    let sds = Sds::from_plan(&plan).unwrap();
     assert_eq!((sds.definitions.len(), sds.kept_definitions.len()), (0, 1));
     let all = Arc::new(all);
     let (prometheus_url, range_reads) = prometheus(all.clone()).await;
     let process = start(&plan, &prometheus_url).await;
     remote_write(&process.url, &all).await;
-    let query = &plan.queries[0];
+    let query = &plan.queries[0].query;
     let mut reads = Vec::new();
     for minute in [10, 11, 12] {
         let before = range_reads.load(Ordering::SeqCst);
@@ -592,12 +590,12 @@ async fn example1_range() {
     let workload = workload("example1");
     let inputs = DeploymentInputs::default();
     let plan = plan_workload(&workload, &inputs).unwrap();
-    let at_query_time = plan_selected_at_query_time(&workload, &inputs).unwrap();
+    let at_query_time = plan.query_time_reference().unwrap();
     let all = Arc::new(all);
     let (prometheus_url, reads) = prometheus(all.clone()).await;
     let process = start(&plan, &prometheus_url).await;
     remote_write(&process.url, &all).await;
-    for query in &plan.queries {
+    for query in plan.queries.iter().map(|q| &q.query) {
         let range = (3 * MINUTE, 6 * MINUTE, "30s");
         let read = check_range(
             &process.url,
@@ -613,8 +611,9 @@ async fn example1_range() {
     }
 }
 
-/// Example 4b as a range query on a deployment without raw data: every
-/// step reads six stored panes and nothing from Prometheus.
+/// Example 4b as a range query on a deployment without raw data, its query
+/// declared as range requests over 10 minutes: every step reads six stored
+/// panes and nothing from Prometheus.
 #[tokio::test]
 async fn example4b_range() {
     let series = [
@@ -625,15 +624,19 @@ async fn example4b_range() {
     let all = samples(&series, MINUTE, 101 * MINUTE, 15_000, |i, t| {
         (i * 1000) as f64 + (t / 15_000) as f64
     });
-    let workload = workload("example4b");
+    let workload = common::with_range_evaluation(
+        &workload("example4b"),
+        10 * MINUTE as u64,
+        10 * MINUTE as u64,
+    );
     let inputs = without_raw_data();
     let plan = plan_workload(&workload, &inputs).unwrap();
-    let at_query_time = plan_selected_at_query_time(&workload, &inputs).unwrap();
+    let at_query_time = plan.query_time_reference().unwrap();
     let all = Arc::new(all);
     let (prometheus_url, reads) = prometheus(all.clone()).await;
     let process = start(&plan, &prometheus_url).await;
     remote_write(&process.url, &all).await;
-    let query = &plan.queries[0];
+    let query = &plan.queries[0].query;
     let range = (90 * MINUTE, 100 * MINUTE, "10m");
     let read = check_range(
         &process.url,
@@ -653,7 +656,7 @@ async fn example4b_range() {
 /// pane is built once and reused by later steps, and every step equals the
 /// instant query and the Planner executor. Samples run to 15 min, so every
 /// pane read is closed and kept. The same range query again reads one raw
-/// range, for the panes ending at 6..8 min: they were evicted, measured from
+/// range, for the panes ending at 6..9 min: they were evicted, measured from
 /// the newest step.
 #[tokio::test]
 async fn example4_b3_range() {
@@ -667,12 +670,12 @@ async fn example4_b3_range() {
     let workload = workload("example4-b3");
     let inputs = DeploymentInputs::default();
     let plan = plan_workload(&workload, &inputs).unwrap();
-    let at_query_time = plan_selected_at_query_time(&workload, &inputs).unwrap();
+    let at_query_time = plan.query_time_reference().unwrap();
     let all = Arc::new(all);
     let (prometheus_url, reads) = prometheus(all.clone()).await;
     let process = start(&plan, &prometheus_url).await;
     remote_write(&process.url, &all).await;
-    let query = &plan.queries[0];
+    let query = &plan.queries[0].query;
     let range = (10 * MINUTE, 14 * MINUTE, "60");
     let read = check_range(
         &process.url,

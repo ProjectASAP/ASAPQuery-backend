@@ -1,33 +1,27 @@
-//! Stored summaries (SDS): what the data plane stores for a plan's
-//! ingestion-time outputs, and how a query finds them again.
+//! Stored summaries (SDS): what the data plane stores for a plan's stored
+//! outputs, and how a query finds them again.
 //!
-//! The Planner's selected DAG marks each output computed at ingestion time
-//! (`MatAtIngestion`) and read at query time: the executor's materialization
-//! frontier. The control plane installs the DAG with each `PaneChain`
-//! expanded into its panes, so each such output reads one tumbling pane of
-//! raw samples:
+//! The installed plan lists every output it stores across evaluations
+//! (`InstallablePlan::stored_outputs`): when it is built (in an ingestion
+//! run, or in the query run that first reads it), the pane of raw samples
+//! it is built from, and how long it must stay available. At evaluation
+//! time `T` an output's pane covers `(T - end_offset - width, T -
+//! end_offset]`, the PromQL range convention.
 //!
-//! ```text
-//! frontier node <- ... <- TimeRange(width) <- TimeShift(offset)* <- Scan
-//! ```
-//!
-//! At evaluation time `T` it covers `(T - offset - width, T - offset]`, the
-//! PromQL range convention.
-//! Outputs that differ only in `offset` compute the same thing over different
-//! panes, so they share one [`SummaryDefinition`]: the data plane builds each
-//! pane of a definition once, and every output reads the pane it needs.
-//!
-//! A `MatAtQueryKeptAcrossEvaluations` output (#509 Example 4's B3) is
-//! computed at query time and kept for the next evaluations. It has the same
-//! pane shape and is described the same way, in [`Sds::kept_definitions`]:
-//! the query engine keeps each of its panes by definition and pane end.
+//! Outputs that differ only in their pane's offset compute the same thing
+//! over different panes, so they share one [`SummaryDefinition`]: the data
+//! plane builds each pane of a definition once, and every output reads the
+//! pane it needs. Identity is the SDS's own: the Planner states what each
+//! node computes, not which nodes are equal.
 
 use std::collections::{BTreeMap, HashMap};
 
-use planner_types::ir::physical_export::{PhysicalASAPDAG, PhysicalASAPDAGNode};
-use planner_types::ir::schema::Schema;
-use planner_types::ir::{NonASAPOp, Operator};
-use planner_types::physical::Materialization;
+use asap_executor::planner::ir::physical_export::{
+    PhysicalASAPDAG, PhysicalASAPDAGNode, RawSampleWindow,
+};
+use asap_executor::planner::ir::schema::Schema;
+use asap_executor::planner::ir::{NonASAPOp, Operator};
+use asap_planner::{InstallablePlan, StoredOutputBuild};
 use sha2::{Digest, Sha256};
 
 /// Identifies what a stored summary computes, independent of node ids and of
@@ -44,9 +38,27 @@ pub struct SummaryDefinition {
     /// The output that builds a pane; any output of the definition computes
     /// the same, and this is the first in node order.
     pub builder: u64,
-    /// The raw input of the build: the `TimeRange` node fed one pane's samples.
-    pub raw_input: u64,
+    /// The builder's pane: its `TimeRange`, fed one pane's samples, and the
+    /// `Scan` that selects them.
+    pub window: RawSampleWindow,
     pub output_schema: Schema,
+    /// How far back from the newest evaluation time a pane stays available:
+    /// the largest `retention_ms` the plan states for the definition's
+    /// outputs. A pane that starts earlier is no longer read.
+    pub retention_ms: i64,
+}
+
+impl SummaryDefinition {
+    /// The builder's `TimeRange`, which one pane's samples feed.
+    pub fn raw_input(&self) -> u64 {
+        self.window.time_range_node_id as u64
+    }
+
+    /// The end of the oldest pane still read when the newest evaluation is
+    /// at `newest_ms`: panes ending before it are evicted.
+    pub fn oldest_kept_end_ms(&self, newest_ms: i64) -> i64 {
+        newest_ms - self.retention_ms + self.pane_ms
+    }
 }
 
 /// How one output reads its definition: at evaluation time `T`, the pane
@@ -64,7 +76,7 @@ pub struct PaneBinding {
 pub struct Sds {
     /// Definitions built at ingestion time, by identity.
     pub definitions: BTreeMap<DefinitionId, SummaryDefinition>,
-    /// Every frontier output, with its definition and pane.
+    /// Every output built at ingestion time, with its definition and pane.
     pub outputs: BTreeMap<u64, (DefinitionId, PaneBinding)>,
     /// Definitions of the outputs computed at query time and kept across
     /// evaluations, by identity.
@@ -77,137 +89,65 @@ pub struct Sds {
 pub enum SdsError {
     #[error("node {0} is not in the DAG")]
     UnknownNode(u64),
-    #[error("output {node} does not read one pane of one Scan: {reason}")]
-    UnsupportedShape { node: u64, reason: String },
+    #[error("stored output {0}'s retention does not fit in i64 milliseconds")]
+    RetentionOverflow(u64),
 }
 
 impl Sds {
-    /// The definitions behind `frontier`, the DAG outputs computed at
-    /// ingestion time and read at query time, and behind the outputs kept
-    /// across evaluations (`MatAtQueryKeptAcrossEvaluations`).
-    pub fn from_dag(dag: &PhysicalASAPDAG, frontier: &[u64]) -> Result<Self, SdsError> {
+    /// The definitions behind `plan`'s stored outputs: those built in an
+    /// ingestion run and those built in a query run and kept.
+    pub fn from_plan(plan: &InstallablePlan) -> Result<Self, SdsError> {
+        let dag = &plan.dag.dag;
         let nodes: HashMap<u64, &PhysicalASAPDAGNode> =
             dag.nodes.iter().map(|n| (n.id as u64, n)).collect();
-        let mut inputs: HashMap<u64, Vec<u64>> = HashMap::new();
-        for edge in &dag.edges {
-            inputs
-                .entry(edge.consumer as u64)
-                .or_default()
-                .push(edge.producer as u64);
-        }
+        let inputs = inputs_of(dag);
         let mut sds = Sds::default();
         let mut hashes = HashMap::new();
-        for &node in frontier {
-            let (definitions, outputs) = (&mut sds.definitions, &mut sds.outputs);
-            add_output(node, &nodes, &inputs, &mut hashes, definitions, outputs)?;
-        }
-        for node in &dag.nodes {
-            if let Materialization::MatAtQueryKeptAcrossEvaluations(_) = node.materialization {
-                let (definitions, outputs) = (&mut sds.kept_definitions, &mut sds.kept_outputs);
-                add_output(
-                    node.id as u64,
-                    &nodes,
-                    &inputs,
-                    &mut hashes,
-                    definitions,
-                    outputs,
-                )?;
+        for output in &plan.stored_outputs {
+            let node = output.node_id as u64;
+            let (definitions, outputs) = match output.built_at {
+                StoredOutputBuild::IngestionRun => (&mut sds.definitions, &mut sds.outputs),
+                StoredOutputBuild::QueryRun => (&mut sds.kept_definitions, &mut sds.kept_outputs),
+            };
+            let id = DefinitionId(hex(&identity(node, &nodes, &inputs, &mut hashes)?));
+            let retention_ms = i64::try_from(output.retention_ms)
+                .map_err(|_| SdsError::RetentionOverflow(node))?;
+            let output_schema = nodes[&node].output_schema.clone();
+            let definition = definitions
+                .entry(id.clone())
+                .or_insert_with(|| SummaryDefinition {
+                    id: id.clone(),
+                    pane_ms: output.pane.width_ms,
+                    builder: node,
+                    window: output.pane.clone(),
+                    output_schema,
+                    retention_ms,
+                });
+            if node < definition.builder {
+                definition.builder = node;
+                definition.window = output.pane.clone();
             }
+            definition.retention_ms = definition.retention_ms.max(retention_ms);
+            let binding = PaneBinding {
+                offset_ms: output.pane.end_offset_ms,
+                raw_input: output.pane.time_range_node_id as u64,
+            };
+            outputs.insert(node, (id, binding));
         }
         Ok(sds)
     }
 }
 
-/// Adds `node`, which must read one pane, to `outputs`, and its definition
-/// to `definitions` if it is new.
-fn add_output(
-    node: u64,
-    nodes: &HashMap<u64, &PhysicalASAPDAGNode>,
-    inputs: &HashMap<u64, Vec<u64>>,
-    hashes: &mut HashMap<u64, [u8; 32]>,
-    definitions: &mut BTreeMap<DefinitionId, SummaryDefinition>,
-    outputs: &mut BTreeMap<u64, (DefinitionId, PaneBinding)>,
-) -> Result<(), SdsError> {
-    let (raw_input, pane_ms, offset_ms) = pane_of(node, nodes, inputs)?;
-    let id = DefinitionId(hex(&identity(node, nodes, inputs, hashes)?));
-    let output_schema = nodes[&node].output_schema.clone();
-    let definition = definitions
-        .entry(id.clone())
-        .or_insert_with(|| SummaryDefinition {
-            id: id.clone(),
-            pane_ms,
-            builder: node,
-            raw_input,
-            output_schema,
-        });
-    if node < definition.builder {
-        definition.builder = node;
-        definition.raw_input = raw_input;
+/// Each node's inputs, in edge order.
+fn inputs_of(dag: &PhysicalASAPDAG) -> HashMap<u64, Vec<u64>> {
+    let mut inputs: HashMap<u64, Vec<u64>> = HashMap::new();
+    for edge in &dag.edges {
+        inputs
+            .entry(edge.consumer as u64)
+            .or_default()
+            .push(edge.producer as u64);
     }
-    let binding = PaneBinding {
-        offset_ms,
-        raw_input,
-    };
-    outputs.insert(node, (id, binding));
-    Ok(())
-}
-
-/// `(raw input, pane width, offset)` of a frontier output: follow its single
-/// inputs down to the `TimeRange`, then sum the `TimeShift`s down to the `Scan`.
-fn pane_of(
-    node: u64,
-    nodes: &HashMap<u64, &PhysicalASAPDAGNode>,
-    inputs: &HashMap<u64, Vec<u64>>,
-) -> Result<(u64, i64, i64), SdsError> {
-    let unsupported = |reason: &str| SdsError::UnsupportedShape {
-        node,
-        reason: reason.into(),
-    };
-    let only_input = |id: u64| match inputs.get(&id).map(Vec::as_slice) {
-        Some([input]) => Ok(*input),
-        _ => Err(unsupported(
-            "every operator above the Scan must have one input",
-        )),
-    };
-    let mut current = node;
-    let (raw_input, pane_ms) = loop {
-        match relational(nodes, current)? {
-            Some(NonASAPOp::TimeRange { range, .. }) => {
-                break (current, range.as_millis() as i64);
-            }
-            Some(NonASAPOp::TimeShift { .. }) => {
-                return Err(unsupported("a TimeShift above the TimeRange"));
-            }
-            Some(NonASAPOp::Scan { .. }) => return Err(unsupported("no TimeRange")),
-            _ => current = only_input(current)?,
-        }
-    };
-    let mut offset_ms = 0;
-    current = only_input(raw_input)?;
-    loop {
-        match relational(nodes, current)? {
-            Some(NonASAPOp::TimeShift { shift, .. }) if shift.at.is_none() => {
-                offset_ms += shift.offset_ms;
-                current = only_input(current)?;
-            }
-            Some(NonASAPOp::Scan { .. }) => return Ok((raw_input, pane_ms, offset_ms)),
-            _ => {
-                return Err(unsupported(
-                    "only offset TimeShifts between TimeRange and Scan",
-                ))
-            }
-        }
-    }
-}
-
-fn relational<'a>(
-    nodes: &HashMap<u64, &'a PhysicalASAPDAGNode>,
-    id: u64,
-) -> Result<Option<&'a NonASAPOp<usize>>, SdsError> {
-    match &nodes.get(&id).ok_or(SdsError::UnknownNode(id))?.payload {
-        Operator::NonASAP(operator) => Ok(Some(operator)),
-        Operator::ASAP(_) => Ok(None),
-    }
+    inputs
 }
 
 /// SHA-256 over a node's payload and output schema, then its inputs'
@@ -270,10 +210,10 @@ impl<S> SummaryStore<S> {
         self.panes.get(&(definition.clone(), end_ms))
     }
 
-    /// Drops the panes of `definition` that end at or before `end_ms`.
-    pub fn evict_through(&mut self, definition: &DefinitionId, end_ms: i64) {
+    /// Drops the panes of `definition` that end before `end_ms`.
+    pub fn evict_before(&mut self, definition: &DefinitionId, end_ms: i64) {
         self.panes
-            .retain(|(id, end), _| id != definition || *end > end_ms);
+            .retain(|(id, end), _| id != definition || *end >= end_ms);
     }
 
     pub fn len(&self) -> usize {

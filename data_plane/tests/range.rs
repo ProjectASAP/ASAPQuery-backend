@@ -7,18 +7,16 @@ mod common;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use asap_executor::physical_planner::frontier_from_timing;
 use asap_executor::values::Batch;
-use control_plane::{plan_selected_at_query_time, InstalledPlan};
+use asap_planner::InstallablePlan;
 use data_plane::precompute::{Precompute, RawSample};
 use data_plane::query::{KeptResultStats, QueryEngine, RawRange, ResultSample, Unanswered};
 use data_plane::sds::{Sds, SummaryStore};
 
 const MINUTE: i64 = 60_000;
 
-fn sds(plan: &InstalledPlan) -> Sds {
-    let dag = &plan.dag.dag;
-    Sds::from_dag(dag, &frontier_from_timing(dag).unwrap()).unwrap()
+fn sds(plan: &InstallablePlan) -> Sds {
+    Sds::from_plan(plan).unwrap()
 }
 
 /// Samples every 15 s in `[from, to)` of `metric` for each `service`, with
@@ -185,10 +183,13 @@ fn raw_samples_are_fetched_once_and_sliced_per_step() {
 /// off the pane grid, or reading an evicted pane, forward the whole query.
 #[test]
 fn every_step_reads_stored_panes() {
-    let plan = common::plan("example4b", false);
+    // Declared as range requests over 10 minutes, so the Planner keeps the
+    // panes the first step reads.
+    let workload = common::with_range_evaluation(&common::workload("example4b"), 600_000, 600_000);
+    let plan = control_plane::plan_workload(&workload, &common::inputs(false)).unwrap();
     let query = "quantile_over_time(0.99, latency_ms[60m])";
     let sds = sds(&plan);
-    let mut precompute = Precompute::new(plan.dag.dag.clone(), &sds, 0).unwrap();
+    let mut precompute = Precompute::new(&plan, &sds, 0).unwrap();
     // Values grow with time, so each hour's p99 differs.
     let all = samples("latency_ms", &["a", "b"], MINUTE, 101 * MINUTE, |i, t| {
         (i * 1000) as f64 + (t / 15_000) as f64
@@ -234,13 +235,13 @@ fn every_step_reads_stored_panes() {
 /// it at the later steps; every step answers like the Planner executor.
 /// Kept panes are evicted as for instant evaluations, measured from the
 /// newest step: the same range query again rebuilds the panes ending at
-/// 6..8 min, which are older than 14 min minus 6.
+/// 6..9 min, which start before 14 min minus the plan's 5-minute retention.
 #[test]
 fn kept_panes_are_shared_across_steps() {
     let workload = common::workload("example4-b3");
     let inputs = common::inputs(true);
     let plan = control_plane::plan_workload(&workload, &inputs).unwrap();
-    let reference_plan = plan_selected_at_query_time(&workload, &inputs).unwrap();
+    let reference_plan = plan.query_time_reference().unwrap();
     let query = "quantile_over_time(0.99, latency_ms[5m])";
     let all = samples("latency_ms", &["a", "b"], 0, 30 * MINUTE + 1, |i, t| {
         (i * 100) as f64 + (t / 15_000 * 25 % 101) as f64
@@ -284,17 +285,18 @@ fn kept_panes_are_shared_across_steps() {
             .iter()
             .map(|r| (r.start_ms, r.end_ms))
             .collect::<Vec<_>>(),
-        vec![(5 * MINUTE, 8 * MINUTE)],
+        vec![(5 * MINUTE, 9 * MINUTE)],
         "only the evicted panes are fetched"
     );
     assert_eq!(again, results);
-    // Panes 6..8 are older than the newest evaluation's retention, so each
-    // step reading one rebuilds it: 3 at 10 min, 2 at 11, 1 at 12.
+    // Panes 6..9 start before the newest evaluation's retention (14 min
+    // minus 5), so each step reading one rebuilds it: 4 at 10 min, 3 at 11,
+    // 2 at 12, 1 at 13.
     assert_eq!(
         engine.kept_stats,
         KeptResultStats {
-            built: 15,
-            reused: 35
+            built: 19,
+            reused: 31
         }
     );
 }
@@ -308,7 +310,7 @@ fn open_panes_are_recomputed_at_each_step() {
     let workload = common::workload("example4-b3");
     let inputs = common::inputs(true);
     let plan = control_plane::plan_workload(&workload, &inputs).unwrap();
-    let reference_plan = plan_selected_at_query_time(&workload, &inputs).unwrap();
+    let reference_plan = plan.query_time_reference().unwrap();
     let query = "quantile_over_time(0.99, latency_ms[5m])";
     let all = samples("latency_ms", &["a", "b"], 0, 30 * MINUTE + 1, |i, t| {
         (i * 100) as f64 + (t / 15_000 * 25 % 101) as f64
@@ -339,6 +341,7 @@ fn open_panes_are_recomputed_at_each_step() {
     let kept_ends: Vec<i64> = (0..=30)
         .filter(|m| engine.kept.get(&definition, m * MINUTE).is_some())
         .collect();
-    // 6..8 are evicted, measured from the newest step (14 min).
-    assert_eq!(kept_ends, vec![9, 10, 11, 12]);
+    // 6..9 are evicted: they start before the newest step (14 min) minus
+    // the plan's 5-minute retention.
+    assert_eq!(kept_ends, vec![10, 11, 12]);
 }

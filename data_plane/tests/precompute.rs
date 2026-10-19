@@ -3,19 +3,18 @@ mod common;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use asap_executor::physical_planner::frontier_from_timing;
-use control_plane::{plan_workload, InstalledPlan};
+use asap_executor::planner::workload::{PlanningWorkload, Query};
+use asap_planner::InstallablePlan;
+use control_plane::plan_workload;
 use data_plane::precompute::{pane_end, Precompute, RawSample};
 use data_plane::sds::Sds;
-use planner_types::workload::{PlanningWorkload, Query};
 
 const MINUTE: i64 = 60_000;
 const PANE: i64 = 10 * MINUTE;
 
-fn precompute(plan: InstalledPlan) -> (Precompute, Sds) {
-    let dag = plan.dag.dag;
-    let sds = Sds::from_dag(&dag, &frontier_from_timing(&dag).unwrap()).unwrap();
-    (Precompute::new(dag, &sds, 0).unwrap(), sds)
+fn precompute(plan: InstallablePlan) -> (Precompute, Sds) {
+    let sds = Sds::from_plan(&plan).unwrap();
+    (Precompute::new(&plan, &sds, 0).unwrap(), sds)
 }
 
 fn sample(metric: &str, job: &str, timestamp_ms: i64, value: f64) -> RawSample {
@@ -113,4 +112,25 @@ fn panes_are_left_open() {
     assert_eq!(pane_end(0, PANE), 0);
     assert_eq!(pane_end(-1, PANE), 0);
     assert_eq!(pane_end(-PANE, PANE), -PANE);
+}
+
+/// A pane stays stored while an output reads it: Example 4b's oldest output
+/// reads the pane ending 50 min before the evaluation, so with the watermark
+/// at 90 min the pane ending at 40 min is kept and the one at 30 min, which
+/// starts before the plan's 60-minute retention, is evicted.
+#[test]
+fn keeps_panes_for_the_plans_retention() {
+    let (mut engine, sds) = precompute(common::plan("example4b", false));
+    let definition = sds.definitions.values().next().unwrap();
+    assert_eq!(definition.retention_ms, 60 * MINUTE);
+    let id = definition.id.clone();
+    engine.ingest(&samples("latency_ms", &["a"], MINUTE, 90 * MINUTE + 1));
+    assert!(
+        engine.store.get(&id, 4 * PANE).is_some(),
+        "read at offset 50 min"
+    );
+    assert!(
+        engine.store.get(&id, 3 * PANE).is_none(),
+        "older than the retention"
+    );
 }

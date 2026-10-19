@@ -12,8 +12,7 @@ class PlannerSyncTests(unittest.TestCase):
     revision = "a" * 40
     manifest = ''.join(
         f'{name} = {{ git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "{"b" * 40}" }}\n'
-        for name in ['planner-types', 'asap-frontend-promql', 'asap-logical-asap-optimization',
-                     'asap-plan-selection', 'asap-executor']
+        for name in ['asap-planner', 'asap-executor']
     )
 
     def run_sync(self, manifest, revision=None, cargo_status=0):
@@ -37,12 +36,10 @@ class PlannerSyncTests(unittest.TestCase):
         root, result = self.run_sync(self.manifest + other)
         self.assertEqual(result.returncode, 0, result.stderr)
         updated = (root / 'Cargo.toml').read_text()
-        self.assertEqual(updated.count(f'rev = "{self.revision}"'), 5)
+        self.assertEqual(updated.count(f'rev = "{self.revision}"'), 2)
         self.assertTrue(updated.endswith(other))
         self.assertEqual((root / 'cargo-args').read_text().splitlines(), [
-            'update', '-p', 'asap-types@0.1.0', '-p', 'asap-frontend-promql',
-            '-p', 'asap-logical-asap-optimization', '-p', 'asap-plan-selection',
-            '-p', 'asap-executor', '--precise', self.revision])
+            'update', '-p', 'asap-planner', '-p', 'asap-executor', '--precise', self.revision])
 
     def test_invalid_revision_does_not_mutate_manifest(self):
         """An upstream lookup failure cannot produce a malformed pin."""

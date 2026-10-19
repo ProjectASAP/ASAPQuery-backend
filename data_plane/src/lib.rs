@@ -1,7 +1,8 @@
 //! Backend data plane: receives Prometheus Remote Write samples and serves
 //! the Prometheus query API for an installed plan.
 //!
-//! The installed plan is ASAPPlanner's selected `PhysicalASAPDAG`. The
+//! The installed plan is ASAPPlanner's `InstallablePlan`: its selected
+//! physical DAG, the outputs it stores and the raw windows it reads. The
 //! engine thread builds its ingestion-time outputs pane by pane and answers
 //! the plan's instant and range queries from them; every other query, and
 //! any planned query it cannot answer, is forwarded to Prometheus.
@@ -17,13 +18,13 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use asap_planner::InstallablePlan;
 use axum::body::Bytes;
 use axum::extract::{RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use control_plane::InstalledPlan;
 use engine::EngineHandle;
 use precompute::RawSample;
 use prometheus::{InstantQuery, RangeQuery};
@@ -50,17 +51,17 @@ pub struct DataPlane {
 }
 
 impl DataPlane {
-    /// Installs the plan serialized in `plan_json` (an [`InstalledPlan`]).
+    /// Installs the plan serialized in `plan_json` (an [`InstallablePlan`]).
     /// Panes close `allowed_lateness_ms` after the newest sample passes them.
     pub fn new(
         plan_json: String,
         prometheus_url: String,
         allowed_lateness_ms: i64,
     ) -> anyhow::Result<Self> {
-        let plan: InstalledPlan = serde_json::from_str(&plan_json)?;
+        let plan: InstallablePlan = serde_json::from_str(&plan_json)?;
         plan.validate()?;
         Ok(Self {
-            queries: plan.queries,
+            queries: plan.queries.into_iter().map(|q| q.query).collect(),
             engine: EngineHandle::spawn(plan_json, allowed_lateness_ms)?,
             prometheus_url: prometheus_url.trim_end_matches('/').to_string(),
             limits: remote_write::Limits::default(),
