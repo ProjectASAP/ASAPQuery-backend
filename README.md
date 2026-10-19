@@ -31,14 +31,18 @@ The backend is being rebuilt on the Planner's physical DAG:
 | Part | State |
 |---|---|
 | Control plane: plan a PromQL workload, write `plan.json` | done |
-| Data plane: load and validate `plan.json`, accept Remote Write | done |
+| Data plane: load and validate `plan.json`; accept, count and drop Remote Write samples | done |
 | Stored summaries (SDS) | next |
 | Precompute engine: run ingestion-time nodes per pane | planned |
 | Query engine: run query-time nodes over stored panes and raw data | planned |
 
-Until the query engine lands, the data plane forwards every query to
-Prometheus and marks the response `x-asap-execution: forwarded`. SQL and
-ClickHouse are not supported yet.
+Until the precompute engine lands, the data plane validates and counts Remote
+Write samples, then drops them: Prometheus must receive Remote Write itself
+(for example, configure the sender with both endpoints). Until the query engine
+lands, the data plane forwards every query to Prometheus, with its
+end-to-end headers such as `Authorization` and `X-Scope-OrgID`, and marks the
+response `x-asap-execution: forwarded`. SQL and ClickHouse are not supported
+yet.
 
 ## Running
 
@@ -47,7 +51,8 @@ ClickHouse are not supported yet.
 cargo run -p control_plane -- \
   --workload examples/planner-layering-example1.json --out plan.json
 
-# Serve Remote Write on /api/v1/write and the query API on /api/v1/query[_range].
+# Serve Remote Write on /api/v1/write (samples are counted and dropped for now)
+# and the query API on /api/v1/query[_range], forwarded to Prometheus.
 cargo run -p data_plane -- --plan plan.json --prometheus-url http://localhost:9090
 ```
 
@@ -59,6 +64,9 @@ in Prometheus, and no query-time result kept across evaluations
 ingestion time. `--measured-operation-costs costs.json` gives Stage 3 the
 deployment's measured sketch operation costs; otherwise it prices every node
 with cost model 1 and illustrative unit costs.
+
+`--forward-timeout-seconds` bounds each forwarded query (default 120, matching
+Prometheus's default query timeout); a query that runs longer gets 502.
 
 ## Development
 
