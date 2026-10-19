@@ -1,15 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use control_plane::{
-    plan_selected_at_query_time, plan_workload, DeploymentInputs, InstalledPlan, PlanError,
-};
-use planner_types::ir::{ASAPOp, Operator};
-use planner_types::physical::Materialization;
-use planner_types::workload::{PlanningWorkload, QueryLanguage, SqlDialect};
+use asap_planner::{InstallablePlan, PlanningWorkload, StoredOutputBuild};
+use control_plane::{plan_workload, save_plan, DeploymentInputs, PlanError};
 
-fn example1() -> PlanningWorkload {
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/planner-layering-example1.json");
+fn example(name: &str) -> PlanningWorkload {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../examples/planner-layering-{name}.json"));
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
@@ -18,13 +14,17 @@ fn temp_path(name: &str) -> PathBuf {
 }
 
 /// The Planner selects one physical DAG for #509 Example 1, with one root per
-/// query, and the plan survives the file the data plane loads.
+/// query bound to the query's text, and the plan survives the file the data
+/// plane loads.
 #[test]
 fn plans_example1_and_round_trips_the_plan() {
-    let workload = example1();
+    let workload = example("example1");
     let plan = plan_workload(&workload, &DeploymentInputs::default()).unwrap();
     assert_eq!(
-        plan.queries,
+        plan.queries
+            .iter()
+            .map(|q| q.query.clone())
+            .collect::<Vec<_>>(),
         workload
             .query_workload
             .entries()
@@ -33,103 +33,68 @@ fn plans_example1_and_round_trips_the_plan() {
     );
     assert_eq!(plan.dag.dag.roots.len(), 2);
     let path = temp_path("example1.json");
-    plan.save(&path).unwrap();
-    assert_eq!(InstalledPlan::load(&path).unwrap(), plan);
+    save_plan(&plan, &path).unwrap();
+    let loaded: InstallablePlan =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    loaded.validate().unwrap();
+    assert_eq!(loaded, plan);
     std::fs::remove_file(path).unwrap();
 }
 
-/// Only PromQL workloads are planned; SQL support comes later.
+/// Only PromQL workloads are planned: the Planner refuses a SQL workload
+/// for the PromQL frontend.
 #[test]
 fn rejects_sql_workloads() {
-    let mut workload = example1();
-    workload.query_workload.language = QueryLanguage::SQL(SqlDialect::ClickhouseSQL);
+    let mut workload: serde_json::Value = serde_json::to_value(example("example1")).unwrap();
+    workload["query_workload"]["language"] = serde_json::json!({"sql": "clickhouse_sql"});
+    let workload: PlanningWorkload = serde_json::from_value(workload).unwrap();
     assert!(matches!(
         plan_workload(&workload, &DeploymentInputs::default()),
-        Err(PlanError::UnsupportedLanguage(_))
+        Err(PlanError::Planning(_))
     ));
 }
 
-/// A plan whose queries do not match the DAG's roots is not installed.
+/// Without raw data the Planner builds Example 4b's six ten-minute panes at
+/// ingestion time and lists them as stored outputs, each with its pane and
+/// a retention at least as long as its pane reaches back; its query-time
+/// reference stores nothing and answers the same queries.
 #[test]
-fn load_rejects_a_plan_without_a_query_per_root() {
-    let mut plan = plan_workload(&example1(), &DeploymentInputs::default()).unwrap();
-    plan.queries.pop();
-    let path = temp_path("mismatched.json");
-    plan.save(&path).unwrap();
-    assert!(matches!(
-        InstalledPlan::load(&path),
-        Err(PlanError::RootCount {
-            roots: 2,
-            queries: 1
-        })
-    ));
-    std::fs::remove_file(path).unwrap();
-}
-
-fn example4b() -> PlanningWorkload {
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/planner-layering-example4b.json");
-    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
-}
-
-/// Without raw data the Planner builds Example 4b's panes at ingestion time,
-/// installed as plain panes (no `PaneChain`); the reference plan of the same
-/// selection materializes nothing.
-#[test]
-fn reference_plan_materializes_nothing() {
+fn stores_example4b_panes_and_references_them_at_query_time() {
     let mut inputs = DeploymentInputs::default();
     inputs.deployment_capabilities.raw_data_retained = false;
-    let installed = plan_workload(&example4b(), &inputs).unwrap();
-    let materialized = |plan: &InstalledPlan| {
-        plan.dag
-            .dag
-            .nodes
-            .iter()
-            .filter(|n| n.materialization != Materialization::NotMaterialized)
-            .count()
-    };
-    assert_eq!(materialized(&installed), 6, "six ten-minute panes");
-    assert!(installed
-        .dag
-        .dag
-        .nodes
+    let plan = plan_workload(&example("example4b"), &inputs).unwrap();
+    assert_eq!(plan.stored_outputs.len(), 6, "six ten-minute panes");
+    let mut offsets: Vec<i64> = plan
+        .stored_outputs
         .iter()
-        .all(|n| !matches!(n.payload, Operator::ASAP(ASAPOp::PaneChain { .. }))));
-    let reference = plan_selected_at_query_time(&example4b(), &inputs).unwrap();
-    assert_eq!(materialized(&reference), 0);
-    assert_eq!(reference.queries, installed.queries);
+        .map(|output| {
+            assert_eq!(output.built_at, StoredOutputBuild::IngestionRun);
+            assert_eq!(output.pane.width_ms, 600_000);
+            assert!(output.retention_ms >= output.pane.reach_ms());
+            output.pane.end_offset_ms
+        })
+        .collect();
+    offsets.sort();
+    assert_eq!(offsets, (0..6).map(|i| i * 600_000).collect::<Vec<_>>());
+    assert!(plan.query_time_raw_windows.is_empty());
+    let reference = plan.query_time_reference().unwrap();
+    assert!(reference.stored_outputs.is_empty());
+    assert_eq!(reference.queries, plan.queries);
 }
 
 /// The backend keeps query-time results across evaluations, so for a few
 /// series sampled every millisecond the Planner selects #509 Example 4's
-/// B3: five 1-minute KLL panes built at query time and kept, installed as
-/// plain panes.
+/// B3: five 1-minute KLL panes built at query time and kept.
 #[test]
 fn selects_panes_kept_across_evaluations() {
     let inputs = DeploymentInputs::default();
     assert!(inputs.deployment_capabilities.query_time_results_retained);
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/planner-layering-example4-b3.json");
-    let workload: PlanningWorkload =
-        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    let plan = plan_workload(&workload, &inputs).unwrap();
-    let kept = plan
-        .dag
-        .dag
-        .nodes
+    let plan = plan_workload(&example("example4-b3"), &inputs).unwrap();
+    let kept: Vec<_> = plan
+        .stored_outputs
         .iter()
-        .filter(|n| {
-            matches!(
-                n.materialization,
-                Materialization::MatAtQueryKeptAcrossEvaluations(_)
-            )
-        })
-        .inspect(|n| {
-            assert!(matches!(
-                n.payload,
-                Operator::ASAP(ASAPOp::SummaryAgg { .. })
-            ))
-        })
-        .count();
-    assert_eq!(kept, 5, "five one-minute panes");
+        .filter(|output| output.built_at == StoredOutputBuild::QueryRun)
+        .collect();
+    assert_eq!(kept.len(), 5, "five one-minute panes");
+    assert!(kept.iter().all(|output| output.pane.width_ms == 60_000));
 }

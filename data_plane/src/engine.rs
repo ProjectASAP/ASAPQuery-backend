@@ -5,8 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 
-use asap_executor::physical_planner::frontier_from_timing;
-use control_plane::InstalledPlan;
+use asap_planner::InstallablePlan;
 use tokio::sync::oneshot;
 
 use crate::precompute::{Precompute, PrecomputeStats, RawSample};
@@ -170,10 +169,9 @@ struct Engine {
 
 impl Engine {
     fn new(plan_json: &str, allowed_lateness_ms: i64) -> anyhow::Result<Self> {
-        let plan: InstalledPlan = serde_json::from_str(plan_json)?;
+        let plan: InstallablePlan = serde_json::from_str(plan_json)?;
         plan.validate()?;
-        let frontier = frontier_from_timing(&plan.dag.dag)?;
-        let sds = Sds::from_dag(&plan.dag.dag, &frontier)?;
+        let sds = Sds::from_plan(&plan)?;
         tracing::info!(
             definitions = sds.definitions.len(),
             outputs = sds.outputs.len(),
@@ -183,7 +181,7 @@ impl Engine {
         );
         let query = QueryEngine::new(&plan, &sds);
         Ok(Self {
-            precompute: Precompute::new(plan.dag.dag, &sds, allowed_lateness_ms)?,
+            precompute: Precompute::new(&plan, &sds, allowed_lateness_ms)?,
             query,
         })
     }

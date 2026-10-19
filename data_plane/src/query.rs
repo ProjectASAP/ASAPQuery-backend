@@ -2,7 +2,7 @@
 //! its root of the plan's DAG over stored panes and raw samples.
 //!
 //! Each root is compiled once with three kinds of inputs:
-//! - stored outputs (the SDS frontier): bound to the pane of their definition
+//! - stored outputs built at ingestion time: bound to the pane of their definition
 //!   ending at `T - offset`, which must be stored;
 //! - kept outputs (`MatAtQueryKeptAcrossEvaluations`): bound to the kept
 //!   pane of their definition ending at `T - offset`. A missing one is built
@@ -10,9 +10,11 @@
 //!   next evaluations once it is closed (its end at or before the
 //!   precompute engine's watermark); kept panes are evicted like stored
 //!   ones, measured from the newest evaluation;
-//! - query-time raw ranges, `TimeRange(range) <- TimeShift(offset)* <- Scan`:
-//!   bound to the samples in `(T - offset - range, T - offset]`, which the
-//!   caller fetches, filtered by the plan's `Scan`.
+//! - query-time raw windows (`InstallablePlan::query_time_raw_windows`):
+//!   bound to the samples in `(T - offset - width, T - offset]`, which the
+//!   caller fetches, selected by the executor's `RawSampleSelector` (the
+//!   plan's `Scan` matchers, and the latest sample per series for an
+//!   instant selector).
 //!
 //! A range query is one evaluation per step, in time order. Each raw range
 //! is fetched once for all steps and sliced per step, and each kept
@@ -26,18 +28,16 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use asap_executor::operators::Operator;
-use asap_executor::physical_planner::promql_rows::{
-    decode_series_identity, SERIES_IDENTITY_COLUMN,
-};
 use asap_executor::physical_planner::{compile, CompiledPhysicalDAG, InputContract, Source};
+use asap_executor::planner::ir::physical_export::RawSampleWindow;
+use asap_executor::planner::ir::schema::{DataType, FieldDataType, Schema};
+use asap_executor::planner::ir::{NonASAPOp, Operator as IrOperator};
 use asap_executor::runtime::Scope;
 use asap_executor::values::{Batch, Value};
-use control_plane::InstalledPlan;
-use planner_types::ir::physical_export::PhysicalASAPDAG;
-use planner_types::ir::schema::{DataType, FieldDataType, Schema};
-use planner_types::ir::{NonASAPOp, Operator as IrOperator};
+use asap_executor::{series_labels_of_output_row, RawSampleSelector, Sample};
+use asap_planner::{InstallablePlan, PhysicalASAPDAG};
 
-use crate::precompute::{run, scan_below, select, PaneBuild, RawSample, ScanInput};
+use crate::precompute::{output_schema, run, PaneBuild, RawSample};
 use crate::sds::{DefinitionId, Sds, SummaryStore};
 
 /// Raw samples a query needs: `metric`'s samples in `(start_ms, end_ms]`.
@@ -85,10 +85,10 @@ struct KeptInput {
 }
 
 struct RawInput {
+    /// The window's `TimeRange`, which its rows feed.
     node: u64,
-    scan: ScanInput,
-    range_ms: i64,
-    offset_ms: i64,
+    window: RawSampleWindow,
+    selector: RawSampleSelector,
 }
 
 struct Program {
@@ -119,29 +119,33 @@ pub struct QueryEngine {
     newest_evaluation_ms: Option<i64>,
     /// How each kept definition's panes are built, or why they cannot be.
     kept_builds: BTreeMap<DefinitionId, Result<PaneBuild, String>>,
-    dag: PhysicalASAPDAG,
     /// Each query, with its compiled root or why it cannot run.
     roots: Vec<(String, Result<Program, String>)>,
 }
 
 impl QueryEngine {
-    pub fn new(plan: &InstalledPlan, sds: &Sds) -> Self {
-        let dag = plan.dag.dag.clone();
+    pub fn new(plan: &InstallablePlan, sds: &Sds) -> Self {
+        let dag = &plan.dag.dag;
         let kept_builds: BTreeMap<_, _> = sds
             .kept_definitions
             .values()
             .map(|definition| {
-                let build = PaneBuild::new(&dag, definition, &sds.kept_outputs);
+                let build = PaneBuild::new(dag, definition);
                 (definition.id.clone(), build.map_err(|e| e.to_string()))
             })
+            .collect();
+        let windows: HashMap<u64, &RawSampleWindow> = plan
+            .query_time_raw_windows
+            .iter()
+            .map(|window| (window.time_range_node_id as u64, window))
             .collect();
         let roots = plan
             .queries
             .iter()
-            .zip(&dag.roots)
-            .map(|(query, root)| {
-                let program = program(&dag, sds, &kept_builds, *root as u64);
-                (query.trim().to_string(), program)
+            .map(|query| {
+                let root = query.root_node_id as u64;
+                let program = program(dag, sds, &kept_builds, &windows, root);
+                (query.query.trim().to_string(), program)
             })
             .collect();
         Self {
@@ -149,7 +153,6 @@ impl QueryEngine {
             kept_stats: KeptResultStats::default(),
             newest_evaluation_ms: None,
             kept_builds,
-            dag,
             roots,
         }
     }
@@ -171,11 +174,14 @@ impl QueryEngine {
         let mut ranges: Vec<RawRange> = program
             .raw
             .iter()
-            .map(|input| RawRange {
-                node: input.node,
-                metric: input.scan.metric.clone(),
-                start_ms: time_ms - input.offset_ms - input.range_ms,
-                end_ms: time_ms - input.offset_ms,
+            .map(|input| {
+                let (start_ms, end_ms) = input.window.bounds_ms(time_ms);
+                RawRange {
+                    node: input.node,
+                    metric: input.selector.metric().to_string(),
+                    start_ms,
+                    end_ms,
+                }
             })
             .collect();
         for input in &program.kept {
@@ -184,7 +190,7 @@ impl QueryEngine {
                 let build = self.kept_build(&input.definition);
                 ranges.push(RawRange {
                     node: input.raw_input,
-                    metric: build.scan.metric.clone(),
+                    metric: build.selector.metric().to_string(),
                     start_ms: end_ms - build.definition.pane_ms,
                     end_ms,
                 });
@@ -247,7 +253,7 @@ impl QueryEngine {
                     };
                     let pane = self
                         .kept_build(&input.definition)
-                        .run(&self.dag, samples, pane_scope)
+                        .run(&samples_of(samples), end_ms, pane_scope)
                         .map_err(|e| Unanswered::Execution(e.to_string()))?;
                     self.kept_stats.built += 1;
                     // Kept only once closed, as the precompute engine closes
@@ -263,8 +269,12 @@ impl QueryEngine {
         }
         for input in &program.raw {
             let samples = raw.get(&input.node).map(Vec::as_slice).unwrap_or_default();
-            let rows = select(&self.dag, &input.scan, samples, scope.clone()).map_err(failed)?;
-            let source = Operator::source(input.scan.schema.clone(), vec![rows]).map_err(failed)?;
+            let (_, end_ms) = input.window.bounds_ms(time_ms);
+            let rows = input
+                .selector
+                .rows(end_ms, &samples_of(samples))
+                .map_err(failed)?;
+            let source = Operator::source(rows.schema().clone(), vec![rows]).map_err(failed)?;
             sources.insert(input.node, Box::new(source));
         }
         // Evict the kept panes older than each definition's retention
@@ -273,8 +283,8 @@ impl QueryEngine {
         self.newest_evaluation_ms = Some(newest);
         for (definition, build) in &self.kept_builds {
             if let Ok(build) = build {
-                self.kept
-                    .evict_through(definition, newest - build.retention_ms);
+                let oldest = build.definition.oldest_kept_end_ms(newest);
+                self.kept.evict_before(definition, oldest);
             }
         }
         let dag = program.compiled.instantiate(sources).map_err(failed)?;
@@ -308,9 +318,9 @@ impl QueryEngine {
             .iter()
             .map(|input| RawRange {
                 node: input.node,
-                metric: input.scan.metric.clone(),
-                start_ms: first - input.offset_ms - input.range_ms,
-                end_ms: last - input.offset_ms,
+                metric: input.selector.metric().to_string(),
+                start_ms: input.window.bounds_ms(first).0,
+                end_ms: input.window.bounds_ms(last).1,
             })
             .collect();
         // The first and last end of each kept definition's missing panes.
@@ -327,8 +337,8 @@ impl QueryEngine {
         for (definition, (first_end_ms, last_end_ms)) in missing {
             let build = self.kept_build(definition);
             ranges.push(RawRange {
-                node: build.definition.raw_input,
-                metric: build.scan.metric.clone(),
+                node: build.definition.raw_input(),
+                metric: build.selector.metric().to_string(),
                 start_ms: first_end_ms - build.definition.pane_ms,
                 end_ms: last_end_ms,
             });
@@ -359,7 +369,13 @@ impl QueryEngine {
         let raw_inputs: Vec<(u64, i64, i64)> = program
             .raw
             .iter()
-            .map(|input| (input.node, input.offset_ms, input.range_ms))
+            .map(|input| {
+                (
+                    input.node,
+                    input.window.end_offset_ms,
+                    input.window.width_ms,
+                )
+            })
             .collect();
         // Each kept output: its definition and offset, the node its pane's
         // samples feed, and the node its definition's samples were fetched for.
@@ -372,7 +388,7 @@ impl QueryEngine {
                     input.definition.clone(),
                     input.offset_ms,
                     input.raw_input,
-                    definition.raw_input,
+                    definition.raw_input(),
                     definition.pane_ms,
                 )
             })
@@ -447,6 +463,11 @@ fn slice(runs: &[&[RawSample]], start_ms: i64, end_ms: i64) -> Vec<RawSample> {
     samples
 }
 
+/// `samples` as the executor's samples, for a `RawSampleSelector`.
+fn samples_of(samples: &[RawSample]) -> Vec<Sample> {
+    samples.iter().map(RawSample::to_sample).collect()
+}
+
 /// The stored pane `input` reads at `time_ms`.
 fn pane<'a>(
     input: &StoredInput,
@@ -468,11 +489,13 @@ fn pane<'a>(
     })
 }
 
-/// Compiles `root` with its stored, kept and raw inputs, or says why it cannot.
+/// Compiles `root` with its stored, kept and raw inputs, or says why it
+/// cannot. `windows` are the plan's query-time raw windows, by `TimeRange`.
 fn program(
     dag: &PhysicalASAPDAG,
     sds: &Sds,
     kept_builds: &BTreeMap<DefinitionId, Result<PaneBuild, String>>,
+    windows: &HashMap<u64, &RawSampleWindow>,
     root: u64,
 ) -> Result<Program, String> {
     let nodes: HashMap<u64, _> = dag.nodes.iter().map(|n| (n.id as u64, n)).collect();
@@ -509,19 +532,20 @@ fn program(
             });
             continue;
         }
+        if let Some(window) = windows.get(&id) {
+            let selector = RawSampleSelector::new(dag, window).map_err(|e| e.to_string())?;
+            raw.push(RawInput {
+                node: id,
+                window: (*window).clone(),
+                selector,
+            });
+            continue;
+        }
         match &nodes[&id].payload {
-            IrOperator::NonASAP(NonASAPOp::TimeRange { range, .. }) => {
-                raw.push(raw_input(
-                    dag,
-                    &nodes,
-                    &producers,
-                    id,
-                    range.as_millis() as i64,
-                )?);
-                continue;
-            }
-            IrOperator::NonASAP(NonASAPOp::Scan { .. }) => {
-                return Err(format!("node {id}: a Scan read without a TimeRange"))
+            IrOperator::NonASAP(NonASAPOp::TimeRange { .. } | NonASAPOp::Scan { .. }) => {
+                return Err(format!(
+                    "node {id}: raw samples read outside the plan's raw windows"
+                ))
             }
             _ => pending.extend(producers.get(&id).into_iter().flatten().copied()),
         }
@@ -531,15 +555,10 @@ fn program(
         .iter()
         .map(|i| i.node)
         .chain(kept.iter().map(|i| i.node))
+        .chain(raw.iter().map(|i| i.node))
     {
-        let schema = Arc::new(nodes[&node].output_schema.clone());
+        let schema = Arc::new(output_schema(dag, node).clone());
         inputs.insert(node, InputContract::bounded(schema));
-    }
-    for input in &raw {
-        inputs.insert(
-            input.node,
-            InputContract::bounded(input.scan.schema.clone()),
-        );
     }
     let compiled = compile(dag, inputs, &[root]).map_err(|e| e.to_string())?;
     Ok(Program {
@@ -548,47 +567,6 @@ fn program(
         kept,
         raw,
         output: nodes[&root].output_schema.clone(),
-    })
-}
-
-/// A query-time `TimeRange`: the `Scan` below it and the `TimeShift`
-/// offsets between them.
-fn raw_input(
-    dag: &PhysicalASAPDAG,
-    nodes: &HashMap<u64, &planner_types::ir::physical_export::PhysicalASAPDAGNode>,
-    producers: &HashMap<u64, Vec<u64>>,
-    time_range: u64,
-    range_ms: i64,
-) -> Result<RawInput, String> {
-    let unsupported = |reason: &str| format!("node {time_range}: {reason}");
-    let mut offset_ms = 0;
-    let mut current = time_range;
-    loop {
-        current = match producers.get(&current).map(Vec::as_slice) {
-            Some([input]) => *input,
-            _ => return Err(unsupported("a TimeRange must read one input")),
-        };
-        match &nodes[&current].payload {
-            IrOperator::NonASAP(NonASAPOp::TimeShift { shift, .. }) if shift.at.is_none() => {
-                offset_ms += shift.offset_ms
-            }
-            IrOperator::NonASAP(NonASAPOp::Scan { .. }) => break,
-            _ => {
-                return Err(unsupported(
-                    "only offset TimeShifts between TimeRange and Scan",
-                ))
-            }
-        }
-    }
-    let scan = scan_below(dag, time_range).ok_or_else(|| unsupported("not a time-series Scan"))?;
-    if Arc::new(nodes[&time_range].output_schema.clone()) != scan.schema {
-        return Err(unsupported("TimeRange rows differ from its Scan's"));
-    }
-    Ok(RawInput {
-        node: time_range,
-        scan,
-        range_ms,
-        offset_ms,
     })
 }
 
@@ -608,17 +586,8 @@ fn result_samples(schema: &Schema, rows: Vec<Vec<Value>>) -> Result<Vec<ResultSa
     };
     rows.into_iter()
         .map(|row| {
-            let mut labels = BTreeMap::new();
-            for (field, cell) in schema.fields.iter().zip(&row) {
-                let Value::Utf8(text) = cell else { continue };
-                if field.name == SERIES_IDENTITY_COLUMN {
-                    let identity = decode_series_identity(text)
-                        .map_err(|e| Unanswered::Execution(e.to_string()))?;
-                    labels.extend(identity);
-                } else if !text.is_empty() {
-                    labels.insert(field.name.clone(), text.to_string());
-                }
-            }
+            let labels = series_labels_of_output_row(schema, &row)
+                .map_err(|e| Unanswered::Execution(e.to_string()))?;
             let value = match &row[value] {
                 Value::Float64(v) => *v,
                 other => return Err(Unanswered::Execution(format!("value {other:?}"))),

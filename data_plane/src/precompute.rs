@@ -1,43 +1,51 @@
 //! Precompute engine: builds each stored summary pane once, when the
 //! watermark passes its end.
 //!
-//! For every [`SummaryDefinition`] the engine buffers the samples of its
-//! `Scan`'s metric by tumbling pane. A pane `(end - pane, end]` closes when
-//! the watermark (the newest sample time minus the allowed lateness) reaches
-//! `end`. Closing it runs the plan's `Scan` over the buffered samples, which
-//! applies the label matchers, then the definition's build from its
-//! `TimeRange` input up to its output, under ingestion scope. The output is
+//! For every [`SummaryDefinition`] built at ingestion time the engine
+//! buffers the samples of its pane's metric by tumbling pane. A pane `(end -
+//! pane, end]` closes when the watermark (the newest sample time minus the
+//! allowed lateness) reaches `end`. Closing it selects the pane's rows with
+//! the executor's `RawSampleSelector`, which applies the plan's `Scan`
+//! (its label matchers), then runs the definition's build from its
+//! `TimeRange` up to its output, under ingestion scope. The output is
 //! stored and never changes; samples older than a closed pane are dropped.
 //! The first pane a definition sees may have started before the data plane
 //! did, so it is never built: queries that need it are not answered from
 //! stored panes.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock};
 
 use asap_executor::operators::Operator;
-use asap_executor::physical_planner::promql_rows::series_row;
-use asap_executor::physical_planner::{
-    bind_with_data_sources, compile, CompiledPhysicalDAG, InputContract, Source,
-};
+use asap_executor::physical_planner::{compile, CompiledPhysicalDAG, InputContract, Source};
+use asap_executor::plan::PhysicalDAG;
 use asap_executor::runtime::{Limits, RunContext, Scope};
-use asap_executor::sources::{DataSources, MemorySource};
-use asap_executor::values::{Batch, SchemaRef};
+use asap_executor::values::{Batch, SchemaRef, Value};
+use asap_executor::{RawSampleSelector, Sample};
+use asap_planner::{InstallablePlan, PhysicalASAPDAG};
 use futures::executor::block_on;
 use futures::StreamExt;
-use planner_types::ir::operator::operator_properties::Source as ScanSource;
-use planner_types::ir::physical_export::PhysicalASAPDAG;
-use planner_types::ir::{NonASAPOp, Operator as IrOperator};
 
-use crate::sds::{DefinitionId, PaneBinding, Sds, SummaryDefinition, SummaryStore};
+use crate::sds::{DefinitionId, Sds, SummaryDefinition, SummaryStore};
 
 /// One raw sample: its series' full label set (including `__name__`), time
-/// and value.
+/// and value. Samples of one series share their labels.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawSample {
     pub labels: Arc<BTreeMap<String, String>>,
     pub timestamp_ms: i64,
     pub value: f64,
+}
+
+impl RawSample {
+    /// The executor's sample, for a `RawSampleSelector`.
+    pub fn to_sample(&self) -> Sample {
+        Sample {
+            labels: (*self.labels).clone(),
+            timestamp_ms: self.timestamp_ms,
+            value: self.value,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -61,75 +69,51 @@ pub struct PrecomputeStats {
     pub panes_failed: u64,
 }
 
-/// A time-series `Scan` of the plan: its node, metric and row schema.
-#[derive(Debug, Clone)]
-pub struct ScanInput {
-    pub node: u64,
-    pub metric: String,
-    pub schema: SchemaRef,
-}
-
 /// How the panes of one definition are built from raw samples. The
 /// precompute engine builds stored panes with it, and the query engine kept
 /// ones.
 pub(crate) struct PaneBuild {
     pub(crate) definition: SummaryDefinition,
-    pub(crate) scan: ScanInput,
+    /// Selects one pane's rows from raw samples.
+    pub(crate) selector: RawSampleSelector,
     build: CompiledPhysicalDAG,
-    /// Largest offset any output of the definition reads, plus two panes:
-    /// panes ending at or before `newest - retention_ms` are no longer read.
-    pub(crate) retention_ms: i64,
 }
 
 impl PaneBuild {
-    /// Compiles `definition`'s build from its `TimeRange` up to its builder;
-    /// `outputs` are the outputs that read it.
+    /// Compiles `definition`'s build from its `TimeRange` up to its builder.
     pub(crate) fn new(
         dag: &PhysicalASAPDAG,
         definition: &SummaryDefinition,
-        outputs: &BTreeMap<u64, (DefinitionId, PaneBinding)>,
     ) -> Result<Self, PrecomputeError> {
-        let error =
-            |message: &str| PrecomputeError::Definition(definition.id.clone(), message.into());
-        let scan = scan_below(dag, definition.raw_input)
-            .ok_or_else(|| error("no time-series Scan below its TimeRange"))?;
-        let raw_schema = Arc::new(output_schema(dag, definition.raw_input).clone());
-        if raw_schema != scan.schema {
-            return Err(error("TimeRange rows differ from its Scan's"));
-        }
+        let selector = RawSampleSelector::new(dag, &definition.window)
+            .map_err(|e| PrecomputeError::Definition(definition.id.clone(), e.to_string()))?;
+        let raw_schema = Arc::new(output_schema(dag, definition.raw_input()).clone());
         let build = compile(
             dag,
-            BTreeMap::from([(definition.raw_input, InputContract::bounded(raw_schema))]),
+            BTreeMap::from([(definition.raw_input(), InputContract::bounded(raw_schema))]),
             &[definition.builder],
         )?;
-        let max_offset = outputs
-            .values()
-            .filter(|(id, _)| id == &definition.id)
-            .map(|(_, binding)| binding.offset_ms)
-            .max()
-            .unwrap_or(0);
         Ok(Self {
             definition: definition.clone(),
-            scan,
+            selector,
             build,
-            retention_ms: max_offset + 2 * definition.pane_ms,
         })
     }
 
-    /// Runs the plan's `Scan` over `samples`, then the build over the rows
-    /// it selects, under `scope`.
+    /// The pane ending at `end_ms`, built from `samples` under `scope`:
+    /// the selector keeps the pane's samples that the plan's `Scan` selects,
+    /// then the build runs over them.
     pub(crate) fn run(
         &self,
-        dag: &PhysicalASAPDAG,
-        samples: &[RawSample],
+        samples: &[Sample],
+        end_ms: i64,
         scope: Scope,
     ) -> Result<Batch, PrecomputeError> {
-        let selected = select(dag, &self.scan, samples, scope.clone())?;
-        let input: Source<'_> =
-            Box::new(Operator::source(self.scan.schema.clone(), vec![selected])?);
+        let rows = self.selector.rows(end_ms, samples)?;
+        let input: Source<'_> = Box::new(Operator::source(rows.schema().clone(), vec![rows])?);
         let build = self
             .build
-            .instantiate(BTreeMap::from([(self.definition.raw_input, input)]))?;
+            .instantiate(BTreeMap::from([(self.definition.raw_input(), input)]))?;
         let rows = run(&build, self.build.roots(), scope)?;
         let schema = Arc::new(self.definition.output_schema.clone());
         Ok(Batch::try_new(schema, rows)?)
@@ -139,14 +123,13 @@ impl PaneBuild {
 struct Builder {
     pane: PaneBuild,
     /// Samples of open panes, by pane end.
-    open: BTreeMap<i64, Vec<RawSample>>,
+    open: BTreeMap<i64, Vec<Sample>>,
     /// End of the newest pane built or skipped; samples in it or before it
     /// are dropped. `None` until the first sample.
     built_through: Option<i64>,
 }
 
 pub struct Precompute {
-    dag: PhysicalASAPDAG,
     builders: Vec<Builder>,
     allowed_lateness_ms: i64,
     newest_sample_ms: Option<i64>,
@@ -155,9 +138,10 @@ pub struct Precompute {
 }
 
 impl Precompute {
-    /// Compiles one build per definition of `sds`, a description of `dag`.
+    /// Compiles one build per ingestion-time definition of `sds`, the
+    /// stored summaries of `plan`.
     pub fn new(
-        dag: PhysicalASAPDAG,
+        plan: &InstallablePlan,
         sds: &Sds,
         allowed_lateness_ms: i64,
     ) -> Result<Self, PrecomputeError> {
@@ -166,14 +150,13 @@ impl Precompute {
             .values()
             .map(|definition| {
                 Ok(Builder {
-                    pane: PaneBuild::new(&dag, definition, &sds.outputs)?,
+                    pane: PaneBuild::new(&plan.dag.dag, definition)?,
                     open: BTreeMap::new(),
                     built_through: None,
                 })
             })
             .collect::<Result<_, PrecomputeError>>()?;
         Ok(Self {
-            dag,
             builders,
             allowed_lateness_ms,
             newest_sample_ms: None,
@@ -195,7 +178,7 @@ impl Precompute {
             let metric = sample.labels.get("__name__").map(String::as_str);
             let mut accepted = false;
             for builder in &mut self.builders {
-                if metric != Some(builder.pane.scan.metric.as_str()) {
+                if metric != Some(builder.pane.selector.metric()) {
                     continue;
                 }
                 let end = pane_end(sample.timestamp_ms, builder.pane.definition.pane_ms);
@@ -205,7 +188,11 @@ impl Precompute {
                     self.stats.dropped += 1;
                     continue;
                 }
-                builder.open.entry(end).or_default().push(sample.clone());
+                builder
+                    .open
+                    .entry(end)
+                    .or_default()
+                    .push(sample.to_sample());
                 accepted = true;
             }
             if accepted {
@@ -235,7 +222,7 @@ impl Precompute {
                     window_end_ms: end,
                     revision: 1,
                 };
-                match builder.pane.run(&self.dag, &samples, scope) {
+                match builder.pane.run(&samples, end, scope) {
                     Ok(state) => {
                         self.store.insert(&builder.pane.definition.id, end, state);
                         self.stats.panes_built += 1;
@@ -248,9 +235,14 @@ impl Precompute {
                 builder.built_through = Some(end);
                 end += pane_ms;
             }
-            let definition = &builder.pane.definition.id;
-            self.store
-                .evict_through(definition, watermark - builder.pane.retention_ms);
+            // The newest evaluation that reads stored panes is at most the
+            // newest closed pane's end, so retention is measured from it,
+            // not from the watermark, which may already be past it.
+            let definition = &builder.pane.definition;
+            if let Some(newest) = builder.built_through {
+                self.store
+                    .evict_before(&definition.id, definition.oldest_kept_end_ms(newest));
+            }
         }
     }
 }
@@ -262,39 +254,32 @@ pub fn pane_end(timestamp_ms: i64, pane_ms: i64) -> i64 {
     -(-timestamp_ms).div_euclid(pane_ms) * pane_ms
 }
 
-/// The rows of `samples` the plan's `scan` selects: its label matchers
-/// applied by the executor's `Scan`.
-pub fn select(
-    dag: &PhysicalASAPDAG,
-    scan: &ScanInput,
-    samples: &[RawSample],
-    scope: Scope,
-) -> Result<Batch, asap_executor::Error> {
-    let rows = samples
-        .iter()
-        .map(|s| series_row(&scan.schema, &s.labels, s.timestamp_ms, s.value))
-        .collect::<Result<Vec<_>, _>>()?;
-    let raw = Batch::try_new(scan.schema.clone(), rows)?;
-    let mut sources = DataSources::default();
-    sources.register(
-        ScanSource::TimeSeries {
-            metric: scan.metric.clone(),
-        },
-        Arc::new(MemorySource::new(scan.schema.clone(), vec![raw])?),
-    )?;
-    let dag = bind_with_data_sources(dag, BTreeMap::new(), &[scan.node], &sources)?;
-    let selected = run(&dag, &[scan.node], scope)?;
-    Batch::try_new(scan.schema.clone(), selected)
+/// Working memory one execution may hold, in bytes; the executor's own
+/// default (64 MiB) unless [`set_execution_memory_limit`] changed it.
+static EXECUTION_MEMORY_LIMIT_BYTES: OnceLock<usize> = OnceLock::new();
+
+/// Sets the working memory every later execution may hold. An execution
+/// over it fails, and its query is forwarded. Only the first call counts.
+pub fn set_execution_memory_limit(bytes: usize) {
+    let _ = EXECUTION_MEMORY_LIMIT_BYTES.set(bytes);
+}
+
+fn limits() -> Limits {
+    let mut limits = Limits::default();
+    if let Some(&bytes) = EXECUTION_MEMORY_LIMIT_BYTES.get() {
+        limits.max_bytes = bytes;
+    }
+    limits
 }
 
 /// Executes `dag`'s single root to completion and returns its rows.
 pub fn run(
-    dag: &asap_executor::plan::PhysicalDAG<'_, Batch, SchemaRef>,
+    dag: &PhysicalDAG<'_, Batch, SchemaRef>,
     roots: &[u64],
     scope: Scope,
-) -> Result<Vec<Vec<asap_executor::values::Value>>, asap_executor::Error> {
+) -> Result<Vec<Vec<Value>>, asap_executor::Error> {
     block_on(async {
-        let context = RunContext::new(scope, Limits::default())?;
+        let context = RunContext::new(scope, limits())?;
         let mut output = dag.execute(roots, context)?.remove(0);
         let mut rows = Vec::new();
         while let Some(batch) = output.next().await {
@@ -304,35 +289,13 @@ pub fn run(
     })
 }
 
-fn output_schema(dag: &PhysicalASAPDAG, id: u64) -> &planner_types::ir::schema::Schema {
+pub(crate) fn output_schema(
+    dag: &PhysicalASAPDAG,
+    id: u64,
+) -> &asap_executor::planner::ir::schema::Schema {
     &dag.nodes
         .iter()
         .find(|n| n.id as u64 == id)
-        .expect("SDS names DAG nodes")
+        .expect("stored outputs and raw windows name DAG nodes")
         .output_schema
-}
-
-/// The time-series `Scan` that `id` reads through single-input operators.
-pub fn scan_below(dag: &PhysicalASAPDAG, id: u64) -> Option<ScanInput> {
-    let inputs: HashMap<u64, u64> = dag
-        .edges
-        .iter()
-        .map(|e| (e.consumer as u64, e.producer as u64))
-        .collect();
-    let mut current = id;
-    loop {
-        let node = dag.nodes.iter().find(|n| n.id as u64 == current)?;
-        if let IrOperator::NonASAP(NonASAPOp::Scan {
-            source: ScanSource::TimeSeries { metric },
-            ..
-        }) = &node.payload
-        {
-            return Some(ScanInput {
-                node: current,
-                metric: metric.clone(),
-                schema: Arc::new(node.output_schema.clone()),
-            });
-        }
-        current = *inputs.get(&current)?;
-    }
 }

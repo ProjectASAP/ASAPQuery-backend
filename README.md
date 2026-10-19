@@ -11,15 +11,17 @@ Following the Planner's
 the Planner decides everything about a plan: which summaries to use, how to
 share them, what to materialize and which plan is cheapest. The backend
 supplies its deployment inputs (`DeploymentCapabilities`, and Stage 3's
-`PlanSelectionSettings`), then executes the one selected `PhysicalASAPDAG` as
-given.
+`PlanSelectionSettings`), calls `asap_planner::plan_installable` once, and
+executes the returned `InstallablePlan` as given. Among the Planner's crates
+it depends only on `asap-planner` (to plan) and `asap-executor` (to execute).
 
 ```text
 PlanningWorkload (JSON)       DeploymentCapabilities + PlanSelectionSettings
           \                             /
-           control_plane: ASAPPlanner stages 0-3
+           control_plane: asap_planner::plan_installable
                          |
-           plan.json: selected PhysicalASAPDAG + query per root
+           plan.json: InstallablePlan (selected DAG, root per query,
+                      stored outputs with pane and retention, raw windows)
                          |
            data_plane: Remote Write in, Prometheus query API out
 ```
@@ -51,7 +53,14 @@ it. It is kept in memory, by definition and pane end, once the pane is
 closed by the precompute engine's rule (its end at or before the newest
 sample minus `--allowed-lateness-ms`), and later evaluations reuse it; a pane
 read before it closes is computed again by later evaluations. Kept panes are
-evicted like stored ones, measured from the newest evaluation. Anything else is forwarded
+evicted like stored ones, measured from the newest evaluation.
+
+Each stored definition is kept for the largest `retention_ms` the plan
+states among its outputs: a pane that starts more than that before the
+newest evaluation is evicted. The Planner's retention covers the range
+evaluations the workload declares (`range_evaluation`), so a range query
+reaching further back than declared reads an evicted pane and is
+forwarded. Anything else is forwarded
 to Prometheus (`x-asap-execution: forwarded`); a planned query that could not
 be answered also says why in `x-asap-forward-reason`.
 
@@ -79,7 +88,9 @@ cargo run -p data_plane -- --plan plan.json --prometheus-url http://localhost:90
 `DeploymentCapabilities`: every summary the Planner can build, raw data kept
 in Prometheus, and query-time results kept across evaluations. For example
 `{"raw_data_retained": false}` makes the Planner build every input at
-ingestion time. `--measured-operation-costs costs.json` gives Stage 3 the
+ingestion time. `--plan-selection-settings settings.json` replaces Stage 3's
+`PlanSelectionSettings` (cost model and unit prices, resource speed, measured
+operation costs). `--measured-operation-costs costs.json` gives Stage 3 the
 deployment's measured sketch operation costs; otherwise it prices every node
 with cost model 1 and illustrative unit costs.
 
@@ -91,8 +102,9 @@ which the Planner keeps query-time panes across evaluations) as Planner
 `PlanningWorkload`s. `data_plane/tests/e2e_examples.rs` plans each
 one, runs the `data_plane` binary against a Prometheus holding generated
 samples, Remote Writes the same samples, and checks every planned query
-against the Planner executor running the selected plan with nothing
-materialized.
+against the Planner executor running the plan's query-time reference
+(`InstallablePlan::query_time_reference`: the same plan with every node at
+query time).
 
 ## Development
 

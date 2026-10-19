@@ -208,12 +208,15 @@ async fn answers_query_time_plans_from_raw_samples() {
     assert_eq!(response.body, json!({"forwarded": "up"}));
 }
 
-/// Example 4b's data plane, with Remote Write samples every 15 s in
-/// `[1 min, end)` for jobs a and b.
+/// Example 4b's data plane, with its query also answered as range requests
+/// over the last 10 minutes by 10 minutes, and Remote Write samples every
+/// 15 s in `[1 min, end)` for jobs a and b.
 async fn example4b(end_ms: i64) -> (Arc<DataPlane>, Router) {
+    let workload = common::with_range_evaluation(&common::workload("example4b"), 600_000, 600_000);
+    let plan = control_plane::plan_workload(&workload, &common::inputs(false)).unwrap();
     let state = Arc::new(
         DataPlane::new(
-            common::plan_json("example4b", false),
+            serde_json::to_string(&plan).unwrap(),
             fake_prometheus(vec![]).await,
             0,
         )
