@@ -30,18 +30,17 @@ use std::sync::{Arc, Mutex};
 
 use asap_executor::operators::Operator;
 use asap_executor::physical_planner::{compile, CompiledPhysicalDAG, InputContract, Source};
-use asap_executor::plan::{Boundedness, Emission, PhysicalOperator, PlanProperties};
 use asap_executor::planner::ir::physical_export::RawSampleWindow;
 use asap_executor::planner::ir::schema::{DataType, FieldDataType, Schema};
 use asap_executor::planner::ir::{NonASAPOp, Operator as IrOperator};
-use asap_executor::runtime::{Input, OutputStream, RunContext, Scope};
+use asap_executor::runtime::Scope;
+use asap_executor::series_labels_of_output_row;
 use asap_executor::values::{Batch, SchemaRef, Value};
-use asap_executor::{series_labels_of_output_row, RawSampleSelector, Sample};
 use asap_planner::{InstallablePlan, PhysicalASAPDAG};
-use futures::StreamExt;
 
-use crate::precompute::{output_schema, run, PaneBuild, RawSample};
+use crate::precompute::{output_schema, run, Pane, PaneBuild, RawSample};
 use crate::sds::{DefinitionId, Sds, SummaryStore};
+use crate::series::SeriesWindow;
 
 /// Raw samples a query needs: `metric`'s samples in `(start_ms, end_ms]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +73,8 @@ pub enum Unanswered {
 
 struct StoredInput {
     node: u64,
+    /// The output's rows, which its panes hold.
+    schema: SchemaRef,
     definition: DefinitionId,
     offset_ms: i64,
     pane_ms: i64,
@@ -81,6 +82,7 @@ struct StoredInput {
 
 struct KeptInput {
     node: u64,
+    schema: SchemaRef,
     definition: DefinitionId,
     offset_ms: i64,
     /// The output's own `TimeRange`, which its raw samples feed.
@@ -88,10 +90,11 @@ struct KeptInput {
 }
 
 struct RawInput {
-    /// The window's `TimeRange`, which its rows feed.
+    /// The window's `TimeRange`, which its batch feeds.
     node: u64,
     window: RawSampleWindow,
-    selector: RawSampleSelector,
+    /// Its input batch from raw samples, column by column.
+    series: SeriesWindow,
 }
 
 struct Program {
@@ -119,7 +122,7 @@ pub struct KeptResultStats {
 pub struct KeptResults {
     /// Kept panes (`MatAtQueryKeptAcrossEvaluations`), by definition and
     /// pane end, in memory.
-    pub panes: SummaryStore<Batch>,
+    pub panes: SummaryStore<Pane>,
     built: AtomicU64,
     reused: AtomicU64,
     /// Newest evaluation time, from which kept panes are evicted; `None`
@@ -145,9 +148,8 @@ impl KeptResults {
     }
 }
 
-/// One thread's compiled roots of the plan. The executor's compiled plans
-/// are not `Send`, so each query thread builds its own; they share the
-/// stored panes and the [`KeptResults`].
+/// The plan's compiled roots, compiled once and shared by every query
+/// thread, with the [`KeptResults`] they share.
 pub struct QueryEngine {
     /// Results kept across evaluations, shared with the other query threads.
     pub kept: Arc<KeptResults>,
@@ -203,7 +205,7 @@ impl QueryEngine {
         &self,
         query: &str,
         time_ms: i64,
-        store: &SummaryStore<Batch>,
+        store: &SummaryStore<Pane>,
     ) -> Result<(usize, Vec<RawRange>), Unanswered> {
         let (root, program) = self.program(query)?;
         for input in &program.stored {
@@ -216,7 +218,7 @@ impl QueryEngine {
                 let (start_ms, end_ms) = input.window.bounds_ms(time_ms);
                 RawRange {
                     node: input.node,
-                    metric: input.selector.metric().to_string(),
+                    metric: input.series.metric().to_string(),
                     start_ms,
                     end_ms,
                 }
@@ -228,7 +230,7 @@ impl QueryEngine {
                 let build = self.kept_build(&input.definition);
                 ranges.push(RawRange {
                     node: input.raw_input,
-                    metric: build.selector.metric().to_string(),
+                    metric: build.window.metric().to_string(),
                     start_ms: end_ms - build.definition.pane_ms,
                     end_ms,
                 });
@@ -247,7 +249,7 @@ impl QueryEngine {
         &self,
         root: usize,
         time_ms: i64,
-        store: &SummaryStore<Batch>,
+        store: &SummaryStore<Pane>,
         watermark_ms: Option<i64>,
         raw: &BTreeMap<u64, Vec<RawSample>>,
     ) -> Result<Vec<ResultSample>, Unanswered> {
@@ -264,7 +266,9 @@ impl QueryEngine {
         for input in &program.stored {
             sources.insert(
                 input.node,
-                Box::new(PaneSource(pane(input, time_ms, store)?)),
+                Box::new(
+                    pane_source(&*pane(input, time_ms, store)?, &input.schema).map_err(failed)?,
+                ),
             );
         }
         for input in &program.kept {
@@ -291,7 +295,7 @@ impl QueryEngine {
                     };
                     let pane = self
                         .kept_build(&input.definition)
-                        .run(&samples_of(samples), end_ms, pane_scope)
+                        .run(samples, end_ms, pane_scope)
                         .map_err(|e| Unanswered::Execution(e.to_string()))?;
                     self.kept.built.fetch_add(1, Ordering::Relaxed);
                     // Kept only once closed, as the precompute engine closes
@@ -303,15 +307,13 @@ impl QueryEngine {
                     }
                 }
             };
-            sources.insert(input.node, Box::new(PaneSource(pane)));
+            let source = pane_source(&pane, &input.schema).map_err(failed)?;
+            sources.insert(input.node, Box::new(source));
         }
         for input in &program.raw {
             let samples = raw.get(&input.node).map(Vec::as_slice).unwrap_or_default();
             let (_, end_ms) = input.window.bounds_ms(time_ms);
-            let rows = input
-                .selector
-                .rows(end_ms, &samples_of(samples))
-                .map_err(failed)?;
+            let rows = input.series.batch(end_ms, samples).map_err(failed)?;
             let source = Operator::source(rows.schema().clone(), vec![rows]).map_err(failed)?;
             sources.insert(input.node, Box::new(source));
         }
@@ -325,8 +327,8 @@ impl QueryEngine {
             }
         }
         let dag = program.compiled.instantiate(sources).map_err(failed)?;
-        let rows = run(&dag, program.compiled.roots(), scope).map_err(failed)?;
-        result_samples(&program.output, rows)
+        let batches = run(&dag, program.compiled.roots(), scope).map_err(failed)?;
+        result_samples(&program.output, &batches)
     }
 
     /// The root answering `query` at each of `steps` (ascending) and the
@@ -339,7 +341,7 @@ impl QueryEngine {
         &self,
         query: &str,
         steps: &[i64],
-        store: &SummaryStore<Batch>,
+        store: &SummaryStore<Pane>,
     ) -> Result<(usize, Vec<RawRange>), Unanswered> {
         let (root, program) = self.program(query)?;
         let (Some(&first), Some(&last)) = (steps.first(), steps.last()) else {
@@ -355,7 +357,7 @@ impl QueryEngine {
             .iter()
             .map(|input| RawRange {
                 node: input.node,
-                metric: input.selector.metric().to_string(),
+                metric: input.series.metric().to_string(),
                 start_ms: input.window.bounds_ms(first).0,
                 end_ms: input.window.bounds_ms(last).1,
             })
@@ -375,7 +377,7 @@ impl QueryEngine {
             let build = self.kept_build(definition);
             ranges.push(RawRange {
                 node: build.definition.raw_input(),
-                metric: build.selector.metric().to_string(),
+                metric: build.window.metric().to_string(),
                 start_ms: first_end_ms - build.definition.pane_ms,
                 end_ms: last_end_ms,
             });
@@ -394,7 +396,7 @@ impl QueryEngine {
         &self,
         root: usize,
         steps: &[i64],
-        store: &SummaryStore<Batch>,
+        store: &SummaryStore<Pane>,
         watermark_ms: Option<i64>,
         raw: &BTreeMap<u64, Vec<RawSample>>,
     ) -> Result<Vec<Vec<ResultSample>>, Unanswered> {
@@ -500,56 +502,19 @@ fn slice(runs: &[&[RawSample]], start_ms: i64, end_ms: i64) -> Vec<RawSample> {
     samples
 }
 
-/// `samples` as the executor's samples, for a `RawSampleSelector`.
-fn samples_of(samples: &[RawSample]) -> Vec<Sample> {
-    samples.iter().map(RawSample::to_sample).collect()
-}
-
-/// A stored or kept pane bound as a source of a compiled root. The pane is
-/// shared, not copied into the source; the executor's sources emit owned
-/// batches, so each run takes one copy of its rows.
-struct PaneSource(Arc<Batch>);
-
-impl PhysicalOperator<Batch, SchemaRef> for PaneSource {
-    fn name(&self) -> &str {
-        "StoredPane"
-    }
-
-    fn properties(&self, _inputs: &[PlanProperties]) -> PlanProperties {
-        PlanProperties {
-            boundedness: Boundedness::Bounded,
-            emission: Emission::Incremental,
-        }
-    }
-
-    fn input_schemas(&self) -> Vec<SchemaRef> {
-        Vec::new()
-    }
-
-    fn output_schema(&self) -> SchemaRef {
-        self.0.schema().clone()
-    }
-
-    fn start<'a>(
-        &'a self,
-        _inputs: Vec<Input<'a, Batch>>,
-        _context: RunContext,
-    ) -> Result<OutputStream<'a, Batch>, asap_executor::Error> {
-        let batch = (*self.0).clone();
-        Ok(futures::stream::once(async move { Ok(batch) }).boxed_local())
-    }
-
-    fn output_bytes(&self, value: &Batch) -> usize {
-        value.bytes()
-    }
+/// A stored or kept pane bound as a source of a compiled root. The batches
+/// share the pane's buffers, and the executor treats them as held outside
+/// the run, so the run is not charged for their states.
+fn pane_source(pane: &Pane, schema: &SchemaRef) -> Result<Operator, asap_executor::Error> {
+    Operator::source(schema.clone(), pane.clone())
 }
 
 /// The stored pane `input` reads at `time_ms`.
 fn pane(
     input: &StoredInput,
     time_ms: i64,
-    store: &SummaryStore<Batch>,
-) -> Result<Arc<Batch>, Unanswered> {
+    store: &SummaryStore<Pane>,
+) -> Result<Arc<Pane>, Unanswered> {
     let end = time_ms - input.offset_ms;
     if end.rem_euclid(input.pane_ms) != 0 {
         return Err(Unanswered::MissingPane(format!(
@@ -592,6 +557,7 @@ fn program(
         if let Some((definition, binding)) = sds.outputs.get(&id) {
             stored.push(StoredInput {
                 node: id,
+                schema: Arc::new(nodes[&id].output_schema.clone()),
                 definition: definition.clone(),
                 offset_ms: binding.offset_ms,
                 pane_ms: sds.definitions[definition].pane_ms,
@@ -602,6 +568,7 @@ fn program(
             kept_builds[definition].as_ref().map_err(Clone::clone)?;
             kept.push(KeptInput {
                 node: id,
+                schema: Arc::new(nodes[&id].output_schema.clone()),
                 definition: definition.clone(),
                 offset_ms: binding.offset_ms,
                 raw_input: binding.raw_input,
@@ -609,11 +576,11 @@ fn program(
             continue;
         }
         if let Some(window) = windows.get(&id) {
-            let selector = RawSampleSelector::new(dag, window).map_err(|e| e.to_string())?;
+            let series = SeriesWindow::new(dag, window).map_err(|e| e.to_string())?;
             raw.push(RawInput {
                 node: id,
                 window: (*window).clone(),
-                selector,
+                series,
             });
             continue;
         }
@@ -646,9 +613,11 @@ fn program(
     })
 }
 
-/// PromQL vector samples from result rows: labels from the series identity
-/// and the other text columns, the value from the one `Float64` column.
-fn result_samples(schema: &Schema, rows: Vec<Vec<Value>>) -> Result<Vec<ResultSample>, Unanswered> {
+/// PromQL vector samples from a root's result batches: labels from the
+/// series identity and the other text columns, the value from the one
+/// `Float64` column. The one place rows are read: the answer's JSON
+/// encoding.
+fn result_samples(schema: &Schema, batches: &[Batch]) -> Result<Vec<ResultSample>, Unanswered> {
     let unsupported = |reason: &str| Unanswered::Unsupported(format!("result rows: {reason}"));
     let values: Vec<usize> = schema
         .fields
@@ -660,7 +629,9 @@ fn result_samples(schema: &Schema, rows: Vec<Vec<Value>>) -> Result<Vec<ResultSa
     let [value] = values[..] else {
         return Err(unsupported("expected one Float64 value column"));
     };
-    rows.into_iter()
+    batches
+        .iter()
+        .flat_map(Batch::to_rows)
         .map(|row| {
             let labels = series_labels_of_output_row(schema, &row)
                 .map_err(|e| Unanswered::Execution(e.to_string()))?;

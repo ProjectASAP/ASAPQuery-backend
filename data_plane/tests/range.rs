@@ -7,9 +7,8 @@ mod common;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use asap_executor::values::Batch;
 use asap_planner::InstallablePlan;
-use data_plane::precompute::{Precompute, RawSample};
+use data_plane::precompute::{Pane, Precompute, RawSample};
 use data_plane::query::{KeptResultStats, QueryEngine, RawRange, ResultSample, Unanswered};
 use data_plane::sds::{Sds, SummaryStore};
 
@@ -80,7 +79,7 @@ fn instant(
     engine: &mut QueryEngine,
     query: &str,
     time_ms: i64,
-    store: &SummaryStore<Batch>,
+    store: &SummaryStore<Pane>,
     all: &[RawSample],
 ) -> Vec<ResultSample> {
     let (root, ranges) = engine.raw_ranges(query, time_ms, store).unwrap();
@@ -97,7 +96,7 @@ fn range(
     engine: &mut QueryEngine,
     query: &str,
     steps: &[i64],
-    store: &SummaryStore<Batch>,
+    store: &SummaryStore<Pane>,
     all: &[RawSample],
 ) -> (Vec<Vec<ResultSample>>, Vec<RawRange>) {
     let watermark_ms = all.iter().map(|s| s.timestamp_ms).max();
@@ -110,7 +109,7 @@ fn range_at_watermark(
     engine: &mut QueryEngine,
     query: &str,
     steps: &[i64],
-    store: &SummaryStore<Batch>,
+    store: &SummaryStore<Pane>,
     watermark_ms: Option<i64>,
     all: &[RawSample],
 ) -> (Vec<Vec<ResultSample>>, Vec<RawRange>) {
@@ -218,10 +217,10 @@ fn every_step_reads_stored_panes() {
     };
     // A step 5 minutes apart lands off the 10-minute grid.
     assert!(missing(&[90 * MINUTE, 95 * MINUTE]).contains("pane grid"));
-    // 80 min reads the pane ending at 30 min, already evicted: the whole
+    // 70 min reads the pane ending at 20 min, already evicted: the whole
     // range is forwarded even though its later steps could be answered.
     assert!(missing(
-        &minutes(8..=10)
+        &minutes(7..=10)
             .into_iter()
             .map(|t| t * 10)
             .collect::<Vec<_>>()

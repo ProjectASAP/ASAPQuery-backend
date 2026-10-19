@@ -46,11 +46,12 @@ across the ingestion workers by a hash of their label set; a pane closes
 passes its end, and later samples for it are dropped. The first pane after
 startup is skipped because it may be partial. Each query, including every
 step of a range query, runs on one query thread; queries read the stored
-panes concurrently, by shared reference. Ingestion updates each open pane's summary
-state per sample, with the updater the Planner executor's batch build uses;
-a definition whose build has another shape (a row filter, a keyed family,
-operators between its range and its summary) is built from the pane's
-buffered samples instead. The data plane uses jemalloc as its allocator.
+panes concurrently, by shared reference. The plan is compiled once and shared by every thread. Ingestion updates
+each open pane's summary state per sample with the executor's
+`StateColumnUpdater`, and builds the pane from columns; a definition whose
+build has another shape (a row filter, a keyed family, operators between
+its range and its summary, groups that are not series) is built once over
+the pane's samples instead. Batches are Arrow columns throughout. The data plane uses jemalloc as its allocator.
 
 An instant query whose text is one of the plan's queries is answered by the
 plan (`x-asap-execution: plan`). Its stored inputs read the panes ending at
