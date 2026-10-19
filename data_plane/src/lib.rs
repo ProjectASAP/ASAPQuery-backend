@@ -9,6 +9,7 @@
 //! answer, is forwarded to Prometheus.
 
 pub mod engine;
+mod per_sample;
 pub mod precompute;
 pub mod prometheus;
 pub mod query;

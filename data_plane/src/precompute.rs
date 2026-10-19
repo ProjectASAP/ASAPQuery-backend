@@ -29,6 +29,7 @@ use asap_planner::{InstallablePlan, PhysicalASAPDAG};
 use futures::executor::block_on;
 use futures::StreamExt;
 
+use crate::per_sample::PerSampleBuild;
 use crate::sds::{DefinitionId, Sds, SummaryDefinition, SummaryStore};
 
 /// One raw sample: its series' full label set (including `__name__`), time
@@ -112,7 +113,11 @@ impl PaneBuild {
         end_ms: i64,
         scope: Scope,
     ) -> Result<Batch, PrecomputeError> {
-        let rows = self.selector.rows(end_ms, samples)?;
+        self.run_rows(self.selector.rows(end_ms, samples)?, scope)
+    }
+
+    /// The build over `rows`, input rows already selected, under `scope`.
+    pub(crate) fn run_rows(&self, rows: Batch, scope: Scope) -> Result<Batch, PrecomputeError> {
         let input: Source<'_> = Box::new(Operator::source(rows.schema().clone(), vec![rows])?);
         let build = self
             .build
@@ -287,7 +292,9 @@ pub fn shard_of(labels: &BTreeMap<String, String>, workers: usize) -> usize {
 
 struct Builder {
     pane: PaneBuild,
-    /// This worker's samples of open panes, by pane end.
+    /// The build run per sample, unless its shape keeps the batch build.
+    per_sample: Option<PerSampleBuild>,
+    /// For the batch build, this worker's samples of open panes, by pane end.
     open: BTreeMap<i64, Vec<Sample>>,
     /// End of the newest pane this worker built its part of, or skipped;
     /// samples in it or before it are dropped. `None` before the first
@@ -309,19 +316,30 @@ pub struct ShardWorker {
 
 impl ShardWorker {
     /// Worker `index` of `shared`'s workers, with one build per
-    /// ingestion-time definition of `sds`, the stored summaries of `plan`.
+    /// ingestion-time definition of `sds`, the stored summaries of `plan`:
+    /// per sample where its shape allows ([`crate::per_sample`]) and
+    /// `per_sample` is set, else over each pane's buffered samples.
     pub fn new(
         plan: &InstallablePlan,
         sds: &Sds,
         index: usize,
         shared: Arc<Shared>,
+        per_sample: bool,
     ) -> Result<Self, PrecomputeError> {
         let builders = sds
             .definitions
             .values()
             .map(|definition| {
+                let pane = PaneBuild::new(&plan.dag.dag, definition)?;
+                let per_sample = per_sample
+                    .then(|| PerSampleBuild::new(&plan.dag.dag, &pane))
+                    .flatten();
+                if index == 0 {
+                    tracing::info!(definition = ?definition.id, per_sample = per_sample.is_some(), "pane build");
+                }
                 Ok(Builder {
-                    pane: PaneBuild::new(&plan.dag.dag, definition)?,
+                    pane,
+                    per_sample,
                     open: BTreeMap::new(),
                     built_through: None,
                 })
@@ -367,11 +385,14 @@ impl ShardWorker {
                     dropped += 1;
                     continue;
                 }
-                builder
-                    .open
-                    .entry(end)
-                    .or_default()
-                    .push(sample.to_sample());
+                match &mut builder.per_sample {
+                    Some(per_sample) => per_sample.update(&builder.pane, sample, end),
+                    None => builder
+                        .open
+                        .entry(end)
+                        .or_default()
+                        .push(sample.to_sample()),
+                }
                 buffered = true;
             }
             accepted += u64::from(buffered);
@@ -419,16 +440,21 @@ impl ShardWorker {
                 .get_or_insert(pane_end(start_ms, pane_ms));
             let mut end = built + pane_ms;
             while end <= watermark {
-                let samples = builder.open.remove(&end).unwrap_or_default();
                 let scope = Scope::Ingestion {
                     window_start_ms: end - pane_ms,
                     window_end_ms: end,
                     revision: 1,
                 };
-                let part = builder
-                    .pane
-                    .run(&samples, end, scope)
-                    .map_err(|e| e.to_string());
+                let part = match &mut builder.per_sample {
+                    Some(per_sample) => per_sample.close(&builder.pane, end, scope),
+                    None => {
+                        let samples = builder.open.remove(&end).unwrap_or_default();
+                        builder
+                            .pane
+                            .run(&samples, end, scope)
+                            .map_err(|e| e.to_string())
+                    }
+                };
                 self.shared.add_part(&builder.pane.definition, end, part);
                 builder.built_through = Some(end);
                 end += pane_ms;
@@ -461,11 +487,40 @@ impl Precompute {
         allowed_lateness_ms: i64,
         shards: usize,
     ) -> Result<Self, PrecomputeError> {
+        Self::workers(plan, sds, allowed_lateness_ms, shards, true)
+    }
+
+    /// One worker that builds every pane over its buffered samples with
+    /// the executor's batch build: the reference per-sample builds equal.
+    pub fn batch(
+        plan: &InstallablePlan,
+        sds: &Sds,
+        allowed_lateness_ms: i64,
+    ) -> Result<Self, PrecomputeError> {
+        Self::workers(plan, sds, allowed_lateness_ms, 1, false)
+    }
+
+    fn workers(
+        plan: &InstallablePlan,
+        sds: &Sds,
+        allowed_lateness_ms: i64,
+        shards: usize,
+        per_sample: bool,
+    ) -> Result<Self, PrecomputeError> {
         let shared = Arc::new(Shared::new(shards, allowed_lateness_ms));
         let workers = (0..shared.workers())
-            .map(|index| ShardWorker::new(plan, sds, index, shared.clone()))
+            .map(|index| ShardWorker::new(plan, sds, index, shared.clone(), per_sample))
             .collect::<Result<_, _>>()?;
         Ok(Self { shared, workers })
+    }
+
+    /// How many definitions are built per sample.
+    pub fn per_sample_definitions(&self) -> usize {
+        self.workers[0]
+            .builders
+            .iter()
+            .filter(|b| b.per_sample.is_some())
+            .count()
     }
 
     /// Routes `samples` to their workers, then lets every worker build the

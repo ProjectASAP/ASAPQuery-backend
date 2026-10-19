@@ -148,8 +148,9 @@ impl EngineHandle {
         for (index, mut commands) in receivers.into_iter().enumerate() {
             let (plan_json, shared, peers) = (plan_json.clone(), precompute.clone(), peers.clone());
             spawn(format!("ingest-{index}"), move |ready| {
-                let started = install(&plan_json)
-                    .and_then(|(plan, sds)| Ok(ShardWorker::new(&plan, &sds, index, shared)?));
+                let started = install(&plan_json).and_then(|(plan, sds)| {
+                    Ok(ShardWorker::new(&plan, &sds, index, shared, true)?)
+                });
                 let mut worker = match started {
                     Ok(worker) => {
                         let _ = ready.send(Ok(()));
