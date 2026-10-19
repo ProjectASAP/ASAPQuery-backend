@@ -1,0 +1,296 @@
+{
+  "deployment_inputs": {
+    "cost_model": "cost model 1 (usage over time)",
+    "measured_operation_costs": "/mydata/be-bench-inputs/mcost/measured_operation_costs.json",
+    "prices": "AwsFargateUsEast1",
+    "raw_data_retained": false
+  },
+  "queries": [
+    {
+      "accuracy": {
+        "accuracy_scope": "whole_result",
+        "failure_probability": 0.0,
+        "max_error": 0.0
+      },
+      "answered_by_plan": 481,
+      "asap_labels_differ": 0,
+      "asap_latency_ms_p50": 168.77558000000002,
+      "asap_latency_ms_p99": 1700.547262,
+      "asap_max_abs_error": 0.0,
+      "asap_max_rank_error": null,
+      "asap_max_rel_error": 0.0,
+      "asap_meets_target": 481,
+      "baseline_latency_ms_p50": 46.615325,
+      "baseline_latency_ms_p99": 74.171261,
+      "baseline_matches_reference": 481,
+      "baseline_reference_mismatch_example": null,
+      "evaluations": 481,
+      "forwarded": {},
+      "name": "example1/q1",
+      "plan_matches_reference": 481,
+      "plan_reference_mismatch_example": null,
+      "query": "sum by (job) (rate(http_requests_total[1m]))"
+    },
+    {
+      "accuracy": {
+        "accuracy_scope": "whole_result",
+        "failure_probability": 0.001,
+        "max_error": 0.01
+      },
+      "answered_by_plan": 481,
+      "asap_labels_differ": 481,
+      "asap_latency_ms_p50": 134.54589,
+      "asap_latency_ms_p99": 202.659692,
+      "asap_max_abs_error": 0.0,
+      "asap_max_rank_error": null,
+      "asap_max_rel_error": 0.0,
+      "asap_meets_target": 481,
+      "baseline_latency_ms_p50": 46.100179,
+      "baseline_latency_ms_p99": 74.32224599999999,
+      "baseline_matches_reference": 481,
+      "baseline_reference_mismatch_example": null,
+      "evaluations": 481,
+      "forwarded": {},
+      "name": "example1/q2",
+      "plan_matches_reference": 481,
+      "plan_reference_mismatch_example": null,
+      "query": "topk by (job) (10, sum_over_time(http_requests_total[1m]))"
+    },
+    {
+      "accuracy": {
+        "accuracy_metric": "rank",
+        "accuracy_scope": "whole_result",
+        "failure_probability": 0.01,
+        "max_error": 0.01
+      },
+      "answered_by_plan": 81,
+      "asap_labels_differ": 0,
+      "asap_latency_ms_p50": 373.908282,
+      "asap_latency_ms_p99": 545.7239780000001,
+      "asap_max_abs_error": 347.37434000000235,
+      "asap_max_rank_error": 0.010000000000205733,
+      "asap_max_rel_error": 0.20451674224059335,
+      "asap_meets_target": 81,
+      "baseline_latency_ms_p50": 99.913781,
+      "baseline_latency_ms_p99": 156.85289799999998,
+      "baseline_matches_reference": 81,
+      "baseline_reference_mismatch_example": null,
+      "evaluations": 81,
+      "forwarded": {},
+      "name": "example3b/q1",
+      "plan_matches_reference": 81,
+      "plan_reference_mismatch_example": null,
+      "query": "quantile_over_time(0.99, latency_ms[5m])"
+    },
+    {
+      "accuracy": {
+        "accuracy_metric": "rank",
+        "accuracy_scope": "whole_result",
+        "failure_probability": 0.01,
+        "max_error": 0.01
+      },
+      "answered_by_plan": 4,
+      "asap_labels_differ": 0,
+      "asap_latency_ms_p50": 436.930754,
+      "asap_latency_ms_p99": 665.976126,
+      "asap_max_abs_error": 154.16934000000583,
+      "asap_max_rank_error": 0.005815899581590012,
+      "asap_max_rel_error": 0.26103334973103537,
+      "asap_meets_target": 9,
+      "baseline_latency_ms_p50": 363.200429,
+      "baseline_latency_ms_p99": 533.1993729999999,
+      "baseline_matches_reference": 9,
+      "baseline_reference_mismatch_example": null,
+      "evaluations": 9,
+      "forwarded": {
+        "pane": 5
+      },
+      "name": "example4b/q1",
+      "plan_matches_reference": 4,
+      "plan_reference_mismatch_example": null,
+      "query": "quantile_over_time(0.99, latency_ms[60m])"
+    }
+  ],
+  "runs": [
+    {
+      "evaluations": 1052,
+      "mode": "baseline",
+      "processes": [
+        {
+          "cores": "0-3",
+          "cpu_core_seconds": 98.56,
+          "mean_rss_gib": 0.12173771926923856,
+          "name": "prometheus",
+          "peak_rss_gib": 0.14224624633789062,
+          "samples": 347
+        }
+      ],
+      "prometheus_version": "prometheus, version 3.5.0 (branch: HEAD, revision: 8be3a9560fbdd18a94dedec4b747c35178177202)",
+      "samples_written": 3610000,
+      "wall_seconds": 86.462987653
+    },
+    {
+      "evaluations": 1052,
+      "mode": "asap",
+      "processes": [
+        {
+          "cores": "0-3",
+          "cpu_core_seconds": 32.99,
+          "mean_rss_gib": 0.12006800809352518,
+          "name": "prometheus",
+          "peak_rss_gib": 0.13520050048828125,
+          "samples": 1112
+        },
+        {
+          "cores": "4-7",
+          "cpu_core_seconds": 249.96,
+          "mean_rss_gib": 1.3586114567818401,
+          "name": "data_plane",
+          "peak_rss_gib": 1.6942367553710938,
+          "samples": 1112
+        }
+      ],
+      "prometheus_version": "prometheus, version 3.5.0 (branch: HEAD, revision: 8be3a9560fbdd18a94dedec4b747c35178177202)",
+      "samples_written": 3610000,
+      "wall_seconds": 277.91229111
+    }
+  ],
+  "scale": {
+    "counter_reset_probability": 0.0001,
+    "duration_ms": 5400000,
+    "factor": 50,
+    "sample_interval_ms": 15000,
+    "seed": 1,
+    "start_ms": 1767225600000
+  },
+  "selection": {
+    "accepted_accuracy": [
+      "metric not set; accepted exact",
+      "metric not set; accepted exact",
+      "metric rank; accepted rank (Kll)",
+      "metric rank; accepted rank (Kll)"
+    ],
+    "cheapest_materialized_candidate": {
+      "average_memory_bytes": 990640000.0,
+      "candidate": "P195-m40",
+      "cost_per_second": 1.1397553880005906e-6,
+      "cost_source": "analytical-cost-v2 (illustrative statistics)",
+      "cpu_core_seconds_per_second": 0.00003003599999999999,
+      "cpu_ops_per_second": 19363.999999999996,
+      "latency_ms_per_query": [
+        0.0401,
+        0.067,
+        0.034999999999999996,
+        0.04
+      ],
+      "peak_cpu_cores": 5,
+      "peak_memory_bytes": 1143043520,
+      "scanned_bytes_per_second": 106720.0
+    },
+    "cheapest_valid_candidates": [
+      {
+        "average_memory_bytes": 990640000.0,
+        "candidate": "P195-m40",
+        "cost_per_second": 1.1397553880005906e-6,
+        "cost_source": "analytical-cost-v2 (illustrative statistics)",
+        "cpu_core_seconds_per_second": 0.00003003599999999999,
+        "cpu_ops_per_second": 19363.999999999996,
+        "latency_ms_per_query": [
+          0.0401,
+          0.067,
+          0.034999999999999996,
+          0.04
+        ],
+        "peak_cpu_cores": 5,
+        "peak_memory_bytes": 1143043520,
+        "scanned_bytes_per_second": 106720.0
+      },
+      {
+        "average_memory_bytes": 990640000.0,
+        "candidate": "P196-m40",
+        "cost_per_second": 1.1397553880005906e-6,
+        "cost_source": "analytical-cost-v2 (illustrative statistics)",
+        "cpu_core_seconds_per_second": 0.00003003599999999999,
+        "cpu_ops_per_second": 19363.999999999996,
+        "latency_ms_per_query": [
+          0.0401,
+          0.067,
+          0.034999999999999996,
+          0.04
+        ],
+        "peak_cpu_cores": 5,
+        "peak_memory_bytes": 1143043520,
+        "scanned_bytes_per_second": 106720.0
+      },
+      {
+        "average_memory_bytes": 990640000.0,
+        "candidate": "P197-m40",
+        "cost_per_second": 1.1397553880005906e-6,
+        "cost_source": "analytical-cost-v2 (illustrative statistics)",
+        "cpu_core_seconds_per_second": 0.00003003599999999999,
+        "cpu_ops_per_second": 19363.999999999996,
+        "latency_ms_per_query": [
+          0.0401,
+          0.067,
+          0.034999999999999996,
+          0.04
+        ],
+        "peak_cpu_cores": 5,
+        "peak_memory_bytes": 1143043520,
+        "scanned_bytes_per_second": 106720.0
+      },
+      {
+        "average_memory_bytes": 990640000.0,
+        "candidate": "P198-m40",
+        "cost_per_second": 1.1397553880005906e-6,
+        "cost_source": "analytical-cost-v2 (illustrative statistics)",
+        "cpu_core_seconds_per_second": 0.00003003599999999999,
+        "cpu_ops_per_second": 19363.999999999996,
+        "latency_ms_per_query": [
+          0.0401,
+          0.067,
+          0.034999999999999996,
+          0.04
+        ],
+        "peak_cpu_cores": 5,
+        "peak_memory_bytes": 1143043520,
+        "scanned_bytes_per_second": 106720.0
+      }
+    ],
+    "node_materializations": {
+      "MatAtIngestion": 23,
+      "NotMaterialized": 61
+    },
+    "planning_seconds": 5.172157304,
+    "predicted_nothing_materialized": null,
+    "predicted_selected": {
+      "average_memory_bytes": 990640000.0,
+      "candidate": "P195-m40",
+      "cost_per_second": 1.1397553880005906e-6,
+      "cost_source": "analytical-cost-v2 (illustrative statistics)",
+      "cpu_core_seconds_per_second": 0.00003003599999999999,
+      "cpu_ops_per_second": 19363.999999999996,
+      "latency_ms_per_query": [
+        0.0401,
+        0.067,
+        0.034999999999999996,
+        0.04
+      ],
+      "peak_cpu_cores": 5,
+      "peak_memory_bytes": 1143043520,
+      "scanned_bytes_per_second": 106720.0
+    },
+    "rejections_by_cause": {
+      "accuracy_target_missed": 14388,
+      "raw_data_not_retained": 1646,
+      "tied_lost_on_enumeration_order": 3
+    },
+    "selected": "P195-m40",
+    "valid_candidates": 4
+  },
+  "series_per_metric": {
+    "http_requests_total": 5000,
+    "latency_ms": 5000
+  },
+  "series_total": 10000
+}

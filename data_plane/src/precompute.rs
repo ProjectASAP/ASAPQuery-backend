@@ -287,6 +287,24 @@ pub fn select(
     Batch::try_new(scan.schema.clone(), selected)
 }
 
+/// Working memory one execution may hold, in bytes; the executor's own
+/// default (64 MiB) unless [`set_execution_memory_limit`] changed it.
+static EXECUTION_MEMORY_LIMIT_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Sets the working memory every later execution may hold. An execution
+/// over it fails, and its query is forwarded. Only the first call counts.
+pub fn set_execution_memory_limit(bytes: usize) {
+    let _ = EXECUTION_MEMORY_LIMIT_BYTES.set(bytes);
+}
+
+fn limits() -> Limits {
+    let mut limits = Limits::default();
+    if let Some(&bytes) = EXECUTION_MEMORY_LIMIT_BYTES.get() {
+        limits.max_bytes = bytes;
+    }
+    limits
+}
+
 /// Executes `dag`'s single root to completion and returns its rows.
 pub fn run(
     dag: &asap_executor::plan::PhysicalDAG<'_, Batch, SchemaRef>,
@@ -294,7 +312,7 @@ pub fn run(
     scope: Scope,
 ) -> Result<Vec<Vec<asap_executor::values::Value>>, asap_executor::Error> {
     block_on(async {
-        let context = RunContext::new(scope, Limits::default())?;
+        let context = RunContext::new(scope, limits())?;
         let mut output = dag.execute(roots, context)?.remove(0);
         let mut rows = Vec::new();
         while let Some(batch) = output.next().await {

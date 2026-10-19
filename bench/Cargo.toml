@@ -1,0 +1,24 @@
+[package]
+name = "benefit"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "benefit"
+path = "src/main.rs"
+
+[dependencies]
+control_plane.workspace = true
+data_plane = { path = "../data_plane" }
+planner-types.workspace = true
+asap-plan-selection.workspace = true
+asap-executor.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+tokio.workspace = true
+reqwest.workspace = true

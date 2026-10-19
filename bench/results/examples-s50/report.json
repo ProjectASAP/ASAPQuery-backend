@@ -1,0 +1,327 @@
+{
+  "deployment_inputs": {
+    "cost_model": "cost model 1 (usage over time)",
+    "measured_operation_costs": "/mydata/be-bench-inputs/mcost/measured_operation_costs.json",
+    "prices": "AwsFargateUsEast1",
+    "raw_data_retained": true
+  },
+  "queries": [
+    {
+      "accuracy": {
+        "accuracy_scope": "whole_result",
+        "failure_probability": 0.0,
+        "max_error": 0.0
+      },
+      "answered_by_plan": 481,
+      "asap_labels_differ": 0,
+      "asap_latency_ms_p50": 248.703589,
+      "asap_latency_ms_p99": 328.06240599999995,
+      "asap_max_abs_error": 0.0,
+      "asap_max_rank_error": null,
+      "asap_max_rel_error": 0.0,
+      "asap_meets_target": 481,
+      "baseline_latency_ms_p50": 46.666833999999994,
+      "baseline_latency_ms_p99": 72.27036700000001,
+      "baseline_matches_reference": 481,
+      "baseline_reference_mismatch_example": null,
+      "evaluations": 481,
+      "forwarded": {},
+      "name": "example1/q1",
+      "plan_matches_reference": 481,
+      "plan_reference_mismatch_example": null,
+      "query": "sum by (job) (rate(http_requests_total[1m]))"
+    },
+    {
+      "accuracy": {
+        "accuracy_scope": "whole_result",
+        "failure_probability": 0.001,
+        "max_error": 0.01
+      },
+      "answered_by_plan": 481,
+      "asap_labels_differ": 481,
+      "asap_latency_ms_p50": 237.994779,
+      "asap_latency_ms_p99": 304.51513400000005,
+      "asap_max_abs_error": 0.0,
+      "asap_max_rank_error": null,
+      "asap_max_rel_error": 0.0,
+      "asap_meets_target": 481,
+      "baseline_latency_ms_p50": 46.77466,
+      "baseline_latency_ms_p99": 75.099362,
+      "baseline_matches_reference": 481,
+      "baseline_reference_mismatch_example": null,
+      "evaluations": 481,
+      "forwarded": {},
+      "name": "example1/q2",
+      "plan_matches_reference": 481,
+      "plan_reference_mismatch_example": null,
+      "query": "topk by (job) (10, sum_over_time(http_requests_total[1m]))"
+    },
+    {
+      "accuracy": {
+        "accuracy_metric": "rank",
+        "accuracy_scope": "whole_result",
+        "failure_probability": 0.01,
+        "max_error": 0.01
+      },
+      "answered_by_plan": 81,
+      "asap_labels_differ": 0,
+      "asap_latency_ms_p50": 722.3521010000001,
+      "asap_latency_ms_p99": 1141.927823,
+      "asap_max_abs_error": 347.37434000000235,
+      "asap_max_rank_error": 0.010000000000205733,
+      "asap_max_rel_error": 0.20451674224059335,
+      "asap_meets_target": 81,
+      "baseline_latency_ms_p50": 103.59109,
+      "baseline_latency_ms_p99": 142.438592,
+      "baseline_matches_reference": 81,
+      "baseline_reference_mismatch_example": null,
+      "evaluations": 81,
+      "forwarded": {},
+      "name": "example3b/q1",
+      "plan_matches_reference": 81,
+      "plan_reference_mismatch_example": null,
+      "query": "quantile_over_time(0.99, latency_ms[5m])"
+    },
+    {
+      "accuracy": {
+        "accuracy_metric": "rank",
+        "accuracy_scope": "whole_result",
+        "failure_probability": 0.01,
+        "max_error": 0.01
+      },
+      "answered_by_plan": 9,
+      "asap_labels_differ": 0,
+      "asap_latency_ms_p50": 4699.110229000001,
+      "asap_latency_ms_p99": 6399.1216810000005,
+      "asap_max_abs_error": 1587.1063999999944,
+      "asap_max_rank_error": 0.010000000000056852,
+      "asap_max_rel_error": 1.6395369722817605,
+      "asap_meets_target": 9,
+      "baseline_latency_ms_p50": 406.852922,
+      "baseline_latency_ms_p99": 531.106568,
+      "baseline_matches_reference": 9,
+      "baseline_reference_mismatch_example": null,
+      "evaluations": 9,
+      "forwarded": {},
+      "name": "example4b/q1",
+      "plan_matches_reference": 9,
+      "plan_reference_mismatch_example": null,
+      "query": "quantile_over_time(0.99, latency_ms[60m])"
+    }
+  ],
+  "runs": [
+    {
+      "evaluations": 1052,
+      "mode": "baseline",
+      "processes": [
+        {
+          "cores": "0-3",
+          "cpu_core_seconds": 99.09,
+          "mean_rss_gib": 0.12260882059733073,
+          "name": "prometheus",
+          "peak_rss_gib": 0.14225006103515625,
+          "samples": 348
+        }
+      ],
+      "prometheus_version": "prometheus, version 3.5.0 (branch: HEAD, revision: 8be3a9560fbdd18a94dedec4b747c35178177202)",
+      "samples_written": 3610000,
+      "wall_seconds": 86.641223677
+    },
+    {
+      "evaluations": 1052,
+      "mode": "asap",
+      "processes": [
+        {
+          "cores": "0-3",
+          "cpu_core_seconds": 103.54,
+          "mean_rss_gib": 0.1654560007386646,
+          "name": "prometheus",
+          "peak_rss_gib": 0.3037567138671875,
+          "samples": 1447
+        },
+        {
+          "cores": "4-7",
+          "cpu_core_seconds": 272.61,
+          "mean_rss_gib": 0.7443321982003445,
+          "name": "data_plane",
+          "peak_rss_gib": 1.6874580383300781,
+          "samples": 1447
+        }
+      ],
+      "prometheus_version": "prometheus, version 3.5.0 (branch: HEAD, revision: 8be3a9560fbdd18a94dedec4b747c35178177202)",
+      "samples_written": 3610000,
+      "wall_seconds": 361.804617177
+    }
+  ],
+  "scale": {
+    "counter_reset_probability": 0.0001,
+    "duration_ms": 5400000,
+    "factor": 50,
+    "sample_interval_ms": 15000,
+    "seed": 1,
+    "start_ms": 1767225600000
+  },
+  "selection": {
+    "accepted_accuracy": [
+      "metric not set; accepted exact",
+      "metric not set; accepted exact",
+      "metric rank; accepted rank (Kll)",
+      "metric rank; accepted rank (Kll)"
+    ],
+    "cheapest_materialized_candidate": {
+      "average_memory_bytes": 400000.0,
+      "candidate": "P141-m8",
+      "cost_per_second": 1.2107286387400463e-9,
+      "cost_source": "analytical-cost-v2 (illustrative statistics)",
+      "cpu_core_seconds_per_second": 0.00006676052,
+      "cpu_ops_per_second": 36893.53333333333,
+      "latency_ms_per_query": [
+        0.09210259999999999,
+        0.1190026,
+        1.25,
+        14.89
+      ],
+      "peak_cpu_cores": 4,
+      "peak_memory_bytes": 152883584,
+      "scanned_bytes_per_second": 298669.8666666667
+    },
+    "cheapest_valid_candidates": [
+      {
+        "average_memory_bytes": 400000.0,
+        "candidate": "P141-m8",
+        "cost_per_second": 1.2107286387400463e-9,
+        "cost_source": "analytical-cost-v2 (illustrative statistics)",
+        "cpu_core_seconds_per_second": 0.00006676052,
+        "cpu_ops_per_second": 36893.53333333333,
+        "latency_ms_per_query": [
+          0.09210259999999999,
+          0.1190026,
+          1.25,
+          14.89
+        ],
+        "peak_cpu_cores": 4,
+        "peak_memory_bytes": 152883584,
+        "scanned_bytes_per_second": 298669.8666666667
+      },
+      {
+        "average_memory_bytes": 400000.0,
+        "candidate": "P142-m8",
+        "cost_per_second": 1.2107286387400463e-9,
+        "cost_source": "analytical-cost-v2 (illustrative statistics)",
+        "cpu_core_seconds_per_second": 0.00006676052,
+        "cpu_ops_per_second": 36893.53333333333,
+        "latency_ms_per_query": [
+          0.09210259999999999,
+          0.1190026,
+          1.25,
+          14.89
+        ],
+        "peak_cpu_cores": 4,
+        "peak_memory_bytes": 152883584,
+        "scanned_bytes_per_second": 298669.8666666667
+      },
+      {
+        "average_memory_bytes": 400000.0,
+        "candidate": "P177-m24",
+        "cost_per_second": 1.2112908387400462e-9,
+        "cost_source": "analytical-cost-v2 (illustrative statistics)",
+        "cpu_core_seconds_per_second": 0.00006681052,
+        "cpu_ops_per_second": 36943.53333333333,
+        "latency_ms_per_query": [
+          0.09210259999999999,
+          0.1190026,
+          1.25,
+          14.92
+        ],
+        "peak_cpu_cores": 4,
+        "peak_memory_bytes": 609843552,
+        "scanned_bytes_per_second": 298669.8666666667
+      },
+      {
+        "average_memory_bytes": 400000.0,
+        "candidate": "P178-m24",
+        "cost_per_second": 1.2112908387400462e-9,
+        "cost_source": "analytical-cost-v2 (illustrative statistics)",
+        "cpu_core_seconds_per_second": 0.00006681052,
+        "cpu_ops_per_second": 36943.53333333333,
+        "latency_ms_per_query": [
+          0.09210259999999999,
+          0.1190026,
+          1.25,
+          14.92
+        ],
+        "peak_cpu_cores": 4,
+        "peak_memory_bytes": 609843552,
+        "scanned_bytes_per_second": 298669.8666666667
+      },
+      {
+        "average_memory_bytes": 400000.0,
+        "candidate": "P159-m24",
+        "cost_per_second": 1.2154136387400467e-9,
+        "cost_source": "analytical-cost-v2 (illustrative statistics)",
+        "cpu_core_seconds_per_second": 0.00006717718666666667,
+        "cpu_ops_per_second": 37310.200000000004,
+        "latency_ms_per_query": [
+          0.09210259999999999,
+          0.1190026,
+          1.275,
+          14.89
+        ],
+        "peak_cpu_cores": 4,
+        "peak_memory_bytes": 533683552,
+        "scanned_bytes_per_second": 298669.8666666667
+      }
+    ],
+    "node_materializations": {
+      "MatAtQueryKeptAcrossEvaluations": 12,
+      "NotMaterialized": 43
+    },
+    "planning_seconds": 6.897062989,
+    "predicted_nothing_materialized": {
+      "average_memory_bytes": 0.0,
+      "candidate": "P141",
+      "cost_per_second": 1.33533744e-9,
+      "cost_source": "analytical-cost-v2 (illustrative statistics)",
+      "cpu_core_seconds_per_second": 0.00011876000000000002,
+      "cpu_ops_per_second": 56893.33333333335,
+      "latency_ms_per_query": [
+        0.3521,
+        0.379,
+        1.25,
+        14.89
+      ],
+      "peak_cpu_cores": 4,
+      "peak_memory_bytes": 152883584,
+      "scanned_bytes_per_second": 618666.6666666667
+    },
+    "predicted_selected": {
+      "average_memory_bytes": 400000.0,
+      "candidate": "P141-m8",
+      "cost_per_second": 1.2107286387400463e-9,
+      "cost_source": "analytical-cost-v2 (illustrative statistics)",
+      "cpu_core_seconds_per_second": 0.00006676052,
+      "cpu_ops_per_second": 36893.53333333333,
+      "latency_ms_per_query": [
+        0.09210259999999999,
+        0.1190026,
+        1.25,
+        14.89
+      ],
+      "peak_cpu_cores": 4,
+      "peak_memory_bytes": 152883584,
+      "scanned_bytes_per_second": 298669.8666666667
+    },
+    "rejections_by_cause": {
+      "accuracy_target_missed": 14388,
+      "costlier": 1648,
+      "tied_lost_on_enumeration_order": 1
+    },
+    "selected": "P141-m8",
+    "valid_candidates": 1650
+  },
+  "series_per_metric": {
+    "http_requests_total": 5000,
+    "latency_ms": 5000
+  },
+  "series_total": 10000
+}

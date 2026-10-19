@@ -1,0 +1,402 @@
+{
+  "deployment_inputs": {
+    "cost_model": "cost model 1 (usage over time)",
+    "measured_operation_costs": "/mydata/be-bench-inputs/mcost/measured_operation_costs.json",
+    "prices": "AwsFargateUsEast1",
+    "raw_data_retained": true
+  },
+  "queries": [
+    {
+      "accuracy": {
+        "accuracy_scope": "whole_result",
+        "failure_probability": 0.0,
+        "max_error": 0.0
+      },
+      "answered_by_plan": 27,
+      "asap_labels_differ": 0,
+      "asap_latency_ms_p50": 6331.851525,
+      "asap_latency_ms_p99": 12154.87167,
+      "asap_max_abs_error": 0.0,
+      "asap_max_rank_error": null,
+      "asap_max_rel_error": 0.0,
+      "asap_meets_target": 27,
+      "baseline_latency_ms_p50": 469.131617,
+      "baseline_latency_ms_p99": 678.0849599999999,
+      "baseline_matches_reference": 27,
+      "baseline_reference_mismatch_example": null,
+      "evaluations": 27,
+      "forwarded": {},
+      "name": "cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase1h",
+      "plan_matches_reference": 27,
+      "plan_reference_mismatch_example": null,
+      "query": "sum by (cluster, verb, scope, le) (increase(apiserver_request_sli_duration_seconds_bucket[1h]))"
+    },
+    {
+      "accuracy": {
+        "accuracy_scope": "whole_result",
+        "failure_probability": 0.0,
+        "max_error": 0.0
+      },
+      "answered_by_plan": 161,
+      "asap_labels_differ": 0,
+      "asap_latency_ms_p50": 55.702653999999995,
+      "asap_latency_ms_p99": 109.882607,
+      "asap_max_abs_error": 0.0,
+      "asap_max_rank_error": null,
+      "asap_max_rel_error": 0.0,
+      "asap_meets_target": 161,
+      "baseline_latency_ms_p50": 2.311853,
+      "baseline_latency_ms_p99": 4.288221,
+      "baseline_matches_reference": 161,
+      "baseline_reference_mismatch_example": null,
+      "evaluations": 161,
+      "forwarded": {},
+      "name": "KubeAggregatedAPIErrors",
+      "plan_matches_reference": 161,
+      "plan_reference_mismatch_example": null,
+      "query": "sum by (cluster, instance, name, reason) (increase(aggregator_unavailable_apiservice_total{job=\"apiserver\"}[1m])) > 0"
+    },
+    {
+      "accuracy": {
+        "accuracy_scope": "whole_result",
+        "failure_probability": 0.0,
+        "max_error": 0.0
+      },
+      "answered_by_plan": 161,
+      "asap_labels_differ": 0,
+      "asap_latency_ms_p50": 87.609869,
+      "asap_latency_ms_p99": 153.324587,
+      "asap_max_abs_error": 0.0,
+      "asap_max_rank_error": null,
+      "asap_max_rel_error": 0.0,
+      "asap_meets_target": 161,
+      "baseline_latency_ms_p50": 2.998128,
+      "baseline_latency_ms_p99": 4.023033,
+      "baseline_matches_reference": 161,
+      "baseline_reference_mismatch_example": null,
+      "evaluations": 161,
+      "forwarded": {},
+      "name": "KubeAggregatedAPIDown",
+      "plan_matches_reference": 161,
+      "plan_reference_mismatch_example": null,
+      "query": "(1 - max by (name, namespace, cluster) (avg_over_time(aggregator_unavailable_apiservice{job=\"apiserver\"}[10m]))) * 100 < 85"
+    },
+    {
+      "accuracy": {
+        "accuracy_scope": "whole_result",
+        "failure_probability": 0.0,
+        "max_error": 0.0
+      },
+      "answered_by_plan": 161,
+      "asap_labels_differ": 0,
+      "asap_latency_ms_p50": 55.953233,
+      "asap_latency_ms_p99": 92.83299,
+      "asap_max_abs_error": 0.0,
+      "asap_max_rank_error": null,
+      "asap_max_rel_error": 0.0,
+      "asap_meets_target": 161,
+      "baseline_latency_ms_p50": 2.3438920000000003,
+      "baseline_latency_ms_p99": 4.199988,
+      "baseline_matches_reference": 161,
+      "baseline_reference_mismatch_example": null,
+      "evaluations": 161,
+      "forwarded": {},
+      "name": "KubeNodeNotReady",
+      "plan_matches_reference": 161,
+      "plan_reference_mismatch_example": null,
+      "query": "kube_node_status_condition{condition=\"Ready\",job=\"kube-state-metrics\",status=\"true\"} == 0 and on (cluster, node) kube_node_spec_unschedulable{job=\"kube-state-metrics\"} == 0"
+    },
+    {
+      "accuracy": {
+        "accuracy_scope": "whole_result",
+        "failure_probability": 0.0,
+        "max_error": 0.0
+      },
+      "answered_by_plan": 161,
+      "asap_labels_differ": 0,
+      "asap_latency_ms_p50": 39.414291,
+      "asap_latency_ms_p99": 61.962263,
+      "asap_max_abs_error": 0.0,
+      "asap_max_rank_error": null,
+      "asap_max_rel_error": 0.0,
+      "asap_meets_target": 161,
+      "baseline_latency_ms_p50": 4.771717,
+      "baseline_latency_ms_p99": 12.99066,
+      "baseline_matches_reference": 161,
+      "baseline_reference_mismatch_example": null,
+      "evaluations": 161,
+      "forwarded": {},
+      "name": "KubeletTooManyPods",
+      "plan_matches_reference": 161,
+      "plan_reference_mismatch_example": null,
+      "query": "(max by (cluster, instance) (kubelet_running_pods{job=\"kubelet\",metrics_path=\"/metrics\"} > 1) * on (cluster, instance) group_left (node) max by (cluster, instance, node) (kubelet_node_name{job=\"kubelet\",metrics_path=\"/metrics\"})) / on (cluster, node) group_left () max by (cluster, node) (kube_node_status_capacity{job=\"kube-state-metrics\",resource=\"pods\"} != 1) > 0.95"
+    },
+    {
+      "accuracy": {
+        "accuracy_scope": "whole_result",
+        "failure_probability": 0.0,
+        "max_error": 0.0
+      },
+      "answered_by_plan": 161,
+      "asap_labels_differ": 0,
+      "asap_latency_ms_p50": 128.300538,
+      "asap_latency_ms_p99": 202.608014,
+      "asap_max_abs_error": 0.0,
+      "asap_max_rank_error": null,
+      "asap_max_rel_error": 0.0,
+      "asap_meets_target": 161,
+      "baseline_latency_ms_p50": 8.401797,
+      "baseline_latency_ms_p99": 21.078929,
+      "baseline_matches_reference": 161,
+      "baseline_reference_mismatch_example": null,
+      "evaluations": 161,
+      "forwarded": {},
+      "name": "KubeNodeEviction",
+      "plan_matches_reference": 161,
+      "plan_reference_mismatch_example": null,
+      "query": "sum by (cluster, eviction_signal, instance) (rate(kubelet_evictions{job=\"kubelet\",metrics_path=\"/metrics\"}[15m])) * on (cluster, instance) group_left (node) max by (cluster, instance, node) (kubelet_node_name{job=\"kubelet\",metrics_path=\"/metrics\"}) > 0"
+    }
+  ],
+  "runs": [
+    {
+      "evaluations": 832,
+      "mode": "baseline",
+      "processes": [
+        {
+          "cores": "0-3",
+          "cpu_core_seconds": 144.59,
+          "mean_rss_gib": 0.19979954560597737,
+          "name": "prometheus",
+          "peak_rss_gib": 0.2351226806640625,
+          "samples": 480
+        }
+      ],
+      "prometheus_version": "prometheus, version 3.5.0 (branch: HEAD, revision: 8be3a9560fbdd18a94dedec4b747c35178177202)",
+      "samples_written": 8252460,
+      "wall_seconds": 119.870888872
+    },
+    {
+      "evaluations": 832,
+      "mode": "asap",
+      "processes": [
+        {
+          "cores": "0-3",
+          "cpu_core_seconds": 152.93,
+          "mean_rss_gib": 0.19738903309690692,
+          "name": "prometheus",
+          "peak_rss_gib": 0.2386932373046875,
+          "samples": 1517
+        },
+        {
+          "cores": "4-7",
+          "cpu_core_seconds": 265.87,
+          "mean_rss_gib": 0.8595005832538843,
+          "name": "data_plane",
+          "peak_rss_gib": 1.2796173095703125,
+          "samples": 1517
+        }
+      ],
+      "prometheus_version": "prometheus, version 3.5.0 (branch: HEAD, revision: 8be3a9560fbdd18a94dedec4b747c35178177202)",
+      "samples_written": 8252460,
+      "wall_seconds": 379.494180124
+    }
+  ],
+  "scale": {
+    "counter_reset_probability": 0.0001,
+    "duration_ms": 5400000,
+    "factor": 10,
+    "sample_interval_ms": 15000,
+    "seed": 1,
+    "start_ms": 1767225600000
+  },
+  "selection": {
+    "accepted_accuracy": [
+      "metric not set; accepted exact",
+      "metric not set; accepted exact",
+      "metric not set; accepted exact",
+      "metric not set; accepted exact",
+      "metric not set; accepted exact",
+      "metric not set; accepted exact"
+    ],
+    "cheapest_materialized_candidate": {
+      "average_memory_bytes": 2742960.02190368,
+      "candidate": "P159-m485",
+      "cost_per_second": 4.540267025304992e-9,
+      "cost_source": "analytical-cost-v2 (illustrative statistics)",
+      "cpu_core_seconds_per_second": 0.00012320882222222217,
+      "cpu_ops_per_second": 26239.222222222197,
+      "latency_ms_per_query": [
+        3.401236,
+        0.568232,
+        0.5904159999999999,
+        0.300404,
+        0.6693319999999998,
+        0.821388
+      ],
+      "peak_cpu_cores": 6,
+      "peak_memory_bytes": 3039384,
+      "scanned_bytes_per_second": 969696.0
+    },
+    "cheapest_valid_candidates": [
+      {
+        "average_memory_bytes": 2742960.02190368,
+        "candidate": "P159-m485",
+        "cost_per_second": 4.540267025304992e-9,
+        "cost_source": "analytical-cost-v2 (illustrative statistics)",
+        "cpu_core_seconds_per_second": 0.00012320882222222217,
+        "cpu_ops_per_second": 26239.222222222197,
+        "latency_ms_per_query": [
+          3.401236,
+          0.568232,
+          0.5904159999999999,
+          0.300404,
+          0.6693319999999998,
+          0.821388
+        ],
+        "peak_cpu_cores": 6,
+        "peak_memory_bytes": 3039384,
+        "scanned_bytes_per_second": 969696.0
+      },
+      {
+        "average_memory_bytes": 2742960.02190368,
+        "candidate": "P160-m485",
+        "cost_per_second": 4.540267025304992e-9,
+        "cost_source": "analytical-cost-v2 (illustrative statistics)",
+        "cpu_core_seconds_per_second": 0.00012320882222222217,
+        "cpu_ops_per_second": 26239.2222222222,
+        "latency_ms_per_query": [
+          3.401236,
+          0.568232,
+          0.5904159999999999,
+          0.300404,
+          0.6693319999999998,
+          0.821388
+        ],
+        "peak_cpu_cores": 6,
+        "peak_memory_bytes": 3039384,
+        "scanned_bytes_per_second": 969696.0
+      },
+      {
+        "average_memory_bytes": 2745360.02190368,
+        "candidate": "P159-m467",
+        "cost_per_second": 4.543027465416152e-9,
+        "cost_source": "analytical-cost-v2 (illustrative statistics)",
+        "cpu_core_seconds_per_second": 0.00012320882222222217,
+        "cpu_ops_per_second": 26239.222222222197,
+        "latency_ms_per_query": [
+          3.401236,
+          0.568232,
+          0.510496,
+          0.300404,
+          0.6693319999999998,
+          0.821388
+        ],
+        "peak_cpu_cores": 7,
+        "peak_memory_bytes": 3040584,
+        "scanned_bytes_per_second": 969696.0
+      },
+      {
+        "average_memory_bytes": 2745360.02190368,
+        "candidate": "P159-m479",
+        "cost_per_second": 4.543027465416152e-9,
+        "cost_source": "analytical-cost-v2 (illustrative statistics)",
+        "cpu_core_seconds_per_second": 0.00012320882222222217,
+        "cpu_ops_per_second": 26239.222222222197,
+        "latency_ms_per_query": [
+          3.401236,
+          0.568232,
+          0.510496,
+          0.300404,
+          0.6693319999999998,
+          0.821388
+        ],
+        "peak_cpu_cores": 7,
+        "peak_memory_bytes": 3040584,
+        "scanned_bytes_per_second": 969696.0
+      },
+      {
+        "average_memory_bytes": 2745360.02190368,
+        "candidate": "P160-m467",
+        "cost_per_second": 4.543027465416152e-9,
+        "cost_source": "analytical-cost-v2 (illustrative statistics)",
+        "cpu_core_seconds_per_second": 0.00012320882222222217,
+        "cpu_ops_per_second": 26239.2222222222,
+        "latency_ms_per_query": [
+          3.401236,
+          0.568232,
+          0.510496,
+          0.300404,
+          0.6693319999999998,
+          0.821388
+        ],
+        "peak_cpu_cores": 7,
+        "peak_memory_bytes": 3040584,
+        "scanned_bytes_per_second": 969696.0
+      }
+    ],
+    "node_materializations": {
+      "MatAtQuery": 1,
+      "MatAtQueryKeptAcrossEvaluations": 92,
+      "NotMaterialized": 232
+    },
+    "planning_seconds": 12.450810414,
+    "predicted_nothing_materialized": {
+      "average_memory_bytes": 0.0,
+      "candidate": "P159",
+      "cost_per_second": 1.5438361563466673e-8,
+      "cost_source": "analytical-cost-v2 (illustrative statistics)",
+      "cpu_core_seconds_per_second": 0.001373031088888889,
+      "cpu_ops_per_second": 347923.88888888893,
+      "latency_ms_per_query": [
+        60.79978,
+        1.135664,
+        11.67532,
+        0.300404,
+        0.6693319999999998,
+        17.276916
+      ],
+      "peak_cpu_cores": 6,
+      "peak_memory_bytes": 3040312,
+      "scanned_bytes_per_second": 10251072.0
+    },
+    "predicted_selected": {
+      "average_memory_bytes": 2742960.02190368,
+      "candidate": "P159-m485",
+      "cost_per_second": 4.540267025304992e-9,
+      "cost_source": "analytical-cost-v2 (illustrative statistics)",
+      "cpu_core_seconds_per_second": 0.00012320882222222217,
+      "cpu_ops_per_second": 26239.222222222197,
+      "latency_ms_per_query": [
+        3.401236,
+        0.568232,
+        0.5904159999999999,
+        0.300404,
+        0.6693319999999998,
+        0.821388
+      ],
+      "peak_cpu_cores": 6,
+      "peak_memory_bytes": 3039384,
+      "scanned_bytes_per_second": 969696.0
+    },
+    "rejections_by_cause": {
+      "costlier": 7166,
+      "tied_lost_on_enumeration_order": 1
+    },
+    "selected": "P159-m485",
+    "valid_candidates": 7168
+  },
+  "series_per_metric": {
+    "aggregator_unavailable_apiservice": 150,
+    "aggregator_unavailable_apiservice_total": 150,
+    "apiserver_request_sli_duration_seconds_bucket": 17280,
+    "apiserver_request_sli_duration_seconds_count": 1440,
+    "apiserver_request_sli_duration_seconds_sum": 1440,
+    "kube_node_spec_unschedulable": 100,
+    "kube_node_status_capacity": 300,
+    "kube_node_status_condition": 1500,
+    "kubelet_evictions": 300,
+    "kubelet_node_name": 100,
+    "kubelet_running_pods": 100
+  },
+  "series_total": 22860
+}

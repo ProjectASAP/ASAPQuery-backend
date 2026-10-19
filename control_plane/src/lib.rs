@@ -12,7 +12,7 @@ use std::rc::Rc;
 use asap_logical_asap_optimization::DeploymentCapabilities;
 use asap_plan_selection::{
     resize_for_failure_probability, run_stage1_to_stage3, with_confirmed_weights,
-    PlanSelectionSettings, PlanningModels, Stage1ToStage3Run,
+    PlanSelectionSettings, PlanningModels, Selection, Stage1ToStage3Run,
 };
 use planner_types::ir::operator::pane_chain::expand_pane_chains;
 use planner_types::ir::physical_export::{compile_physical_asap_workload, PhysicalASAPDAGDocument};
@@ -178,13 +178,24 @@ pub fn plan_workload(
     workload: &PlanningWorkload,
     inputs: &DeploymentInputs,
 ) -> Result<InstalledPlan, PlanError> {
+    plan_and_select(workload, inputs).map(|(plan, _)| plan)
+}
+
+/// [`plan_workload`], with Stage 3's selection record: every valid
+/// candidate's predicted resource usage and cost, and why the others lost.
+/// Experiments read it to compare predicted with measured usage.
+pub fn plan_and_select(
+    workload: &PlanningWorkload,
+    inputs: &DeploymentInputs,
+) -> Result<(InstalledPlan, Selection), PlanError> {
     let planned = plan(workload, inputs)?;
     let selection = planned
         .run
         .stage3_plan_selection
         .map_err(|e| PlanError::Planning(e.to_string()))?;
     tracing::info!(candidate = %selection.selected, "selected physical plan");
-    InstalledPlan::from_roots(planned.queries, &selection.plan)
+    let plan = InstalledPlan::from_roots(planned.queries, &selection.plan)?;
+    Ok((plan, selection))
 }
 
 /// The selected plan with nothing materialized: the Stage 2 candidate that

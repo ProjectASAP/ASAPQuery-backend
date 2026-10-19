@@ -1,0 +1,62 @@
+[
+  {
+    "name": "cluster_verb_scope_le:apiserver_request_sli_duration_seconds_bucket:increase1h",
+    "query": "sum by (cluster, verb, scope, le) (increase(apiserver_request_sli_duration_seconds_bucket[1h]))",
+    "interval_ms": 180000,
+    "accuracy": {
+      "accuracy_scope": "whole_result",
+      "failure_probability": 0.0,
+      "max_error": 0.0
+    }
+  },
+  {
+    "name": "KubeAggregatedAPIErrors",
+    "query": "sum by (cluster, instance, name, reason) (increase(aggregator_unavailable_apiservice_total{job=\"apiserver\"}[1m])) > 0",
+    "interval_ms": 30000,
+    "accuracy": {
+      "accuracy_scope": "whole_result",
+      "failure_probability": 0.0,
+      "max_error": 0.0
+    }
+  },
+  {
+    "name": "KubeAggregatedAPIDown",
+    "query": "(1 - max by (name, namespace, cluster) (avg_over_time(aggregator_unavailable_apiservice{job=\"apiserver\"}[10m]))) * 100 < 85",
+    "interval_ms": 30000,
+    "accuracy": {
+      "accuracy_scope": "whole_result",
+      "failure_probability": 0.0,
+      "max_error": 0.0
+    }
+  },
+  {
+    "name": "KubeNodeNotReady",
+    "query": "kube_node_status_condition{condition=\"Ready\",job=\"kube-state-metrics\",status=\"true\"} == 0 and on (cluster, node) kube_node_spec_unschedulable{job=\"kube-state-metrics\"} == 0",
+    "interval_ms": 30000,
+    "accuracy": {
+      "accuracy_scope": "whole_result",
+      "failure_probability": 0.0,
+      "max_error": 0.0
+    }
+  },
+  {
+    "name": "KubeletTooManyPods",
+    "query": "(max by (cluster, instance) (kubelet_running_pods{job=\"kubelet\",metrics_path=\"/metrics\"} > 1) * on (cluster, instance) group_left (node) max by (cluster, instance, node) (kubelet_node_name{job=\"kubelet\",metrics_path=\"/metrics\"})) / on (cluster, node) group_left () max by (cluster, node) (kube_node_status_capacity{job=\"kube-state-metrics\",resource=\"pods\"} != 1) > 0.95",
+    "interval_ms": 30000,
+    "accuracy": {
+      "accuracy_scope": "whole_result",
+      "failure_probability": 0.0,
+      "max_error": 0.0
+    }
+  },
+  {
+    "name": "KubeNodeEviction",
+    "query": "sum by (cluster, eviction_signal, instance) (rate(kubelet_evictions{job=\"kubelet\",metrics_path=\"/metrics\"}[15m])) * on (cluster, instance) group_left (node) max by (cluster, instance, node) (kubelet_node_name{job=\"kubelet\",metrics_path=\"/metrics\"}) > 0",
+    "interval_ms": 30000,
+    "accuracy": {
+      "accuracy_scope": "whole_result",
+      "failure_probability": 0.0,
+      "max_error": 0.0
+    }
+  }
+]

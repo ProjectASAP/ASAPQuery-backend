@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["control_plane", "data_plane"]
+members = ["control_plane", "data_plane", "bench"]
 
 [workspace.package]
 edition = "2021"

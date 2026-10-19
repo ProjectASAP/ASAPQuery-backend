@@ -1,0 +1,44 @@
+[
+  {
+    "name": "example1/q1",
+    "query": "sum by (job) (rate(http_requests_total[1m]))",
+    "interval_ms": 10000,
+    "accuracy": {
+      "accuracy_scope": "whole_result",
+      "failure_probability": 0.0,
+      "max_error": 0.0
+    }
+  },
+  {
+    "name": "example1/q2",
+    "query": "topk by (job) (10, sum_over_time(http_requests_total[1m]))",
+    "interval_ms": 10000,
+    "accuracy": {
+      "accuracy_scope": "whole_result",
+      "failure_probability": 0.001,
+      "max_error": 0.01
+    }
+  },
+  {
+    "name": "example3b/q1",
+    "query": "quantile_over_time(0.99, latency_ms[5m])",
+    "interval_ms": 60000,
+    "accuracy": {
+      "accuracy_metric": "rank",
+      "accuracy_scope": "whole_result",
+      "failure_probability": 0.01,
+      "max_error": 0.01
+    }
+  },
+  {
+    "name": "example4b/q1",
+    "query": "quantile_over_time(0.99, latency_ms[60m])",
+    "interval_ms": 600000,
+    "accuracy": {
+      "accuracy_metric": "rank",
+      "accuracy_scope": "whole_result",
+      "failure_probability": 0.01,
+      "max_error": 0.01
+    }
+  }
+]

@@ -1,0 +1,25 @@
+{
+  "mode": "asap",
+  "wall_seconds": 72.032393935,
+  "samples_written": 722000,
+  "evaluations": 1052,
+  "processes": [
+    {
+      "name": "prometheus",
+      "cores": "0-3",
+      "cpu_core_seconds": 22.0,
+      "peak_rss_gib": 0.12883758544921875,
+      "mean_rss_gib": 0.09918239289914035,
+      "samples": 289
+    },
+    {
+      "name": "data_plane",
+      "cores": "4-7",
+      "cpu_core_seconds": 53.35,
+      "peak_rss_gib": 0.33551025390625,
+      "mean_rss_gib": 0.1113945192119242,
+      "samples": 289
+    }
+  ],
+  "prometheus_version": "prometheus, version 3.5.0 (branch: HEAD, revision: 8be3a9560fbdd18a94dedec4b747c35178177202)"
+}
