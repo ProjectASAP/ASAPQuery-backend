@@ -7,10 +7,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::body::Body;
+use axum::body::Bytes;
 use axum::extract::Query;
 use axum::http::{Request, StatusCode};
 use axum::routing::get;
 use axum::{Json, Router};
+use data_plane::remote_read::{self, QueryResult, ReadRequest, ReadResponse};
 use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use data_plane::{router, DataPlane, EXECUTION_HEADER, FORWARD_REASON_HEADER};
 use http_body_util::BodyExt;
@@ -28,49 +30,65 @@ fn series(metric: &str, labels: &[(&str, &str)]) -> BTreeMap<String, String> {
     map
 }
 
-/// A stand-in Prometheus holding `points`. It answers
-/// `{__name__="m"}[Nms]` at `time` with the samples in `[time - N, time]`,
-/// both ends included as Prometheus 2 does, and anything else with
-/// `{"forwarded": query}`. Range queries are answered with
+/// A stand-in Prometheus holding `points`. It answers remote read with each
+/// metric's samples within the request's inclusive bounds, and any instant
+/// query with `{"forwarded": query}`. Range queries are answered with
 /// `{"forwarded_range": parameters}`.
 async fn fake_prometheus(points: Vec<Point>) -> String {
     let points = Arc::new(points);
-    let handler = move |Query(params): Query<BTreeMap<String, String>>| {
-        let points = points.clone();
+    let read_points = points.clone();
+    let read = move |body: Bytes| {
+        let points = read_points.clone();
         async move {
-            let query = &params["query"];
-            let parsed = query
-                .strip_prefix("{__name__=\"")
-                .and_then(|rest| rest.split_once("\"}["))
-                .and_then(|(metric, rest)| {
-                    Some((metric, rest.strip_suffix("ms]")?.parse::<i64>().ok()?))
-                });
-            let Some((metric, range)) = parsed else {
-                return Json(json!({ "forwarded": query }));
-            };
-            let time = (params["time"].parse::<f64>().unwrap() * 1000.0).round() as i64;
-            let mut by_series: BTreeMap<&BTreeMap<String, String>, Vec<Value>> = BTreeMap::new();
-            for (labels, t, v) in points.iter() {
-                if labels["__name__"] == metric && time - range <= *t && *t <= time {
-                    by_series
-                        .entry(labels)
-                        .or_default()
-                        .push(json!([*t as f64 / 1000.0, v.to_string()]));
-                }
-            }
-            let result: Vec<Value> = by_series
-                .into_iter()
-                .map(|(labels, values)| json!({"metric": labels, "values": values}))
+            let request: ReadRequest = remote_read::decode(&body).unwrap();
+            let results = request
+                .queries
+                .iter()
+                .map(|query| {
+                    let metric = &query.matchers[0].value;
+                    let mut by_series: BTreeMap<&BTreeMap<String, String>, Vec<Sample>> =
+                        BTreeMap::new();
+                    for (labels, t, v) in points.iter() {
+                        if &labels["__name__"] == metric
+                            && query.start_timestamp_ms <= *t
+                            && *t <= query.end_timestamp_ms
+                        {
+                            by_series.entry(labels).or_default().push(Sample {
+                                value: *v,
+                                timestamp: *t,
+                            });
+                        }
+                    }
+                    QueryResult {
+                        timeseries: by_series
+                            .into_iter()
+                            .map(|(labels, samples)| TimeSeries {
+                                labels: labels
+                                    .iter()
+                                    .map(|(name, value)| Label {
+                                        name: name.clone(),
+                                        value: value.clone(),
+                                    })
+                                    .collect(),
+                                samples,
+                            })
+                            .collect(),
+                    }
+                })
                 .collect();
-            Json(json!({"status": "success", "data": {"resultType": "matrix", "result": result}}))
+            remote_read::encode(&ReadResponse { results })
         }
+    };
+    let handler = |Query(params): Query<BTreeMap<String, String>>| async move {
+        Json(json!({ "forwarded": params["query"] }))
     };
     let range = |Query(params): Query<BTreeMap<String, String>>| async move {
         Json(json!({ "forwarded_range": params }))
     };
     let app = Router::new()
         .route("/api/v1/query", get(handler))
-        .route("/api/v1/query_range", get(range));
+        .route("/api/v1/query_range", get(range))
+        .route("/api/v1/read", axum::routing::post(read));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

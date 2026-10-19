@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use data_plane::engine::Threads;
+use data_plane::engine::EngineOptions;
 use data_plane::{router, DataPlane};
 
 // jemalloc, as ASAPQuery's engine uses: the executor allocates per row, and
@@ -34,6 +34,12 @@ struct Args {
     /// Query threads, each running one query at a time; default one per core.
     #[arg(long)]
     query_threads: Option<usize>,
+    /// How far back from the newest sample to keep the raw samples of each
+    /// metric read at query time, in ms; default each metric's longest
+    /// query-time read in the plan. 0 reads every raw window from
+    /// Prometheus remote read.
+    #[arg(long)]
+    raw_buffer_ms: Option<i64>,
 }
 
 #[tokio::main]
@@ -44,18 +50,30 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     data_plane::precompute::set_execution_memory_limit(args.execution_memory_limit_mib << 20);
     let plan = std::fs::read_to_string(&args.plan)?;
-    let defaults = Threads::default();
-    let threads = Threads {
+    let defaults = EngineOptions::default();
+    let options = EngineOptions {
         ingestion_workers: args.ingestion_workers.unwrap_or(defaults.ingestion_workers),
         query_threads: args.query_threads.unwrap_or(defaults.query_threads),
+        raw_buffer_ms: args.raw_buffer_ms,
     };
     let state = Arc::new(DataPlane::with_threads(
         plan,
         args.prometheus_url,
         args.allowed_lateness_ms,
-        threads,
+        options,
     )?);
     tracing::info!(queries = state.queries.len(), "installed plan");
+    let reporting = state.clone();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            every.tick().await;
+            if let Some(buffer) = reporting.engine.raw_buffer() {
+                let (series, samples) = buffer.size();
+                tracing::info!(series, samples, "local raw buffer");
+            }
+        }
+    });
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     tracing::info!(address = %listener.local_addr()?, "listening");
     axum::serve(listener, router(state)).await?;

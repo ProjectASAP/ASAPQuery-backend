@@ -1,14 +1,12 @@
 //! The Prometheus HTTP API as the data plane speaks it: instant- and
-//! range-query parameters and results, and fetching raw samples for
-//! query-time ranges.
+//! range-query parameters and results. Raw samples are read with remote
+//! read ([`crate::remote_read`]).
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::precompute::RawSample;
-use crate::query::{RawRange, ResultSample};
+use crate::query::ResultSample;
 
 /// Parameters of an instant query, from its URL query and form body.
 pub struct InstantQuery {
@@ -142,10 +140,6 @@ fn seconds_to_ms(seconds: f64) -> i64 {
     (seconds * 1000.0).round() as i64
 }
 
-fn ms_to_seconds(ms: i64) -> String {
-    format!("{:.3}", ms as f64 / 1000.0)
-}
-
 /// A Prometheus instant-query response for `samples` at `time_ms`.
 pub fn vector_response(time_ms: i64, samples: &[ResultSample]) -> Value {
     let time = time_ms as f64 / 1000.0;
@@ -183,64 +177,6 @@ fn format_value(value: f64) -> String {
         v if v == f64::INFINITY => "+Inf".into(),
         v if v == f64::NEG_INFINITY => "-Inf".into(),
         v => v.to_string(),
-    }
-}
-
-/// The samples of `range`'s metric in `(start, end]`, read from Prometheus
-/// with a range selector evaluated at the range's end.
-pub async fn fetch(
-    client: &reqwest::Client,
-    prometheus_url: &str,
-    range: &RawRange,
-) -> anyhow::Result<Vec<RawSample>> {
-    let selector = format!(
-        "{{__name__=\"{}\"}}[{}ms]",
-        range.metric,
-        range.end_ms - range.start_ms
-    );
-    let response: Value = client
-        .get(format!("{prometheus_url}/api/v1/query"))
-        .query(&[
-            ("query", selector.as_str()),
-            ("time", &ms_to_seconds(range.end_ms)),
-        ])
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let malformed = || anyhow::anyhow!("unexpected Prometheus response: {response}");
-    let series = response["data"]["result"]
-        .as_array()
-        .ok_or_else(malformed)?;
-    let mut samples = Vec::new();
-    for series in series {
-        let labels: BTreeMap<String, String> = serde_json::from_value(series["metric"].clone())?;
-        let labels = Arc::new(labels);
-        for point in series["values"].as_array().ok_or_else(malformed)? {
-            let seconds = point[0].as_f64().ok_or_else(malformed)?;
-            let value = point[1].as_str().ok_or_else(malformed)?;
-            let timestamp_ms = seconds_to_ms(seconds);
-            // Prometheus 2 ranges include their start; the plan's do not.
-            if timestamp_ms <= range.start_ms {
-                continue;
-            }
-            samples.push(RawSample {
-                labels: labels.clone(),
-                timestamp_ms,
-                value: parse_value(value).ok_or_else(malformed)?,
-            });
-        }
-    }
-    Ok(samples)
-}
-
-fn parse_value(value: &str) -> Option<f64> {
-    match value {
-        "+Inf" | "Inf" => Some(f64::INFINITY),
-        "-Inf" => Some(f64::NEG_INFINITY),
-        "NaN" => Some(f64::NAN),
-        v => v.parse().ok(),
     }
 }
 
@@ -285,7 +221,6 @@ mod tests {
                 {"metric": {}, "value": [1.5, "+Inf"]},
             ]}})
         );
-        assert_eq!(ms_to_seconds(4_200_001), "4200.001");
     }
 
     fn range(params: &str) -> Option<(i64, i64, i64)> {

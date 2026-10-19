@@ -55,7 +55,11 @@ buffered samples instead. The data plane uses jemalloc as its allocator.
 An instant query whose text is one of the plan's queries is answered by the
 plan (`x-asap-execution: plan`). Its stored inputs read the panes ending at
 `T - offset`, so `T` must be on the pane grid and those panes stored; its
-query-time raw ranges are read from Prometheus. An input the plan keeps
+query-time raw windows are read from the local raw buffer: the recent
+samples Remote Write delivered, sharded like ingestion. Each metric the
+plan reads at query time is kept for its longest query-time read back from
+the newest sample (`--raw-buffer-ms` overrides it; 0 keeps none). The part of a window older
+than the buffer is read with Prometheus remote read (`/api/v1/read`). An input the plan keeps
 across evaluations (`MatAtQueryKeptAcrossEvaluations`) is computed from its
 pane's raw samples when an evaluation reads it and no evaluation has kept
 it. It is kept in memory, by definition and pane end, once the pane is
@@ -75,8 +79,7 @@ be answered also says why in `x-asap-forward-reason`.
 
 A range query (`/api/v1/query_range`) whose text is one of the plan's queries
 is answered as one evaluation per step, `start + k * step` through `end`,
-and returns a Prometheus matrix. Each query-time raw range is read from
-Prometheus once for all steps and sliced per step; stored and kept panes are
+and returns a Prometheus matrix. Each query-time raw range is read once for all steps and sliced per step; stored and kept panes are
 read per step, so a kept pane built at one step is reused by the later ones.
 If any step cannot be answered, for example because a step is off the pane
 grid or reads an evicted pane, the whole range query is forwarded with the
