@@ -12,7 +12,7 @@ ASAPPlanner turns a query workload and deployment inputs (such as runtime capabi
 flowchart TB
   W[Workload + deployment inputs] --> PL
   subgraph CP[Control plane]
-    PL[Call ASAPPlanner once] --> P[(InstallablePlan)]
+    PL[Call ASAPPlanner once] --> P[(InstalledPlan)]
   end
   subgraph DP[Data plane]
     subgraph ING[Ingestion]
@@ -63,15 +63,14 @@ ASAPPlanner decides **what to compute**, **whether to compute it during ingestio
 
 **Planning interface: workload and deployment models → executable plan**
 
-Once per installed workload, the backend supplies the query workload and deployment models (capabilities, costs, and data facts). The Planner returns `InstallablePlan`: the execution plan and metadata the backend needs to install it. This is the role of `asap_planner::plan_installable`; `UserInput` packages those inputs, and `models` refers to deployment models, not machine-learning models.
+Once per installed workload, the backend control plane supplies the query workload and deployment inputs (capabilities, costs, and data facts) to ASAPPlanner. The Planner selects a physical DAG. The control plane packages that DAG and its query text into `InstalledPlan`, the backend's current installation contract.
 
-| Plan field | Meaning for the backend |
+| `InstalledPlan` field | Meaning for the backend |
 | --- | --- |
-| `dag` | The operators to execute and their dependencies. |
-| `queries` | Maps each planned query to the DAG node that produces its answer. |
-| `stored_outputs` | Identifies which node outputs to store, whether to build them during ingestion or query execution (`built_at`: `IngestionRun` or `QueryRun`), the time coverage of each summary, and how long to retain it (`retention_ms`, in milliseconds). |
-| `query_time_raw_windows` | Specifies which time ranges of raw samples are needed during query execution. |
-| `selection` | Records the selected candidate and its estimated cost per second for reporting. |
+| `dag` | The selected physical DAG, including its operators, dependencies, and query roots, with pane chains expanded. |
+| `queries` | Query text in the same order as the DAG roots, associating each query with the root that produces its answer. |
+
+There are no separate `stored_outputs`, `query_time_raw_windows`, or `selection` fields in this contract. Summary definitions and raw-sample read requirements are derived from the DAG. Candidate selection details and estimated costs belong to planning reports rather than the runtime installation contract.
 
 **Runtime interface: samples and summaries → query answers**
 
