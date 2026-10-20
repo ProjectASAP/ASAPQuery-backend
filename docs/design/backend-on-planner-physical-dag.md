@@ -14,17 +14,29 @@ flowchart TB
   subgraph CP[Control plane]
     PL[Call ASAPPlanner once] --> P[(InstallablePlan)]
   end
-  P --> PE
-  P --> QE
-  P --> SDS
   subgraph DP[Data plane]
-    RW[Remote Write] --> PE[Precompute engine<br/>per-sample state updates]
-    PE --> SDS[(SDS<br/>immutable stored panes)]
-    Q[Planned query at T] --> QE[Query engine<br/>executes the query's DAG root]
-    SDS --> QE
+    RW[Remote Write] --> PE[Precompute engine<br/>Update state per sample]
+    PE -->|Store panes| SDS[(SDS<br/>Immutable stored panes)]
+    SDS -->|Read panes| QE[Query engine<br/>Execute the query's DAG root]
+    Q[Planned query at T] --> QE
   end
+
+  P -.-> PE
+  P -.-> SDS
+  P -.-> QE
   QE <--> PROM[Prometheus<br/>remote read, unplanned queries]
+
+  classDef input fill:#f8fafc,stroke:#64748b,color:#0f172a
+  classDef engine fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
+  classDef storage fill:#fef3c7,stroke:#d97706,color:#78350f
+  class W,RW,Q,PROM input
+  class PL,PE,QE engine
+  class P,SDS storage
+  style CP fill:#f0f9ff,stroke:#0284c7,color:#0c4a6e
+  style DP fill:#f8fafc,stroke:#64748b,color:#0f172a
 ```
+
+Dashed arrows install the plan into each data-plane component; solid arrows show runtime data flow.
 
 ## Boundary between ASAPPlanner and ASAPQuery-backend
 
