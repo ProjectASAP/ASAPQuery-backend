@@ -1,3 +1,5 @@
+mod common;
+
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,8 +9,9 @@ use axum::extract::RawQuery;
 use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::routing::get;
 use axum::Router;
+use data_plane::engine::EngineOptions;
 use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
-use data_plane::{router, DataPlane, DEFAULT_FORWARD_TIMEOUT, EXECUTION_HEADER};
+use data_plane::{router, DataPlane, EXECUTION_HEADER};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
@@ -38,6 +41,11 @@ async fn serve(app: Router) -> String {
     url
 }
 
+/// A data plane for #509 Example 1 that forwards to `prometheus_url`.
+fn data_plane(prometheus_url: String) -> Arc<DataPlane> {
+    Arc::new(DataPlane::new(common::plan_json("example1", true), prometheus_url, 0).unwrap())
+}
+
 async fn send(app: &Router, request: Request<Body>) -> (StatusCode, Option<String>, String) {
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
@@ -53,11 +61,7 @@ async fn send(app: &Router, request: Request<Body>) -> (StatusCode, Option<Strin
 /// unchanged, and the response says it was forwarded.
 #[tokio::test]
 async fn forwards_queries_to_prometheus() {
-    let state = Arc::new(DataPlane::new(
-        vec![],
-        fake_prometheus().await,
-        DEFAULT_FORWARD_TIMEOUT,
-    ));
+    let state = data_plane(fake_prometheus().await);
     let app = router(state);
     let (status, execution, body) = send(
         &app,
@@ -85,11 +89,7 @@ async fn forwards_queries_to_prometheus() {
 /// rejected with 400.
 #[tokio::test]
 async fn accepts_remote_write() {
-    let state = Arc::new(DataPlane::new(
-        vec![],
-        "http://unused".into(),
-        DEFAULT_FORWARD_TIMEOUT,
-    ));
+    let state = data_plane("http://unused".into());
     let app = router(state.clone());
     let request = WriteRequest {
         timeseries: vec![TimeSeries {
@@ -133,11 +133,7 @@ async fn accepts_remote_write() {
 /// `Limits::max_compressed_bytes` are accepted; larger ones get 413.
 #[tokio::test]
 async fn accepts_remote_write_up_to_the_compressed_limit() {
-    let state = Arc::new(DataPlane::new(
-        vec![],
-        "http://unused".into(),
-        DEFAULT_FORWARD_TIMEOUT,
-    ));
+    let state = data_plane("http://unused".into());
     let app = router(state.clone());
     // Pseudo-random hex label values do not compress, so the encoded body
     // stays near its decoded size.
@@ -208,11 +204,7 @@ async fn forwards_auth_and_tenancy_headers() {
         names.join("\n")
     }
     let url = serve(Router::new().route("/api/v1/query", get(headers))).await;
-    let app = router(Arc::new(DataPlane::new(
-        vec![],
-        url,
-        DEFAULT_FORWARD_TIMEOUT,
-    )));
+    let app = router(data_plane(url));
     let (status, _, body) = send(
         &app,
         Request::get("/api/v1/query?query=up")
@@ -247,11 +239,11 @@ async fn forwarded_query_times_out() {
         "late"
     }
     let url = serve(Router::new().route("/api/v1/query", get(slow))).await;
-    let app = router(Arc::new(DataPlane::new(
-        vec![],
-        url,
-        Duration::from_millis(100),
-    )));
+    let app = router(Arc::new(
+        DataPlane::new(common::plan_json("example1", true), url, 0)
+            .unwrap()
+            .with_forward_timeout(Duration::from_millis(100)),
+    ));
     let (status, _, body) = send(
         &app,
         Request::get("/api/v1/query?query=up")
@@ -260,4 +252,127 @@ async fn forwarded_query_times_out() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+}
+
+/// A Remote Write body of `count` samples of one Example 1 series.
+fn write_body(count: usize) -> Vec<u8> {
+    encode(&WriteRequest {
+        timeseries: vec![TimeSeries {
+            labels: vec![Label {
+                name: "__name__".into(),
+                value: "http_requests_total".into(),
+            }],
+            samples: (0..count)
+                .map(|i| Sample {
+                    value: i as f64,
+                    timestamp: 1_000 * (i as i64 + 1),
+                })
+                .collect(),
+        }],
+    })
+}
+
+async fn write(app: &Router, count: usize) -> StatusCode {
+    let request = Request::post("/api/v1/write")
+        .body(Body::from(write_body(count)))
+        .unwrap();
+    send(app, request).await.0
+}
+
+/// GET `path` and parse the JSON body.
+async fn get_json(app: &Router, path: &str) -> (StatusCode, serde_json::Value) {
+    let (status, _, body) = send(app, Request::get(path).body(Body::empty()).unwrap()).await;
+    (status, serde_json::from_str(&body).unwrap_or_default())
+}
+
+/// A request larger than `max_queued_samples` is still admitted when nothing
+/// is queued, so a small queue bound cannot refuse a large request forever.
+#[tokio::test]
+async fn admits_a_large_request_into_an_empty_queue() {
+    let options = EngineOptions {
+        max_queued_samples: 2,
+        ..EngineOptions::default()
+    };
+    let state = Arc::new(
+        DataPlane::with_options(
+            common::plan_json("example1", true),
+            "http://unused".into(),
+            options,
+        )
+        .unwrap(),
+    );
+    let app = router(state.clone());
+    assert_eq!(write(&app, 3).await, StatusCode::NO_CONTENT);
+    assert_eq!(state.samples.load(Ordering::Relaxed), 3);
+}
+
+/// A Remote Write request without samples is accepted and not queued.
+#[tokio::test]
+async fn does_not_queue_empty_requests() {
+    let state = data_plane("http://unused".into());
+    let app = router(state.clone());
+    state.engine.stop();
+    for _ in 0..200 {
+        if !state.engine.is_running() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // A stopped engine refuses samples, but there is nothing to refuse.
+    assert_eq!(write(&app, 0).await, StatusCode::NO_CONTENT);
+}
+
+/// Once the engine thread has stopped, Remote Write gets 500 instead of a
+/// 503 that senders would retry forever, and the data plane is not ready.
+#[tokio::test]
+async fn stopped_engine_fails_writes_and_readiness() {
+    let state = data_plane("http://unused".into());
+    let app = router(state.clone());
+    let (status, _, _) = send(&app, Request::get("/-/ready").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    state.engine.stop();
+    for _ in 0..200 {
+        if !state.engine.is_running() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!state.engine.is_running());
+    assert_eq!(write(&app, 1).await, StatusCode::INTERNAL_SERVER_ERROR);
+    let (status, _, _) = send(&app, Request::get("/-/ready").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let (_, body) = get_json(&app, "/api/v1/status/asap").await;
+    assert_eq!(body["engine_running"], false);
+}
+
+/// The status endpoint reports what the engine did with every sample.
+#[tokio::test]
+async fn reports_sample_counters() {
+    let state = data_plane("http://unused".into());
+    let app = router(state.clone());
+    assert_eq!(write(&app, 3).await, StatusCode::NO_CONTENT);
+    let mut body = serde_json::Value::Null;
+    for _ in 0..200 {
+        let (status, json) = get_json(&app, "/api/v1/status/asap").await;
+        assert_eq!(status, StatusCode::OK);
+        body = json;
+        if body["samples_queued"] == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(body["engine_running"], true);
+    assert_eq!(body["samples_queued"], 0);
+    let counters = &body["precompute"];
+    let total: u64 = [
+        "samples_accepted",
+        "samples_dropped_late",
+        "samples_skipped_first_pane",
+        "samples_dropped_future",
+        "samples_unrouted",
+    ]
+    .iter()
+    .map(|name| counters[name].as_u64().unwrap())
+    .sum();
+    assert_eq!(total, 3, "{body}");
 }

@@ -1,14 +1,16 @@
 //! Backend data plane: receives Prometheus Remote Write samples and serves
 //! the Prometheus query API for an installed plan.
 //!
-//! The installed plan is ASAPPlanner's selected `PhysicalASAPDAG`. Executing
-//! it is not implemented yet: Remote Write samples are validated, counted and
-//! dropped (Prometheus must receive Remote Write itself), and every query is
-//! forwarded to Prometheus.
+//! The installed plan is ASAPPlanner's selected `PhysicalASAPDAG`. The
+//! engine thread builds its ingestion-time outputs pane by pane; queries are
+//! still forwarded to Prometheus.
 
+pub mod engine;
+pub mod precompute;
 pub mod remote_write;
 pub mod sds;
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +21,8 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use engine::{EngineHandle, EngineOptions, IngestError};
+use precompute::RawSample;
 
 /// Response header naming what answered a query.
 pub const EXECUTION_HEADER: &str = "x-asap-execution";
@@ -28,33 +32,62 @@ pub const EXECUTION_HEADER: &str = "x-asap-execution";
 pub const DEFAULT_FORWARD_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct DataPlane {
-    /// The installed plan's queries, in root order. The plan itself is not
-    /// `Send` (its operator payloads hold `Rc`s), so it stays with its loader.
+    /// The installed plan's queries, in root order.
     pub queries: Vec<String>,
+    pub engine: EngineHandle,
     /// Base URL of the Prometheus that answers forwarded queries.
     pub prometheus_url: String,
     pub limits: remote_write::Limits,
-    /// Samples accepted (and, until the precompute engine lands, dropped)
-    /// since startup.
+    /// Samples accepted since startup.
     pub samples: AtomicU64,
     client: reqwest::Client,
 }
 
 impl DataPlane {
-    /// `forward_timeout` bounds each forwarded query, from sending the
-    /// request to reading the whole response.
-    pub fn new(queries: Vec<String>, prometheus_url: String, forward_timeout: Duration) -> Self {
-        Self {
+    /// Installs the plan serialized in `plan_json` (a
+    /// `control_plane::InstalledPlan`) with [`EngineOptions::default`], except
+    /// that panes close `allowed_lateness_ms` after the newest sample passes
+    /// them.
+    pub fn new(
+        plan_json: String,
+        prometheus_url: String,
+        allowed_lateness_ms: u64,
+    ) -> anyhow::Result<Self> {
+        let mut options = EngineOptions::default();
+        options.precompute.allowed_lateness_ms = allowed_lateness_ms;
+        Self::with_options(plan_json, prometheus_url, options)
+    }
+
+    /// Installs the plan serialized in `plan_json` with `options`.
+    pub fn with_options(
+        plan_json: String,
+        prometheus_url: String,
+        options: EngineOptions,
+    ) -> anyhow::Result<Self> {
+        let (engine, queries) = EngineHandle::spawn(plan_json, options)?;
+        Ok(Self {
             queries,
+            engine,
             prometheus_url: prometheus_url.trim_end_matches('/').to_string(),
             limits: remote_write::Limits::default(),
             samples: AtomicU64::new(0),
-            client: reqwest::Client::builder()
-                .timeout(forward_timeout)
-                .build()
-                .expect("reqwest client with only a timeout set"),
-        }
+            client: forward_client(DEFAULT_FORWARD_TIMEOUT),
+        })
     }
+
+    /// Bounds each forwarded query by `timeout`, from sending the request to
+    /// reading the whole response (default [`DEFAULT_FORWARD_TIMEOUT`]).
+    pub fn with_forward_timeout(mut self, timeout: Duration) -> Self {
+        self.client = forward_client(timeout);
+        self
+    }
+}
+
+fn forward_client(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .expect("reqwest client with only a timeout set")
 }
 
 pub fn router(state: Arc<DataPlane>) -> Router {
@@ -65,19 +98,83 @@ pub fn router(state: Arc<DataPlane>) -> Router {
         .route("/api/v1/write", post(write).layer(write_body_limit))
         .route("/api/v1/query", get(query).post(query))
         .route("/api/v1/query_range", get(query_range).post(query_range))
-        .route("/-/ready", get(|| async { StatusCode::OK }))
+        .route("/api/v1/status/asap", get(status))
+        .route("/-/ready", get(ready))
         .with_state(state)
 }
 
 async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
     match remote_write::decode(&body, &state.limits) {
         Ok(request) => {
-            let samples: usize = request.timeseries.iter().map(|s| s.samples.len()).sum();
-            state.samples.fetch_add(samples as u64, Ordering::Relaxed);
-            StatusCode::NO_CONTENT.into_response()
+            let mut samples = Vec::new();
+            for series in request.timeseries {
+                let labels: Arc<BTreeMap<String, String>> = Arc::new(
+                    series
+                        .labels
+                        .into_iter()
+                        .map(|label| (label.name, label.value))
+                        .collect(),
+                );
+                // Stale markers are kept: the executor's sample selector
+                // drops them from range windows and ends instant selectors.
+                samples.extend(series.samples.into_iter().map(|s| RawSample {
+                    labels: labels.clone(),
+                    timestamp_ms: s.timestamp,
+                    value: s.value,
+                }));
+            }
+            let count = samples.len() as u64;
+            if count == 0 {
+                return StatusCode::NO_CONTENT.into_response();
+            }
+            match state.engine.try_ingest(samples) {
+                Ok(()) => {
+                    state.samples.fetch_add(count, Ordering::Relaxed);
+                    StatusCode::NO_CONTENT.into_response()
+                }
+                // Remote Write senders retry on 503.
+                Err(IngestError::Busy) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    IngestError::Busy.to_string(),
+                )
+                    .into_response(),
+                Err(IngestError::Stopped) => {
+                    tracing::error!("Remote Write refused: the engine has stopped");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        IngestError::Stopped.to_string(),
+                    )
+                        .into_response()
+                }
+            }
         }
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
+}
+
+/// Ready while the engine thread runs; a stopped engine never ingests
+/// again, so the data plane must be restarted.
+async fn ready(State(state): State<Arc<DataPlane>>) -> StatusCode {
+    if state.engine.is_running() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+/// The data plane's counters, as JSON: the precompute engine's sample and
+/// pane counters, the samples queued for it, and whether it runs.
+async fn status(State(state): State<Arc<DataPlane>>) -> Response {
+    let body = serde_json::json!({
+        "engine_running": state.engine.is_running(),
+        "samples_queued": state.engine.queued_samples(),
+        "precompute": state.engine.stats(),
+    });
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 async fn query(

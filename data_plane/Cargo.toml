@@ -20,9 +20,10 @@ axum.workspace = true
 reqwest.workspace = true
 prost = "0.13"
 snap = "1.1"
+futures = "0.3"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-# The tests find the frontier the way the Planner does; the runtime does not.
+# The tests check the SDS's frontier against the executor's own.
 asap-executor = { workspace = true, features = ["test-support"] }
