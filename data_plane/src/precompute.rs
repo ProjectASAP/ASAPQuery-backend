@@ -29,7 +29,9 @@ use asap_executor::{RawSampleSelector, Sample};
 use futures::executor::block_on;
 use futures::StreamExt;
 
-use crate::sds::{DefinitionId, Sds, SummaryDefinition, SummaryStore};
+use crate::sds::{
+    DefinitionId, Sds, Selection, SummaryDefinition, SummaryInstanceKey, SummaryStore,
+};
 
 /// One raw sample: its series' full label set (including `__name__`), time
 /// and value.
@@ -300,7 +302,10 @@ impl Precompute {
                 let samples = builder.open.remove(&end).unwrap_or_default();
                 match build_pane(builder, end, &samples) {
                     Ok(state) => {
-                        self.store.insert(id, end, state);
+                        self.store.insert(
+                            SummaryInstanceKey::new(id.clone(), Selection::ending_at(end)),
+                            state,
+                        );
                         self.stats.panes_built += 1;
                     }
                     Err(error) => {
@@ -314,7 +319,8 @@ impl Precompute {
                     None => break,
                 }
             }
-            self.store.evict_before(id, oldest_kept_end);
+            self.store
+                .evict_before(id, Selection::ending_at(oldest_kept_end));
         }
     }
 }

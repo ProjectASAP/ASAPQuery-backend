@@ -3,7 +3,7 @@ mod common;
 use asap_executor::planner::ir::{NonASAPOp, Operator};
 use asap_planner::{InstallablePlan, StoredOutputBuild};
 use common::plan;
-use data_plane::sds::{DefinitionId, Sds, SdsError, SummaryStore};
+use data_plane::sds::{DefinitionId, Sds, SdsError, Selection, SummaryInstanceKey, SummaryStore};
 
 /// Example 4b's six ingestion-time KLL panes are one definition with a
 /// 10-minute pane; each output reads the pane `i * 10min` before evaluation,
@@ -166,14 +166,29 @@ fn store_finds_and_evicts_panes() {
     let (a, b) = (DefinitionId("a".into()), DefinitionId("b".into()));
     let mut store = SummaryStore::new();
     for end in [60, 120, 180] {
-        store.insert(&a, end, format!("a{end}"));
+        store.insert(
+            SummaryInstanceKey::new(a.clone(), Selection::ending_at(end)),
+            format!("a{end}"),
+        );
     }
-    store.insert(&b, 60, "b60".to_string());
-    assert_eq!(store.get(&a, 120).map(String::as_str), Some("a120"));
-    assert_eq!(store.get(&a, 90), None);
-    store.evict_before(&a, 180);
-    assert_eq!(store.get(&a, 120), None);
-    assert_eq!(store.get(&a, 180).map(String::as_str), Some("a180"));
-    assert_eq!(store.get(&b, 60).map(String::as_str), Some("b60"));
+    store.insert(
+        SummaryInstanceKey::new(b.clone(), Selection::ending_at(60)),
+        "b60".to_string(),
+    );
+    assert_eq!(
+        store.get(&a, Selection::ending_at(120)).map(String::as_str),
+        Some("a120")
+    );
+    assert_eq!(store.get(&a, Selection::ending_at(90)), None);
+    store.evict_before(&a, Selection::ending_at(180));
+    assert_eq!(store.get(&a, Selection::ending_at(120)), None);
+    assert_eq!(
+        store.get(&a, Selection::ending_at(180)).map(String::as_str),
+        Some("a180")
+    );
+    assert_eq!(
+        store.get(&b, Selection::ending_at(60)).map(String::as_str),
+        Some("b60")
+    );
     assert_eq!(store.len(), 2);
 }

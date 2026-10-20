@@ -7,7 +7,7 @@ use asap_executor::planner::workload::{PlanningWorkload, Query};
 use asap_planner::InstallablePlan;
 use control_plane::plan_workload;
 use data_plane::precompute::{pane_end, Precompute, PrecomputeOptions, RawSample};
-use data_plane::sds::Sds;
+use data_plane::sds::{Sds, Selection};
 
 const MINUTE: i64 = 60_000;
 const PANE: i64 = 10 * MINUTE;
@@ -57,13 +57,26 @@ fn builds_panes_after_the_first_as_the_watermark_passes() {
     let id = sds.definitions.keys().next().unwrap().clone();
     // The first sample, at 1 min, opens pane (0, 10 min], which is skipped.
     engine.ingest(&samples("latency_ms", &["a", "b"], MINUTE, 35 * MINUTE));
-    assert_eq!(engine.store.get(&id, PANE).map(|_| ()), None, "first pane");
+    assert_eq!(
+        engine
+            .store
+            .get(&id, Selection::ending_at(PANE))
+            .map(|_| ()),
+        None,
+        "first pane"
+    );
     for end in [2 * PANE, 3 * PANE] {
-        let pane = engine.store.get(&id, end).expect("built pane");
+        let pane = engine
+            .store
+            .get(&id, Selection::ending_at(end))
+            .expect("built pane");
         assert_eq!(pane.num_rows(), 2, "one state per series");
     }
     assert_eq!(
-        engine.store.get(&id, 4 * PANE).map(|_| ()),
+        engine
+            .store
+            .get(&id, Selection::ending_at(4 * PANE))
+            .map(|_| ()),
         None,
         "open pane"
     );
@@ -104,9 +117,30 @@ fn stores_empty_panes() {
     let id = sds.definitions.keys().next().unwrap().clone();
     engine.ingest(&samples("latency_ms", &["a"], 0, 20 * MINUTE));
     engine.ingest(&[sample("latency_ms", "a", 45 * MINUTE, 1.0)]);
-    assert_eq!(engine.store.get(&id, 2 * PANE).unwrap().num_rows(), 1);
-    assert_eq!(engine.store.get(&id, 3 * PANE).unwrap().num_rows(), 0);
-    assert_eq!(engine.store.get(&id, 4 * PANE).unwrap().num_rows(), 0);
+    assert_eq!(
+        engine
+            .store
+            .get(&id, Selection::ending_at(2 * PANE))
+            .unwrap()
+            .num_rows(),
+        1
+    );
+    assert_eq!(
+        engine
+            .store
+            .get(&id, Selection::ending_at(3 * PANE))
+            .unwrap()
+            .num_rows(),
+        0
+    );
+    assert_eq!(
+        engine
+            .store
+            .get(&id, Selection::ending_at(4 * PANE))
+            .unwrap()
+            .num_rows(),
+        0
+    );
 }
 
 /// The plan's label matchers select which series a pane summarizes.
@@ -121,7 +155,14 @@ fn applies_label_matchers() {
     let (mut engine, sds) = precompute(plan_workload(&workload, &common::inputs(false)).unwrap());
     let id = sds.definitions.keys().next().unwrap().clone();
     engine.ingest(&samples("latency_ms", &["a", "b"], 0, 25 * MINUTE));
-    assert_eq!(engine.store.get(&id, 2 * PANE).unwrap().num_rows(), 1);
+    assert_eq!(
+        engine
+            .store
+            .get(&id, Selection::ending_at(2 * PANE))
+            .unwrap()
+            .num_rows(),
+        1
+    );
 }
 
 /// Panes are `(end - width, end]`, like PromQL ranges: a sample at a
@@ -152,9 +193,23 @@ fn engine_assigns_boundary_samples_to_the_pane_they_end() {
         sample("latency_ms", "a", 45 * MINUTE, 1.0),
     ]);
     // (10 min, 20 min]: series a and b, the one at its end included.
-    assert_eq!(engine.store.get(&id, 2 * PANE).unwrap().num_rows(), 2);
+    assert_eq!(
+        engine
+            .store
+            .get(&id, Selection::ending_at(2 * PANE))
+            .unwrap()
+            .num_rows(),
+        2
+    );
     // (20 min, 30 min]: only c, one millisecond after the boundary.
-    assert_eq!(engine.store.get(&id, 3 * PANE).unwrap().num_rows(), 1);
+    assert_eq!(
+        engine
+            .store
+            .get(&id, Selection::ending_at(3 * PANE))
+            .unwrap()
+            .num_rows(),
+        1
+    );
 }
 
 /// Samples of a metric no definition reads do not move the watermark, even
@@ -205,9 +260,18 @@ fn watermark_jump_builds_only_retained_panes() {
         engine.stats.panes_skipped_expired,
         (30 * DAY - 80 * MINUTE) as u64 / PANE as u64
     );
-    assert!(engine.store.get(&id, 30 * DAY).is_some());
-    assert!(engine.store.get(&id, 30 * DAY - 6 * PANE).is_none());
-    assert!(engine.store.get(&id, 2 * PANE).is_none());
+    assert!(engine
+        .store
+        .get(&id, Selection::ending_at(30 * DAY))
+        .is_some());
+    assert!(engine
+        .store
+        .get(&id, Selection::ending_at(30 * DAY - 6 * PANE))
+        .is_none());
+    assert!(engine
+        .store
+        .get(&id, Selection::ending_at(2 * PANE))
+        .is_none());
     assert_eq!(engine.store.len(), 6);
 }
 
@@ -249,14 +313,29 @@ fn evicts_panes_past_retention() {
     let (mut engine, sds) = precompute(common::plan("example4b", false));
     let id = sds.definitions.keys().next().unwrap().clone();
     engine.ingest(&samples("latency_ms", &["a"], 0, 25 * MINUTE));
-    assert!(engine.store.get(&id, 2 * PANE).is_some());
+    assert!(engine
+        .store
+        .get(&id, Selection::ending_at(2 * PANE))
+        .is_some());
     // Watermark 100 min, retention 60 min: the oldest pane read is
     // (40, 50 min], so panes ending before 50 min are evicted.
     engine.ingest(&[sample("latency_ms", "a", 100 * MINUTE, 1.0)]);
-    assert!(engine.store.get(&id, 2 * PANE).is_none());
-    assert!(engine.store.get(&id, 4 * PANE).is_none());
-    assert!(engine.store.get(&id, 5 * PANE).is_some());
-    assert!(engine.store.get(&id, 10 * PANE).is_some());
+    assert!(engine
+        .store
+        .get(&id, Selection::ending_at(2 * PANE))
+        .is_none());
+    assert!(engine
+        .store
+        .get(&id, Selection::ending_at(4 * PANE))
+        .is_none());
+    assert!(engine
+        .store
+        .get(&id, Selection::ending_at(5 * PANE))
+        .is_some());
+    assert!(engine
+        .store
+        .get(&id, Selection::ending_at(10 * PANE))
+        .is_some());
     assert_eq!(engine.store.len(), 6);
 }
 
@@ -271,7 +350,14 @@ fn accepts_out_of_order_samples_within_lateness() {
     engine.ingest(&[sample("latency_ms", "b", 15 * MINUTE, 1.0)]);
     engine.ingest(&[sample("latency_ms", "a", 26 * MINUTE, 1.0)]);
     // Watermark 21 min: (10, 20 min] holds b's late sample.
-    assert_eq!(engine.store.get(&id, 2 * PANE).unwrap().num_rows(), 1);
+    assert_eq!(
+        engine
+            .store
+            .get(&id, Selection::ending_at(2 * PANE))
+            .unwrap()
+            .num_rows(),
+        1
+    );
     assert_eq!(engine.stats.samples_dropped_late, 0);
     engine.ingest(&[sample("latency_ms", "c", 18 * MINUTE, 1.0)]);
     assert_eq!(engine.stats.samples_dropped_late, 1);
@@ -291,7 +377,14 @@ fn stale_markers_are_not_samples() {
         sample("latency_ms", "b", 14 * MINUTE, stale),
         sample("latency_ms", "a", 25 * MINUTE, 1.0),
     ]);
-    assert_eq!(engine.store.get(&id, 2 * PANE).unwrap().num_rows(), 1);
+    assert_eq!(
+        engine
+            .store
+            .get(&id, Selection::ending_at(2 * PANE))
+            .unwrap()
+            .num_rows(),
+        1
+    );
 }
 
 /// One series stamped ahead of the wall clock, though within
@@ -307,7 +400,10 @@ fn series_ahead_of_the_clock_does_not_close_panes_early() {
     let now = base + 9 * MINUTE;
     engine.ingest_at(&[sample("latency_ms", "b", base + 13 * MINUTE, 1.0)], now);
     assert!(
-        engine.store.get(&id, base + PANE).is_none(),
+        engine
+            .store
+            .get(&id, Selection::ending_at(base + PANE))
+            .is_none(),
         "(10, 20 min] still open"
     );
     engine.ingest_at(&[sample("latency_ms", "a", base + 9 * MINUTE, 1.0)], now);
@@ -348,7 +444,10 @@ fn keeps_every_pane_the_newest_served_evaluation_reads() {
     let id = sds.definitions.keys().next().unwrap().clone();
     engine.ingest(&samples("latency_ms", &["a"], MINUTE, 75 * MINUTE));
     for end in (2..=7).map(|i| i * PANE) {
-        assert!(engine.store.get(&id, end).is_some(), "pane ending at {end}");
+        assert!(
+            engine.store.get(&id, Selection::ending_at(end)).is_some(),
+            "pane ending at {end}"
+        );
     }
     assert_eq!(engine.stats.panes_skipped_expired, 0);
 }

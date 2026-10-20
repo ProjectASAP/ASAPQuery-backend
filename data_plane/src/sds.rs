@@ -32,7 +32,10 @@ use asap_planner::{InstallablePlan, StoredOutputBuild};
 use sha2::{Digest, Sha256};
 
 /// Identifies what a stored summary computes, independent of node ids and of
-/// which pane an output reads. Equal for equal computations across plans.
+/// which data an output reads: the hash of its coverage definition. Equal for
+/// equal computations across plans. When the Planner states each stored
+/// output's coverage (ASAPPlanner #781), this becomes the plan's definition
+/// id instead of the SDS's own hash.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DefinitionId(pub String);
 
@@ -268,11 +271,43 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Built panes, by definition and pane end. A pane is stored once, when it
-/// is complete, and never changes.
+/// Which data one summary instance covers. For now only time: the interval
+/// `(end_ms - width, end_ms]`, the width being its definition's coverage
+/// width. When the Planner states each stored output's coverage (definition
+/// and selection, ASAPPlanner #781), this becomes the plan's selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Selection {
+    pub end_ms: i64,
+}
+
+impl Selection {
+    /// The coverage ending at `end_ms`.
+    pub fn ending_at(end_ms: i64) -> Self {
+        Self { end_ms }
+    }
+}
+
+/// One stored summary: what it computes and which data it covers.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SummaryInstanceKey {
+    pub definition: DefinitionId,
+    pub selection: Selection,
+}
+
+impl SummaryInstanceKey {
+    pub fn new(definition: DefinitionId, selection: Selection) -> Self {
+        Self {
+            definition,
+            selection,
+        }
+    }
+}
+
+/// Stored summary instances, by definition and selection. An instance is
+/// stored once, when its coverage is complete, and never changes.
 #[derive(Debug)]
 pub struct SummaryStore<S> {
-    panes: BTreeMap<DefinitionId, BTreeMap<i64, S>>,
+    instances: BTreeMap<DefinitionId, BTreeMap<Selection, S>>,
 }
 
 impl<S> Default for SummaryStore<S> {
@@ -284,38 +319,36 @@ impl<S> Default for SummaryStore<S> {
 impl<S> SummaryStore<S> {
     pub fn new() -> Self {
         Self {
-            panes: BTreeMap::new(),
+            instances: BTreeMap::new(),
         }
     }
 
-    pub fn insert(&mut self, definition: &DefinitionId, end_ms: i64, state: S) {
-        match self.panes.get_mut(definition) {
-            Some(panes) => {
-                panes.insert(end_ms, state);
-            }
-            None => {
-                self.panes
-                    .insert(definition.clone(), BTreeMap::from([(end_ms, state)]));
-            }
-        }
+    pub fn insert(&mut self, key: SummaryInstanceKey, state: S) {
+        self.instances
+            .entry(key.definition)
+            .or_default()
+            .insert(key.selection, state);
     }
 
-    pub fn get(&self, definition: &DefinitionId, end_ms: i64) -> Option<&S> {
-        self.panes.get(definition)?.get(&end_ms)
+    /// The instance of `definition` covering `selection`, if stored. Borrows
+    /// the definition id, so a lookup allocates nothing.
+    pub fn get(&self, definition: &DefinitionId, selection: Selection) -> Option<&S> {
+        self.instances.get(definition)?.get(&selection)
     }
 
-    /// Drops the panes of `definition` that end before `end_ms`.
-    pub fn evict_before(&mut self, definition: &DefinitionId, end_ms: i64) {
-        if let Some(panes) = self.panes.get_mut(definition) {
-            *panes = panes.split_off(&end_ms);
+    /// Drops the instances of `definition` whose coverage ends before
+    /// `oldest`'s.
+    pub fn evict_before(&mut self, definition: &DefinitionId, oldest: Selection) {
+        if let Some(instances) = self.instances.get_mut(definition) {
+            *instances = instances.split_off(&oldest);
         }
     }
 
     pub fn len(&self) -> usize {
-        self.panes.values().map(BTreeMap::len).sum()
+        self.instances.values().map(BTreeMap::len).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.panes.values().all(BTreeMap::is_empty)
+        self.instances.values().all(BTreeMap::is_empty)
     }
 }
