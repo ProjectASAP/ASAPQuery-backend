@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use asap_planner::PlanningWorkload;
 use clap::Parser;
-use control_plane::{plan_workload, save_plan, DeploymentInputs};
+use control_plane::{plan_workload, predict, save_plan, DeploymentInputs};
 
 /// Plan a workload with ASAPPlanner and write the selected plan.
 #[derive(Parser)]
@@ -27,6 +27,10 @@ struct Args {
     /// Where to write the plan the data plane installs.
     #[arg(long)]
     out: PathBuf,
+    /// Also write Stage 3's prediction for the selected plan (JSON): its
+    /// CPU, memory and price per second, and how its nodes were priced.
+    #[arg(long)]
+    prediction: Option<PathBuf>,
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
@@ -53,6 +57,11 @@ fn main() -> anyhow::Result<()> {
     }
     let plan = plan_workload(&workload, &inputs)?;
     save_plan(&plan, &args.out)?;
+    if let Some(path) = &args.prediction {
+        let prediction = predict(&workload, &inputs)?;
+        std::fs::write(path, serde_json::to_string_pretty(&prediction)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
     println!(
         "wrote {} ({} queries, {} nodes)",
         args.out.display(),
