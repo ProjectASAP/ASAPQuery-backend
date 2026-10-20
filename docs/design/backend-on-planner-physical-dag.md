@@ -22,8 +22,8 @@ flowchart TB
       Q[Planned query at T] --> QE[Query engine<br/>Execute the query's DAG root]
       QE <--> PROM[Prometheus<br/>remote read, unplanned queries]
     end
-    PE -->|Store panes| SDS[(SDS<br/>Immutable stored panes)]
-    QE -->|Read stored panes| SDS
+    PE -->|Store results| SDS[(SDS<br/>Immutable stored results)]
+    QE -->|Read / store results| SDS
   end
 
   P -.-> PE
@@ -42,7 +42,7 @@ flowchart TB
   style QUERY fill:#eff6ff,stroke:#93c5fd,color:#1e3a8a
 ```
 
-Dashed arrows show which data-plane components receive the installed plan; solid arrows show planning inputs and runtime operations. The precompute engine writes panes to SDS; the query engine reads them. A query's DAG root is the operator that produces its final answer. SDS stores immutable panes: states computed over bounded time intervals, which queries can reuse.
+Dashed arrows show which data-plane components receive the installed plan; solid arrows show planning inputs and runtime operations. The precompute engine writes results to SDS; the query engine reads stored results and can store query-time results for reuse. A query's DAG root is the operator that produces its final answer. SDS stores immutable results specified by the plan, including time panes, rollups over time ranges, rollups across series, and sliding-window results. A pane is one kind of stored result, covering a bounded time interval; it is not the only kind SDS can hold.
 
 ## Boundary between ASAPPlanner and ASAPQuery-backend
 
@@ -52,7 +52,7 @@ ASAPPlanner decides **what to compute**, **whether to compute it during ingestio
 | --- | --- | --- |
 | Plan search | Stage 1 generates candidate plans; Stage 2 chooses which intermediate results to store; Stage 3 selects a plan using cost and accuracy targets | None |
 | Installed plan | One validated DAG, with the operators for constructing and combining time panes already included | Installs it |
-| Stored outputs | Specifies each output's computation phase (ingestion or query time), pane interval, and retention duration | Stores them |
+| Stored outputs | Specifies each output's computation phase (ingestion or query time), time coverage, and retention duration | Stores them |
 | Identifying shared summaries, avoiding duplicate storage, storage layout, eviction | None | SDS |
 | Operators | The physical operator library (`asap-executor`): one columnar operator per plan-node kind, per-sample state updaters, `RawSampleSelector` | The execution engine: walks the DAG node by node with those operators |
 | Ingestion, watermark, pane close, late data | None | Precompute engine |
@@ -69,11 +69,11 @@ Once per installed workload, the backend supplies the query workload and deploym
 | --- | --- |
 | `dag` | The operators to execute and their dependencies. |
 | `queries` | Maps each planned query to the DAG node that produces its answer. |
-| `stored_outputs` | Identifies which node outputs to store, whether to build them during ingestion or query execution (`built_at`: `IngestionRun` or `QueryRun`), the time interval each pane covers, and how long to retain it (`retention_ms`, in milliseconds). |
+| `stored_outputs` | Identifies which node outputs to store, whether to build them during ingestion or query execution (`built_at`: `IngestionRun` or `QueryRun`), the time coverage of each stored result, and how long to retain it (`retention_ms`, in milliseconds). |
 | `query_time_raw_windows` | Specifies which time ranges of raw samples are needed during query execution. |
 | `selection` | Records the selected candidate and its estimated cost per second for reporting. |
 
-**Runtime interface: samples and stored panes → query answers**
+**Runtime interface: samples and stored results → query answers**
 
 After installation, the backend uses the operator library to execute the plan. The following names refer to separate runtime helpers, not additional plan fields or calls to the Planner.
 
@@ -81,7 +81,7 @@ After installation, the backend uses the operator library to execute the plan. T
 | --- | --- |
 | `RawSampleSelector` | Selects the raw samples that belong to a pane or query-time window. |
 | `StateColumnUpdater` | Updates aggregate or sketch states as samples arrive, merges states across shards, and seals them when a pane closes. |
-| `Batch::try_from_columns` | Packages sealed state columns into a batch that the backend can store as an immutable pane. |
+| `Batch::try_from_columns` | Constructs a batch from state columns. The backend can store the batch as an immutable result; a sealed pane is one example. |
 | Compiled operators for DAG nodes | Execute the operations specified by the plan, using input batches to produce output batches. This describes a group of operators, not a single API name. |
 
 The Planner specifies **which results to compute and retain**. The operator library supplies **the computation implementations**. The backend supplies **ingestion, scheduling, storage, and query serving**.
@@ -106,7 +106,7 @@ The Planner specifies **which results to compute and retain**. The operator libr
 | Correctness reference | Differential tests, PromQL compliance suite | Answers checked against a reference that executes every node at query time |
 | Summary sharing across offsets | Inside one sliding aggregation | SDS reuses the same stored summary across outputs and query time offsets |
 | Ingestion | Remote Write, VictoriaMetrics, OTLP, files; sharded workers; per-sample update | Remote Write; sharded workers; per-sample update |
-| Store | Columnar epochs, interned label ids, `Arc` states | Immutable `Arc` panes under an `RwLock` |
+| Store | Columnar epochs, interned label ids, `Arc` states | Immutable results shared through `Arc` under an `RwLock` |
 | Query languages | PromQL, SQL, Elastic, ClickHouse adapters | PromQL |
 | Workload discovery, plan swap, drop-in | Yes | No |
 
@@ -121,7 +121,7 @@ ASAPQuery avoids all of these: it updates states in place per sample, stores `Ar
 **Fixes made, and their effect**
 
 - *In ASAPPlanner:* every operator of the operator library is now columnar (Arrow batches, interned group ids, state columns, per-sample updaters).
-- *In the backend:* jemalloc, sharded ingestion, a query thread pool, `Arc` panes under an `RwLock`, per-sample ingestion, a local raw ring buffer and Prometheus remote read.
+- *In the backend:* jemalloc, sharded ingestion, a query thread pool, immutable results shared through `Arc` under an `RwLock`, per-sample ingestion, a local raw ring buffer and Prometheus remote read.
 
 In-process measurements using the same data and queries on one CPU core (lower is better):
 
@@ -161,7 +161,7 @@ The merged runtime keeps ASAPQuery's low-overhead data path and the backend's si
 1. **One planner.** ASAPPlanner replaces `asap-planner`. Every planned query executes the plan selected by Stage 3.
 2. **One executor.** The data plane executes the installed DAG with ASAPPlanner's columnar operator library. It replaces `SimpleEngine` and pattern matching.
 3. **ASAPQuery's data path.** Sharded per-sample ingestion with a per-worker watermark (the global watermark is their minimum), immutable `Arc` state shared by reference, jemalloc. The per-sample updates use the operator library's updaters, so incremental state updates produce the same states as building them from a batch of samples.
-4. **The backend's SDS.** Identify summaries by their definitions, reuse them across query time offsets, and evict stored panes according to the plan's retention duration.
+4. **The backend's SDS.** Identify summaries by their definitions, reuse them across query time offsets, and evict stored results according to the plan's retention duration.
 5. **Read raw samples locally when available.** A ring buffer filled by Remote Write serves query-time raw windows; Prometheus remote read covers anything older.
 6. **ASAPQuery's features come along.** OTLP and VictoriaMetrics ingestion, idle-window close, the query tracker (now feeding ASAPPlanner), plan swap at runtime, the drop-in deployment and the PromQL compliance suite.
 7. **Measured costs feed future planning.** Supply runtime measurements as deployment inputs for subsequent Planner calls; they do not modify an already installed plan.
@@ -174,7 +174,7 @@ The merged runtime keeps ASAPQuery's low-overhead data path and the backend's si
 | Operators and per-sample updaters | ASAPPlanner's operator library |
 | DAG execution engine, SDS | Backend |
 | Ingestion drivers, sharded router, watermark | ASAPQuery |
-| Store concurrency | ASAPQuery's model with the backend's immutable panes |
+| Store concurrency | ASAPQuery's model with the backend's immutable stored results |
 | Local raw windows, remote read | Backend |
 | HTTP adapters, forwarding, tracker, drop-in | ASAPQuery |
 
