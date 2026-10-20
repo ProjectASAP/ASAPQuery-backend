@@ -5,6 +5,9 @@ edition.workspace = true
 
 [dependencies]
 control_plane.workspace = true
+planner-types.workspace = true
+asap-executor.workspace = true
+sha2 = "0.10"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -21,3 +24,5 @@ snap = "1.1"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# The tests find the frontier the way the Planner does; the runtime does not.
+asap-executor = { workspace = true, features = ["test-support"] }
