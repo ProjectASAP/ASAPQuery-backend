@@ -88,3 +88,21 @@ fn load_rejects_a_plan_without_a_query_per_root() {
     ));
     std::fs::remove_file(path).unwrap();
 }
+
+/// The backend retains query-time results (`query_time_results_retained`),
+/// so for a few series sampled every millisecond the Planner selects #509
+/// Example 4's B3: five 1-minute KLL panes, stored outputs built in a
+/// `QueryRun` (`MatAtQueryKeptAcrossEvaluations`).
+#[test]
+fn selects_stored_outputs_built_in_a_query_run() {
+    let inputs = DeploymentInputs::default();
+    assert!(inputs.deployment_capabilities.query_time_results_retained);
+    let plan = plan_workload(&example("example4-b3"), &inputs).unwrap();
+    let query_run: Vec<_> = plan
+        .stored_outputs
+        .iter()
+        .filter(|o| o.built_at == asap_planner::StoredOutputBuild::QueryRun)
+        .collect();
+    assert_eq!(query_run.len(), 5, "five one-minute summaries");
+    assert!(query_run.iter().all(|o| o.pane.width_ms == 60_000));
+}

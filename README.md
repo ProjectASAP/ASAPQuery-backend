@@ -54,9 +54,19 @@ stopped, which also makes `/-/ready` fail. `/api/v1/status/asap` reports the
 engine's sample and pane counters as JSON.
 
 An instant query whose text is one of the plan's queries is answered by the
-plan (`x-asap-execution: plan`). Its stored inputs read the panes ending at
-`T - offset`, so `T` must be on the pane grid and those panes stored; its
-query-time bound raw-sample windows are read from Prometheus. Anything else is forwarded
+plan (`x-asap-execution: plan`) at its evaluation time `T`. Stored outputs
+built in an `IngestionRun` are read from the SDS as the panes ending at
+`T - offset`, so `T` must be on the pane grid and those panes stored. The
+plan's query-time `RawSampleWindow`s are read from Prometheus. A stored output
+built in a `QueryRun` (`MatAtQueryKeptAcrossEvaluations`) is built from its
+pane's raw samples the first time an evaluation needs it. It is stored in the
+SDS under the same key once its pane is closed, that is, once its end is at or
+before the watermark at the time the evaluation chose its fetch. Later
+evaluations reuse it. It is evicted like an `IngestionRun` output: the plan's
+`retention_ms` plus one pane, measured from the newest closed pane at or
+before the watermark. `/api/v1/status/asap` reports `query_run` counters,
+including summary states stored while their own metric lagged behind the
+global watermark. Anything else is forwarded
 to Prometheus with its end-to-end headers, such as `Authorization` and
 `X-Scope-OrgID` (`x-asap-execution: forwarded`); a planned query that could not
 be answered also says why in `x-asap-forward-reason`. Range queries, SQL and
@@ -75,8 +85,7 @@ cargo run -p data_plane -- --plan plan.json --prometheus-url http://localhost:90
 
 `--deployment-capabilities caps.json` replaces the default
 `DeploymentCapabilities`: every summary the Planner can build, raw data kept
-in Prometheus, and no stored outputs built in a `QueryRun`
-(`MatAtQueryKeptAcrossEvaluations`). For example
+in Prometheus, and stored outputs built in a `QueryRun` (`MatAtQueryKeptAcrossEvaluations`). For example
 `{"raw_data_retained": false}` makes the Planner build every input at
 ingestion time. `--measured-operation-costs costs.json` gives Stage 3 the
 deployment's measured sketch operation costs; otherwise it prices every node
