@@ -22,6 +22,7 @@
 //! all its stored inputs are sealed.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, RwLock};
 
 use asap_executor::planner::ir::physical_export::{
     PhysicalASAPDAG, PhysicalASAPDAGNode, RawSampleWindow,
@@ -320,11 +321,15 @@ impl SummaryInstanceKey {
     }
 }
 
-/// Stored summary instances, by definition and selection. An instance is
-/// stored once, when its coverage is complete, and never changes.
+/// Stored summary instances, by definition and selection, shared by every
+/// thread that builds or reads them. An instance is stored once, when its
+/// coverage is complete, and never changes: a read takes the read lock only
+/// to clone the instance's `Arc`, so readers share it without copying and
+/// hold no lock while they compute. Inserts and evictions take the write
+/// lock briefly.
 #[derive(Debug)]
 pub struct SummaryStore<S> {
-    instances: BTreeMap<DefinitionId, BTreeMap<Selection, S>>,
+    instances: RwLock<BTreeMap<DefinitionId, BTreeMap<Selection, Arc<S>>>>,
 }
 
 impl<S> Default for SummaryStore<S> {
@@ -336,36 +341,59 @@ impl<S> Default for SummaryStore<S> {
 impl<S> SummaryStore<S> {
     pub fn new() -> Self {
         Self {
-            instances: BTreeMap::new(),
+            instances: RwLock::new(BTreeMap::new()),
         }
     }
 
-    pub fn insert(&mut self, key: SummaryInstanceKey, state: S) {
-        self.instances
+    fn read(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, BTreeMap<DefinitionId, BTreeMap<Selection, Arc<S>>>> {
+        self.instances.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, BTreeMap<DefinitionId, BTreeMap<Selection, Arc<S>>>> {
+        self.instances.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Stores `state` unless an instance of `key` is already stored, and
+    /// returns the stored instance: an instance is never rewritten, so two
+    /// threads that build the same one read the same.
+    pub fn insert(&self, key: SummaryInstanceKey, state: S) -> Arc<S> {
+        self.write()
             .entry(key.definition)
             .or_default()
-            .insert(key.selection, state);
+            .entry(key.selection)
+            .or_insert_with(|| Arc::new(state))
+            .clone()
     }
 
     /// The instance of `definition` covering `selection`, if stored. Borrows
     /// the definition id, so a lookup allocates nothing.
-    pub fn get(&self, definition: &DefinitionId, selection: Selection) -> Option<&S> {
-        self.instances.get(definition)?.get(&selection)
+    pub fn get(&self, definition: &DefinitionId, selection: Selection) -> Option<Arc<S>> {
+        self.read().get(definition)?.get(&selection).cloned()
     }
 
     /// Drops the instances of `definition` whose coverage ends before
     /// `oldest`'s.
-    pub fn evict_before(&mut self, definition: &DefinitionId, oldest: Selection) {
-        if let Some(instances) = self.instances.get_mut(definition) {
-            *instances = instances.split_off(&oldest);
+    pub fn evict_before(&self, definition: &DefinitionId, oldest: Selection) {
+        let mut instances = self.write();
+        if let Some(instances) = instances.get_mut(definition) {
+            if instances
+                .first_key_value()
+                .is_some_and(|(first, _)| *first < oldest)
+            {
+                *instances = instances.split_off(&oldest);
+            }
         }
     }
 
     pub fn len(&self) -> usize {
-        self.instances.values().map(BTreeMap::len).sum()
+        self.read().values().map(BTreeMap::len).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.instances.values().all(BTreeMap::is_empty)
+        self.read().values().all(BTreeMap::is_empty)
     }
 }

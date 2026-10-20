@@ -18,6 +18,7 @@
 //! forwards it to Prometheus.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use asap_executor::operators::Operator;
@@ -153,6 +154,19 @@ pub struct KeptResultStats {
     pub reused: u64,
 }
 
+/// [`KeptResultStats`] as counters every query thread adds to.
+#[derive(Default)]
+struct KeptResultCounters {
+    built: AtomicU64,
+    kept: AtomicU64,
+    kept_while_metric_behind: AtomicU64,
+    reused: AtomicU64,
+}
+
+fn add(counter: &AtomicU64) {
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
 /// What ingestion had seen when an evaluation decided what to fetch. The
 /// keep decision uses this snapshot, not the state when the evaluation
 /// runs: samples ingested in between were not in the fetched data.
@@ -175,9 +189,11 @@ pub struct Prepared {
     pub progress: IngestionProgress,
 }
 
+/// The plan's compiled roots, compiled once and shared by every query
+/// thread.
 pub struct QueryEngine {
     /// How many query-run summaries evaluations built, kept and reused.
-    pub kept_stats: KeptResultStats,
+    kept_stats: KeptResultCounters,
     /// How each query-run definition's summaries are built, or why they
     /// cannot be.
     kept_builds: BTreeMap<DefinitionId, Result<SummaryBuild, String>>,
@@ -221,7 +237,7 @@ impl QueryEngine {
             })
             .collect();
         Self {
-            kept_stats: KeptResultStats::default(),
+            kept_stats: KeptResultCounters::default(),
             kept_builds,
             kept_matchers,
             roots,
@@ -301,10 +317,10 @@ impl QueryEngine {
     /// measured from the newest closed pane at or before the watermark, are
     /// evicted.
     pub fn evaluate(
-        &mut self,
+        &self,
         root: usize,
         time_ms: i64,
-        store: &mut SummaryStore<Batch>,
+        store: &SummaryStore<Batch>,
         progress: &IngestionProgress,
         raw: &BTreeMap<u64, Vec<RawSample>>,
     ) -> Result<Vec<ResultSample>, Unanswered> {
@@ -320,8 +336,9 @@ impl QueryEngine {
         let mut sources: BTreeMap<u64, Source<'_>> = BTreeMap::new();
         for input in &program.stored {
             let pane = pane(input, time_ms, store)?;
+            // Cloning a batch shares its buffers: the pane is not copied.
             let source =
-                Operator::source(pane.schema().clone(), vec![pane.clone()]).map_err(failed)?;
+                Operator::source(pane.schema().clone(), vec![(*pane).clone()]).map_err(failed)?;
             sources.insert(input.node, Box::new(source));
         }
         for input in &program.kept {
@@ -332,8 +349,8 @@ impl QueryEngine {
             let selection = Selection::ending_at(end_ms);
             let summary = match store.get(&input.definition, selection) {
                 Some(summary) => {
-                    self.kept_stats.reused += 1;
-                    summary.clone()
+                    add(&self.kept_stats.reused);
+                    (*summary).clone()
                 }
                 None => {
                     // `raw_ranges` asked for these samples unless the
@@ -355,21 +372,22 @@ impl QueryEngine {
                     let summary = build
                         .run(end_ms, samples, build_scope)
                         .map_err(|e| Unanswered::Execution(e.to_string()))?;
-                    self.kept_stats.built += 1;
+                    add(&self.kept_stats.built);
                     // Kept only once closed, as the precompute engine closes
                     // panes: a sample may still arrive for an open one.
                     if progress.watermark_ms.is_some_and(|w| end_ms <= w) {
-                        self.kept_stats.kept += 1;
+                        add(&self.kept_stats.kept);
                         let metric_newest = progress.newest_sample_ms.get(build.metric());
                         if metric_newest.is_none_or(|newest| *newest < end_ms) {
-                            self.kept_stats.kept_while_metric_behind += 1;
+                            add(&self.kept_stats.kept_while_metric_behind);
                         }
-                        store.insert(
-                            SummaryInstanceKey::new(input.definition.clone(), selection),
-                            summary.clone(),
-                        );
+                        // Another query thread may have stored it meanwhile:
+                        // the first stored is the one every evaluation reads.
+                        let key = SummaryInstanceKey::new(input.definition.clone(), selection);
+                        (*store.insert(key, summary)).clone()
+                    } else {
+                        summary
                     }
-                    summary
                 }
             };
             let source =
@@ -405,6 +423,18 @@ impl QueryEngine {
         result_samples(&program.output, rows)
     }
 
+    /// How many query-run summaries evaluations built, kept and reused.
+    pub fn kept_stats(&self) -> KeptResultStats {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let c = &self.kept_stats;
+        KeptResultStats {
+            built: load(&c.built),
+            kept: load(&c.kept),
+            kept_while_metric_behind: load(&c.kept_while_metric_behind),
+            reused: load(&c.reused),
+        }
+    }
+
     /// The build of a query-run definition a compiled root reads.
     fn kept_build(&self, definition: &DefinitionId) -> &SummaryBuild {
         self.kept_builds[definition]
@@ -437,11 +467,11 @@ fn window(time_ms: i64, offset_ms: i64, width_ms: i64) -> Result<(i64, i64), Una
 }
 
 /// The stored pane `input` reads at `time_ms`.
-fn pane<'a>(
+fn pane(
     input: &StoredInput,
     time_ms: i64,
-    store: &'a SummaryStore<Batch>,
-) -> Result<&'a Batch, Unanswered> {
+    store: &SummaryStore<Batch>,
+) -> Result<Arc<Batch>, Unanswered> {
     let (_, end) = window(time_ms, input.offset_ms, input.pane_ms)?;
     if end.rem_euclid(input.pane_ms) != 0 {
         return Err(Unanswered::MissingPane(format!(

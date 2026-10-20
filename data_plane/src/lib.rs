@@ -1,10 +1,11 @@
 //! Backend data plane: receives Prometheus Remote Write samples and serves
 //! the Prometheus query API for an installed plan.
 //!
-//! The installed plan is ASAPPlanner's selected `PhysicalASAPDAG`. The
-//! engine thread builds its ingestion-time outputs pane by pane and answers
-//! the plan's instant queries from them; every other query, and any planned
-//! query it cannot answer, is forwarded to Prometheus.
+//! The installed plan is ASAPPlanner's `InstallablePlan`. Ingestion
+//! workers build its ingestion-time outputs pane by pane, and a pool of
+//! query threads answers the plan's instant queries from them ([`engine`]);
+//! every other query, and any planned query it cannot answer, is forwarded
+//! to Prometheus.
 
 pub mod engine;
 pub mod precompute;

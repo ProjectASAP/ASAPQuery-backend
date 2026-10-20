@@ -177,7 +177,7 @@ fn kept_summaries_answer_like_the_reference_and_are_reused() {
     assert_eq!(first, answer(&mut reference, 10 * MINUTE, &all).0);
     assert_eq!(first.len(), 2);
     assert_eq!(
-        k.engine.kept_stats,
+        k.engine.kept_stats(),
         KeptResultStats {
             built: 5,
             kept: 5,
@@ -191,7 +191,7 @@ fn kept_summaries_answer_like_the_reference_and_are_reused() {
     assert_eq!(second, answer(&mut reference, 11 * MINUTE, &all).0);
     assert_ne!(second, first, "the answer moves with the window");
     assert_eq!(
-        (k.engine.kept_stats.built, k.engine.kept_stats.reused),
+        (k.engine.kept_stats().built, k.engine.kept_stats().reused),
         (6, 4)
     );
 
@@ -200,11 +200,11 @@ fn kept_summaries_answer_like_the_reference_and_are_reused() {
     assert!(ranges.is_empty());
     assert_eq!(again, second);
     assert_eq!(
-        (k.engine.kept_stats.built, k.engine.kept_stats.reused),
+        (k.engine.kept_stats().built, k.engine.kept_stats().reused),
         (6, 9)
     );
     assert_eq!(
-        reference.engine.kept_stats,
+        reference.engine.kept_stats(),
         KeptResultStats::default(),
         "the reference keeps nothing"
     );
@@ -351,6 +351,10 @@ fn counts_summaries_kept_while_their_metric_is_behind() {
             &raw,
         )
         .unwrap();
-    assert_eq!(k.engine.kept_stats.kept, 5);
-    assert_eq!(k.engine.kept_stats.kept_while_metric_behind, 2, "9 and 10");
+    assert_eq!(k.engine.kept_stats().kept, 5);
+    assert_eq!(
+        k.engine.kept_stats().kept_while_metric_behind,
+        2,
+        "9 and 10"
+    );
 }

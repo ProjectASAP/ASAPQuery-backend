@@ -53,6 +53,13 @@ are dropped. Remote Write gets 503 when admitting it would leave more than
 stopped, which also makes `/-/ready` fail. `/api/v1/status/asap` reports the
 engine's sample and pane counters as JSON.
 
+Series are sharded by their label set across `--ingestion-workers` (default
+one per core); with several workers, a pane closes once the newest sample of
+every worker that has received one has passed it. Planned queries run on
+`--query-threads` (default one per core), one query per thread, and each
+sees the panes of every write acknowledged before it. The data plane uses
+jemalloc.
+
 A producer can close panes without waiting for later samples:
 `POST /api/v1/precompute/watermark?time_ms=T` states that every sample at or
 before `T` has been written. After the writes acknowledged before it have
