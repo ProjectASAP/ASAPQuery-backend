@@ -308,7 +308,9 @@ The merged runtime keeps ASAPQuery's low-overhead data path and the backend's si
 ## Open decisions
 
 - **Pane retention.** The runtime keeps ingestion-built panes for one extra pane width beyond the plan's retention, to cover evaluations just behind the newest closed pane. Whether the Planner should model the deployment's evaluation delay explicitly remains a design question.
-- **Idle shards.** A shard that stops receiving samples no longer advances its watermark (the timestamp used to decide which panes can close). Its panes remain open unless the runtime closes them using elapsed wall-clock time; that mechanism is not implemented yet.
+- **Idle shards.** A shard that stops receiving samples no longer advances its watermark (the timestamp used to decide which panes can close). Its panes then stay open.
+  - A producer can close them with the event-time barrier `POST /api/v1/precompute/watermark?time_ms=T`. The barrier is queued behind acknowledged writes, closes every pane ending at or before `T`, is capped at the wall clock, and leaves input open. With several producers, it must be sent only after all of them have written through `T`.
+  - Whether the runtime should also close idle panes by elapsed wall-clock time, without a producer barrier, remains open.
 - **The local raw buffer.** Expose it as an explicit capability with a cost the Planner can compare, or keep it as a runtime choice whose effect is reflected in measured costs.
 - **Planner dependency weight.** `plan_installable` lives in `asap-planner`, which also builds the SQL and MetricsQL frontends. A PromQL-only runtime would benefit if those frontends were optional features.
 
