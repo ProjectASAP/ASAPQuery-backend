@@ -96,6 +96,19 @@ The Planner specifies **which summaries to compute and retain**. The operator li
 - Each operator has exactly one implementation, in the operator library. The Planner's tests, the correctness reference and the data plane all use it.
 - If the backend cannot execute a plan, installation fails with a reason before any part of that plan runs.
 
+**Design references for the runtime capabilities**
+
+The Planner references below are pinned to `92bc1296`, the revision used by the latest backend stack. Runtime details are documented in the corresponding PRs and source-module documentation; the links distinguish those implementation notes from the broader Planner design.
+
+| Capability | Design and implementation references |
+| --- | --- |
+| DAG execution | [Planner/runtime boundary](https://github.com/ProjectASAP/ASAPPlanner/blob/92bc1296fd33802e8ce3fcab6b75f8e3205c3960/docs/design_docs/architecture/planner-runtime-contract.md), [physical planning and deployment](https://github.com/ProjectASAP/ASAPPlanner/blob/92bc1296fd33802e8ce3fcab6b75f8e3205c3960/docs/design_docs/physical-planning-and-deployment.md), and [#832: compile once and execute shared roots](https://github.com/ProjectASAP/ASAPQuery-backend/pull/832). |
+| Sharded ingestion and query concurrency | [#829: worker ownership, watermarks, query pool, and shared store](https://github.com/ProjectASAP/ASAPQuery-backend/pull/829); [latest engine module design](https://github.com/ProjectASAP/ASAPQuery-backend/blob/3158464f/data_plane/src/engine.rs). |
+| Columnar operators and per-sample updates | [#832: Arrow batches, state-column updates, and batch-build fallback](https://github.com/ProjectASAP/ASAPQuery-backend/pull/832); [#834: interned series IDs](https://github.com/ProjectASAP/ASAPQuery-backend/pull/834). |
+| Summary identity, retention, and reuse | [#828: installable-plan handoff and storage metadata](https://github.com/ProjectASAP/ASAPQuery-backend/pull/828); [latest SDS design](https://github.com/ProjectASAP/ASAPQuery-backend/blob/3158464f/data_plane/src/sds.rs) and [query-engine design for retained summaries](https://github.com/ProjectASAP/ASAPQuery-backend/blob/3158464f/data_plane/src/query.rs). |
+| Raw-sample reads | [#831: per-metric local buffers, read boundaries, and remote-read fallback](https://github.com/ProjectASAP/ASAPQuery-backend/pull/831). |
+| Measured costs and planning feedback | [#835: operation measurement, prediction reports, and cost-model limitations](https://github.com/ProjectASAP/ASAPQuery-backend/pull/835). |
+
 ## ASAPQuery and ASAPQuery-backend compared
 
 This table compares ASAPQuery `main` at `5f0f00a` with the latest backend runtime PR stack through [#835](https://github.com/ProjectASAP/ASAPQuery-backend/pull/835) at `3158464f`. Backend capabilities below include the implementation in those open PRs.
@@ -116,6 +129,32 @@ This table compares ASAPQuery `main` at `5f0f00a` with the latest backend runtim
 | Deployment and workload management | Provides quickstart and drop-in deployments, workload discovery, and runtime plan replacement. | Provides explicit workload planning and a Prometheus-compatible service; integration of ASAPQuery's discovery and plan replacement remains merge work. |
 
 The difference is how planning and execution are connected: ASAPQuery uses its existing planner and execution paths, while the backend runs ASAPPlanner's selected DAG with the shared operator library. Both build and query summaries; the backend additionally supports plan-directed query-time construction, retention, and raw-sample reads.
+
+**Latest reported performance**
+
+Source: [#835's measured-cost benchmark runs](https://github.com/ProjectASAP/ASAPQuery-backend/pull/835), using the #834 data-plane binary with the deployment settings produced by #835. These compare the backend plus Prometheus with Prometheus alone. They do **not** provide a direct performance comparison with the current ASAPQuery version; the capability table above should not be read as a performance ranking.
+
+The reported setup is the 90-minute benefit harness, Prometheus 3.5.0, four queries, and four CPU cores allocated to each service. `s10` and `s50` are the benchmark's 1,000- and 5,000-series configurations as labeled in [#834](https://github.com/ProjectASAP/ASAPQuery-backend/pull/834). Prometheus alone was measured in the same session, and the backend setup's Prometheus still receives the samples. All figures below are reported measurements, not new runs for this documentation update.
+
+CPU is core-seconds over the complete run; lower is better. **Total CPU includes both services**, calculated by adding the reported backend and Prometheus values. Peak RSS is backend-only and is not total system memory.
+
+| Configuration | Prometheus alone CPU | Backend CPU | Backend's Prometheus CPU | Total CPU | Backend peak RSS (GiB) | Forwarded evaluations |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| s10, raw retained | 18.9 | 11.2 | 8.6 | 19.8 | 0.04 | 90 |
+| s10, no raw retained | 19.9 | 19.4 | 6.3 | 25.7 | 0.34 | 5 |
+| s50, raw retained | 86.7 | 52.0 | 41.7 | 93.7 | 0.11 | 90 |
+| s50, no raw retained | 85.3 | 84.3 | 29.9 | 114.2 | 0.81 | 5 |
+
+Latency for the raw-retained configurations is shown below as **p50 / p99 in milliseconds**. “Backend setup” includes answers forwarded to Prometheus; these are client-visible timings, not timings of backend computation alone. The query columns are rate aggregation, top-k, and the 0.99 quantile over 5- and 60-minute windows.
+
+| Configuration | System | Rate | Top-k | Quantile [5m] | Quantile [60m] |
+| --- | --- | ---: | ---: | ---: | ---: |
+| s10, raw retained | Prometheus alone | 9.5 / 19.9 | 9.9 / 18.2 | 18.4 / 35.3 | 84.3 / 140.1 |
+| s10, raw retained | Backend setup | 10.0 / 11.2 | 10.2 / 11.1 | 22.2 / 34.8 | 107.6 / 138.3 |
+| s50, raw retained | Prometheus alone | 44.2 / 71.7 | 45.0 / 77.5 | 93.3 / 140.3 | 379.9 / 583.4 |
+| s50, raw retained | Backend setup | 41.7 / 59.2 | 37.6 / 55.0 | 104.5 / 150.1 | 408.3 / 520.6 |
+
+In the raw-retained runs, measured costs make the Planner select an exact quantile candidate that fails executor validation (`per-entity aggregate requires an explicit entity binding`). All 90 quantile evaluations are therefore forwarded to Prometheus. The lower backend CPU and RSS partly reflect that work being done upstream. The combined CPU is above Prometheus alone in all four configurations; these results do not establish a whole-system CPU saving. The source PR reports that all evaluations met their accuracy targets, including forwarded answers, and contains the no-raw latency tables and detailed cost-model gaps.
 
 ## Merging with ASAPQuery
 
@@ -152,6 +191,6 @@ The merged runtime keeps ASAPQuery's low-overhead data path and the backend's si
 
 **Open decisions**
 
-- Pane retention. Retention is counted from the newest closed pane. A delayed query can therefore need a pane that has already been evicted, causing the query to be forwarded to Prometheus. Options: add a margin of one pane width in the runtime, or have the Planner include the deployment's evaluation delay in `retention_ms`.
+- Pane retention. [#832](https://github.com/ProjectASAP/ASAPQuery-backend/pull/832) keeps ingestion-built panes for one extra pane width beyond the plan's retention to cover evaluations just behind the newest closed pane. Whether the Planner should model the deployment's evaluation delay explicitly remains a design question.
 - Idle shards. A shard that stops receiving samples no longer advances its watermark (the timestamp used to decide which panes can close). Its panes remain open unless the runtime closes them using elapsed wall-clock time; that mechanism is not implemented yet.
 - Whether to expose the local raw buffer as an explicit capability with a cost the Planner can compare, or keep it as a runtime choice whose effect is reflected in measured costs.
