@@ -7,6 +7,9 @@ use data_plane::engine::EngineOptions;
 use data_plane::precompute::PrecomputeOptions;
 use data_plane::{router, DataPlane, DEFAULT_FORWARD_TIMEOUT};
 
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 /// Serve Remote Write ingestion and the Prometheus query API for a plan.
 #[derive(Parser)]
 struct Args {
@@ -30,6 +33,12 @@ struct Args {
     /// Samples queued for the engine beyond which Remote Write gets 503.
     #[arg(long, default_value_t = EngineOptions::default().max_queued_samples)]
     max_queued_samples: u64,
+    /// Ingestion workers series are sharded across; default one per core.
+    #[arg(long, default_value_t = EngineOptions::default().ingestion_workers)]
+    ingestion_workers: usize,
+    /// Query threads, each running one query at a time; default one per core.
+    #[arg(long, default_value_t = EngineOptions::default().query_threads)]
+    query_threads: usize,
 }
 
 #[tokio::main]
@@ -49,6 +58,8 @@ async fn main() -> anyhow::Result<()> {
                     max_future_ms: args.max_future_ms,
                 },
                 max_queued_samples: args.max_queued_samples,
+                ingestion_workers: args.ingestion_workers,
+                query_threads: args.query_threads,
             },
         )?
         .with_forward_timeout(Duration::from_secs(args.forward_timeout_seconds)),

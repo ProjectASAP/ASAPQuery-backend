@@ -164,7 +164,7 @@ fn build_order_follows_stored_inputs() {
 #[test]
 fn store_finds_and_evicts_panes() {
     let (a, b) = (DefinitionId("a".into()), DefinitionId("b".into()));
-    let mut store = SummaryStore::new();
+    let store = SummaryStore::new();
     for end in [60, 120, 180] {
         store.insert(
             SummaryInstanceKey::new(a.clone(), Selection::ending_at(end)),
@@ -176,18 +176,27 @@ fn store_finds_and_evicts_panes() {
         "b60".to_string(),
     );
     assert_eq!(
-        store.get(&a, Selection::ending_at(120)).map(String::as_str),
+        store
+            .get(&a, Selection::ending_at(120))
+            .as_deref()
+            .map(String::as_str),
         Some("a120")
     );
     assert_eq!(store.get(&a, Selection::ending_at(90)), None);
     store.evict_before(&a, Selection::ending_at(180));
     assert_eq!(store.get(&a, Selection::ending_at(120)), None);
     assert_eq!(
-        store.get(&a, Selection::ending_at(180)).map(String::as_str),
+        store
+            .get(&a, Selection::ending_at(180))
+            .as_deref()
+            .map(String::as_str),
         Some("a180")
     );
     assert_eq!(
-        store.get(&b, Selection::ending_at(60)).map(String::as_str),
+        store
+            .get(&b, Selection::ending_at(60))
+            .as_deref()
+            .map(String::as_str),
         Some("b60")
     );
     assert_eq!(store.len(), 2);
@@ -274,4 +283,55 @@ fn kept_summaries_share_one_query_run_definition() {
         .collect();
     offsets.sort();
     assert_eq!(offsets, (0..5).map(|i| i * 60_000).collect::<Vec<_>>());
+}
+
+/// An instance is stored once and never rewritten: a second insert of the
+/// same key returns the first instance, and readers share it.
+#[test]
+fn store_shares_instances_and_never_rewrites_them() {
+    let a = DefinitionId("a".into());
+    let store = SummaryStore::new();
+    let key = || SummaryInstanceKey::new(a.clone(), Selection::ending_at(60));
+    let first = store.insert(key(), "first".to_string());
+    let second = store.insert(key(), "second".to_string());
+    assert!(std::sync::Arc::ptr_eq(&first, &second));
+    let read = store.get(&a, Selection::ending_at(60)).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first, &read));
+    assert_eq!(read.as_str(), "first");
+}
+
+/// Readers on several threads find every instance while another thread
+/// inserts and evicts.
+#[test]
+fn store_is_read_concurrently() {
+    let a = DefinitionId("a".into());
+    let store = SummaryStore::new();
+    for end in 0..100 {
+        store.insert(
+            SummaryInstanceKey::new(a.clone(), Selection::ending_at(end)),
+            end,
+        );
+    }
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                for _ in 0..100 {
+                    for end in 50..100 {
+                        let found = store.get(&a, Selection::ending_at(end));
+                        assert_eq!(found.as_deref(), Some(&end));
+                    }
+                }
+            });
+        }
+        scope.spawn(|| {
+            for end in 100..200 {
+                store.insert(
+                    SummaryInstanceKey::new(a.clone(), Selection::ending_at(end)),
+                    end,
+                );
+                store.evict_before(&a, Selection::ending_at(end.min(150) - 100));
+            }
+        });
+    });
+    assert_eq!(store.len(), 150);
 }

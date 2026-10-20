@@ -493,3 +493,106 @@ async fn barrier_serves_the_window_of_a_stopped_series() {
         );
     }
 }
+
+/// A data plane for Example 4b on `workers` ingestion workers and `threads`
+/// query threads, with no lateness.
+async fn sharded_example4b(workers: usize, threads: usize) -> (Router, Arc<DataPlane>) {
+    let mut options = data_plane::engine::EngineOptions {
+        ingestion_workers: workers,
+        query_threads: threads,
+        ..Default::default()
+    };
+    options.precompute.allowed_lateness_ms = 0;
+    let state = Arc::new(
+        DataPlane::with_options(
+            common::plan_json("example4b", false),
+            fake_prometheus(vec![]).await,
+            options,
+        )
+        .unwrap(),
+    );
+    (router(state.clone()), state)
+}
+
+/// Writes one sample every 15 s in `[from, to)` of each job's `latency_ms`.
+async fn write_jobs(app: &Router, jobs: &[String], from: i64, to: i64) {
+    let timeseries = jobs
+        .iter()
+        .enumerate()
+        .map(|(i, job)| TimeSeries {
+            labels: vec![
+                Label {
+                    name: "__name__".into(),
+                    value: "latency_ms".into(),
+                },
+                Label {
+                    name: "job".into(),
+                    value: job.clone(),
+                },
+            ],
+            samples: (from..to)
+                .step_by(15_000)
+                .map(|t| Sample {
+                    timestamp: t,
+                    value: (i * 1000) as f64 + ((t / 15_000) % 240) as f64,
+                })
+                .collect(),
+        })
+        .collect();
+    let write = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/write")
+                .body(Body::from(encode(&WriteRequest { timeseries })))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(write.status(), StatusCode::NO_CONTENT);
+}
+
+/// 32 queries at once, on 4 query threads over 4 ingestion workers, get
+/// the answers they get one at a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn answers_concurrent_queries_like_one_at_a_time() {
+    let (app, _) = sharded_example4b(4, 4).await;
+    let jobs: Vec<String> = (0..16).map(|i| format!("job{i}")).collect();
+    write_jobs(&app, &jobs, MINUTE, 95 * MINUTE).await;
+    let query = "quantile_over_time(0.99, latency_ms[60m])";
+    let times: Vec<i64> = (0..32).map(|i| (80 + 10 * (i % 2)) * MINUTE).collect();
+    let mut sequential = Vec::new();
+    for &time in &times {
+        let response = instant(&app, query, time).await;
+        assert_eq!(response.execution.as_deref(), Some("plan"), "{time}");
+        assert_eq!(by_job(&response.body).len(), 16);
+        sequential.push(response.body);
+    }
+    let concurrent = futures::future::join_all(times.iter().map(|&time| {
+        let app = app.clone();
+        async move { instant(&app, query, time).await.body }
+    }))
+    .await;
+    assert_eq!(concurrent, sequential);
+}
+
+/// A query sees the panes of every write acknowledged before it, with no
+/// wait in between, though the write's series go to different workers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_query_reads_the_panes_of_the_writes_before_it() {
+    let jobs: Vec<String> = (0..8).map(|i| format!("job{i}")).collect();
+    let query = "quantile_over_time(0.99, latency_ms[60m])";
+    for _ in 0..8 {
+        let (app, _) = sharded_example4b(4, 2).await;
+        for start in (0..8).map(|i| MINUTE + i * 10 * MINUTE) {
+            write_jobs(&app, &jobs, start, start + 10 * MINUTE).await;
+        }
+        let response = instant(&app, query, 80 * MINUTE).await;
+        assert_eq!(
+            response.execution.as_deref(),
+            Some("plan"),
+            "{:?}",
+            response.reason
+        );
+        assert_eq!(by_job(&response.body).len(), 8);
+    }
+}

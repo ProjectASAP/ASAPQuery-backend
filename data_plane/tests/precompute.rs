@@ -6,7 +6,7 @@ use std::sync::Arc;
 use asap_executor::planner::workload::{PlanningWorkload, Query};
 use asap_planner::InstallablePlan;
 use control_plane::plan_workload;
-use data_plane::precompute::{pane_end, Precompute, PrecomputeOptions, RawSample};
+use data_plane::precompute::{pane_end, shard_of, Precompute, PrecomputeOptions, RawSample};
 use data_plane::sds::{Sds, Selection};
 
 const MINUTE: i64 = 60_000;
@@ -599,4 +599,112 @@ fn input_stays_open_after_a_barrier() {
     assert_eq!(engine.stats.samples_accepted, accepted + 1);
     engine.ingest_at(&[sample("latency_ms", "a", 29 * MINUTE, 1.0)], 36 * MINUTE);
     assert_eq!(engine.stats.samples_dropped_late, 1);
+}
+
+fn sharded(plan: &InstallablePlan, shards: usize) -> (Precompute, Sds) {
+    let sds = Sds::from_plan(plan).unwrap();
+    let options = PrecomputeOptions {
+        allowed_lateness_ms: 0,
+        ..PrecomputeOptions::default()
+    };
+    let engine = Precompute::with_shards(&plan.dag.dag, &sds, options, shards).unwrap();
+    (engine, sds)
+}
+
+/// Two jobs whose series two shards own one each.
+fn jobs_on_two_shards() -> (String, String) {
+    let shard = |job: &str| shard_of(&sample("latency_ms", job, 0, 0.0).labels, 2);
+    let a = (0..)
+        .map(|i| format!("j{i}"))
+        .find(|j| shard(j) == 0)
+        .unwrap();
+    let b = (0..)
+        .map(|i| format!("j{i}"))
+        .find(|j| shard(j) == 1)
+        .unwrap();
+    (a, b)
+}
+
+/// With two shards, a pane closes only once both have passed it: the
+/// global watermark is the minimum over the shards' newest samples.
+#[test]
+fn a_pane_closes_once_every_shard_has_passed_it() {
+    let (mut engine, sds) = sharded(&common::plan("example4b", false), 2);
+    let id = sds.definitions.keys().next().unwrap().clone();
+    let (a, b) = jobs_on_two_shards();
+    engine.ingest(&samples("latency_ms", &[&a, &b], MINUTE, 15 * MINUTE));
+    engine.ingest(&samples("latency_ms", &[&a], 15 * MINUTE, 35 * MINUTE));
+    assert_eq!(engine.watermark_ms(), Some(15 * MINUTE - 15_000));
+    assert!(
+        engine
+            .store
+            .get(&id, Selection::ending_at(2 * PANE))
+            .is_none(),
+        "the shard of {b} is still in (10, 20 min]"
+    );
+    engine.ingest(&[sample("latency_ms", &b, 21 * MINUTE, 1.0)]);
+    let pane = engine
+        .store
+        .get(&id, Selection::ending_at(2 * PANE))
+        .unwrap();
+    assert_eq!(pane.num_rows(), 2, "both shards' series");
+    assert!(engine
+        .store
+        .get(&id, Selection::ending_at(3 * PANE))
+        .is_none());
+}
+
+/// A barrier closes every shard's panes, the idle shard's included.
+#[test]
+fn a_barrier_closes_every_shards_panes() {
+    let (mut engine, sds) = sharded(&common::plan("example4b", false), 2);
+    let id = sds.definitions.keys().next().unwrap().clone();
+    let (a, b) = jobs_on_two_shards();
+    engine.ingest_at(&samples("latency_ms", &[&b], MINUTE, 15 * MINUTE), DAY);
+    engine.ingest_at(&samples("latency_ms", &[&a], MINUTE, 35 * MINUTE), DAY);
+    assert!(engine
+        .store
+        .get(&id, Selection::ending_at(2 * PANE))
+        .is_none());
+    engine.advance_watermark_at(3 * PANE, DAY);
+    for (end, rows) in [(2 * PANE, 2), (3 * PANE, 1)] {
+        let pane = engine.store.get(&id, Selection::ending_at(end)).unwrap();
+        assert_eq!(pane.num_rows(), rows, "pane ending at {end}");
+    }
+}
+
+/// Panes built on four shards equal those built on one, row for row:
+/// Example 4b's per-series KLL and Example 1's rates and sums, with series
+/// spread over the shards.
+#[test]
+fn sharded_panes_answer_like_one_shard() {
+    for (example, metric) in [
+        ("example4b", "latency_ms"),
+        ("example1", "http_requests_total"),
+    ] {
+        let plan = common::plan(example, false);
+        let jobs: Vec<String> = (0..12).map(|i| format!("job{i}")).collect();
+        let jobs: Vec<&str> = jobs.iter().map(String::as_str).collect();
+        let all = samples(metric, &jobs, MINUTE, 75 * MINUTE);
+        let (mut one, sds) = sharded(&plan, 1);
+        let (mut four, _) = sharded(&plan, 4);
+        // Whole timestamps per request, as a scraper writes them.
+        for chunk in all.chunks(4 * jobs.len()) {
+            one.ingest_at(chunk, DAY);
+            four.ingest_at(chunk, DAY);
+        }
+        assert_eq!(one.stats, four.stats, "{example}");
+        assert!(one.stats.panes_built > 0, "{example}");
+        for id in sds.definitions.keys() {
+            for end in (0..=75 * MINUTE).step_by(10_000) {
+                let rows = |engine: &Precompute| {
+                    engine
+                        .store
+                        .get(id, Selection::ending_at(end))
+                        .map(|pane| format!("{:?}", pane.to_rows()))
+                };
+                assert_eq!(rows(&one), rows(&four), "{example} {id:?} {end}");
+            }
+        }
+    }
 }
