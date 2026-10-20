@@ -29,6 +29,8 @@ use asap_executor::{RawSampleSelector, Sample};
 use futures::executor::block_on;
 use futures::StreamExt;
 
+use asap_planner::StoredOutputBuild;
+
 use crate::sds::{
     DefinitionId, Sds, Selection, SummaryDefinition, SummaryInstanceKey, SummaryStore,
 };
@@ -68,6 +70,10 @@ pub struct PrecomputeStats {
     pub samples_dropped_future: u64,
     /// Samples of a metric no stored summary reads.
     pub samples_unrouted: u64,
+    /// Samples of a metric only query-run summaries read: they move the
+    /// watermark, which says when such a summary is closed, but are not
+    /// buffered (the query engine reads them from Prometheus).
+    pub samples_query_run_only: u64,
     /// Panes built and stored.
     pub panes_built: u64,
     /// Panes whose build failed; they are skipped, not retried.
@@ -95,13 +101,84 @@ impl Default for PrecomputeOptions {
     }
 }
 
-struct Builder {
-    definition: SummaryDefinition,
-    /// Turns a pane's samples into the build's input: the `Scan`'s label
-    /// matchers, then the pane's `TimeRange` rows.
+/// How one definition's summaries are built from raw samples. The
+/// precompute engine builds ingestion-run summaries with it, and the query
+/// engine query-run ones.
+pub struct SummaryBuild {
+    pub definition: SummaryDefinition,
+    /// Turns a coverage's samples into the build's input: the `Scan`'s label
+    /// matchers, then the coverage's `TimeRange` rows.
     selector: RawSampleSelector,
     raw_schema: SchemaRef,
     build: CompiledPhysicalDAG,
+}
+
+impl SummaryBuild {
+    /// Compiles `definition`'s build from its `TimeRange` up to its builder.
+    /// A definition built from other stored outputs is refused until the
+    /// engine can build it once its inputs are sealed.
+    pub fn new(
+        dag: &PhysicalASAPDAG,
+        definition: &SummaryDefinition,
+    ) -> Result<Self, PrecomputeError> {
+        let error = |message: String| PrecomputeError::Definition(definition.id.clone(), message);
+        if !definition.stored_inputs.is_empty() {
+            return Err(error(
+                "built from other stored outputs, which the data plane cannot build yet".into(),
+            ));
+        }
+        if definition.pane_ms <= 0 {
+            return Err(error(format!("pane width {} ms", definition.pane_ms)));
+        }
+        let raw_schema = Arc::new(output_schema(dag, definition.raw_input()).clone());
+        // `window_batch` is called with each coverage's end, so the window's
+        // offset from evaluation time is not used.
+        let selector = RawSampleSelector::new(dag, &definition.window)?;
+        let build = compile(
+            dag,
+            BTreeMap::from([(
+                definition.raw_input(),
+                InputContract::bounded(raw_schema.clone()),
+            )]),
+            &[definition.builder],
+        )?;
+        Ok(Self {
+            definition: definition.clone(),
+            selector,
+            raw_schema,
+            build,
+        })
+    }
+
+    /// The metric whose samples the build reads.
+    pub fn metric(&self) -> &str {
+        self.selector.metric()
+    }
+
+    /// Selects the coverage ending at `end_ms` from `samples` with the plan's
+    /// `Scan` matchers, then runs the build over those rows under `scope`.
+    pub fn run(
+        &self,
+        end_ms: i64,
+        samples: &[RawSample],
+        scope: Scope,
+    ) -> Result<Batch, PrecomputeError> {
+        let selected = self
+            .selector
+            .window_batch(end_ms, &executor_samples(samples))?;
+        let input: Source<'_> =
+            Box::new(Operator::source(self.raw_schema.clone(), vec![selected])?);
+        let build = self
+            .build
+            .instantiate(BTreeMap::from([(self.definition.raw_input(), input)]))?;
+        let rows = run_root(&build, self.definition.builder, scope)?;
+        let schema = Arc::new(self.definition.output_schema.clone());
+        Ok(Batch::try_new(schema, rows)?)
+    }
+}
+
+struct Builder {
+    summary: SummaryBuild,
     /// Samples of open panes, by pane end.
     open: BTreeMap<i64, Vec<RawSample>>,
     /// End of the first pane seen, which is skipped. `None` until then.
@@ -121,6 +198,9 @@ enum Outcome {
 
 pub struct Precompute {
     builders: Vec<Builder>,
+    /// Metrics read by query-run summaries, with each one's newest routed
+    /// sample time.
+    query_run_metrics: BTreeMap<String, Option<i64>>,
     allowed_lateness_ms: i64,
     max_future_ms: i64,
     newest_sample_ms: Option<i64>,
@@ -147,43 +227,35 @@ impl Precompute {
             .ingestion_build_order()
             .map_err(|e| PrecomputeError::Plan(e.to_string()))?;
         for id in &order {
-            let definition = &sds.definitions[id];
-            let error =
-                |message: String| PrecomputeError::Definition(definition.id.clone(), message);
-            if !definition.stored_inputs.is_empty() {
-                return Err(error(
-                    "built from other stored outputs, which the precompute engine cannot build yet"
-                        .into(),
-                ));
-            }
-            if definition.pane_ms <= 0 {
-                return Err(error(format!("pane width {} ms", definition.pane_ms)));
-            }
-            let raw_schema = Arc::new(output_schema(&dag, definition.raw_input()).clone());
-            // `window_batch` is called with each pane's end, so the window's
-            // offset from evaluation time is not used.
-            let selector = RawSampleSelector::new(&dag, &definition.window)?;
-            let build = compile(
-                &dag,
-                BTreeMap::from([(
-                    definition.raw_input(),
-                    InputContract::bounded(raw_schema.clone()),
-                )]),
-                &[definition.builder],
-            )?;
             builders.push(Builder {
-                definition: definition.clone(),
-                selector,
-                raw_schema,
-                build,
+                summary: SummaryBuild::new(&dag, &sds.definitions[id])?,
                 open: BTreeMap::new(),
                 first_pane_end: None,
                 built_through: None,
             });
         }
+        // Samples of a metric only query-run summaries read move the
+        // watermark, which says when such a summary's coverage is closed.
+        // A query-run definition whose selector does not build is not
+        // tracked here; the query engine forwards the queries that read it.
+        let mut query_run_metrics = BTreeMap::new();
+        for definition in sds.definitions.values() {
+            if definition.built_at == StoredOutputBuild::QueryRun {
+                match RawSampleSelector::new(&dag, &definition.window) {
+                    Ok(selector) => {
+                        query_run_metrics.insert(selector.metric().to_string(), None);
+                    }
+                    Err(error) => tracing::warn!(
+                        definition = ?definition.id, %error,
+                        "query-run summary cannot be built; its queries are forwarded"
+                    ),
+                }
+            }
+        }
         let millis = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
         Ok(Self {
             builders,
+            query_run_metrics,
             allowed_lateness_ms: millis(options.allowed_lateness_ms),
             max_future_ms: millis(options.max_future_ms),
             newest_sample_ms: None,
@@ -191,6 +263,19 @@ impl Precompute {
             store: SummaryStore::new(),
             stats: PrecomputeStats::default(),
         })
+    }
+
+    /// What ingestion has seen, for the query engine's keep decisions: the
+    /// watermark and each query-run metric's newest sample.
+    pub fn progress(&self) -> crate::query::IngestionProgress {
+        crate::query::IngestionProgress {
+            watermark_ms: self.watermark_ms(),
+            newest_sample_ms: self
+                .query_run_metrics
+                .iter()
+                .filter_map(|(metric, newest)| Some((metric.clone(), (*newest)?)))
+                .collect(),
+        }
     }
 
     /// The watermark: no sample older than this is expected any more. It is
@@ -220,10 +305,12 @@ impl Precompute {
         let latest_allowed_ms = now_ms.saturating_add(self.max_future_ms);
         for sample in samples {
             let metric = sample.labels.get("__name__").map(String::as_str);
-            if !self
-                .builders
-                .iter()
-                .any(|b| metric == Some(b.selector.metric()))
+            let query_run = metric.is_some_and(|m| self.query_run_metrics.contains_key(m));
+            if !query_run
+                && !self
+                    .builders
+                    .iter()
+                    .any(|b| metric == Some(b.summary.metric()))
             {
                 self.stats.samples_unrouted += 1;
                 continue;
@@ -234,10 +321,10 @@ impl Precompute {
             }
             let mut outcome: Option<Outcome> = None;
             for builder in &mut self.builders {
-                if metric != Some(builder.selector.metric()) {
+                if metric != Some(builder.summary.metric()) {
                     continue;
                 }
-                let this = match pane_end(sample.timestamp_ms, builder.definition.pane_ms) {
+                let this = match pane_end(sample.timestamp_ms, builder.summary.definition.pane_ms) {
                     None => Outcome::Late,
                     Some(end) => {
                         let first = *builder.first_pane_end.get_or_insert(end);
@@ -255,15 +342,14 @@ impl Precompute {
                 outcome = outcome.max(Some(this));
             }
             match outcome {
-                None => self.stats.samples_unrouted += 1,
-                Some(outcome) => {
-                    match outcome {
-                        Outcome::Buffered => self.stats.samples_accepted += 1,
-                        Outcome::FirstPane => self.stats.samples_skipped_first_pane += 1,
-                        Outcome::Late => self.stats.samples_dropped_late += 1,
-                    }
-                    self.newest_sample_ms = self.newest_sample_ms.max(Some(sample.timestamp_ms));
-                }
+                None => self.stats.samples_query_run_only += 1,
+                Some(Outcome::Buffered) => self.stats.samples_accepted += 1,
+                Some(Outcome::FirstPane) => self.stats.samples_skipped_first_pane += 1,
+                Some(Outcome::Late) => self.stats.samples_dropped_late += 1,
+            }
+            self.newest_sample_ms = self.newest_sample_ms.max(Some(sample.timestamp_ms));
+            if let Some(newest) = metric.and_then(|m| self.query_run_metrics.get_mut(m)) {
+                *newest = (*newest).max(Some(sample.timestamp_ms));
             }
         }
         self.close_panes();
@@ -277,8 +363,8 @@ impl Precompute {
             let Some(built) = builder.built_through else {
                 continue;
             };
-            let pane_ms = builder.definition.pane_ms;
-            let id = &builder.definition.id;
+            let pane_ms = builder.summary.definition.pane_ms;
+            let id = &builder.summary.definition.id;
             // The newest evaluation stored panes can serve is at the end of
             // the newest closed pane. Panes are kept for one extra pane
             // width beyond the plan's retention, so an evaluation one pane
@@ -286,6 +372,7 @@ impl Precompute {
             // skip them.
             let newest_closed_end = watermark.div_euclid(pane_ms).saturating_mul(pane_ms);
             let oldest_kept_end = builder
+                .summary
                 .definition
                 .oldest_kept_end_ms(newest_closed_end.saturating_sub(pane_ms));
             let Some(mut end) = built.checked_add(pane_ms) else {
@@ -304,7 +391,12 @@ impl Precompute {
             // a pane without samples is stored as empty, not missing.
             while end <= watermark {
                 let samples = builder.open.remove(&end).unwrap_or_default();
-                match build_pane(builder, end, &samples) {
+                let scope = Scope::Ingestion {
+                    window_start_ms: end - pane_ms,
+                    window_end_ms: end,
+                    revision: 1,
+                };
+                match builder.summary.run(end, &samples, scope) {
                     Ok(state) => {
                         self.store.insert(
                             SummaryInstanceKey::new(id.clone(), Selection::ending_at(end)),
@@ -339,33 +431,6 @@ pub fn pane_end(timestamp_ms: i64, pane_ms: i64) -> Option<i64> {
         .checked_div_euclid(pane_ms)?
         .checked_neg()?
         .checked_mul(pane_ms)
-}
-
-/// Selects the pane's rows from `samples` with the plan's `Scan` matchers,
-/// then runs the definition's build over them, for the pane ending at `end`.
-fn build_pane(
-    builder: &Builder,
-    end: i64,
-    samples: &[RawSample],
-) -> Result<Batch, PrecomputeError> {
-    let scope = Scope::Ingestion {
-        window_start_ms: end - builder.definition.pane_ms,
-        window_end_ms: end,
-        revision: 1,
-    };
-    let selected = builder
-        .selector
-        .window_batch(end, &executor_samples(samples))?;
-    let input: Source<'_> = Box::new(Operator::source(
-        builder.raw_schema.clone(),
-        vec![selected],
-    )?);
-    let build = builder
-        .build
-        .instantiate(BTreeMap::from([(builder.definition.raw_input(), input)]))?;
-    let rows = run_root(&build, builder.definition.builder, scope)?;
-    let schema = Arc::new(builder.definition.output_schema.clone());
-    Ok(Batch::try_new(schema, rows)?)
 }
 
 /// `samples` as the executor's [`Sample`]s. The selector takes owned label

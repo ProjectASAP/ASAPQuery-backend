@@ -432,7 +432,7 @@ fn does_not_build_query_run_summaries() {
     let (mut engine, _) = precompute(plan);
     engine.ingest(&samples("latency_ms", &["a"], 0, 45 * MINUTE));
     assert_eq!(engine.stats.panes_built, 0);
-    assert_eq!(engine.stats.samples_unrouted, 180);
+    assert_eq!(engine.stats.samples_query_run_only, 180);
 }
 
 /// Retention is measured from the newest evaluation the stored panes can
@@ -472,4 +472,32 @@ fn keeps_one_pane_of_margin_beyond_the_retention() {
     // Panes ending 230..290 min: the six the evaluation at 290 reads, plus
     // the one more the evaluation at 280 reads.
     assert_eq!(engine.store.len(), 7);
+}
+
+/// Samples of a metric only query-run summaries read (B3) are not buffered
+/// but move the watermark, which says when those summaries are closed.
+#[test]
+fn query_run_metrics_move_the_watermark() {
+    let (mut engine, _) = precompute_with(common::plan("example4-b3", true), 0);
+    assert_eq!(engine.watermark_ms(), None);
+    engine.ingest(&samples("latency_ms", &["a"], 0, 3 * MINUTE));
+    assert_eq!(engine.stats.samples_query_run_only, 12);
+    assert_eq!(engine.stats.samples_accepted, 0);
+    assert_eq!(engine.watermark_ms(), Some(3 * MINUTE - 15_000));
+}
+
+/// Samples of a query-run-only metric get the same future bound and
+/// wall-clock cap as routed samples: one far ahead is dropped, and one
+/// ahead of the clock but within the bound moves the watermark only to the
+/// clock.
+#[test]
+fn query_run_metrics_are_bounded_like_routed_samples() {
+    let (mut engine, _) = precompute_with(common::plan("example4-b3", true), 0);
+    let now = 10 * MINUTE;
+    engine.ingest_at(&[sample("latency_ms", "a", 30 * DAY, 1.0)], now);
+    assert_eq!(engine.stats.samples_dropped_future, 1);
+    assert_eq!(engine.watermark_ms(), None);
+    engine.ingest_at(&[sample("latency_ms", "a", now + 2 * MINUTE, 1.0)], now);
+    assert_eq!(engine.stats.samples_query_run_only, 1);
+    assert_eq!(engine.watermark_ms(), Some(now));
 }

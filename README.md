@@ -56,7 +56,16 @@ engine's sample and pane counters as JSON.
 An instant query whose text is one of the plan's queries is answered by the
 plan (`x-asap-execution: plan`). Its stored inputs read the panes ending at
 `T - offset`, so `T` must be on the pane grid and those panes stored; its
-query-time raw ranges are read from Prometheus. Anything else is forwarded
+query-time raw ranges are read from Prometheus. A summary the plan builds in
+a query run and keeps (`MatAtQueryKeptAcrossEvaluations`) is built from its
+coverage's raw samples the first time an evaluation needs it, stored in the
+SDS under the same key as ingestion-built summaries once its coverage is
+closed (its end at or before the watermark when the evaluation chose its
+fetch), reused by later evaluations, and evicted like ingestion-built
+summaries: the plan's `retention_ms` plus one pane, measured from the newest
+closed coverage at or before the watermark. `/api/v1/status/asap` reports
+`query_run` counters, including summaries kept while their own metric lagged
+behind the global watermark. Anything else is forwarded
 to Prometheus with its end-to-end headers, such as `Authorization` and
 `X-Scope-OrgID` (`x-asap-execution: forwarded`); a planned query that could not
 be answered also says why in `x-asap-forward-reason`. Range queries, SQL and
@@ -75,8 +84,7 @@ cargo run -p data_plane -- --plan plan.json --prometheus-url http://localhost:90
 
 `--deployment-capabilities caps.json` replaces the default
 `DeploymentCapabilities`: every summary the Planner can build, raw data kept
-in Prometheus, and no query-time result kept across evaluations
-(`MatAtQueryKeptAcrossEvaluations` is not implemented). For example
+in Prometheus, and query-time results kept across evaluations. For example
 `{"raw_data_retained": false}` makes the Planner build every input at
 ingestion time. `--measured-operation-costs costs.json` gives Stage 3 the
 deployment's measured sketch operation costs; otherwise it prices every node

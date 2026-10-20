@@ -85,6 +85,9 @@ impl SummaryDefinition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneBinding {
     pub offset_ms: i64,
+    /// The output's own `TimeRange` node: where its coverage's raw samples
+    /// feed when a query-run summary is built for it.
+    pub raw_input: u64,
 }
 
 /// The stored summaries of one plan.
@@ -153,6 +156,7 @@ impl Sds {
             definition.retention_ms = definition.retention_ms.max(retention_ms);
             let binding = PaneBinding {
                 offset_ms: output.pane.end_offset_ms,
+                raw_input: output.pane.time_range_node_id as u64,
             };
             outputs.insert(node, (id, binding));
         }

@@ -251,3 +251,27 @@ fn build_order_refuses_ingestion_reading_query_run() {
         })
     );
 }
+
+/// B3's five query-time KLL summaries kept across evaluations are one
+/// query-run definition with a 1-minute coverage, each output reading the
+/// summary `i * 1min` before evaluation. Nothing is built at ingestion.
+#[test]
+fn kept_summaries_share_one_query_run_definition() {
+    let sds = Sds::from_plan(&plan("example4-b3", true)).unwrap();
+    assert!(sds.ingestion_build_order().unwrap().is_empty());
+    let mut kept = sds
+        .definitions
+        .values()
+        .filter(|d| d.built_at == StoredOutputBuild::QueryRun);
+    let definition = kept.next().unwrap();
+    assert!(kept.next().is_none());
+    assert_eq!(definition.pane_ms, 60_000);
+    let mut offsets: Vec<i64> = sds
+        .outputs
+        .values()
+        .filter(|(id, _)| id == &definition.id)
+        .map(|(_, binding)| binding.offset_ms)
+        .collect();
+    offsets.sort();
+    assert_eq!(offsets, (0..5).map(|i| i * 60_000).collect::<Vec<_>>());
+}

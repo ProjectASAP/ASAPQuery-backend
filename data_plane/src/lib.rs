@@ -176,6 +176,7 @@ async fn status(State(state): State<Arc<DataPlane>>) -> Response {
         "engine_running": state.engine.is_running(),
         "samples_queued": state.engine.queued_samples(),
         "precompute": state.engine.stats(),
+        "query_run": state.engine.kept_stats(),
     });
     (
         [(header::CONTENT_TYPE, "application/json")],
@@ -249,7 +250,8 @@ async fn answer(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as i64)
     });
-    let (root, ranges) = state.engine.raw_ranges(query.query, time_ms).await?;
+    let prepared = state.engine.raw_ranges(query.query, time_ms).await?;
+    let ranges = &prepared.ranges;
     let mut fetch_headers = forwarded_headers(headers);
     // The raw read is a GET without the caller's body.
     fetch_headers.remove(header::CONTENT_TYPE);
@@ -264,7 +266,7 @@ async fn answer(
         .map_err(|e| Unanswered::Execution(format!("fetching raw samples: {e}")))?
         .into_iter()
         .collect();
-    let samples = state.engine.evaluate(root, time_ms, raw).await?;
+    let samples = state.engine.evaluate(prepared, time_ms, raw).await?;
     Ok(prometheus::vector_response(time_ms, &samples))
 }
 

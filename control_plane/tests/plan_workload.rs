@@ -88,3 +88,20 @@ fn load_rejects_a_plan_without_a_query_per_root() {
     ));
     std::fs::remove_file(path).unwrap();
 }
+
+/// The backend keeps query-time results across evaluations, so for a few
+/// series sampled every millisecond the Planner selects #509 Example 4's
+/// B3: five 1-minute KLL summaries built in a query run and kept.
+#[test]
+fn selects_summaries_kept_across_evaluations() {
+    let inputs = DeploymentInputs::default();
+    assert!(inputs.deployment_capabilities.query_time_results_retained);
+    let plan = plan_workload(&example("example4-b3"), &inputs).unwrap();
+    let kept: Vec<_> = plan
+        .stored_outputs
+        .iter()
+        .filter(|o| o.built_at == asap_planner::StoredOutputBuild::QueryRun)
+        .collect();
+    assert_eq!(kept.len(), 5, "five one-minute summaries");
+    assert!(kept.iter().all(|o| o.pane.width_ms == 60_000));
+}

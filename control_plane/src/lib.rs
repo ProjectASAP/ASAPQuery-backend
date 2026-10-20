@@ -82,14 +82,14 @@ pub fn load_plan(path: &Path) -> Result<InstallablePlan, PlanError> {
 }
 
 /// What this backend's data plane can execute and keep: every summary the
-/// Planner executor builds, raw samples kept in Prometheus, and no
-/// query-time result kept across evaluations: the SDS describes such
-/// outputs, but nothing builds them until the query engine does.
+/// Planner executor builds, raw samples kept in Prometheus, and query-time
+/// results kept across evaluations (the query engine builds query-run
+/// summaries on first use and keeps them once their coverage is closed).
 pub fn backend_capabilities() -> DeploymentCapabilities {
     DeploymentCapabilities {
         supported_summaries: None,
         raw_data_retained: true,
-        query_time_results_retained: false,
+        query_time_results_retained: true,
     }
 }
 
