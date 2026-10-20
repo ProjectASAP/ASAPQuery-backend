@@ -68,6 +68,8 @@ This document, the backend's code and its PR descriptions use ASAPPlanner's term
 | SDS | Backend | The backend's store of summary instances, keyed by (`definition` identity, concrete `selection`). |
 | watermark | Backend | The newest routed raw sample's time, capped at the wall clock, minus the allowed lateness. Panes that end at or before it are closed. |
 | forward | Backend | Answer a query with Prometheus instead of the plan, with the reason in `x-asap-forward-reason`. |
+| event-time barrier | Backend | A producer's statement that every raw sample up to time `T` has been written (`POST /api/v1/precompute/watermark?time_ms=T`). It closes every pane that ends at or before `T`. |
+| bound raw-sample window | Backend | A `RawSampleWindow` bound to one evaluation time: the absolute interval `(T − offset − width, T − offset]`. |
 
 Rules:
 - Use the Planner's name for anything the Planner defines. Don't introduce a backend synonym: "kept query-time result", for example, is a stored output with `StoredOutputBuild::QueryRun`, built because of `MatAtQueryKeptAcrossEvaluations`.
