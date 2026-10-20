@@ -9,6 +9,7 @@ use axum::extract::RawQuery;
 use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::routing::get;
 use axum::Router;
+use data_plane::engine::EngineOptions;
 use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use data_plane::{router, DataPlane, EXECUTION_HEADER};
 use http_body_util::BodyExt;
@@ -251,4 +252,113 @@ async fn forwarded_query_times_out() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+}
+
+/// A Remote Write body of `count` samples of one Example 1 series.
+fn write_body(count: usize) -> Vec<u8> {
+    encode(&WriteRequest {
+        timeseries: vec![TimeSeries {
+            labels: vec![Label {
+                name: "__name__".into(),
+                value: "http_requests_total".into(),
+            }],
+            samples: (0..count)
+                .map(|i| Sample {
+                    value: i as f64,
+                    timestamp: 1_000 * (i as i64 + 1),
+                })
+                .collect(),
+        }],
+    })
+}
+
+async fn write(app: &Router, count: usize) -> StatusCode {
+    let request = Request::post("/api/v1/write")
+        .body(Body::from(write_body(count)))
+        .unwrap();
+    send(app, request).await.0
+}
+
+/// GET `path` and parse the JSON body.
+async fn get_json(app: &Router, path: &str) -> (StatusCode, serde_json::Value) {
+    let (status, _, body) = send(app, Request::get(path).body(Body::empty()).unwrap()).await;
+    (status, serde_json::from_str(&body).unwrap_or_default())
+}
+
+/// Remote Write that would queue more samples than `max_queued_samples` gets
+/// 503 and is not counted; a request that fits is accepted.
+#[tokio::test]
+async fn refuses_remote_write_beyond_the_sample_queue() {
+    let options = EngineOptions {
+        max_queued_samples: 2,
+        ..EngineOptions::default()
+    };
+    let state = Arc::new(
+        DataPlane::with_options(
+            common::plan_json("example1", true),
+            "http://unused".into(),
+            options,
+        )
+        .unwrap(),
+    );
+    let app = router(state.clone());
+    assert_eq!(write(&app, 3).await, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(state.samples.load(Ordering::Relaxed), 0);
+    assert_eq!(write(&app, 2).await, StatusCode::NO_CONTENT);
+    assert_eq!(state.samples.load(Ordering::Relaxed), 2);
+}
+
+/// Once the engine thread has stopped, Remote Write gets 500 instead of a
+/// 503 that senders would retry forever, and the data plane is not ready.
+#[tokio::test]
+async fn stopped_engine_fails_writes_and_readiness() {
+    let state = data_plane("http://unused".into());
+    let app = router(state.clone());
+    let (status, _, _) = send(&app, Request::get("/-/ready").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    state.engine.stop();
+    for _ in 0..200 {
+        if !state.engine.is_running() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!state.engine.is_running());
+    assert_eq!(write(&app, 1).await, StatusCode::INTERNAL_SERVER_ERROR);
+    let (status, _, _) = send(&app, Request::get("/-/ready").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let (_, body) = get_json(&app, "/api/v1/status/asap").await;
+    assert_eq!(body["engine_running"], false);
+}
+
+/// The status endpoint reports what the engine did with every sample.
+#[tokio::test]
+async fn reports_sample_counters() {
+    let state = data_plane("http://unused".into());
+    let app = router(state.clone());
+    assert_eq!(write(&app, 3).await, StatusCode::NO_CONTENT);
+    let mut body = serde_json::Value::Null;
+    for _ in 0..200 {
+        let (status, json) = get_json(&app, "/api/v1/status/asap").await;
+        assert_eq!(status, StatusCode::OK);
+        body = json;
+        if body["samples_queued"] == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(body["engine_running"], true);
+    assert_eq!(body["samples_queued"], 0);
+    let counters = &body["precompute"];
+    let total: u64 = [
+        "samples_accepted",
+        "samples_dropped_late",
+        "samples_skipped_first_pane",
+        "samples_dropped_future",
+        "samples_unrouted",
+    ]
+    .iter()
+    .map(|name| counters[name].as_u64().unwrap())
+    .sum();
+    assert_eq!(total, 3, "{body}");
 }

@@ -2,67 +2,162 @@
 //! it. Planner IR holds `Rc`s, so the plan cannot be shared across the HTTP
 //! server's threads; handlers send the engine commands instead.
 
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 use control_plane::InstalledPlan;
-use tokio::sync::oneshot;
 
-use crate::precompute::{Precompute, PrecomputeStats, RawSample};
+use crate::precompute::{Precompute, PrecomputeOptions, PrecomputeStats, RawSample};
 use crate::sds::Sds;
 
-/// Commands queued for the engine before ingestion pushes back.
-const QUEUE: usize = 1024;
-
-pub enum Command {
-    Ingest(Vec<RawSample>),
-    Stats(oneshot::Sender<PrecomputeStats>),
+/// How the engine thread ingests samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineOptions {
+    /// Lateness, future bound and pane checks of the precompute engine.
+    pub precompute: PrecomputeOptions,
+    /// Samples queued for the engine, not yet ingested, beyond which Remote
+    /// Write is refused with 503 so senders retry.
+    pub max_queued_samples: u64,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("the engine is busy")]
-pub struct Busy;
+impl Default for EngineOptions {
+    fn default() -> Self {
+        Self {
+            precompute: PrecomputeOptions::default(),
+            // Two Remote Write requests of the default sample limit.
+            max_queued_samples: 2_000_000,
+        }
+    }
+}
+
+enum Command {
+    Ingest(Vec<RawSample>),
+    Stop,
+}
+
+/// Why the engine did not take samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum IngestError {
+    /// More samples are queued than `max_queued_samples`; retry later.
+    #[error("the engine is busy: too many samples queued")]
+    Busy,
+    /// The engine thread has stopped; no sample will be ingested again.
+    #[error("the engine has stopped")]
+    Stopped,
+}
 
 /// The HTTP side of the engine thread.
 #[derive(Clone)]
 pub struct EngineHandle {
-    commands: SyncSender<Command>,
+    commands: Sender<Command>,
+    /// Samples sent and not yet ingested.
+    queued_samples: Arc<AtomicU64>,
+    max_queued_samples: u64,
+    /// False once the engine thread has exited, for any reason.
+    running: Arc<AtomicBool>,
+    /// The counters as of the last command the engine ran.
+    stats: Arc<Mutex<PrecomputeStats>>,
+}
+
+/// Marks the engine stopped when its thread exits, panics included.
+struct RunningGuard(Arc<AtomicBool>);
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 impl EngineHandle {
-    /// Starts the engine for the plan serialized in `plan_json`. Fails if the
+    /// Starts the engine for the plan serialized in `plan_json`, parsed once
+    /// on the engine thread, and returns the plan's queries. Fails if the
     /// plan is invalid or the data plane cannot execute it.
-    pub fn spawn(plan_json: String, allowed_lateness_ms: i64) -> anyhow::Result<Self> {
-        let (commands, receiver) = sync_channel(QUEUE);
+    pub fn spawn(plan_json: String, options: EngineOptions) -> anyhow::Result<(Self, Vec<String>)> {
+        let (commands, receiver) = channel();
         let (ready, started) = std::sync::mpsc::channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let queued_samples = Arc::new(AtomicU64::new(0));
+        let stats = Arc::new(Mutex::new(PrecomputeStats::default()));
+        let shared = Shared {
+            queued_samples: queued_samples.clone(),
+            stats: stats.clone(),
+        };
+        let guard = RunningGuard(running.clone());
         std::thread::Builder::new()
             .name("engine".into())
-            .spawn(move || match Engine::new(&plan_json, allowed_lateness_ms) {
-                Ok(engine) => {
-                    let _ = ready.send(Ok(()));
-                    engine.serve(receiver);
-                }
-                Err(error) => {
-                    let _ = ready.send(Err(error));
+            .spawn(move || {
+                let _guard = guard;
+                match Engine::new(&plan_json, options.precompute) {
+                    Ok((engine, queries)) => {
+                        let _ = ready.send(Ok(queries));
+                        engine.serve(receiver, shared);
+                    }
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                    }
                 }
             })?;
-        started.recv()??;
-        Ok(Self { commands })
+        let queries = started.recv()??;
+        let handle = Self {
+            commands,
+            queued_samples,
+            max_queued_samples: options.max_queued_samples,
+            running,
+            stats,
+        };
+        Ok((handle, queries))
     }
 
-    /// Queues `samples` for precompute, or fails if the engine is behind.
-    pub fn try_ingest(&self, samples: Vec<RawSample>) -> Result<(), Busy> {
-        match self.commands.try_send(Command::Ingest(samples)) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => Err(Busy),
+    /// Queues `samples` for precompute. `Busy` when the queue would hold
+    /// more than `max_queued_samples`; `Stopped` when the engine has exited.
+    pub fn try_ingest(&self, samples: Vec<RawSample>) -> Result<(), IngestError> {
+        if !self.is_running() {
+            return Err(IngestError::Stopped);
         }
+        let count = samples.len() as u64;
+        let admitted =
+            self.queued_samples
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |queued| {
+                    queued
+                        .checked_add(count)
+                        .filter(|&total| total <= self.max_queued_samples)
+                });
+        if admitted.is_err() {
+            return Err(IngestError::Busy);
+        }
+        self.commands.send(Command::Ingest(samples)).map_err(|_| {
+            self.queued_samples.fetch_sub(count, Ordering::SeqCst);
+            IngestError::Stopped
+        })
     }
 
-    /// Precompute counters, once every command queued before has run.
-    pub async fn stats(&self) -> PrecomputeStats {
-        let (reply, stats) = oneshot::channel();
-        let _ = self.commands.send(Command::Stats(reply));
-        stats.await.unwrap_or_default()
+    /// Whether the engine thread is still running.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
     }
+
+    /// Samples queued and not yet ingested.
+    pub fn queued_samples(&self) -> u64 {
+        self.queued_samples.load(Ordering::SeqCst)
+    }
+
+    /// The precompute counters as of the last batch the engine ingested.
+    pub fn stats(&self) -> PrecomputeStats {
+        *self.stats.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Stops the engine thread after the commands queued before; later
+    /// ingestion fails with [`IngestError::Stopped`].
+    pub fn stop(&self) {
+        let _ = self.commands.send(Command::Stop);
+    }
+}
+
+/// What the engine thread publishes to the HTTP side.
+struct Shared {
+    queued_samples: Arc<AtomicU64>,
+    stats: Arc<Mutex<PrecomputeStats>>,
 }
 
 struct Engine {
@@ -70,7 +165,7 @@ struct Engine {
 }
 
 impl Engine {
-    fn new(plan_json: &str, allowed_lateness_ms: i64) -> anyhow::Result<Self> {
+    fn new(plan_json: &str, options: PrecomputeOptions) -> anyhow::Result<(Self, Vec<String>)> {
         let plan: InstalledPlan = serde_json::from_str(plan_json)?;
         plan.validate()?;
         let dag = plan.dag.dag;
@@ -81,19 +176,25 @@ impl Engine {
             outputs = sds.outputs.len(),
             "stored summaries"
         );
-        Ok(Self {
-            precompute: Precompute::new(dag, &sds, allowed_lateness_ms)?,
-        })
+        let engine = Self {
+            precompute: Precompute::new(dag, &sds, options)?,
+        };
+        Ok((engine, plan.queries))
     }
 
-    fn serve(mut self, commands: Receiver<Command>) {
+    fn serve(mut self, commands: Receiver<Command>, shared: Shared) {
         for command in commands {
             match command {
-                Command::Ingest(samples) => self.precompute.ingest(&samples),
-                Command::Stats(reply) => {
-                    let _ = reply.send(self.precompute.stats);
+                Command::Ingest(samples) => {
+                    self.precompute.ingest(&samples);
+                    *shared.stats.lock().unwrap_or_else(|e| e.into_inner()) = self.precompute.stats;
+                    shared
+                        .queued_samples
+                        .fetch_sub(samples.len() as u64, Ordering::SeqCst);
                 }
+                Command::Stop => break,
             }
         }
+        tracing::warn!("engine stopped");
     }
 }

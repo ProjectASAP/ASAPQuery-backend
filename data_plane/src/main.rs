@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use data_plane::engine::EngineOptions;
+use data_plane::precompute::PrecomputeOptions;
 use data_plane::{router, DataPlane, DEFAULT_FORWARD_TIMEOUT};
 
 /// Serve Remote Write ingestion and the Prometheus query API for a plan.
@@ -20,8 +22,14 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:8088")]
     listen: String,
     /// How long after the newest sample passes a pane's end it is built.
-    #[arg(long, default_value_t = 15_000)]
-    allowed_lateness_ms: i64,
+    #[arg(long, default_value_t = PrecomputeOptions::default().allowed_lateness_ms)]
+    allowed_lateness_ms: u64,
+    /// Samples further ahead of the wall clock than this are dropped.
+    #[arg(long, default_value_t = PrecomputeOptions::default().max_future_ms)]
+    max_future_ms: u64,
+    /// Samples queued for the engine beyond which Remote Write gets 503.
+    #[arg(long, default_value_t = EngineOptions::default().max_queued_samples)]
+    max_queued_samples: u64,
 }
 
 #[tokio::main]
@@ -32,8 +40,18 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let plan = std::fs::read_to_string(&args.plan)?;
     let state = Arc::new(
-        DataPlane::new(plan, args.prometheus_url, args.allowed_lateness_ms)?
-            .with_forward_timeout(Duration::from_secs(args.forward_timeout_seconds)),
+        DataPlane::with_options(
+            plan,
+            args.prometheus_url,
+            EngineOptions {
+                precompute: PrecomputeOptions {
+                    allowed_lateness_ms: args.allowed_lateness_ms,
+                    max_future_ms: args.max_future_ms,
+                },
+                max_queued_samples: args.max_queued_samples,
+            },
+        )?
+        .with_forward_timeout(Duration::from_secs(args.forward_timeout_seconds)),
     );
     tracing::info!(queries = state.queries.len(), "installed plan");
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;

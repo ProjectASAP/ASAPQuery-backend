@@ -9,11 +9,11 @@ version = "0.1.0"
 [workspace.dependencies]
 # Keep every Planner crate on the same immutable revision. Alias upstream
 # asap-types as planner-types to name its origin at use sites.
-planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "f9dd41e095997fe2c34c1a1278f9f20c50a814ff" }
-asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "f9dd41e095997fe2c34c1a1278f9f20c50a814ff" }
-asap-logical-asap-optimization = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "f9dd41e095997fe2c34c1a1278f9f20c50a814ff" }
-asap-plan-selection = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "f9dd41e095997fe2c34c1a1278f9f20c50a814ff" }
-asap-executor = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "f9dd41e095997fe2c34c1a1278f9f20c50a814ff" }
+planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "ecea897f78640c377ce1d80846156f330f62dee2" }
+asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "ecea897f78640c377ce1d80846156f330f62dee2" }
+asap-logical-asap-optimization = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "ecea897f78640c377ce1d80846156f330f62dee2" }
+asap-plan-selection = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "ecea897f78640c377ce1d80846156f330f62dee2" }
+asap-executor = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "ecea897f78640c377ce1d80846156f330f62dee2" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -37,8 +37,13 @@ The backend is being rebuilt on the Planner's physical DAG:
 | Query engine: run query-time nodes over stored panes and raw data | planned |
 
 Panes close `--allowed-lateness-ms` (default 15 s) after the newest sample
-passes their end; later samples for them are dropped. The first pane after
-startup is skipped because it may be partial.
+of a stored summary's metric passes their end; later samples for them are
+dropped. The first pane after startup is skipped because it may be partial.
+Samples more than `--max-future-ms` (default 5 min) ahead of the wall clock
+are dropped. Remote Write gets 503 while more than `--max-queued-samples`
+(default 2,000,000) samples wait for the engine, and 500 if the engine has
+stopped, which also makes `/-/ready` fail. `/api/v1/status/asap` reports the
+engine's sample and pane counters as JSON.
 
 Until the query engine lands, the data plane forwards every query to
 Prometheus, with its end-to-end headers such as `Authorization` and

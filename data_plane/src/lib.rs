@@ -21,12 +21,8 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use control_plane::InstalledPlan;
-use engine::EngineHandle;
+use engine::{EngineHandle, EngineOptions, IngestError};
 use precompute::RawSample;
-
-/// Prometheus' staleness marker: a NaN that ends a series, not a sample.
-const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
 
 /// Response header naming what answered a query.
 pub const EXECUTION_HEADER: &str = "x-asap-execution";
@@ -48,18 +44,30 @@ pub struct DataPlane {
 }
 
 impl DataPlane {
-    /// Installs the plan serialized in `plan_json` (an [`InstalledPlan`]).
-    /// Panes close `allowed_lateness_ms` after the newest sample passes them.
+    /// Installs the plan serialized in `plan_json` (a
+    /// `control_plane::InstalledPlan`) with [`EngineOptions::default`], except
+    /// that panes close `allowed_lateness_ms` after the newest sample passes
+    /// them.
     pub fn new(
         plan_json: String,
         prometheus_url: String,
-        allowed_lateness_ms: i64,
+        allowed_lateness_ms: u64,
     ) -> anyhow::Result<Self> {
-        let plan: InstalledPlan = serde_json::from_str(&plan_json)?;
-        plan.validate()?;
+        let mut options = EngineOptions::default();
+        options.precompute.allowed_lateness_ms = allowed_lateness_ms;
+        Self::with_options(plan_json, prometheus_url, options)
+    }
+
+    /// Installs the plan serialized in `plan_json` with `options`.
+    pub fn with_options(
+        plan_json: String,
+        prometheus_url: String,
+        options: EngineOptions,
+    ) -> anyhow::Result<Self> {
+        let (engine, queries) = EngineHandle::spawn(plan_json, options)?;
         Ok(Self {
-            queries: plan.queries,
-            engine: EngineHandle::spawn(plan_json, allowed_lateness_ms)?,
+            queries,
+            engine,
             prometheus_url: prometheus_url.trim_end_matches('/').to_string(),
             limits: remote_write::Limits::default(),
             samples: AtomicU64::new(0),
@@ -90,7 +98,8 @@ pub fn router(state: Arc<DataPlane>) -> Router {
         .route("/api/v1/write", post(write).layer(write_body_limit))
         .route("/api/v1/query", get(query).post(query))
         .route("/api/v1/query_range", get(query_range).post(query_range))
-        .route("/-/ready", get(|| async { StatusCode::OK }))
+        .route("/api/v1/status/asap", get(status))
+        .route("/-/ready", get(ready))
         .with_state(state)
 }
 
@@ -106,17 +115,13 @@ async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
                         .map(|label| (label.name, label.value))
                         .collect(),
                 );
-                samples.extend(
-                    series
-                        .samples
-                        .into_iter()
-                        .filter(|s| s.value.to_bits() != STALE_NAN_BITS)
-                        .map(|s| RawSample {
-                            labels: labels.clone(),
-                            timestamp_ms: s.timestamp,
-                            value: s.value,
-                        }),
-                );
+                // Stale markers are kept: the executor's sample selector
+                // drops them from range windows and ends instant selectors.
+                samples.extend(series.samples.into_iter().map(|s| RawSample {
+                    labels: labels.clone(),
+                    timestamp_ms: s.timestamp,
+                    value: s.value,
+                }));
             }
             let count = samples.len() as u64;
             match state.engine.try_ingest(samples) {
@@ -124,12 +129,49 @@ async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
                     state.samples.fetch_add(count, Ordering::Relaxed);
                     StatusCode::NO_CONTENT.into_response()
                 }
-                // Remote Write senders retry on 5xx.
-                Err(busy) => (StatusCode::SERVICE_UNAVAILABLE, busy.to_string()).into_response(),
+                // Remote Write senders retry on 503.
+                Err(IngestError::Busy) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    IngestError::Busy.to_string(),
+                )
+                    .into_response(),
+                Err(IngestError::Stopped) => {
+                    tracing::error!("Remote Write refused: the engine has stopped");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        IngestError::Stopped.to_string(),
+                    )
+                        .into_response()
+                }
             }
         }
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
+}
+
+/// Ready while the engine thread runs; a stopped engine never ingests
+/// again, so the data plane must be restarted.
+async fn ready(State(state): State<Arc<DataPlane>>) -> StatusCode {
+    if state.engine.is_running() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+/// The data plane's counters, as JSON: the precompute engine's sample and
+/// pane counters, the samples queued for it, and whether it runs.
+async fn status(State(state): State<Arc<DataPlane>>) -> Response {
+    let body = serde_json::json!({
+        "engine_running": state.engine.is_running(),
+        "samples_queued": state.engine.queued_samples(),
+        "precompute": state.engine.stats(),
+    });
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 async fn query(
