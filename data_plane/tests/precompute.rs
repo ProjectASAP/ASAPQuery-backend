@@ -3,10 +3,11 @@ mod common;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use control_plane::{plan_workload, InstalledPlan};
+use asap_executor::planner::workload::{PlanningWorkload, Query};
+use asap_planner::InstallablePlan;
+use control_plane::plan_workload;
 use data_plane::precompute::{pane_end, Precompute, PrecomputeOptions, RawSample};
 use data_plane::sds::Sds;
-use planner_types::workload::{PlanningWorkload, Query};
 
 const MINUTE: i64 = 60_000;
 const PANE: i64 = 10 * MINUTE;
@@ -15,13 +16,13 @@ const DAY: i64 = 24 * 60 * MINUTE;
 /// The Prometheus stale marker's bits.
 const STALE_MARKER: u64 = 0x7ff0_0000_0000_0002;
 
-fn precompute(plan: InstalledPlan) -> (Precompute, Sds) {
+fn precompute(plan: InstallablePlan) -> (Precompute, Sds) {
     precompute_with(plan, 0)
 }
 
-fn precompute_with(plan: InstalledPlan, allowed_lateness_ms: u64) -> (Precompute, Sds) {
+fn precompute_with(plan: InstallablePlan, allowed_lateness_ms: u64) -> (Precompute, Sds) {
+    let sds = Sds::from_plan(&plan).unwrap();
     let dag = plan.dag.dag;
-    let sds = Sds::from_dag(&dag, &Sds::ingestion_frontier(&dag).unwrap()).unwrap();
     let options = PrecomputeOptions {
         allowed_lateness_ms,
         ..PrecomputeOptions::default()
@@ -197,15 +198,17 @@ fn watermark_jump_builds_only_retained_panes() {
     engine.ingest_at(&samples("latency_ms", &["a"], 0, 25 * MINUTE), 30 * DAY);
     let built = engine.stats.panes_built;
     engine.ingest_at(&[sample("latency_ms", "a", 30 * DAY, 1.0)], 30 * DAY);
-    // Example 4b reads panes up to 50 min back, plus two panes: 70 min.
-    assert_eq!(engine.stats.panes_built - built, 7);
+    // The plan keeps Example 4b's panes 60 min back: the six panes ending
+    // at 30 days - 50 min through 30 days.
+    assert_eq!(engine.stats.panes_built - built, 6);
     assert_eq!(
         engine.stats.panes_skipped_expired,
-        (30 * DAY - 70 * MINUTE) as u64 / PANE as u64 - 2
+        (30 * DAY - 80 * MINUTE) as u64 / PANE as u64
     );
     assert!(engine.store.get(&id, 30 * DAY).is_some());
+    assert!(engine.store.get(&id, 30 * DAY - 6 * PANE).is_none());
     assert!(engine.store.get(&id, 2 * PANE).is_none());
-    assert_eq!(engine.store.len(), 7);
+    assert_eq!(engine.store.len(), 6);
 }
 
 /// Timestamps at the ends of `i64` neither overflow nor loop.
@@ -231,28 +234,30 @@ fn extreme_timestamps_do_not_overflow() {
 #[test]
 fn rejects_zero_width_panes() {
     let plan = common::plan("example4b", false);
+    let mut sds = Sds::from_plan(&plan).unwrap();
     let dag = plan.dag.dag;
-    let mut sds = Sds::from_dag(&dag, &Sds::ingestion_frontier(&dag).unwrap()).unwrap();
     for definition in sds.definitions.values_mut() {
         definition.pane_ms = 0;
     }
     assert!(Precompute::new(dag, &sds, PrecomputeOptions::default()).is_err());
 }
 
-/// Panes older than the retention (largest offset plus two panes) are
-/// evicted as the watermark advances.
+/// Panes older than the plan's retention are evicted as the watermark
+/// advances.
 #[test]
 fn evicts_panes_past_retention() {
     let (mut engine, sds) = precompute(common::plan("example4b", false));
     let id = sds.definitions.keys().next().unwrap().clone();
     engine.ingest(&samples("latency_ms", &["a"], 0, 25 * MINUTE));
     assert!(engine.store.get(&id, 2 * PANE).is_some());
-    // Watermark 100 min: panes ending at or before 30 min are evicted.
+    // Watermark 100 min, retention 60 min: the oldest pane read is
+    // (40, 50 min], so panes ending before 50 min are evicted.
     engine.ingest(&[sample("latency_ms", "a", 100 * MINUTE, 1.0)]);
     assert!(engine.store.get(&id, 2 * PANE).is_none());
-    assert!(engine.store.get(&id, 3 * PANE).is_none());
-    assert!(engine.store.get(&id, 4 * PANE).is_some());
+    assert!(engine.store.get(&id, 4 * PANE).is_none());
+    assert!(engine.store.get(&id, 5 * PANE).is_some());
     assert!(engine.store.get(&id, 10 * PANE).is_some());
+    assert_eq!(engine.store.len(), 6);
 }
 
 /// Out-of-order samples within the allowed lateness reach their pane.
@@ -318,4 +323,17 @@ fn far_future_unrouted_sample_counts_as_unrouted() {
     engine.ingest_at(&[sample("other_metric", "a", 30 * DAY, 1.0)], 0);
     assert_eq!(engine.stats.samples_unrouted, 1);
     assert_eq!(engine.stats.samples_dropped_future, 0);
+}
+
+/// Summaries built in a query run are not built at ingestion.
+#[test]
+fn does_not_build_query_run_summaries() {
+    let mut plan = common::plan("example4b", false);
+    for output in &mut plan.stored_outputs {
+        output.built_at = asap_planner::StoredOutputBuild::QueryRun;
+    }
+    let (mut engine, _) = precompute(plan);
+    engine.ingest(&samples("latency_ms", &["a"], 0, 45 * MINUTE));
+    assert_eq!(engine.stats.panes_built, 0);
+    assert_eq!(engine.stats.samples_unrouted, 180);
 }

@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use control_plane::{plan_workload, DeploymentInputs, InstalledPlan, PlanError};
-use planner_types::workload::{PlanningWorkload, QueryLanguage, SqlDialect};
+use asap_planner::{InstallablePlanError, PlanningWorkload};
+use control_plane::{load_plan, plan_workload, save_plan, DeploymentInputs, PlanError};
 
-fn example1() -> PlanningWorkload {
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/planner-layering-example1.json");
+fn example(name: &str) -> PlanningWorkload {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../examples/planner-layering-{name}.json"));
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
@@ -17,10 +17,13 @@ fn temp_path(name: &str) -> PathBuf {
 /// query, and the plan survives the file the data plane loads.
 #[test]
 fn plans_example1_and_round_trips_the_plan() {
-    let workload = example1();
+    let workload = example("example1");
     let plan = plan_workload(&workload, &DeploymentInputs::default()).unwrap();
     assert_eq!(
-        plan.queries,
+        plan.queries
+            .iter()
+            .map(|q| q.query.clone())
+            .collect::<Vec<_>>(),
         workload
             .query_workload
             .entries()
@@ -29,35 +32,59 @@ fn plans_example1_and_round_trips_the_plan() {
     );
     assert_eq!(plan.dag.dag.roots.len(), 2);
     let path = temp_path("example1.json");
-    plan.save(&path).unwrap();
-    assert_eq!(InstalledPlan::load(&path).unwrap(), plan);
+    save_plan(&plan, &path).unwrap();
+    assert_eq!(load_plan(&path).unwrap(), plan);
     std::fs::remove_file(path).unwrap();
 }
 
-/// Only PromQL workloads are planned; SQL support comes later.
+/// Example 4b without raw data stores its six 10-minute panes, built at
+/// ingestion, each kept as long as the Planner states: 60 minutes back for
+/// the oldest pane the 60-minute range reads.
+#[test]
+fn example4b_stores_panes_with_the_planners_retention() {
+    let mut inputs = DeploymentInputs::default();
+    inputs.deployment_capabilities.raw_data_retained = false;
+    let plan = plan_workload(&example("example4b"), &inputs).unwrap();
+    assert_eq!(plan.stored_outputs.len(), 6);
+    let mut offsets: Vec<i64> = plan
+        .stored_outputs
+        .iter()
+        .map(|output| {
+            assert_eq!(output.pane.width_ms, 600_000);
+            output.pane.end_offset_ms
+        })
+        .collect();
+    offsets.sort();
+    assert_eq!(offsets, (0..6).map(|i| i * 600_000).collect::<Vec<_>>());
+    let retention = plan.stored_outputs.iter().map(|o| o.retention_ms).max();
+    assert_eq!(retention, Some(3_600_000));
+}
+
+/// Only PromQL workloads are planned; the Planner's PromQL frontend refuses
+/// SQL.
 #[test]
 fn rejects_sql_workloads() {
-    let mut workload = example1();
-    workload.query_workload.language = QueryLanguage::SQL(SqlDialect::ClickhouseSQL);
+    let mut workload = example("example1");
+    workload.query_workload.language =
+        serde_json::from_str(r#"{"sql": "clickhouse_sql"}"#).unwrap();
     assert!(matches!(
         plan_workload(&workload, &DeploymentInputs::default()),
-        Err(PlanError::UnsupportedLanguage(_))
+        Err(PlanError::Planning(_))
     ));
 }
 
 /// A plan whose queries do not match the DAG's roots is not installed.
 #[test]
 fn load_rejects_a_plan_without_a_query_per_root() {
-    let mut plan = plan_workload(&example1(), &DeploymentInputs::default()).unwrap();
+    let mut plan = plan_workload(&example("example1"), &DeploymentInputs::default()).unwrap();
     plan.queries.pop();
     let path = temp_path("mismatched.json");
-    plan.save(&path).unwrap();
+    save_plan(&plan, &path).unwrap();
     assert!(matches!(
-        InstalledPlan::load(&path),
-        Err(PlanError::RootCount {
-            roots: 2,
-            queries: 1
-        })
+        load_plan(&path),
+        Err(PlanError::InvalidPlan(
+            InstallablePlanError::QueriesDoNotMatchRoots { roots: 2 }
+        ))
     ));
     std::fs::remove_file(path).unwrap();
 }

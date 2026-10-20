@@ -17,18 +17,17 @@
 //! one bad timestamp cannot close every pane up to it. When the watermark
 //! jumps, panes that would already be evicted are skipped, not built.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use asap_executor::operators::Operator;
 use asap_executor::physical_planner::{compile, CompiledPhysicalDAG, InputContract, Source};
+use asap_executor::planner::ir::physical_export::PhysicalASAPDAG;
 use asap_executor::runtime::{Limits, RunContext, Scope};
 use asap_executor::values::{Batch, SchemaRef};
 use asap_executor::{RawSampleSelector, Sample};
 use futures::executor::block_on;
 use futures::StreamExt;
-use planner_types::ir::physical_export::{PhysicalASAPDAG, RawSampleWindow};
-use planner_types::ir::{NonASAPOp, Operator as IrOperator};
 
 use crate::sds::{DefinitionId, Sds, SummaryDefinition, SummaryStore};
 
@@ -43,6 +42,8 @@ pub struct RawSample {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PrecomputeError {
+    #[error("stored summaries: {0}")]
+    Plan(String),
     #[error("stored summary {0:?}: {1}")]
     Definition(DefinitionId, String),
     #[error(transparent)]
@@ -99,9 +100,6 @@ struct Builder {
     selector: RawSampleSelector,
     raw_schema: SchemaRef,
     build: CompiledPhysicalDAG,
-    /// Largest offset any output reads, plus two panes: panes ending at or
-    /// before `watermark - retention_ms` are no longer read.
-    retention_ms: i64,
     /// Samples of open panes, by pane end.
     open: BTreeMap<i64, Vec<RawSample>>,
     /// End of the first pane seen, which is skipped. `None` until then.
@@ -133,57 +131,49 @@ pub struct Precompute {
 }
 
 impl Precompute {
-    /// Compiles one build per definition of `sds`, a description of `dag`.
+    /// Compiles one build per definition of `sds` built in an ingestion run,
+    /// in dependency order; `sds` describes `dag`.
     pub fn new(
         dag: PhysicalASAPDAG,
         sds: &Sds,
         options: PrecomputeOptions,
     ) -> Result<Self, PrecomputeError> {
         let mut builders = Vec::new();
-        for definition in sds.definitions.values() {
+        // Ingestion-run definitions in dependency order; query-run ones are
+        // the query engine's.
+        let order = sds
+            .ingestion_build_order()
+            .map_err(|e| PrecomputeError::Plan(e.to_string()))?;
+        for id in &order {
+            let definition = &sds.definitions[id];
             let error =
                 |message: String| PrecomputeError::Definition(definition.id.clone(), message);
+            if !definition.stored_inputs.is_empty() {
+                return Err(error(
+                    "built from other stored outputs, which the precompute engine cannot build yet"
+                        .into(),
+                ));
+            }
             if definition.pane_ms <= 0 {
                 return Err(error(format!("pane width {} ms", definition.pane_ms)));
             }
-            let scan = scan_below(&dag, definition.raw_input)
-                .ok_or_else(|| error("no time-series Scan below its TimeRange".into()))?;
-            let raw_schema = Arc::new(output_schema(&dag, definition.raw_input).clone());
+            let raw_schema = Arc::new(output_schema(&dag, definition.raw_input()).clone());
             // `window_batch` is called with each pane's end, so the window's
             // offset from evaluation time is not used.
-            let selector = RawSampleSelector::new(
-                &dag,
-                &RawSampleWindow {
-                    time_range_node_id: definition.raw_input as usize,
-                    width_ms: definition.pane_ms,
-                    end_offset_ms: 0,
-                    scan_node_id: scan as usize,
-                },
-            )?;
+            let selector = RawSampleSelector::new(&dag, &definition.window)?;
             let build = compile(
                 &dag,
                 BTreeMap::from([(
-                    definition.raw_input,
+                    definition.raw_input(),
                     InputContract::bounded(raw_schema.clone()),
                 )]),
                 &[definition.builder],
             )?;
-            let max_offset = sds
-                .outputs
-                .values()
-                .filter(|(id, _)| id == &definition.id)
-                .map(|(_, binding)| binding.offset_ms)
-                .max()
-                .unwrap_or(0);
-            let retention_ms = max_offset
-                .checked_add(definition.pane_ms.saturating_mul(2))
-                .ok_or_else(|| error("retention overflows".into()))?;
             builders.push(Builder {
                 definition: definition.clone(),
                 selector,
                 raw_schema,
                 build,
-                retention_ms,
                 open: BTreeMap::new(),
                 first_pane_end: None,
                 built_through: None,
@@ -287,16 +277,13 @@ impl Precompute {
             };
             let pane_ms = builder.definition.pane_ms;
             let id = &builder.definition.id;
-            // Panes ending at or before this are evicted once built: skip them.
-            let expired_through = watermark.saturating_sub(builder.retention_ms);
+            // Panes ending before this are no longer read: skip them.
+            let oldest_kept_end = builder.definition.oldest_kept_end_ms(watermark);
             let Some(mut end) = built.checked_add(pane_ms) else {
                 continue;
             };
-            if end <= expired_through {
-                let Some(first_kept) = expired_through
-                    .checked_add(1)
-                    .and_then(|t| pane_end(t, pane_ms))
-                else {
+            if end < oldest_kept_end {
+                let Some(first_kept) = pane_end(oldest_kept_end, pane_ms) else {
                     continue;
                 };
                 self.stats.panes_skipped_expired +=
@@ -324,7 +311,7 @@ impl Precompute {
                     None => break,
                 }
             }
-            self.store.evict_through(id, expired_through);
+            self.store.evict_before(id, oldest_kept_end);
         }
     }
 }
@@ -370,7 +357,7 @@ fn build_pane(
     )?);
     let build = builder
         .build
-        .instantiate(BTreeMap::from([(builder.definition.raw_input, input)]))?;
+        .instantiate(BTreeMap::from([(builder.definition.raw_input(), input)]))?;
     let rows = run_root(&build, builder.definition.builder, scope)?;
     let schema = Arc::new(builder.definition.output_schema.clone());
     Ok(Batch::try_new(schema, rows)?)
@@ -393,27 +380,10 @@ pub fn run_root(
     })
 }
 
-fn output_schema(dag: &PhysicalASAPDAG, id: u64) -> &planner_types::ir::schema::Schema {
+fn output_schema(dag: &PhysicalASAPDAG, id: u64) -> &asap_executor::planner::ir::schema::Schema {
     &dag.nodes
         .iter()
         .find(|n| n.id as u64 == id)
         .expect("SDS names DAG nodes")
         .output_schema
-}
-
-/// The time-series `Scan` that `id` reads.
-fn scan_below(dag: &PhysicalASAPDAG, id: u64) -> Option<u64> {
-    let inputs: HashMap<u64, u64> = dag
-        .edges
-        .iter()
-        .map(|e| (e.consumer as u64, e.producer as u64))
-        .collect();
-    let mut current = id;
-    loop {
-        let node = dag.nodes.iter().find(|n| n.id as u64 == current)?;
-        if let IrOperator::NonASAP(NonASAPOp::Scan { .. }) = &node.payload {
-            return Some(current);
-        }
-        current = *inputs.get(&current)?;
-    }
 }

@@ -17,9 +17,10 @@ given.
 ```text
 PlanningWorkload (JSON)       DeploymentCapabilities + PlanSelectionSettings
           \                             /
-           control_plane: ASAPPlanner stages 0-3
+           control_plane: asap_planner::plan_installable
                          |
-           plan.json: selected PhysicalASAPDAG + query per root
+           plan.json: InstallablePlan (selected PhysicalASAPDAG, query per
+                      root, stored outputs with retention, raw windows)
                          |
            data_plane: Remote Write in, Prometheus query API out
 ```
@@ -35,6 +36,11 @@ The backend is being rebuilt on the Planner's physical DAG:
 | Stored summaries (SDS): one definition per computation, panes by end time | done |
 | Precompute engine: build ingestion-time outputs once per tumbling pane | done |
 | Query engine: run query-time nodes over stored panes and raw data | planned |
+
+The data plane stores the plan's `stored_outputs`. Outputs that differ only
+in which pane they read share one stored summary, kept for the largest
+`retention_ms` the plan states among them (which covers range-evaluation
+spans); panes ending before the oldest pane still read are evicted.
 
 Panes close `--allowed-lateness-ms` (default 15 s) after the newest sample
 of a stored summary's metric, capped at the wall clock, passes their end; later samples for them are

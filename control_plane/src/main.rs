@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use asap_planner::PlanningWorkload;
 use clap::Parser;
-use control_plane::{plan_workload, DeploymentInputs};
-use planner_types::workload::PlanningWorkload;
+use control_plane::{plan_workload, save_plan, DeploymentInputs};
 
 /// Plan a workload with ASAPPlanner and write the selected plan.
 #[derive(Parser)]
@@ -45,7 +45,7 @@ fn main() -> anyhow::Result<()> {
         inputs.plan_selection.measured_operation_costs = read_json(path)?;
     }
     let plan = plan_workload(&workload, &inputs)?;
-    plan.save(&args.out)?;
+    save_plan(&plan, &args.out)?;
     println!(
         "wrote {} ({} queries, {} nodes)",
         args.out.display(),

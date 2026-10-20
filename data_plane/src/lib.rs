@@ -45,7 +45,7 @@ pub struct DataPlane {
 
 impl DataPlane {
     /// Installs the plan serialized in `plan_json` (a
-    /// `control_plane::InstalledPlan`) with [`EngineOptions::default`], except
+    /// `asap_planner::InstallablePlan`) with [`EngineOptions::default`], except
     /// that panes close `allowed_lateness_ms` after the newest sample passes
     /// them.
     pub fn new(
