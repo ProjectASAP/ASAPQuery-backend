@@ -10,8 +10,10 @@ ASAPPlanner turns a query workload and the deployment's inputs into one physical
 
 ```mermaid
 flowchart LR
-  W[Workload + deployment inputs] --> CP[Control plane<br/>calls ASAPPlanner once]
-  CP --> P[(InstallablePlan)]
+  W[Workload + deployment inputs] --> PL
+  subgraph CP[Control plane]
+    PL[Call ASAPPlanner once] --> P[(InstallablePlan)]
+  end
   P --> DP
   subgraph DP[Data plane]
     RW[Remote Write] --> PE[Precompute engine<br/>per-sample state updates]
