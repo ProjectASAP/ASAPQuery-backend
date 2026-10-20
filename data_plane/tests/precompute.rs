@@ -253,12 +253,12 @@ fn watermark_jump_builds_only_retained_panes() {
     engine.ingest_at(&samples("latency_ms", &["a"], 0, 25 * MINUTE), 30 * DAY);
     let built = engine.stats.panes_built;
     engine.ingest_at(&[sample("latency_ms", "a", 30 * DAY, 1.0)], 30 * DAY);
-    // The plan keeps Example 4b's panes 60 min back: the six panes ending
-    // at 30 days - 50 min through 30 days.
-    assert_eq!(engine.stats.panes_built - built, 6);
+    // The plan keeps Example 4b's panes 60 min back, plus one pane: the
+    // seven panes ending at 30 days - 60 min through 30 days.
+    assert_eq!(engine.stats.panes_built - built, 7);
     assert_eq!(
         engine.stats.panes_skipped_expired,
-        (30 * DAY - 80 * MINUTE) as u64 / PANE as u64
+        (30 * DAY - 90 * MINUTE) as u64 / PANE as u64
     );
     assert!(engine
         .store
@@ -266,13 +266,13 @@ fn watermark_jump_builds_only_retained_panes() {
         .is_some());
     assert!(engine
         .store
-        .get(&id, Selection::ending_at(30 * DAY - 6 * PANE))
+        .get(&id, Selection::ending_at(30 * DAY - 7 * PANE))
         .is_none());
     assert!(engine
         .store
         .get(&id, Selection::ending_at(2 * PANE))
         .is_none());
-    assert_eq!(engine.store.len(), 6);
+    assert_eq!(engine.store.len(), 7);
 }
 
 /// Timestamps at the ends of `i64` neither overflow nor loop.
@@ -317,8 +317,9 @@ fn evicts_panes_past_retention() {
         .store
         .get(&id, Selection::ending_at(2 * PANE))
         .is_some());
-    // Watermark 100 min, retention 60 min: the oldest pane read is
-    // (40, 50 min], so panes ending before 50 min are evicted.
+    // Watermark 100 min, retention 60 min plus one pane: the oldest pane
+    // read by the evaluation at 90 min is (30, 40 min], so panes ending
+    // before 40 min are evicted.
     engine.ingest(&[sample("latency_ms", "a", 100 * MINUTE, 1.0)]);
     assert!(engine
         .store
@@ -326,17 +327,17 @@ fn evicts_panes_past_retention() {
         .is_none());
     assert!(engine
         .store
-        .get(&id, Selection::ending_at(4 * PANE))
+        .get(&id, Selection::ending_at(3 * PANE))
         .is_none());
     assert!(engine
         .store
-        .get(&id, Selection::ending_at(5 * PANE))
+        .get(&id, Selection::ending_at(4 * PANE))
         .is_some());
     assert!(engine
         .store
         .get(&id, Selection::ending_at(10 * PANE))
         .is_some());
-    assert_eq!(engine.store.len(), 6);
+    assert_eq!(engine.store.len(), 7);
 }
 
 /// Out-of-order samples within the allowed lateness reach their pane.
@@ -450,4 +451,25 @@ fn keeps_every_pane_the_newest_served_evaluation_reads() {
         );
     }
     assert_eq!(engine.stats.panes_skipped_expired, 0);
+}
+
+/// An evaluation one pane behind the newest closed pane still has every
+/// pane it reads: with the watermark at 84:45 the newest closed pane ends
+/// at 80 min, and the evaluation at 70 min reads the panes ending 20..70.
+/// The extra pane is the only margin: the store stays bounded.
+#[test]
+fn keeps_one_pane_of_margin_beyond_the_retention() {
+    let (mut engine, sds) = precompute(common::plan("example4b", false));
+    let id = sds.definitions.keys().next().unwrap().clone();
+    engine.ingest(&samples("latency_ms", &["a"], MINUTE, 85 * MINUTE));
+    for end in (2..=8).map(|i| i * PANE) {
+        assert!(
+            engine.store.get(&id, Selection::ending_at(end)).is_some(),
+            "pane ending at {end}"
+        );
+    }
+    engine.ingest(&samples("latency_ms", &["a"], 85 * MINUTE, 300 * MINUTE));
+    // Panes ending 230..290 min: the six the evaluation at 290 reads, plus
+    // the one more the evaluation at 280 reads.
+    assert_eq!(engine.store.len(), 7);
 }

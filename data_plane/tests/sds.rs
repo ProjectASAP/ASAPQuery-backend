@@ -192,3 +192,62 @@ fn store_finds_and_evicts_panes() {
     );
     assert_eq!(store.len(), 2);
 }
+
+/// `definition` under another identity, reading `stored_inputs`.
+fn renamed(
+    definition: &data_plane::sds::SummaryDefinition,
+    name: &str,
+    stored_inputs: &[&str],
+) -> data_plane::sds::SummaryDefinition {
+    let mut definition = definition.clone();
+    definition.id = DefinitionId(name.into());
+    definition.stored_inputs = stored_inputs
+        .iter()
+        .map(|input| DefinitionId(input.to_string()))
+        .collect();
+    definition
+}
+
+/// Several definitions are ordered after the ones they read, whatever
+/// their identities' order: a rollup `a` over `c` and `b`, `b` over `c`.
+#[test]
+fn build_order_puts_inputs_first() {
+    let base = Sds::from_plan(&plan("example4b", false)).unwrap();
+    let template = base.definitions.values().next().unwrap();
+    let mut sds = Sds::default();
+    for definition in [
+        renamed(template, "a", &["c", "b"]),
+        renamed(template, "b", &["c"]),
+        renamed(template, "c", &[]),
+    ] {
+        sds.definitions.insert(definition.id.clone(), definition);
+    }
+    let order: Vec<String> = sds
+        .ingestion_build_order()
+        .unwrap()
+        .into_iter()
+        .map(|id| id.0)
+        .collect();
+    assert_eq!(order, ["c", "b", "a"]);
+}
+
+/// An ingestion-run definition cannot read a query-run one: that summary
+/// is only built when an evaluation needs it.
+#[test]
+fn build_order_refuses_ingestion_reading_query_run() {
+    let base = Sds::from_plan(&plan("example4b", false)).unwrap();
+    let template = base.definitions.values().next().unwrap();
+    let mut query_run = renamed(template, "q", &[]);
+    query_run.built_at = StoredOutputBuild::QueryRun;
+    let mut sds = Sds::default();
+    for definition in [renamed(template, "i", &["q"]), query_run] {
+        sds.definitions.insert(definition.id.clone(), definition);
+    }
+    assert_eq!(
+        sds.ingestion_build_order(),
+        Err(SdsError::IngestionReadsQueryRun {
+            definition: DefinitionId("i".into()),
+            input: DefinitionId("q".into()),
+        })
+    );
+}

@@ -280,10 +280,14 @@ impl Precompute {
             let pane_ms = builder.definition.pane_ms;
             let id = &builder.definition.id;
             // The newest evaluation stored panes can serve is at the end of
-            // the newest closed pane; panes ending before the oldest one it
-            // reads are no longer read: skip them.
+            // the newest closed pane. Panes are kept for one extra pane
+            // width beyond the plan's retention, so an evaluation one pane
+            // behind it is still served; older panes are no longer read:
+            // skip them.
             let newest_closed_end = watermark.div_euclid(pane_ms).saturating_mul(pane_ms);
-            let oldest_kept_end = builder.definition.oldest_kept_end_ms(newest_closed_end);
+            let oldest_kept_end = builder
+                .definition
+                .oldest_kept_end_ms(newest_closed_end.saturating_sub(pane_ms));
             let Some(mut end) = built.checked_add(pane_ms) else {
                 continue;
             };

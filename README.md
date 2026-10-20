@@ -40,7 +40,8 @@ The backend is being rebuilt on the Planner's physical DAG:
 The data plane stores the plan's `stored_outputs`. Outputs that differ only
 in which pane they read share one stored summary, kept for the largest
 `retention_ms` the plan states among them (which covers range-evaluation
-spans); panes ending before the oldest pane still read are evicted.
+spans), plus one pane width so an evaluation one pane behind the newest
+closed pane is still served; older panes are evicted.
 
 Panes close `--allowed-lateness-ms` (default 15 s) after the newest sample
 of a stored summary's metric, capped at the wall clock, passes their end; later samples for them are

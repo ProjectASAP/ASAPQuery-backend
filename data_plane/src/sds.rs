@@ -85,9 +85,6 @@ impl SummaryDefinition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneBinding {
     pub offset_ms: i64,
-    /// The output's own `TimeRange` node: where that pane's raw samples
-    /// feed when the output is computed at query time.
-    pub raw_input: u64,
 }
 
 /// The stored summaries of one plan.
@@ -108,6 +105,13 @@ pub enum SdsError {
     /// Stored outputs read each other in a cycle.
     #[error("stored outputs read each other in a cycle through {0:?}")]
     Cycle(DefinitionId),
+    /// An ingestion-run definition reads a query-run one, which is built
+    /// only when an evaluation needs it, so never in time for ingestion.
+    #[error("ingestion-run summary {definition:?} reads query-run summary {input:?}")]
+    IngestionReadsQueryRun {
+        definition: DefinitionId,
+        input: DefinitionId,
+    },
 }
 
 impl Sds {
@@ -149,7 +153,6 @@ impl Sds {
             definition.retention_ms = definition.retention_ms.max(retention_ms);
             let binding = PaneBinding {
                 offset_ms: output.pane.end_offset_ms,
-                raw_input: output.pane.time_range_node_id as u64,
             };
             outputs.insert(node, (id, binding));
         }
@@ -190,7 +193,8 @@ impl Sds {
     }
 
     /// The definitions built in ingestion runs, each after every definition
-    /// it reads (`stored_inputs`). Fails on a cycle.
+    /// it reads (`stored_inputs`). Fails on a cycle, and when an
+    /// ingestion-run definition reads a query-run one.
     pub fn ingestion_build_order(&self) -> Result<Vec<DefinitionId>, SdsError> {
         let mut order = Vec::new();
         let mut state: HashMap<&DefinitionId, bool> = HashMap::new(); // false: visiting
@@ -206,7 +210,16 @@ impl Sds {
                 None => {}
             }
             state.insert(id, false);
-            for input in &sds.definitions[id].stored_inputs {
+            let definition = &sds.definitions[id];
+            for input in &definition.stored_inputs {
+                if definition.built_at == StoredOutputBuild::IngestionRun
+                    && sds.definitions[input].built_at == StoredOutputBuild::QueryRun
+                {
+                    return Err(SdsError::IngestionReadsQueryRun {
+                        definition: id.clone(),
+                        input: input.clone(),
+                    });
+                }
                 visit(sds, input, state, order)?;
             }
             state.insert(id, true);
