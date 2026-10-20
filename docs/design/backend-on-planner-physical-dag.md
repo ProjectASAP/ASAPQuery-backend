@@ -8,6 +8,7 @@ This document designs the backend: what it must achieve, how its components work
 
 - [Problem](#problem)
 - [Goals and non-goals](#goals-and-non-goals)
+- [Terminology](#terminology)
 - [Architecture](#architecture)
 - [Boundary between ASAPPlanner and ASAPQuery-backend](#boundary-between-asapplanner-and-asapquery-backend)
 - [Component design](#component-design)
@@ -47,6 +48,30 @@ A metrics workload repeats many queries over the same data: dashboards, alerts, 
 - Re-planning when the workload or data changes. A new workload is planned and installed again.
 - Durable state and recovery after restart. State is in memory and is rebuilt from new samples.
 - SQL workloads. The control plane plans PromQL today, and the design keeps the language a Planner concern.
+
+## Terminology
+
+This document, the backend's code and its PR descriptions use ASAPPlanner's terms. Planner terms come from its IR and from [Schema and Physical Data for ASAP Primitives](https://github.com/ProjectASAP/ASAPPlanner/blob/main/docs/design_docs/proposals/asap-primitive-schema.md) §2 and §4. Backend-only terms are listed with what they mean.
+
+| Term | Source | Meaning |
+| --- | --- | --- |
+| relation, row, column, schema | Planner (§2) | As in relational databases. For PromQL, a row is one sample of one series at one time. |
+| summary state | Planner (§2) | A column whose type is a summary type: a sketch or an exact accumulator. |
+| summary family | Planner (`SketchAlgorithm`) | The kind of summary, e.g. KLL, DDSketch, Count-Min, HLL. |
+| `SummaryCoverage` (`definition`, `selection`) | Planner (§4.2) | What a summary state computes, and which rows went into it. |
+| materialization | Planner (`Materialization`) | When a summary is built: `MatAtIngestion`, `MatAtQuery`, `MatAtQueryKeptAcrossEvaluations`, or `NotMaterialized`. |
+| `InstallablePlan`, `StoredOutput`, `StoredOutputBuild` (`IngestionRun`, `QueryRun`), `RawSampleWindow`, `retention_ms` | Planner (`asap_planner`) | The plan a runtime installs, its stored outputs, which run builds each one, the raw-sample windows read at query time, and how long each output is kept. |
+| evaluation time, `RangeEvaluation` (step, span) | Planner (workload) | The time `T` a query is answered for, and the steps of a range query. |
+| pane, pane chain | Planner | A summary over one left-open time interval `(end − width, end]`; the panes that make up a window. |
+| raw sample | Backend | One value of one series at one timestamp, as received over Remote Write. Not a sampling-based approximation. |
+| summary instance | Backend | One stored summary state with its concrete `selection` (relative time bound to an absolute interval). |
+| SDS | Backend | The backend's store of summary instances, keyed by (`definition` identity, concrete `selection`). |
+| watermark | Backend | The newest routed raw sample's time, capped at the wall clock, minus the allowed lateness. Panes that end at or before it are closed. |
+| forward | Backend | Answer a query with Prometheus instead of the plan, with the reason in `x-asap-forward-reason`. |
+
+Rules:
+- Use the Planner's name for anything the Planner defines. Don't introduce a backend synonym: "kept query-time result", for example, is a stored output with `StoredOutputBuild::QueryRun`, built because of `MatAtQueryKeptAcrossEvaluations`.
+- A backend-only term gets one entry in this table and is used with that meaning everywhere.
 
 ## Architecture
 
