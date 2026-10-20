@@ -12,7 +12,7 @@ use asap_planner::InstallablePlan;
 use tokio::sync::oneshot;
 
 use crate::precompute::{Precompute, PrecomputeOptions, PrecomputeStats, RawSample};
-use crate::query::{QueryEngine, RawRange, ResultSample, Unanswered};
+use crate::query::{BoundRawSampleWindow, QueryEngine, ResultSample, Unanswered};
 use crate::sds::Sds;
 
 /// How the engine thread ingests samples.
@@ -39,10 +39,10 @@ type Reply<T> = oneshot::Sender<Result<T, Unanswered>>;
 
 enum Command {
     Ingest(Vec<RawSample>),
-    RawRanges {
+    BoundRawSampleWindows {
         query: String,
         time_ms: i64,
-        reply: Reply<(usize, Vec<RawRange>)>,
+        reply: Reply<(usize, Vec<BoundRawSampleWindow>)>,
     },
     Evaluate {
         root: usize,
@@ -153,13 +153,13 @@ impl EngineHandle {
     }
 
     /// The plan root answering `query` at `time_ms` and the raw samples it
-    /// needs; see [`QueryEngine::raw_ranges`].
-    pub async fn raw_ranges(
+    /// needs; see [`QueryEngine::bound_raw_sample_windows`].
+    pub async fn bound_raw_sample_windows(
         &self,
         query: String,
         time_ms: i64,
-    ) -> Result<(usize, Vec<RawRange>), Unanswered> {
-        self.ask(|reply| Command::RawRanges {
+    ) -> Result<(usize, Vec<BoundRawSampleWindow>), Unanswered> {
+        self.ask(|reply| Command::BoundRawSampleWindows {
             query,
             time_ms,
             reply,
@@ -280,12 +280,12 @@ impl Engine {
                         .queued_samples
                         .fetch_sub(samples.len() as u64, Ordering::SeqCst);
                 }
-                Command::RawRanges {
+                Command::BoundRawSampleWindows {
                     query,
                     time_ms,
                     reply,
                 } => {
-                    let _ = reply.send(self.query.raw_ranges(
+                    let _ = reply.send(self.query.bound_raw_sample_windows(
                         &query,
                         time_ms,
                         &self.precompute.store,

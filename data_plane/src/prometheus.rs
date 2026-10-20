@@ -7,7 +7,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::precompute::RawSample;
-use crate::query::{RawRange, ResultSample};
+use crate::query::{BoundRawSampleWindow, ResultSample};
 
 /// Parameters of an instant query, from its URL query and form body.
 pub struct InstantQuery {
@@ -99,7 +99,7 @@ fn format_value(value: f64) -> String {
 
 /// The PromQL range selector of `range`: its metric and label matchers, every
 /// value escaped as a PromQL string, over `end - start` milliseconds.
-pub fn range_selector(range: &RawRange) -> String {
+pub fn range_selector(range: &BoundRawSampleWindow) -> String {
     let mut matchers = vec![format!("__name__=\"{}\"", escape(&range.metric))];
     matchers.extend(
         range
@@ -137,7 +137,7 @@ pub async fn fetch(
     client: &reqwest::Client,
     prometheus_url: &str,
     headers: &reqwest::header::HeaderMap,
-    range: &RawRange,
+    range: &BoundRawSampleWindow,
 ) -> anyhow::Result<Vec<RawSample>> {
     let selector = range_selector(range);
     let response: Value = client
@@ -218,7 +218,7 @@ mod tests {
     /// each value escaped as a PromQL string.
     #[test]
     fn builds_escaped_range_selectors() {
-        let range = RawRange {
+        let range = BoundRawSampleWindow {
             node: 1,
             metric: "m".into(),
             matchers: vec![

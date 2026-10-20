@@ -4,7 +4,7 @@
 //! Each root is compiled once with two kinds of inputs:
 //! - stored outputs (the SDS frontier): bound to the pane of their definition
 //!   ending at `T - offset`, which must be stored;
-//! - query-time raw ranges, `TimeRange(range) <- TimeShift(offset)* <- Scan`:
+//! - query-time bound raw-sample windows, `TimeRange(range) <- TimeShift(offset)* <- Scan`:
 //!   bound to the samples in `(T - offset - range, T - offset]`, which the
 //!   caller fetches, filtered by the plan's `Scan`.
 //!
@@ -28,10 +28,11 @@ use asap_planner::InstallablePlan;
 use crate::precompute::{executor_samples, run_root, RawSample};
 use crate::sds::{DefinitionId, Sds, Selection, SummaryStore};
 
-/// Raw samples a query needs: `metric`'s samples in `(start_ms, end_ms]`
-/// that `matchers` keep.
+/// A bound raw-sample window: a `RawSampleWindow` of the plan bound to one
+/// evaluation time, i.e. `metric`'s raw samples in `(start_ms, end_ms]`
+/// that `matchers` keep, which the caller fetches.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RawRange {
+pub struct BoundRawSampleWindow {
     pub node: u64,
     pub metric: String,
     /// The window's `Scan` label matchers that PromQL can express, so the
@@ -144,12 +145,12 @@ impl QueryEngine {
 
     /// The root answering `query` at `time_ms`, and the raw samples it needs.
     /// Fails if the query is not planned or a stored pane it reads is missing.
-    pub fn raw_ranges(
+    pub fn bound_raw_sample_windows(
         &self,
         query: &str,
         time_ms: i64,
         store: &SummaryStore<Batch>,
-    ) -> Result<(usize, Vec<RawRange>), Unanswered> {
+    ) -> Result<(usize, Vec<BoundRawSampleWindow>), Unanswered> {
         let (root, program) = self.program(query)?;
         for input in &program.stored {
             pane(input, time_ms, store)?;
@@ -159,7 +160,7 @@ impl QueryEngine {
             .iter()
             .map(|input| {
                 let (start_ms, end_ms) = window(time_ms, input.offset_ms, input.range_ms)?;
-                Ok(RawRange {
+                Ok(BoundRawSampleWindow {
                     node: input.node,
                     metric: input.selector.metric().to_string(),
                     matchers: input.matchers.clone(),
@@ -172,7 +173,7 @@ impl QueryEngine {
     }
 
     /// Runs `root` at `time_ms` over stored panes and `raw`, the samples of
-    /// each of its [`RawRange`]s by node.
+    /// each of its [`BoundRawSampleWindow`]s by node.
     pub fn evaluate(
         &self,
         root: usize,

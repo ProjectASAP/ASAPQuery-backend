@@ -237,7 +237,7 @@ async fn query(
     response
 }
 
-/// Runs a planned instant query. Raw ranges are read from Prometheus with
+/// Runs a planned instant query. Bound raw-sample windows are read from Prometheus with
 /// the caller's end-to-end `headers`, as a forwarded query would be.
 async fn answer(
     state: &DataPlane,
@@ -249,11 +249,14 @@ async fn answer(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as i64)
     });
-    let (root, ranges) = state.engine.raw_ranges(query.query, time_ms).await?;
+    let (root, ranges) = state
+        .engine
+        .bound_raw_sample_windows(query.query, time_ms)
+        .await?;
     let mut fetch_headers = forwarded_headers(headers);
     // The raw read is a GET without the caller's body.
     fetch_headers.remove(header::CONTENT_TYPE);
-    // The raw windows are fetched concurrently.
+    // The bound raw-sample windows are fetched concurrently.
     let fetches = ranges.iter().map(|range| async {
         prometheus::fetch(&state.client, &state.prometheus_url, &fetch_headers, range)
             .await

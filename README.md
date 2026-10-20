@@ -56,7 +56,7 @@ engine's sample and pane counters as JSON.
 An instant query whose text is one of the plan's queries is answered by the
 plan (`x-asap-execution: plan`). Its stored inputs read the panes ending at
 `T - offset`, so `T` must be on the pane grid and those panes stored; its
-query-time raw ranges are read from Prometheus. Anything else is forwarded
+query-time bound raw-sample windows are read from Prometheus. Anything else is forwarded
 to Prometheus with its end-to-end headers, such as `Authorization` and
 `X-Scope-OrgID` (`x-asap-execution: forwarded`); a planned query that could not
 be answered also says why in `x-asap-forward-reason`. Range queries, SQL and
