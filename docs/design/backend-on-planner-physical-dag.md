@@ -159,14 +159,15 @@ The Planner specifies **which summaries to compute and retain**. The operator li
 SDS holds every summary the plan stores, and nothing else.
 
 - **Definitions.** Each stored output in `stored_outputs` maps to one summary definition. A definition's identity is a hash of the sub-DAG that builds it: payloads and schemas, with offset-only `TimeShift`s removed. Outputs that differ only in time offset therefore share one definition. For example, six 10-minute KLL panes read at offsets 0 to 50 minutes are one definition.
-- **Keys.** Summaries are keyed by (definition, end time). A pane covers the left-open interval `(end − width, end]`.
+- **Keys.** Summaries are keyed by (definition, end of their time coverage). A time-bounded summary covers the left-open interval `(end − width, end]`; a pane is the case built directly from raw samples.
+- **Kinds.** Any output the plan stores: time panes, rollups over time ranges, rollups across series, sliding-window summaries, and query-time results kept across evaluations. Each comes from `stored_outputs` with its inputs (raw samples or other stored outputs), its time coverage, its build phase and its retention.
 - **Immutability.** A summary never changes after insertion. It is shared by reference (`Arc`) and never copied.
 - **Retention.** Each definition is kept for the largest `retention_ms` among its outputs, which already includes range-evaluation spans. Older summaries are evicted per definition.
 - **Not read:** summary coverage. Reuse decisions were made by the Planner; SDS stores what the plan names.
 
 ### Precompute engine
 
-The precompute engine builds each ingestion-time summary exactly once, when the watermark closes its pane.
+The precompute engine builds each ingestion-time summary exactly once, as soon as its inputs are complete: a summary over raw samples when the watermark closes its time window, and a summary over other stored summaries (a rollup over time ranges or across series, or a sliding-window summary) once all of those inputs are sealed. Summaries are built in the plan's dependency order.
 
 1. **Route.** Each Remote Write series is interned to a dense series id at decode. Then, once per series, it is matched against each definition's `RawSampleSelector` (metric and label matchers), and its group in that definition is computed. The result is cached by series id.
 2. **Update.** Each sample updates its open pane's state in place through `StateColumnUpdater`, the same code the batch build uses. A per-sample pane therefore equals a pane built from the same samples in one batch.
@@ -193,8 +194,8 @@ A planned query is answered by executing its DAG root at each evaluation time `T
 
   | Input | How it is read |
   | --- | --- |
-  | Summary built at ingestion | The definition's summary ending at `T − offset` |
-  | Query-time summary kept across evaluations | Reused if an earlier evaluation built it after its pane closed; otherwise computed now, and kept only once its pane is closed |
+  | Summary built at ingestion | The definition's summary whose coverage ends at `T − offset` |
+  | Query-time summary kept across evaluations | Reused if an earlier evaluation built it after its coverage closed; otherwise computed now, and stored in SDS only once its coverage is closed |
   | Query-time raw window | Raw samples for `(T − offset − width, T − offset]`, selected by the window's `RawSampleSelector` |
 
 - **Range queries.** One evaluation per step, `T = start + k · step`, on the query's thread. Raw samples are read once for the range and sliced per step, and summaries are shared across steps.
@@ -250,6 +251,7 @@ A planned query is answered by executing its DAG root at each evaluation time `T
 - **SDS inside ASAPPlanner.** Rejected: identity, deduplication, layout and eviction are deployment concerns. The Planner states only each output's computation, coverage and retention.
 - **Row-at-a-time execution.** Replaced: per-row values, clones, grouping keys and memory accounting dominated data-plane CPU, and the sketch kernels were a small fraction. All operators now work on Arrow column batches with state columns.
 - **The runtime deriving storage needs from the DAG.** Replaced by `stored_outputs`. The Planner already knows each output's materialization and retention, including range-evaluation spans, so the runtime reads them instead of re-deriving them.
+- **Storing only raw-sample panes.** Rejected: the plan also stores rollups, sliding-window summaries and kept query-time results. Storing only panes would recompute those at every evaluation, or refuse them at install.
 
 ## Merging with ASAPQuery
 
