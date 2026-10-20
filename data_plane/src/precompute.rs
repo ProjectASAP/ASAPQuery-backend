@@ -141,7 +141,7 @@ impl Precompute {
         options: PrecomputeOptions,
     ) -> Result<Self, PrecomputeError> {
         let mut builders = Vec::new();
-        // Ingestion-run definitions in dependency order; query-run ones are
+        // `IngestionRun` definitions in dependency order; `QueryRun` ones are
         // the query engine's.
         let order = sds
             .ingestion_build_order()

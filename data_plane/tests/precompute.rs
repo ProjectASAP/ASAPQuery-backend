@@ -424,7 +424,7 @@ fn far_future_unrouted_sample_counts_as_unrouted() {
 
 /// Summaries built in a query run are not built at ingestion.
 #[test]
-fn does_not_build_query_run_summaries() {
+fn does_not_build_query_run_outputs() {
     let mut plan = common::plan("example4b", false);
     for output in &mut plan.stored_outputs {
         output.built_at = asap_planner::StoredOutputBuild::QueryRun;

@@ -257,7 +257,7 @@ impl Engine {
         if query_run > 0 {
             tracing::warn!(
                 definitions = query_run,
-                "the plan keeps query-run summaries, which this data plane does not build yet; \
+                "the plan has stored outputs built in a QueryRun, which this data plane does not build yet; \
                  queries that read them are forwarded"
             );
         }

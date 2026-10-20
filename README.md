@@ -75,8 +75,8 @@ cargo run -p data_plane -- --plan plan.json --prometheus-url http://localhost:90
 
 `--deployment-capabilities caps.json` replaces the default
 `DeploymentCapabilities`: every summary the Planner can build, raw data kept
-in Prometheus, and no query-time result kept across evaluations
-(`MatAtQueryKeptAcrossEvaluations` is not implemented). For example
+in Prometheus, and no stored outputs built in a `QueryRun`
+(`MatAtQueryKeptAcrossEvaluations`). For example
 `{"raw_data_retained": false}` makes the Planner build every input at
 ingestion time. `--measured-operation-costs costs.json` gives Stage 3 the
 deployment's measured sketch operation costs; otherwise it prices every node

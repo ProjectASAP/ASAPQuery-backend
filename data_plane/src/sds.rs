@@ -43,9 +43,10 @@ pub struct DefinitionId(pub String);
 #[derive(Debug, Clone, PartialEq)]
 pub struct SummaryDefinition {
     pub id: DefinitionId,
-    /// Which run builds its summaries: an ingestion run, or the query run of
-    /// the first evaluation that needs one (kept once its coverage is
-    /// closed). Ingestion when any output of the definition says so.
+    /// Which run builds its stored outputs (`StoredOutputBuild`): an
+    /// `IngestionRun`, or the `QueryRun` of the first evaluation that needs
+    /// one (stored once its coverage is closed). `IngestionRun` when any
+    /// output of the definition says so.
     pub built_at: StoredOutputBuild,
     /// Coverage width: each stored summary covers `(end - pane_ms, end]`.
     pub pane_ms: i64,
@@ -105,9 +106,9 @@ pub enum SdsError {
     /// Stored outputs read each other in a cycle.
     #[error("stored outputs read each other in a cycle through {0:?}")]
     Cycle(DefinitionId),
-    /// An ingestion-run definition reads a query-run one, which is built
+    /// An `IngestionRun` definition reads a `QueryRun` one, which is built
     /// only when an evaluation needs it, so never in time for ingestion.
-    #[error("ingestion-run summary {definition:?} reads query-run summary {input:?}")]
+    #[error("stored output built in an IngestionRun ({definition:?}) reads one built in a QueryRun ({input:?})")]
     IngestionReadsQueryRun {
         definition: DefinitionId,
         input: DefinitionId,
@@ -115,8 +116,8 @@ pub enum SdsError {
 }
 
 impl Sds {
-    /// The definitions behind `plan`'s stored outputs, built in an ingestion
-    /// run or in a query run and kept.
+    /// The definitions behind `plan`'s stored outputs, built in an
+    /// `IngestionRun` or in a `QueryRun`.
     pub fn from_plan(plan: &InstallablePlan) -> Result<Self, SdsError> {
         let dag = &plan.dag.dag;
         let nodes: HashMap<u64, &PhysicalASAPDAGNode> =
@@ -194,7 +195,7 @@ impl Sds {
 
     /// The definitions built in ingestion runs, each after every definition
     /// it reads (`stored_inputs`). Fails on a cycle, and when an
-    /// ingestion-run definition reads a query-run one.
+    /// `IngestionRun` definition reads a `QueryRun` one.
     pub fn ingestion_build_order(&self) -> Result<Vec<DefinitionId>, SdsError> {
         let mut order = Vec::new();
         let mut state: HashMap<&DefinitionId, bool> = HashMap::new(); // false: visiting
