@@ -1,9 +1,9 @@
 # ASAPQuery-backend on ASAPPlanner's physical DAG
 
-ASAPPlanner turns a query workload and deployment inputs (such as runtime capabilities, prices, and measured costs) into one physical execution plan: a directed acyclic graph (DAG) of operators. ASAPQuery-backend installs that plan, ingests samples, maintains the states specified by the plan, and executes its operators to answer queries. This document covers three things:
+ASAPPlanner turns a query workload and deployment inputs (such as runtime capabilities, prices, and measured costs) into one physical execution plan: a directed acyclic graph (DAG) of operators. In the target architecture, ASAPQuery-backend installs that plan, ingests samples, maintains the states specified by the plan, and executes its operators to answer queries. The comparison below identifies which parts are implemented on the current `main` branches. This document covers three things:
 
 1. the boundary between ASAPPlanner and ASAPQuery-backend;
-2. how the backend compares with ASAPQuery, and where the benefit comes from;
+2. how the current backend implementation compares with ASAPQuery;
 3. the key points for merging the backend into ASAPQuery.
 
 **Repositories.** The backend's code lives in ASAPQuery-backend for now and later merges into ASAPQuery. ASAPPlanner stays a separate repository, used as a library pinned to a specific revision.
@@ -96,61 +96,21 @@ The Planner specifies **which summaries to compute and retain**. The operator li
 
 ## ASAPQuery and ASAPQuery-backend compared
 
-**What each does**
+This table compares the current `main` branches: ASAPQuery at `5f0f00a` and ASAPQuery-backend at `eabf5ef0`. The architecture above describes the intended backend; the table distinguishes that design from what is implemented today.
 
-| | ASAPQuery | ASAPQuery-backend |
+| Concern | ASAPQuery | ASAPQuery-backend |
 | --- | --- | --- |
-| Planner | `asap-planner`: query pattern → one aggregation config; optional MILP | ASAPPlanner Stages 1–3: exact or summary, sketch and parameters per accuracy target, materialization, pane chains, retention |
-| When summaries are built | During ingestion | During ingestion or at query time; query-time summaries can be retained for later evaluations |
-| Query shapes | Fixed patterns, binary arithmetic, top-k, quantile | Any query shape represented by a DAG the Planner emits |
-| Correctness reference | Differential tests, PromQL compliance suite | Answers checked against a reference that executes every node at query time |
-| Summary sharing across offsets | Inside one sliding aggregation | SDS reuses the same stored summary across outputs and query time offsets |
-| Ingestion | Remote Write, VictoriaMetrics, OTLP, files; sharded workers; per-sample update | Remote Write; sharded workers; per-sample update |
-| Store | Columnar epochs, interned label ids, `Arc` states | Immutable summaries shared through `Arc` under an `RwLock` |
-| Query languages | PromQL, SQL, Elastic, ClickHouse adapters | PromQL |
-| Workload discovery, plan swap, drop-in | Yes | No |
+| Role | A query accelerator with ingestion, summary construction, query execution, and a drop-in deployment. | A control plane integrated with ASAPPlanner, plus a data-plane service whose execution path is still being built. |
+| Planning | Uses its own `asap-planner-rs` to plan supported query patterns. | Runs ASAPPlanner Stages 1–3 with deployment capabilities and cost inputs, then exports the selected physical DAG. |
+| Plan contract | Aggregation configurations consumed by the existing query engine. | `InstalledPlan`: the selected physical DAG and the query text corresponding to each DAG root. |
+| Query execution | Executes supported queries through `SimpleEngine` and forwards queries it cannot answer. | Currently forwards every query to Prometheus; execution of the installed DAG is not implemented. |
+| Ingestion | Builds summaries from incoming samples. | Accepts, validates, and counts Remote Write samples, then discards them; Prometheus must receive its own copy. Summary construction is not implemented. |
+| Summary storage | Uses the query engine's summary store to serve accelerated queries. | Defines summaries from ingestion-time DAG outputs and shares definitions across time offsets. Runtime summary storage and retrieval are not implemented. |
+| Retaining query-time summaries | Summaries are built during ingestion. | Currently declares that retaining query-time results across evaluations is unsupported and rejects plans requiring it. |
+| Query languages | Supports PromQL and SQL, with additional adapters. | The control plane currently accepts PromQL workloads only. |
+| Deployment | Provides quickstart and drop-in deployments for an existing Prometheus/Grafana stack. | Provides plan generation and a Prometheus-compatible HTTP service; the planned acceleration path remains to be implemented. |
 
-**Where the backend's overhead came from.** The first benchmark runs comparing CPU use with Prometheus had the backend using 2–3× Prometheus' CPU. A profile showed the cause was the executor's row layout, not the DAG or the sketches:
-
-- row allocation, cloning, per-row group keys and per-row memory accounting took 68–75% of data-plane CPU;
-- sketch and accumulator kernels took 3–7%;
-- the rest was JSON fetching of raw ranges, the glibc allocator, and one engine thread.
-
-ASAPQuery avoids all of these: it updates states in place per sample, stores `Arc` states in columns, uses jemalloc, shards ingestion across workers, and never reads raw data.
-
-**Fixes made, and their effect**
-
-- *In ASAPPlanner:* every operator of the operator library is now columnar (Arrow batches, interned group ids, state columns, per-sample updaters).
-- *In the backend:* jemalloc, sharded ingestion, a query thread pool, immutable summarys shared through `Arc` under an `RwLock`, per-sample ingestion, a local raw ring buffer and Prometheus remote read.
-
-In-process measurements using the same data and queries on one CPU core (lower is better):
-
-| Step | ASAPQuery | Backend before | Backend now |
-| --- | --- | --- | --- |
-| Summary construction | 2.3 µs/sample | 10.5 µs/sample | 1.2 µs/sample (per-sample updater) |
-| `sum by (job) (rate(...[1m]))` | 4.1 ms | 15.4 ms | 5.3 ms |
-| `topk by (job) (10, ...)` | 1.0 ms (approximate) | 15.5 ms (exact) | 5.4 ms (exact) |
-| `quantile_over_time(0.99, ...[5m])` | 24.8 ms | 31.1 ms | 21.5 ms |
-| `quantile_over_time(0.99, ...[60m])` | 33.5 ms | 62.2 ms | 50.4 ms |
-
-The "now" column comes from a later benchmark session on the same machine. These are in-process operator and query timings; they do not establish a whole-system CPU improvement.
-
-Whole-system measurements against Prometheus alone (data-plane CPU core-seconds over a 90-minute run; Prometheus 3.5.0; 4 cores each; lower is better). Here, "before" and "now" refer to the whole-system benchmark runs, separately from the in-process measurements above:
-
-| Series | Raw data retained | Prometheus alone | Backend before | Backend now |
-| --- | --- | --- | --- | --- |
-| 2,000 | yes | 18.9 | 44.6 | 36.6 |
-| 2,000 | no | 18.3 | 38.2 | 31.7 |
-| 10,000 | yes | 85.0 | 248.0 | 152.6 |
-| 10,000 | no | 90.4 | 200.6 | 133.6 |
-
-The whole-system "Backend now" column still uses the row-based executor: those runs did not yet use a backend dependency pinned to the columnar operator library. Correctness: in the benefit runs, all 5,920 planned evaluations equal the Planner's reference answers.
-
-**What still blocks lower whole-system CPU use than Prometheus**
-
-- The backend must move to the columnar operator library and the per-sample updater.
-- Stage 3 under-predicts the runtime's CPU by 400–1,500×. It then picks query-time plans that rebuild sketches from raw data at every evaluation. The runtime's measured costs must be fed back to the Planner as a deployment input.
-- Joint planning over the Kubernetes rule set drops cheaper plans, and several common rule shapes are not yet supported (regex matchers, `histogram_quantile`, `sum without`, chained rules).
+The main difference today is that ASAPQuery has an operating acceleration path, while ASAPQuery-backend has the external Planner integration and plan-derived summary definitions. The merge aims to combine ASAPQuery's runtime with ASAPPlanner's selected DAG and shared operator library.
 
 ## Merging with ASAPQuery
 
@@ -178,21 +138,12 @@ The merged runtime keeps ASAPQuery's low-overhead data path and the backend's si
 | Local raw windows, remote read | Backend |
 | HTTP adapters, forwarding, tracker, drop-in | ASAPQuery |
 
-**Implementation stages**
+**Remaining integration work**
 
-These statuses describe the implementation and benchmark snapshots discussed above.
-
-| Stage | Change | Status |
-| --- | --- | --- |
-| A | jemalloc; panes shared by `Arc` | Done in the backend |
-| B | Per-sample ingestion | Done in the backend, on the row executor |
-| C | Columnar operator library in ASAPPlanner | Done except removing the row form and making compiled plans `Send + Sync` |
-| D | Sharded ingestion, query pool, local raw windows, remote read | Done in the backend |
-| E | Re-pin the backend to the columnar library; feed measured costs to the Planner | Next |
-| F | ASAPQuery features (OTLP, VictoriaMetrics, idle close, tracker, plan swap, compliance suite) | Later |
-| G | Merge into ASAPQuery, replacing `asap-query-engine` internals and `asap-planner` | Later |
-
-For each stage, rerun the benchmark harness and report absolute CPU measurements against Prometheus alone.
+1. Connect Remote Write ingestion to the installed DAG's ingestion-time operators and store the summaries defined by SDS.
+2. Execute planned queries from their DAG roots, reading stored summaries and any required raw samples; forward queries the runtime cannot answer.
+3. Integrate ASAPQuery's ingestion drivers, scheduling, query tracking, plan replacement, and deployment support with that execution path.
+4. Validate answers against the shared operator library's reference execution and measure whole-system resource use against Prometheus alone. Feed measured costs into subsequent planning calls.
 
 **Open decisions**
 
