@@ -1,12 +1,53 @@
 # ASAPQuery-backend on ASAPPlanner's physical DAG
 
-ASAPPlanner turns a query workload and deployment inputs (such as runtime capabilities, prices, and measured costs) into one physical execution plan: a directed acyclic graph (DAG) of operators. ASAPQuery-backend installs that plan, ingests samples, maintains the summaries specified by the plan, and executes its operators to answer queries. Here, backend means the latest runtime PR stack through [#835](https://github.com/ProjectASAP/ASAPQuery-backend/pull/835), at `3158464f`, including its base PRs; these changes are not all merged into `main`. This document covers three things:
+ASAPPlanner turns a query workload and deployment inputs (such as runtime capabilities, prices, and measured costs) into one physical execution plan: a directed acyclic graph (DAG) of operators. ASAPQuery-backend installs that plan, ingests samples, maintains the summaries specified by the plan, and executes its operators to answer queries.
 
-1. the boundary between ASAPPlanner and ASAPQuery-backend;
-2. how the latest backend runtime PR stack compares with ASAPQuery;
-3. the key points for merging the backend into ASAPQuery.
+This document designs the backend: what it must achieve, how its components work, where it meets ASAPPlanner, and how it merges with ASAPQuery. The current implementation status and the latest measurements are in the appendix.
 
-**Repositories.** The backend's code lives in ASAPQuery-backend for now and later merges into ASAPQuery. ASAPPlanner stays a separate repository, used as a library pinned to a specific revision.
+## Contents
+
+- [Problem](#problem)
+- [Goals and non-goals](#goals-and-non-goals)
+- [Architecture](#architecture)
+- [Boundary between ASAPPlanner and ASAPQuery-backend](#boundary-between-asapplanner-and-asapquery-backend)
+- [Component design](#component-design)
+  - [Control plane](#control-plane)
+  - [Stored summaries (SDS)](#stored-summaries-sds)
+  - [Precompute engine](#precompute-engine)
+  - [Query engine](#query-engine)
+  - [Raw samples](#raw-samples)
+  - [Concurrency and memory](#concurrency-and-memory)
+  - [Failure handling](#failure-handling)
+- [Evaluation](#evaluation)
+- [Alternatives considered](#alternatives-considered)
+- [Merging with ASAPQuery](#merging-with-asapquery)
+- [Open decisions](#open-decisions)
+- [Appendix: status and latest measurements](#appendix-status-and-latest-measurements)
+
+## Problem
+
+A metrics workload repeats many queries over the same data: dashboards, alerts, recording rules. ASAPPlanner chooses, for the whole workload, what to precompute as summaries (exact accumulators or sketches), when to build them (during ingestion or at query time), and how long to keep them. That choice only pays off if a runtime executes it faithfully and cheaply. The runtime must:
+
+- build exactly the summaries the plan names, with the same semantics as the plan's reference execution;
+- answer every planned query from them;
+- cost less than answering the same queries with the database alone.
+
+## Goals and non-goals
+
+**Goals**
+
+- **One planner.** Every planned query executes the plan ASAPPlanner selected, unchanged.
+- **Correct answers.** Each answer equals the Planner's reference execution of the same plan, with every node at query time, within the plan's accuracy target.
+- **A measurable benefit.** Lower total CPU, memory and latency than Prometheus alone on the same workload, reported in absolute numbers.
+- **Any query shape the Planner emits** runs through the same DAG execution, with no per-shape code.
+
+**Non-goals**
+
+- Re-planning when the workload or data changes. A new workload is planned and installed again.
+- Durable state and recovery after restart. State is in memory and is rebuilt from new samples.
+- SQL workloads. The control plane plans PromQL today, and the design keeps the language a Planner concern.
+
+## Architecture
 
 ```mermaid
 flowchart TB
@@ -42,7 +83,13 @@ flowchart TB
   style QUERY fill:#eff6ff,stroke:#93c5fd,color:#1e3a8a
 ```
 
-Dashed arrows show which data-plane components receive the installed plan; solid arrows show planning inputs and runtime operations. The precompute engine writes summaries to SDS; the query engine reads summaries and can store query-time summaries for reuse. A query's DAG root is the operator that produces its final answer. SDS stores immutable summaries specified by the plan, including time panes, rollups over time ranges, rollups across series, and sliding-window summaries. A pane is one kind of summary, covering a bounded time interval; it is not the only kind SDS can hold.
+Dashed arrows show which data-plane components receive the installed plan; solid arrows show planning inputs and runtime operations.
+- The precompute engine writes summaries to SDS.
+- The query engine reads summaries, and can store query-time summaries for reuse.
+- A query's DAG root is the operator that produces its final answer.
+- SDS stores the immutable summaries the plan specifies: time panes, rollups over time ranges, rollups across series, and sliding-window summaries. A pane is one kind of summary, covering a bounded time interval; it is not the only kind SDS can hold.
+
+**Repositories.** The backend's code lives in ASAPQuery-backend for now and later merges into ASAPQuery. ASAPPlanner stays a separate repository, used as a library pinned to a specific revision.
 
 ## Boundary between ASAPPlanner and ASAPQuery-backend
 
@@ -58,33 +105,33 @@ ASAPPlanner decides **what to compute**, **whether to compute it during ingestio
 | Ingestion, watermark, pane close, late data | None | Precompute engine |
 | Threads, scheduling, binding a query to its evaluation timestamp | None | Query engine and precompute engine |
 | Raw samples | Specifies the time ranges of raw samples a query needs | Local ring buffer, Prometheus remote read |
-| Unplanned queries | None | Forwarded to Prometheus |
+| Unplanned queries | None | Forwarded to Prometheus, or refused in no-forward mode |
 | Deployment inputs (capabilities, AWS Fargate prices, measured costs, data facts) | Consumes them | Supplies them |
 
 **Planning interface: workload and deployment models → executable plan**
 
 Once per installed workload, the backend control plane supplies the query workload and deployment inputs (capabilities, costs, and data facts) to `asap_planner::plan_installable`. The Planner returns `InstallablePlan`, which the backend saves and installs directly.
 
-| Plan field | Role in the latest runtime PR stack |
+| Plan field | Role |
 | --- | --- |
 | `dag` | The selected operators and their dependencies. |
 | `queries` | Identifies each planned query and the DAG root that answers it. |
 | `stored_outputs` | Tells SDS and the engines which summaries to retain, whether ingestion or query execution builds them, their time coverage, and their retention duration. |
-| `query_time_raw_windows` | Tells the runtime which raw-sample windows to fetch for query execution. The latest runtime reads this metadata to bind inputs and size its local raw buffer. |
-| `selection` | Optional metadata identifying the selected candidate and its estimated price per second. Used for logging and reporting, rather than query computation. |
+| `query_time_raw_windows` | Tells the runtime which raw-sample windows to fetch for query execution, and sizes its local raw buffer. |
+| `selection` | Metadata identifying the selected candidate and its estimated price per second, used for logging and reporting rather than query computation. |
 
 The DAG describes the computation. The stored-output and raw-window metadata make its storage and input requirements explicit, so the backend does not reconstruct them by walking the DAG. Selection metadata describes the planning decision and is separate from the computation itself.
 
 **Runtime interface: samples and summaries → query answers**
 
-After installation, the backend uses the operator library to execute the plan. The following names refer to separate runtime helpers, not additional plan fields or calls to the Planner.
+After installation, the backend uses the operator library to execute the plan. These are runtime helpers, not plan fields or calls to the Planner.
 
 | Runtime helper | Role |
 | --- | --- |
-| `RawSampleSelector` | Selects the raw samples that belong to a pane or query-time window. |
+| `RawSampleSelector` | Selects the raw samples that belong to a pane or query-time window: the window's metric, its `Scan` label matchers, the left-open time range, the latest sample per series for instant selectors, and no stale markers. |
 | `StateColumnUpdater` | Updates aggregate or sketch states as samples arrive, merges states across shards, and seals them when a pane closes. |
-| `Batch::try_from_columns` | Constructs a batch from state columns. The backend can store the batch as an immutable summary; a sealed pane is one example. |
-| Compiled operators for DAG nodes | Execute the operations specified by the plan, using input batches to produce output batches. This describes a group of operators, not a single API name. |
+| `Batch::try_from_columns` | Constructs a batch from state columns. The backend stores the batch as an immutable summary; a sealed pane is one example. |
+| Compiled operators for DAG nodes | Execute the operations specified by the plan, using input batches to produce output batches. |
 
 The Planner specifies **which summaries to compute and retain**. The operator library supplies **the computation implementations**. The backend supplies **ingestion, scheduling, storage, and query serving**.
 
@@ -96,65 +143,113 @@ The Planner specifies **which summaries to compute and retain**. The operator li
 - Each operator has exactly one implementation, in the operator library. The Planner's tests, the correctness reference and the data plane all use it.
 - If the backend cannot execute a plan, installation fails with a reason before any part of that plan runs.
 
-**Design references for the runtime capabilities**
+## Component design
 
-The Planner references below are pinned to `92bc1296`, the revision used by the latest backend stack. Runtime details are documented in the corresponding PRs and source-module documentation; the links distinguish those implementation notes from the broader Planner design.
+### Control plane
 
-| Capability | Design and implementation references |
-| --- | --- |
-| DAG execution | [Planner/runtime boundary](https://github.com/ProjectASAP/ASAPPlanner/blob/92bc1296fd33802e8ce3fcab6b75f8e3205c3960/docs/design_docs/architecture/planner-runtime-contract.md), [physical planning and deployment](https://github.com/ProjectASAP/ASAPPlanner/blob/92bc1296fd33802e8ce3fcab6b75f8e3205c3960/docs/design_docs/physical-planning-and-deployment.md), and [#832: compile once and execute shared roots](https://github.com/ProjectASAP/ASAPQuery-backend/pull/832). |
-| Sharded ingestion and query concurrency | [#829: worker ownership, watermarks, query pool, and shared store](https://github.com/ProjectASAP/ASAPQuery-backend/pull/829); [latest engine module design](https://github.com/ProjectASAP/ASAPQuery-backend/blob/3158464f/data_plane/src/engine.rs). |
-| Columnar operators and per-sample updates | [#832: Arrow batches, state-column updates, and batch-build fallback](https://github.com/ProjectASAP/ASAPQuery-backend/pull/832); [#834: interned series IDs](https://github.com/ProjectASAP/ASAPQuery-backend/pull/834). |
-| Summary identity, retention, and reuse | [#828: installable-plan handoff and storage metadata](https://github.com/ProjectASAP/ASAPQuery-backend/pull/828); [latest SDS design](https://github.com/ProjectASAP/ASAPQuery-backend/blob/3158464f/data_plane/src/sds.rs) and [query-engine design for retained summaries](https://github.com/ProjectASAP/ASAPQuery-backend/blob/3158464f/data_plane/src/query.rs). |
-| Raw-sample reads | [#831: per-metric local buffers, read boundaries, and remote-read fallback](https://github.com/ProjectASAP/ASAPQuery-backend/pull/831). |
-| Measured costs and planning feedback | [#835: operation measurement, prediction reports, and cost-model limitations](https://github.com/ProjectASAP/ASAPQuery-backend/pull/835). |
+- **Input:** a PromQL workload (queries, recurrence, accuracy targets, optional range evaluation) and deployment inputs:
+  - capabilities: supported summaries, whether raw data is retained, whether query-time results may be kept;
+  - plan selection settings: cost model, unit prices, measured operation costs;
+  - data facts: metric types, cardinalities, value domains.
+- **Planning:** one `plan_installable` call. The control plane never selects among candidates.
+- **Install:** the plan is validated and written as `plan.json`. The data plane loads it at startup. In no-forward mode, installation fails unless every query has an executable plan.
 
-## ASAPQuery and ASAPQuery-backend compared
+### Stored summaries (SDS)
 
-This table compares ASAPQuery `main` at `5f0f00a` with the latest backend runtime PR stack through [#835](https://github.com/ProjectASAP/ASAPQuery-backend/pull/835) at `3158464f`. Backend capabilities below include the implementation in those open PRs.
+SDS holds every summary the plan stores, and nothing else.
 
-| Concern | ASAPQuery | ASAPQuery-backend |
-| --- | --- | --- |
-| Planning | Uses its own `asap-planner-rs` to plan supported query patterns. | Calls ASAPPlanner Stages 1–3 to choose the physical DAG using deployment capabilities, costs, and accuracy targets. |
-| Plan contract | Aggregation configurations consumed by the existing query engine. | Installs the Planner's `InstallablePlan`, including its DAG, query roots, stored summaries, and raw-input requirements. |
-| Query execution | Uses `SimpleEngine` and execution paths for supported query patterns. | Compiles the installed DAG once and executes its roots using the shared columnar operator library; supports instant queries and range-query evaluation steps. |
-| When summaries are built | During ingestion. | During ingestion or at query time; retains query-time summaries across evaluations when the plan requires it. |
-| Ingestion | Sharded workers update summaries per sample; supports Remote Write and additional ingestion drivers. | Sharded Remote Write ingestion updates summary states per sample using the operator library's updaters. |
-| Summary sharing and storage | Uses the existing query engine's summary store and reference-shared states. | SDS identifies equivalent summary definitions across outputs and time offsets; immutable summaries are shared through `Arc` under an `RwLock`, with retention from the plan. |
-| Query-time raw samples | Accelerated queries use precomputed summaries; queries it cannot answer are forwarded. | Reads required raw windows from a local buffer, using Prometheus remote read for unavailable ranges. |
-| Concurrency and series identity | Sharded ingestion and interned labels in its existing runtime. | Sharded ingestion workers, a query thread pool, and series interned to dense IDs at decode. |
-| Cost inputs | Uses its own planner's configuration. | Supplies deployment costs and measured operation costs to ASAPPlanner; provides separate prediction reports for the selected plan. |
-| Fallback | Forwards queries it cannot answer to the upstream system. | Forwards unplanned queries and planned queries it cannot answer to Prometheus, with a reason for planned-query fallback. |
-| Query languages | Supports PromQL and SQL, with additional adapters. | The current control plane accepts PromQL workloads. |
-| Deployment and workload management | Provides quickstart and drop-in deployments, workload discovery, and runtime plan replacement. | Provides explicit workload planning and a Prometheus-compatible service; integration of ASAPQuery's discovery and plan replacement remains merge work. |
+- **Definitions.** Each stored output in `stored_outputs` maps to one summary definition. A definition's identity is a hash of the sub-DAG that builds it: payloads and schemas, with offset-only `TimeShift`s removed. Outputs that differ only in time offset therefore share one definition. For example, six 10-minute KLL panes read at offsets 0 to 50 minutes are one definition.
+- **Keys.** Summaries are keyed by (definition, end time). A pane covers the left-open interval `(end − width, end]`.
+- **Immutability.** A summary never changes after insertion. It is shared by reference (`Arc`) and never copied.
+- **Retention.** Each definition is kept for the largest `retention_ms` among its outputs, which already includes range-evaluation spans. Older summaries are evicted per definition.
+- **Not read:** summary coverage. Reuse decisions were made by the Planner; SDS stores what the plan names.
 
-The difference is how planning and execution are connected: ASAPQuery uses its existing planner and execution paths, while the backend runs ASAPPlanner's selected DAG with the shared operator library. Both build and query summaries; the backend additionally supports plan-directed query-time construction, retention, and raw-sample reads.
+### Precompute engine
 
-**Latest reported performance**
+The precompute engine builds each ingestion-time summary exactly once, when the watermark closes its pane.
 
-Source: [#835's measured-cost benchmark runs](https://github.com/ProjectASAP/ASAPQuery-backend/pull/835), using the #834 data-plane binary with the deployment settings produced by #835. These compare the backend plus Prometheus with Prometheus alone. They do **not** provide a direct performance comparison with the current ASAPQuery version; the capability table above should not be read as a performance ranking.
+1. **Route.** Each Remote Write series is interned to a dense series id at decode. Then, once per series, it is matched against each definition's `RawSampleSelector` (metric and label matchers), and its group in that definition is computed. The result is cached by series id.
+2. **Update.** Each sample updates its open pane's state in place through `StateColumnUpdater`, the same code the batch build uses. A per-sample pane therefore equals a pane built from the same samples in one batch.
+3. **Close.** A pane `(end − width, end]` closes when the watermark passes `end`.
+   - The watermark is the newest routed sample's time minus the allowed lateness.
+   - Samples with timestamps beyond a bounded distance into the future are dropped and counted; they never advance the watermark.
+4. **Seal.** Each worker seals its states, `Batch::try_from_columns` turns them into a batch, and the batch is inserted into SDS. A group split across workers is built from the combined samples with the plan's batch build.
+5. **Evict.** Per definition, by retention.
 
-The reported setup is the 90-minute benefit harness, Prometheus 3.5.0, four queries, and four CPU cores allocated to each service. `s10` and `s50` are the benchmark's 1,000- and 5,000-series configurations as labeled in [#834](https://github.com/ProjectASAP/ASAPQuery-backend/pull/834). Prometheus alone was measured in the same session, and the backend setup's Prometheus still receives the samples. All figures below are reported measurements, not new runs for this documentation update.
+**Rules**
 
-CPU is core-seconds over the complete run; lower is better. **Total CPU includes both services**, calculated by adding the reported backend and Prometheus values. Peak RSS is backend-only and is not total system memory.
+- **Late samples:** a sample for an already-built pane is dropped and counted. There are no revisions.
+- **Startup:** the first pane is skipped, because it may be partial.
+- **Back-pressure:** Remote Write returns 503 when the queued samples exceed a bound.
+- **Counters:** accepted, late-dropped, first-pane-skipped and future-dropped samples are exposed.
 
-| Configuration | Prometheus alone CPU | Backend CPU | Backend's Prometheus CPU | Total CPU | Backend peak RSS (GiB) | Forwarded evaluations |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| s10, raw retained | 18.9 | 11.2 | 8.6 | 19.8 | 0.04 | 90 |
-| s10, no raw retained | 19.9 | 19.4 | 6.3 | 25.7 | 0.34 | 5 |
-| s50, raw retained | 86.7 | 52.0 | 41.7 | 93.7 | 0.11 | 90 |
-| s50, no raw retained | 85.3 | 84.3 | 29.9 | 114.2 | 0.81 | 5 |
+### Query engine
 
-Latency for the raw-retained configurations is shown below as **p50 / p99 in milliseconds**. “Backend setup” includes answers forwarded to Prometheus; these are client-visible timings, not timings of backend computation alone. The query columns are rate aggregation, top-k, and the 0.99 quantile over 5- and 60-minute windows.
+A planned query is answered by executing its DAG root at each evaluation time `T`.
 
-| Configuration | System | Rate | Top-k | Quantile [5m] | Quantile [60m] |
-| --- | --- | ---: | ---: | ---: | ---: |
-| s10, raw retained | Prometheus alone | 9.5 / 19.9 | 9.9 / 18.2 | 18.4 / 35.3 | 84.3 / 140.1 |
-| s10, raw retained | Backend setup | 10.0 / 11.2 | 10.2 / 11.1 | 22.2 / 34.8 | 107.6 / 138.3 |
-| s50, raw retained | Prometheus alone | 44.2 / 71.7 | 45.0 / 77.5 | 93.3 / 140.3 | 379.9 / 583.4 |
-| s50, raw retained | Backend setup | 41.7 / 59.2 | 37.6 / 55.0 | 104.5 / 150.1 | 408.3 / 520.6 |
+- **Compile once.** The plan is compiled once at install and shared by every query thread.
+- **One query per thread.** Queries run on a fixed pool. One evaluation, and all steps of a range query, run on one thread.
+- **Inputs of one evaluation at `T`:**
 
-In the raw-retained runs, measured costs make the Planner select an exact quantile candidate that fails executor validation (`per-entity aggregate requires an explicit entity binding`). All 90 quantile evaluations are therefore forwarded to Prometheus. The lower backend CPU and RSS partly reflect that work being done upstream. The combined CPU is above Prometheus alone in all four configurations; these results do not establish a whole-system CPU saving. The source PR reports that all evaluations met their accuracy targets, including forwarded answers, and contains the no-raw latency tables and detailed cost-model gaps.
+  | Input | How it is read |
+  | --- | --- |
+  | Summary built at ingestion | The definition's summary ending at `T − offset` |
+  | Query-time summary kept across evaluations | Reused if an earlier evaluation built it after its pane closed; otherwise computed now, and kept only once its pane is closed |
+  | Query-time raw window | Raw samples for `(T − offset − width, T − offset]`, selected by the window's `RawSampleSelector` |
+
+- **Range queries.** One evaluation per step, `T = start + k · step`, on the query's thread. Raw samples are read once for the range and sliced per step, and summaries are shared across steps.
+- **Forwarding.** An evaluation that cannot run as planned is forwarded whole to Prometheus, with the reason in `x-asap-forward-reason`. Reasons include:
+  - a missing summary, for example one older than its retention;
+  - a `T` off the pane grid;
+  - a root that cannot be compiled.
+
+  In **no-forward mode** the same cases return an error with the reason, so every answer is computed by ASAP.
+
+### Raw samples
+
+- **Local buffer.** Query-time raw windows are served from a per-metric ring buffer filled by Remote Write. Each metric's buffer is sized by the longest query-time raw window of that metric in the plan. Metrics with no query-time raw window are not buffered.
+- **Remote read.** Anything older than the buffer is read from Prometheus with remote read (protobuf).
+- Stale markers are not samples. `RawSampleSelector` drops them, and an instant selector whose latest sample is stale yields no row.
+
+### Concurrency and memory
+
+- **Workers.** Ingestion is sharded by series id across N workers. Each worker owns its open-pane states, so updates take no lock. The global watermark is the minimum of the workers' watermarks.
+- **Store.** SDS is a read-write lock over (definition → end → `Arc` summary).
+  - Queries take the read lock only to clone the `Arc`s they need.
+  - Inserts and evictions take the write lock briefly.
+- **Memory accounting.** A query's execution memory limit charges what the query allocates: new states, merged results, copies. It does not charge the shared summaries it reads, which SDS already holds.
+- **Allocator.** jemalloc is the global allocator.
+
+### Failure handling
+
+- **Installation** fails, with a reason, on a plan the backend cannot run.
+- **Out-of-range timestamps** and arithmetic on pane boundaries are checked, so a bad sample is dropped and counted rather than stalling or crashing the engine.
+- **Engine failure:** if an engine thread fails, the data plane reports an internal error and becomes unready. It does not report itself busy indefinitely.
+
+## Evaluation
+
+- **Correctness.** End-to-end tests run the data-plane binary on the planner-layering PromQL examples. Data enters through Remote Write, and every answer is compared with the Planner's reference execution of the same plan. Equality is exact, except within a stated tolerance for sketches with randomized compaction.
+- **Benefit.** The same workload runs on one deployment twice:
+  - once with Prometheus alone answering every query exactly (the baseline);
+  - once with the backend executing the plan.
+
+  Reported, in absolute numbers:
+  - CPU core-seconds of every service, including the backend deployment's own Prometheus;
+  - peak memory;
+  - p50/p99 latency per query;
+  - error against the exact answer, and whether it meets the target;
+  - the number of forwarded evaluations.
+
+  Benefit runs use no-forward mode, so forwarded work cannot hide in Prometheus' CPU.
+- **Workloads.** The planner-layering examples, the Kubernetes recording-rule set, and ASAPQuery's random mixed workloads, over seeded generated data. The deployment inputs are AWS Fargate us-east-1 unit prices, measured operation costs, and distinct-count bounds read from the generated data.
+- **Cost feedback.** The runtime measures its own per-operation costs on the deployment machine and supplies them as Planner inputs. Stage 3's predicted resource use for the selected plan is reported next to the measured use.
+
+## Alternatives considered
+
+- **Shape-matched fast paths** (hand-written code for common query shapes beside the DAG). Rejected: they need a second implementation of every shape kept in step with the DAG, and they cannot cover arbitrary roots. The data plane always executes the DAG; speed comes from the columnar operator library.
+- **SDS inside ASAPPlanner.** Rejected: identity, deduplication, layout and eviction are deployment concerns. The Planner states only each output's computation, coverage and retention.
+- **Row-at-a-time execution.** Replaced: per-row values, clones, grouping keys and memory accounting dominated data-plane CPU, and the sketch kernels were a small fraction. All operators now work on Arrow column batches with state columns.
+- **The runtime deriving storage needs from the DAG.** Replaced by `stored_outputs`. The Planner already knows each output's materialization and retention, including range-evaluation spans, so the runtime reads them instead of re-deriving them.
 
 ## Merging with ASAPQuery
 
@@ -187,10 +282,29 @@ The merged runtime keeps ASAPQuery's low-overhead data path and the backend's si
 1. Replace ASAPQuery's planner and query-pattern execution paths with the backend's `InstallablePlan` installation and compiled DAG execution.
 2. Connect ASAPQuery's additional ingestion drivers, workload discovery, query tracking, runtime plan replacement, and deployment support to that execution path.
 3. Preserve summary identity, retention, and per-sample update semantics across the combined runtime, and validate answers against the Planner's reference execution.
-4. Extend measured-cost coverage and validate candidate executability. The latest cost-feedback PR still reports gaps in the cost model and an exact quantile candidate that falls back after executor validation fails.
+4. Extend measured-cost coverage to every operator the runtime pays for, so Stage 3's predictions match measured use.
 
-**Open decisions**
+## Open decisions
 
-- Pane retention. [#832](https://github.com/ProjectASAP/ASAPQuery-backend/pull/832) keeps ingestion-built panes for one extra pane width beyond the plan's retention to cover evaluations just behind the newest closed pane. Whether the Planner should model the deployment's evaluation delay explicitly remains a design question.
-- Idle shards. A shard that stops receiving samples no longer advances its watermark (the timestamp used to decide which panes can close). Its panes remain open unless the runtime closes them using elapsed wall-clock time; that mechanism is not implemented yet.
-- Whether to expose the local raw buffer as an explicit capability with a cost the Planner can compare, or keep it as a runtime choice whose effect is reflected in measured costs.
+- **Pane retention.** The runtime keeps ingestion-built panes for one extra pane width beyond the plan's retention, to cover evaluations just behind the newest closed pane. Whether the Planner should model the deployment's evaluation delay explicitly remains a design question.
+- **Idle shards.** A shard that stops receiving samples no longer advances its watermark (the timestamp used to decide which panes can close). Its panes remain open unless the runtime closes them using elapsed wall-clock time; that mechanism is not implemented yet.
+- **The local raw buffer.** Expose it as an explicit capability with a cost the Planner can compare, or keep it as a runtime choice whose effect is reflected in measured costs.
+- **Planner dependency weight.** `plan_installable` lives in `asap-planner`, which also builds the SQL and MetricsQL frontends. A PromQL-only runtime would benefit if those frontends were optional features.
+
+## Appendix: status and latest measurements
+
+**Status.** The backend runtime is a stack of pull requests in ASAPQuery-backend: control plane, SDS, precompute engine, query engine, correctness tests, kept query-time results, range queries, the installable-plan handoff, concurrency, per-sample ingestion, local raw windows, the columnar engine, series interning and cost feedback. They merge in that order after review. ASAPPlanner's columnar operator library is complete.
+
+**Latest reported performance.** This is the 90-minute benefit harness with Prometheus 3.5.0, four queries, and four CPU cores allocated to each service. `s10` and `s50` are the 1,000- and 5,000-series configurations. Prometheus alone was measured in the same session, and the backend setup's Prometheus still receives the samples.
+- **CPU** is core-seconds over the complete run; lower is better.
+- **Total CPU** includes both services.
+- **Peak RSS** is backend-only, not total system memory.
+
+| Configuration | Prometheus alone CPU | Backend CPU | Backend's Prometheus CPU | Total CPU | Backend peak RSS (GiB) | Forwarded evaluations |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| s10, raw retained | 18.9 | 11.2 | 8.6 | 19.8 | 0.04 | 90 |
+| s10, no raw retained | 19.9 | 19.4 | 6.3 | 25.7 | 0.34 | 5 |
+| s50, raw retained | 86.7 | 52.0 | 41.7 | 93.7 | 0.11 | 90 |
+| s50, no raw retained | 85.3 | 84.3 | 29.9 | 114.2 | 0.81 | 5 |
+
+In the raw-retained runs, the 90 forwarded evaluations are quantile queries whose selected exact plan the executor could not run at the time. The Planner now rejects such candidates and the executor runs exact per-series aggregates. Because forwarded work was done by Prometheus, the lower backend CPU and RSS in those runs partly reflect work done upstream. Combined CPU is above Prometheus alone in all four configurations, so these results do not yet establish a whole-system saving. All evaluations met their accuracy targets.
