@@ -15,16 +15,20 @@ flowchart TB
     PL[Call ASAPPlanner once] --> P[(InstallablePlan)]
   end
   subgraph DP[Data plane]
-    RW[Remote Write] --> PE[Precompute engine<br/>Update state per sample]
+    subgraph ING[Ingestion]
+      RW[Remote Write] --> PE[Precompute engine<br/>Update state per sample]
+    end
+    subgraph QUERY[Query execution]
+      Q[Planned query at T] --> QE[Query engine<br/>Execute the query's DAG root]
+      QE <--> PROM[Prometheus<br/>remote read, unplanned queries]
+    end
     PE -->|Store panes| SDS[(SDS<br/>Immutable stored panes)]
-    Q[Planned query at T] --> QE[Query engine<br/>Execute the query's DAG root]
     QE -->|Read stored panes| SDS
-    QE <--> PROM[Prometheus<br/>remote read, unplanned queries]
   end
 
   P -.-> PE
-  P -.-> SDS
   P -.-> QE
+  P -.-> SDS
 
   classDef input fill:#f8fafc,stroke:#64748b,color:#0f172a
   classDef engine fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
@@ -34,6 +38,8 @@ flowchart TB
   class P,SDS storage
   style CP fill:#f0f9ff,stroke:#0284c7,color:#0c4a6e
   style DP fill:#f8fafc,stroke:#64748b,color:#0f172a
+  style ING fill:#eff6ff,stroke:#93c5fd,color:#1e3a8a
+  style QUERY fill:#eff6ff,stroke:#93c5fd,color:#1e3a8a
 ```
 
 Dashed arrows show which data-plane components receive the installed plan; solid arrows show planning inputs and runtime operations. The precompute engine writes panes to SDS; the query engine reads them. A query's DAG root is the operator that produces its final answer. SDS stores immutable panes: states computed over bounded time intervals, which queries can reuse.
