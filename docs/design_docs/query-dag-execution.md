@@ -7,7 +7,7 @@ precomputation and query execution.
 
 ```mermaid
 flowchart LR
-    L["Logical Post-ASAP DAG"] -->|Candidate generation| M["Summary Maintenance Lifecycle"]
+    L["Logical Post-ASAP DAG"] -->|Candidate generation| M["Materialization (Stage 2) and retention (Stage 3)"]
     M -->|Physical Plan Compiler| P["Physical DAG candidates"]
     P -->|Backend selection and Deployment Plan Compiler| D["Deployment Plan / DAG"]
     D --> Pre["PrecomputePlan"]
@@ -21,7 +21,7 @@ This follows [Planner #462's architecture](https://github.com/ProjectASAP/ASAPPl
 | Layer | Responsibility |
 | --- | --- |
 | Logical Post-ASAP DAG | Computation semantics |
-| Summary Maintenance Lifecycle | Build, retention, reuse, and window strategy |
+| Materialization (Stage 2) and retention (Stage 3) | When each stored summary is built (ingestion or query time), how long it is kept, reuse, and window strategy; delivered to the runtime as `InstallablePlan.stored_outputs` |
 | Physical DAG(s) | Supported physical candidates, executable operators, and typed boundaries |
 | Deployment Plan / DAG | Selected candidate, concrete bindings, and operational lifecycle |
 
@@ -30,9 +30,8 @@ candidate using deployment statistics, resource limits and costs, then binds it
 into `PrecomputePlan` and `QueryPlan`. It preserves the candidate's operators,
 dependencies, sharing and materialization frontier.
 
-The lifecycle is a planning contract, not another computation IR. “Maintenance”
-here names Planner's lifecycle concept; input reception is ingestion and execution
-before a request is precomputation. Executing a bound Physical DAG introduces
+Materialization and retention are planning decisions, not another computation IR.
+Input reception is ingestion, and execution before a request is precomputation. Executing a bound Physical DAG introduces
 neither an **Execution DAG** abstraction nor another planning layer.
 
 ## 2. Ownership
@@ -77,7 +76,7 @@ for the broader architecture and DataFusion comparison.
 ## 3. Compilation and execution
 
 ```text
-Planner: Logical Post-ASAP DAG + lifecycle candidate
+Planner: Logical Post-ASAP DAG + materialization and retention
                     ↓ Physical Plan Compiler
          supported Physical DAG candidates
                     ↓ Backend selection and Deployment Plan Compiler
@@ -88,7 +87,7 @@ Planner: Logical Post-ASAP DAG + lifecycle candidate
 
 ### 3.1 Compile
 
-ASAPPlanner compiles semantically legal computation and lifecycle candidates
+ASAPPlanner compiles semantically legal computation and materialization candidates
 into supported Physical DAG candidates with typed input/output boundaries.
 Compilation does not require live storage readers. `CompiledPhysicalDag` is a
 Rust implementation type for physical compilation, not a separate architectural
@@ -304,7 +303,7 @@ operator combination has been tested.
 This design establishes the common execution path:
 
 ```text
-Logical Post-ASAP DAG + Summary Maintenance Lifecycle
+Logical Post-ASAP DAG + materialization and retention
     → Physical DAG candidates
     → Deployment Plan / DAG
     → execute bound Physical DAGs
