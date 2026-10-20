@@ -118,10 +118,7 @@ impl EngineHandle {
         let count = samples.len() as u64;
         let mut queued = self.queued_samples.load(Ordering::SeqCst);
         loop {
-            let total = queued
-                .checked_add(count)
-                .filter(|&total| total <= self.max_queued_samples)
-                .ok_or(IngestError::Busy)?;
+            let total = admit(queued, count, self.max_queued_samples)?;
             match self.queued_samples.compare_exchange(
                 queued,
                 total,
@@ -153,10 +150,26 @@ impl EngineHandle {
         *self.stats.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Stops the engine thread after the commands queued before; later
-    /// ingestion fails with [`IngestError::Stopped`].
+    /// For tests: stops the engine thread after the commands queued before.
+    /// Samples queued between this call and the stop are acknowledged and
+    /// then lost; ingestion after the stop fails with
+    /// [`IngestError::Stopped`].
+    #[doc(hidden)]
     pub fn stop(&self) {
         let _ = self.commands.send(Command::Stop);
+    }
+}
+
+/// The queue length after admitting `count` samples to a queue of
+/// `queued`: admitted while the total stays within `max_queued`, and always
+/// into an empty queue, so a bound smaller than one request cannot refuse
+/// that request forever.
+fn admit(queued: u64, count: u64, max_queued: u64) -> Result<u64, IngestError> {
+    let total = queued.checked_add(count).ok_or(IngestError::Busy)?;
+    if queued == 0 || total <= max_queued {
+        Ok(total)
+    } else {
+        Err(IngestError::Busy)
     }
 }
 
@@ -202,5 +215,33 @@ impl Engine {
             }
         }
         tracing::warn!("engine stopped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request is admitted while the queue stays within its bound, and
+    /// always into an empty queue; otherwise it is `Busy`.
+    #[test]
+    fn admission() {
+        assert_eq!(admit(0, 3, 2), Ok(3));
+        assert_eq!(admit(1, 1, 2), Ok(2));
+        assert_eq!(admit(1, 2, 2), Err(IngestError::Busy));
+        assert_eq!(admit(u64::MAX, 1, u64::MAX), Err(IngestError::Busy));
+    }
+
+    /// The running flag clears when the engine thread panics.
+    #[test]
+    fn running_guard_clears_on_panic() {
+        let running = Arc::new(AtomicBool::new(true));
+        let guard = RunningGuard(running.clone());
+        let thread = std::thread::spawn(move || {
+            let _guard = guard;
+            panic!("engine bug");
+        });
+        assert!(thread.join().is_err());
+        assert!(!running.load(Ordering::SeqCst));
     }
 }

@@ -285,10 +285,10 @@ async fn get_json(app: &Router, path: &str) -> (StatusCode, serde_json::Value) {
     (status, serde_json::from_str(&body).unwrap_or_default())
 }
 
-/// Remote Write that would queue more samples than `max_queued_samples` gets
-/// 503 and is not counted; a request that fits is accepted.
+/// A request larger than `max_queued_samples` is still admitted when nothing
+/// is queued, so a small queue bound cannot refuse a large request forever.
 #[tokio::test]
-async fn refuses_remote_write_beyond_the_sample_queue() {
+async fn admits_a_large_request_into_an_empty_queue() {
     let options = EngineOptions {
         max_queued_samples: 2,
         ..EngineOptions::default()
@@ -302,10 +302,24 @@ async fn refuses_remote_write_beyond_the_sample_queue() {
         .unwrap(),
     );
     let app = router(state.clone());
-    assert_eq!(write(&app, 3).await, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(state.samples.load(Ordering::Relaxed), 0);
-    assert_eq!(write(&app, 2).await, StatusCode::NO_CONTENT);
-    assert_eq!(state.samples.load(Ordering::Relaxed), 2);
+    assert_eq!(write(&app, 3).await, StatusCode::NO_CONTENT);
+    assert_eq!(state.samples.load(Ordering::Relaxed), 3);
+}
+
+/// A Remote Write request without samples is accepted and not queued.
+#[tokio::test]
+async fn does_not_queue_empty_requests() {
+    let state = data_plane("http://unused".into());
+    let app = router(state.clone());
+    state.engine.stop();
+    for _ in 0..200 {
+        if !state.engine.is_running() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // A stopped engine refuses samples, but there is nothing to refuse.
+    assert_eq!(write(&app, 0).await, StatusCode::NO_CONTENT);
 }
 
 /// Once the engine thread has stopped, Remote Write gets 500 instead of a

@@ -288,3 +288,34 @@ fn stale_markers_are_not_samples() {
     ]);
     assert_eq!(engine.store.get(&id, 2 * PANE).unwrap().num_rows(), 1);
 }
+
+/// One series stamped ahead of the wall clock, though within
+/// `max_future_ms`, does not close panes early: the watermark is bounded by
+/// the wall clock, so an on-time sample of the open pane is still accepted.
+#[test]
+fn series_ahead_of_the_clock_does_not_close_panes_early() {
+    let (mut engine, sds) = precompute_with(common::plan("example4b", false), 15_000);
+    let id = sds.definitions.keys().next().unwrap().clone();
+    let base = PANE;
+    // Opens the skipped first pane (0, 10 min].
+    engine.ingest_at(&[sample("latency_ms", "a", MINUTE, 1.0)], MINUTE);
+    let now = base + 9 * MINUTE;
+    engine.ingest_at(&[sample("latency_ms", "b", base + 13 * MINUTE, 1.0)], now);
+    assert!(
+        engine.store.get(&id, base + PANE).is_none(),
+        "(10, 20 min] still open"
+    );
+    engine.ingest_at(&[sample("latency_ms", "a", base + 9 * MINUTE, 1.0)], now);
+    assert_eq!(engine.stats.samples_dropped_late, 0);
+    assert_eq!(engine.stats.samples_accepted, 2);
+}
+
+/// A far-future sample of a metric no definition reads is unrouted, not
+/// dropped as future.
+#[test]
+fn far_future_unrouted_sample_counts_as_unrouted() {
+    let (mut engine, _) = precompute(common::plan("example4b", false));
+    engine.ingest_at(&[sample("other_metric", "a", 30 * DAY, 1.0)], 0);
+    assert_eq!(engine.stats.samples_unrouted, 1);
+    assert_eq!(engine.stats.samples_dropped_future, 0);
+}

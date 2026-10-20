@@ -124,6 +124,9 @@ async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
                 }));
             }
             let count = samples.len() as u64;
+            if count == 0 {
+                return StatusCode::NO_CONTENT.into_response();
+            }
             match state.engine.try_ingest(samples) {
                 Ok(()) => {
                     state.samples.fetch_add(count, Ordering::Relaxed);

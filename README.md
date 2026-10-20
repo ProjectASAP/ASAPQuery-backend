@@ -37,11 +37,12 @@ The backend is being rebuilt on the Planner's physical DAG:
 | Query engine: run query-time nodes over stored panes and raw data | planned |
 
 Panes close `--allowed-lateness-ms` (default 15 s) after the newest sample
-of a stored summary's metric passes their end; later samples for them are
+of a stored summary's metric, capped at the wall clock, passes their end; later samples for them are
 dropped. The first pane after startup is skipped because it may be partial.
 Samples more than `--max-future-ms` (default 5 min) ahead of the wall clock
-are dropped. Remote Write gets 503 while more than `--max-queued-samples`
-(default 2,000,000) samples wait for the engine, and 500 if the engine has
+are dropped. Remote Write gets 503 when admitting it would leave more than
+`--max-queued-samples` (default 2,000,000) samples waiting for the engine
+(a request into an empty queue is always admitted), and 500 if the engine has
 stopped, which also makes `/-/ready` fail. `/api/v1/status/asap` reports the
 engine's sample and pane counters as JSON.
 

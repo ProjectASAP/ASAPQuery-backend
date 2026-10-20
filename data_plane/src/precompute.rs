@@ -124,6 +124,10 @@ pub struct Precompute {
     allowed_lateness_ms: i64,
     max_future_ms: i64,
     newest_sample_ms: Option<i64>,
+    /// The newest wall-clock time an ingest ran at: the watermark never
+    /// passes it, so a series stamped ahead of the others cannot close
+    /// panes early.
+    newest_clock_ms: Option<i64>,
     pub store: SummaryStore<Batch>,
     pub stats: PrecomputeStats,
 }
@@ -172,7 +176,7 @@ impl Precompute {
                 .max()
                 .unwrap_or(0);
             let retention_ms = max_offset
-                .checked_add(2 * definition.pane_ms)
+                .checked_add(definition.pane_ms.saturating_mul(2))
                 .ok_or_else(|| error("retention overflows".into()))?;
             builders.push(Builder {
                 definition: definition.clone(),
@@ -191,15 +195,21 @@ impl Precompute {
             allowed_lateness_ms: millis(options.allowed_lateness_ms),
             max_future_ms: millis(options.max_future_ms),
             newest_sample_ms: None,
+            newest_clock_ms: None,
             store: SummaryStore::new(),
             stats: PrecomputeStats::default(),
         })
     }
 
-    /// The watermark: no sample older than this is expected any more.
+    /// The watermark: no sample older than this is expected any more. It is
+    /// the newest routed sample, capped at the wall clock, minus the allowed
+    /// lateness.
     pub fn watermark_ms(&self) -> Option<i64> {
-        self.newest_sample_ms
-            .map(|newest| newest.saturating_sub(self.allowed_lateness_ms))
+        let newest = match self.newest_clock_ms {
+            Some(clock) => self.newest_sample_ms?.min(clock),
+            None => self.newest_sample_ms?,
+        };
+        Some(newest.saturating_sub(self.allowed_lateness_ms))
     }
 
     /// [`Self::ingest_at`] the current wall-clock time.
@@ -214,13 +224,22 @@ impl Precompute {
     /// watermark has passed. `now_ms` is the wall-clock time that bounds
     /// sample times from above.
     pub fn ingest_at(&mut self, samples: &[RawSample], now_ms: i64) {
+        self.newest_clock_ms = self.newest_clock_ms.max(Some(now_ms));
         let latest_allowed_ms = now_ms.saturating_add(self.max_future_ms);
         for sample in samples {
+            let metric = sample.labels.get("__name__").map(String::as_str);
+            if !self
+                .builders
+                .iter()
+                .any(|b| metric == Some(b.selector.metric()))
+            {
+                self.stats.samples_unrouted += 1;
+                continue;
+            }
             if sample.timestamp_ms > latest_allowed_ms {
                 self.stats.samples_dropped_future += 1;
                 continue;
             }
-            let metric = sample.labels.get("__name__").map(String::as_str);
             let mut outcome: Option<Outcome> = None;
             for builder in &mut self.builders {
                 if metric != Some(builder.selector.metric()) {
