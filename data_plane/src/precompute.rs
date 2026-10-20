@@ -208,6 +208,9 @@ pub struct Precompute {
     /// passes it, so a series stamped ahead of the others cannot close
     /// panes early.
     newest_clock_ms: Option<i64>,
+    /// The newest event-time barrier a producer declared: every pane ending
+    /// at or before it is closed.
+    barrier_ms: Option<i64>,
     pub store: SummaryStore<Batch>,
     pub stats: PrecomputeStats,
 }
@@ -260,6 +263,7 @@ impl Precompute {
             max_future_ms: millis(options.max_future_ms),
             newest_sample_ms: None,
             newest_clock_ms: None,
+            barrier_ms: None,
             store: SummaryStore::new(),
             stats: PrecomputeStats::default(),
         })
@@ -280,21 +284,42 @@ impl Precompute {
 
     /// The watermark: no sample older than this is expected any more. It is
     /// the newest routed sample, capped at the wall clock, minus the allowed
-    /// lateness.
+    /// lateness, or the newest barrier if that is later.
     pub fn watermark_ms(&self) -> Option<i64> {
         let newest = match self.newest_clock_ms {
-            Some(clock) => self.newest_sample_ms?.min(clock),
-            None => self.newest_sample_ms?,
+            Some(clock) => self.newest_sample_ms.map(|newest| newest.min(clock)),
+            None => self.newest_sample_ms,
         };
-        Some(newest.saturating_sub(self.allowed_lateness_ms))
+        let from_samples = newest.map(|newest| newest.saturating_sub(self.allowed_lateness_ms));
+        from_samples.max(self.barrier_ms)
+    }
+
+    /// [`Self::advance_watermark_at`] the current wall-clock time.
+    pub fn advance_watermark(&mut self, barrier_ms: i64) -> i64 {
+        self.advance_watermark_at(barrier_ms, wall_clock_ms())
+    }
+
+    /// An event-time barrier: the producer states that every sample at or
+    /// before `barrier_ms` has been written. Closes every pane with
+    /// `end <= barrier_ms` (panes are `(end - width, end]`), so a pane whose
+    /// series stopped sending closes without a later sample. The barrier is
+    /// capped at `now_ms`; a repeated or lower barrier does nothing. A sample
+    /// that arrives later for a pane the barrier closed counts as late.
+    /// Returns the barrier in force.
+    pub fn advance_watermark_at(&mut self, barrier_ms: i64, now_ms: i64) -> i64 {
+        self.newest_clock_ms = self.newest_clock_ms.max(Some(now_ms));
+        let barrier_ms = barrier_ms.min(now_ms);
+        if self.barrier_ms.is_some_and(|current| current >= barrier_ms) {
+            return self.barrier_ms.unwrap_or(barrier_ms);
+        }
+        self.barrier_ms = Some(barrier_ms);
+        self.close_panes();
+        barrier_ms
     }
 
     /// [`Self::ingest_at`] the current wall-clock time.
     pub fn ingest(&mut self, samples: &[RawSample]) {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
-        self.ingest_at(samples, now_ms);
+        self.ingest_at(samples, wall_clock_ms());
     }
 
     /// Buffers `samples` into their panes, then builds every pane the
@@ -419,6 +444,13 @@ impl Precompute {
                 .evict_before(id, Selection::ending_at(oldest_kept_end));
         }
     }
+}
+
+/// Milliseconds since the Unix epoch.
+fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// End of the tumbling pane of width `pane_ms` that contains `timestamp_ms`,

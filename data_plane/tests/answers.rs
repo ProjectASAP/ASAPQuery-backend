@@ -391,3 +391,105 @@ async fn rejects_evaluation_times_out_of_range() {
     }
     assert!(state.engine.is_running());
 }
+
+/// After a producer's event-time barrier, the last pane of a series that
+/// stopped sending is closed, and the planned query is served from the
+/// plan instead of forwarded. Input stays open.
+#[tokio::test]
+async fn barrier_serves_the_window_of_a_stopped_series() {
+    let state = Arc::new(
+        DataPlane::new(
+            common::plan_json("example4b", false),
+            fake_prometheus(vec![]).await,
+            15_000,
+        )
+        .unwrap(),
+    );
+    let app = router(state.clone());
+    let write = |from: i64, to: i64| {
+        let request = WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![
+                    Label {
+                        name: "__name__".into(),
+                        value: "latency_ms".into(),
+                    },
+                    Label {
+                        name: "job".into(),
+                        value: "a".into(),
+                    },
+                ],
+                samples: (from..to)
+                    .step_by(15_000)
+                    .map(|t| Sample {
+                        timestamp: t,
+                        value: (t / 15_000 % 240) as f64,
+                    })
+                    .collect(),
+            }],
+        };
+        Request::post("/api/v1/write")
+            .body(Body::from(encode(&request)))
+            .unwrap()
+    };
+    let written = app
+        .clone()
+        .oneshot(write(MINUTE, 70 * MINUTE))
+        .await
+        .unwrap();
+    assert_eq!(written.status(), StatusCode::NO_CONTENT);
+    let query = "quantile_over_time(0.99, latency_ms[60m])";
+    // The series stopped at 69:45; with 15 s lateness (60, 70 min] is open.
+    let response = instant(&app, query, 70 * MINUTE).await;
+    assert_eq!(response.execution.as_deref(), Some("forwarded"));
+
+    let barrier = app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/precompute/watermark?time_ms={}",
+                70 * MINUTE
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(barrier.status(), StatusCode::OK);
+    let body = barrier.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["barrier_ms"], 70 * MINUTE, "{body}");
+    let response = instant(&app, query, 70 * MINUTE).await;
+    assert_eq!(
+        response.execution.as_deref(),
+        Some("plan"),
+        "{:?}",
+        response.body
+    );
+
+    let written = app
+        .clone()
+        .oneshot(write(70 * MINUTE + 15_000, 72 * MINUTE))
+        .await
+        .unwrap();
+    assert_eq!(written.status(), StatusCode::NO_CONTENT, "input stays open");
+    for uri in [
+        "/api/v1/precompute/watermark",
+        "/api/v1/precompute/watermark?time_ms=soon",
+        "/api/v1/precompute/watermark?time_ms=1.5",
+    ] {
+        let bad = app
+            .clone()
+            .oneshot(Request::post(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST, "{uri}");
+        let body = bad.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["errorType"], "bad_data", "{uri}");
+        assert!(
+            body["error"].as_str().unwrap().contains("time_ms"),
+            "{uri}: {body}"
+        );
+    }
+}

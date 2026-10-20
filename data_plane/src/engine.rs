@@ -53,6 +53,10 @@ enum Command {
         raw: BTreeMap<u64, Vec<RawSample>>,
         reply: Reply<Vec<ResultSample>>,
     },
+    AdvanceWatermark {
+        barrier_ms: i64,
+        reply: tokio::sync::oneshot::Sender<i64>,
+    },
     Stop,
 }
 
@@ -216,6 +220,21 @@ impl EngineHandle {
         *self.stats.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Queues an event-time barrier behind every write already acknowledged
+    /// and waits until it has run: every pane ending at or before
+    /// `barrier_ms` (capped at the wall clock) is then closed. Returns the
+    /// barrier in force; see [`Precompute::advance_watermark_at`].
+    pub async fn advance_watermark(&self, barrier_ms: i64) -> Result<i64, IngestError> {
+        if !self.is_running() {
+            return Err(IngestError::Stopped);
+        }
+        let (reply, done) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(Command::AdvanceWatermark { barrier_ms, reply })
+            .map_err(|_| IngestError::Stopped)?;
+        done.await.map_err(|_| IngestError::Stopped)
+    }
+
     /// For tests: stops the engine thread after the commands queued before.
     /// Samples queued between this call and the stop are acknowledged and
     /// then lost; ingestion after the stop fails with
@@ -311,6 +330,11 @@ impl Engine {
                     *shared.kept_stats.lock().unwrap_or_else(|e| e.into_inner()) =
                         self.query.kept_stats;
                     let _ = reply.send(answer);
+                }
+                Command::AdvanceWatermark { barrier_ms, reply } => {
+                    let barrier_ms = self.precompute.advance_watermark(barrier_ms);
+                    *shared.stats.lock().unwrap_or_else(|e| e.into_inner()) = self.precompute.stats;
+                    let _ = reply.send(barrier_ms);
                 }
                 Command::Stop => break,
             }
