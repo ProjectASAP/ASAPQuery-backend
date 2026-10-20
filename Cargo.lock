@@ -85,7 +85,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 [[package]]
 name = "asap-frontend-common"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=58999df294fc9b0326341c1f20be62ecc8c2975e#58999df294fc9b0326341c1f20be62ecc8c2975e"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=f9dd41e095997fe2c34c1a1278f9f20c50a814ff#f9dd41e095997fe2c34c1a1278f9f20c50a814ff"
 dependencies = [
  "asap-types",
  "serde",
@@ -95,7 +95,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-promql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=58999df294fc9b0326341c1f20be62ecc8c2975e#58999df294fc9b0326341c1f20be62ecc8c2975e"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=f9dd41e095997fe2c34c1a1278f9f20c50a814ff#f9dd41e095997fe2c34c1a1278f9f20c50a814ff"
 dependencies = [
  "asap-frontend-common",
  "asap-types",
@@ -105,7 +105,7 @@ dependencies = [
 [[package]]
 name = "asap-logical-asap-optimization"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=58999df294fc9b0326341c1f20be62ecc8c2975e#58999df294fc9b0326341c1f20be62ecc8c2975e"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=f9dd41e095997fe2c34c1a1278f9f20c50a814ff#f9dd41e095997fe2c34c1a1278f9f20c50a814ff"
 dependencies = [
  "asap-types",
  "asap_sketchlib",
@@ -117,7 +117,7 @@ dependencies = [
 [[package]]
 name = "asap-physical-asap-optimization"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=58999df294fc9b0326341c1f20be62ecc8c2975e#58999df294fc9b0326341c1f20be62ecc8c2975e"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=f9dd41e095997fe2c34c1a1278f9f20c50a814ff#f9dd41e095997fe2c34c1a1278f9f20c50a814ff"
 dependencies = [
  "asap-logical-asap-optimization",
  "asap-types",
@@ -127,7 +127,7 @@ dependencies = [
 [[package]]
 name = "asap-plan-selection"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=58999df294fc9b0326341c1f20be62ecc8c2975e#58999df294fc9b0326341c1f20be62ecc8c2975e"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=f9dd41e095997fe2c34c1a1278f9f20c50a814ff#f9dd41e095997fe2c34c1a1278f9f20c50a814ff"
 dependencies = [
  "asap-logical-asap-optimization",
  "asap-physical-asap-optimization",
@@ -141,7 +141,7 @@ dependencies = [
 [[package]]
 name = "asap-types"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=58999df294fc9b0326341c1f20be62ecc8c2975e#58999df294fc9b0326341c1f20be62ecc8c2975e"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=f9dd41e095997fe2c34c1a1278f9f20c50a814ff#f9dd41e095997fe2c34c1a1278f9f20c50a814ff"
 dependencies = [
  "serde",
  "serde_json",
