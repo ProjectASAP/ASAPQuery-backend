@@ -1,15 +1,3 @@
 target/
-experiment_outputs/
-asap-quickstart/bin/
-
-# Runtime and generated files
-metadata/
-preprocessed_configs/
-status
-uuid
-/store/
-
+__pycache__/
 .claude/
-
-# Generated evaluation archives stay outside version control.
-/docs/evaluation/**/*.gz

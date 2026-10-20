@@ -1,9 +1,0 @@
-target/
-.git/
-.gitignore
-README.md
-data/
-*.csv
-*.gz
-docker_compose_frames/
-scripts/

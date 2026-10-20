@@ -11,8 +11,8 @@ The updater uses this token to create its PR so GitHub triggers `MVP CI`.
 The merge workflow uses the repository's `GITHUB_TOKEN` and does not require
 GitHub's optional auto-merge feature to be enabled.
 
-MVP CI uses `--locked` and runs the workspace checks, Clippy, unit tests, and
-process E2E tests. Only a successful run for the current update PR head can
+MVP CI uses `--locked` and runs the updater tests, formatting, the workspace
+check, Clippy and the workspace tests. Only a successful run for the current update PR head can
 trigger the merge workflow; it also verifies the repository, branch, base, and
 that main has not advanced since that run and only the two Cargo files changed. Branch protection remains in force.
 Failed updates stay open and main retains its last verified version. Fix an
@@ -27,5 +27,5 @@ python3 -m unittest discover -s scripts/ci -p 'test_*.py'
 node scripts/ci/test_planner_merge.js
 ```
 
-The sync script and scheduled workflow are shared with PR #765, at the same paths
-and with the same automation branch; there is only one updater.
+There is one updater: this script, the scheduled workflow and the
+`automation/sync-asapplanner-main` branch.

@@ -1,18 +1,40 @@
 """Exercise the shared sync script without accessing GitHub or Cargo registries."""
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
 
-SCRIPT = Path(__file__).resolve().parents[1] / "sync-asapplanner-main.sh"
+REPO = Path(__file__).resolve().parents[2]
+SCRIPT = REPO / "scripts" / "sync-asapplanner-main.sh"
+
+# Like `cargo update -p`, the fake cargo exits 101 when a package spec
+# (`name` or `name@version`) is absent from the Cargo.lock in its directory.
+FAKE_CARGO = """#!/usr/bin/env python3
+import os, re, sys
+args = sys.argv[1:]
+with open('cargo-args', 'w') as out:
+    out.write(''.join(arg + '\\n' for arg in args))
+lock = open('Cargo.lock').read()
+locked = set(re.findall(r'name = "([^"]+)"\\nversion = "([^"]+)"', lock))
+for flag, spec in zip(args, args[1:]):
+    if flag != '-p':
+        continue
+    name, _, version = spec.partition('@')
+    if not any(n == name and (not version or v == version) for n, v in locked):
+        sys.stderr.write(f'error: package ID specification `{spec}` did not match any packages\\n')
+        sys.exit(101)
+sys.exit(int(os.environ['TEST_CARGO_STATUS']))
+"""
 
 
 class PlannerSyncTests(unittest.TestCase):
     revision = "a" * 40
     manifest = ''.join(
         f'{name} = {{ git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "{"b" * 40}" }}\n'
-        for name in ['planner-types', 'asap-aware-mapping', 'asap-frontend-promql', 'asap-frontend-sql']
+        for name in ['planner-types', 'asap-frontend-promql', 'asap-logical-asap-optimization',
+                     'asap-plan-selection']
     )
 
     def run_sync(self, manifest, revision=None, cargo_status=0):
@@ -20,8 +42,9 @@ class PlannerSyncTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         root = Path(temp.name)
         (root / 'Cargo.toml').write_text(manifest)
+        shutil.copy(REPO / 'Cargo.lock', root / 'Cargo.lock')
         (root / 'git').write_text('#!/bin/sh\nprintf "%s refs/heads/main\\n" "$TEST_REV"\n')
-        (root / 'cargo').write_text('#!/bin/sh\nprintf "%s\\n" "$@" > cargo-args\nexit "$TEST_CARGO_STATUS"\n')
+        (root / 'cargo').write_text(FAKE_CARGO)
         for name in ['git', 'cargo']:
             (root / name).chmod(0o755)
         env = dict(os.environ, PATH=f'{root}:{os.environ["PATH"]}',
@@ -39,8 +62,17 @@ class PlannerSyncTests(unittest.TestCase):
         self.assertEqual(updated.count(f'rev = "{self.revision}"'), 4)
         self.assertTrue(updated.endswith(other))
         self.assertEqual((root / 'cargo-args').read_text().splitlines(), [
-            'update', '-p', 'asap-types@0.1.0', '-p', 'asap-aware-mapping',
-            '-p', 'asap-frontend-promql', '-p', 'asap-frontend-sql', '--precise', self.revision])
+            'update', '-p', 'asap-types@0.1.0', '-p', 'asap-frontend-promql',
+            '-p', 'asap-logical-asap-optimization', '-p', 'asap-plan-selection',
+            '--precise', self.revision])
+
+    def test_repository_manifest_updates_only_locked_packages(self):
+        """Every pin in the real Cargo.toml is rewritten and every `-p` names a locked package."""
+        manifest = (REPO / 'Cargo.toml').read_text()
+        root, result = self.run_sync(manifest)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        updated = (root / 'Cargo.toml').read_text()
+        self.assertNotRegex(updated, r'ASAPPlanner", rev = "(?!' + self.revision + ')')
 
     def test_invalid_revision_does_not_mutate_manifest(self):
         """An upstream lookup failure cannot produce a malformed pin."""
