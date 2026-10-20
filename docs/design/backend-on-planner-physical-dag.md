@@ -157,14 +157,32 @@ The Planner specifies **which summaries to compute and retain**. The operator li
 
 ### Stored summaries (SDS)
 
-SDS holds every summary the plan stores, and nothing else.
+SDS holds every summary the plan stores, and nothing else. It is the runtime half of the summary model in ASAPPlanner's [Schema and Physical Data for ASAP Primitives](https://github.com/ProjectASAP/ASAPPlanner/blob/main/docs/design_docs/proposals/asap-primitive-schema.md). That document defines what a summary state means. Its §4.3 leaves to the runtime how a summary's definition and selection are stored. This section specifies that.
 
-- **Definitions.** Each stored output in `stored_outputs` maps to one summary definition. A definition's identity is a hash of the sub-DAG that builds it: payloads and schemas, with offset-only `TimeShift`s removed. Outputs that differ only in time offset therefore share one definition. For example, six 10-minute KLL panes read at offsets 0 to 50 minutes are one definition.
-- **Keys.** Summaries are keyed by (definition, end of their time coverage). A time-bounded summary covers the left-open interval `(end − width, end]`; a pane is the case built directly from raw samples.
-- **Kinds.** Any output the plan stores: time panes, rollups over time ranges, rollups across series, sliding-window summaries, and query-time results kept across evaluations. Each comes from `stored_outputs` with its inputs (raw samples or other stored outputs), its time coverage, its build phase and its retention.
-- **Immutability.** A summary never changes after insertion. It is shared by reference (`Arc`) and never copied.
-- **Retention.** Each definition is kept for the largest `retention_ms` among its outputs, which already includes range-evaluation spans. Older summaries are evicted per definition.
-- **Not read:** summary coverage. Reuse decisions were made by the Planner; SDS stores what the plan names.
+**Summary coverage.** In the Planner's IR, every summary node has a **coverage** with two parts (§4.2 of that document):
+
+| Part | Question | Example: `quantile_over_time(0.99, m{job="api"}[1m] offset 2m)` |
+| --- | --- | --- |
+| `definition` | *What* is computed: the sub-DAG below the `SummaryAgg` with the selected conditions taken out, the summary family and its parameters, the input column and the grouping | KLL(value) per series over `Scan m` |
+| `selection` | *Which rows* went in: value sets, value ranges, and time relative to the evaluation time | time `(−3m, −2m]`, `job ∈ {api}`, once label matchers below the window are lifted |
+
+The Planner derives coverage from the DAG; it is a property of the IR, not a deployment concept. SDS uses it as follows.
+
+- **Definition identity.** A summary definition is identified by the hash of its coverage `definition`, ignoring planning details (`timing`, `guarantee`). Two stored outputs with equal definitions are one SDS definition, whatever their time offsets or selected label values. Six 10-minute KLL panes read at offsets 0 to 50 minutes, for example, are one definition.
+- **Summary instances.** Each stored summary is one instance of a definition, keyed by its **concrete selection**: the selection with relative time bound to an absolute interval when the summary is built, `(end − width, end]` for a left-open window.
+  - A pane is an instance whose selection is one time interval.
+  - A rollup over a time range is an instance whose selection is the union of its inputs' intervals.
+  - A rollup across series keeps its definition's coarser grouping.
+  - Instances are immutable and shared by reference (`Arc`).
+- **Lookups.** A query binds each stored input at evaluation time `T`. It turns the input's relative selection into a concrete one and fetches the instance with that key.
+- **Reuse rules, from the coverage model.** These are the Planner's rules; SDS stores instances so that a plan which uses them can find them.
+  - Instances of one definition can be merged when their selections do not overlap (`SummaryMerge`). That is how panes form a window and how per-value summaries form a union.
+  - An instance can be sliced only on a grouping column, and rolled up to a coarser grouping only when its family allows it (§5.6).
+  - SDS never merges, slices or rolls up on its own. It stores and returns the instances the plan names.
+- **Kinds.** Any output the plan stores: time panes, rollups over time ranges, rollups across series, sliding-window summaries, and query-time results kept across evaluations. Each arrives in `stored_outputs` with its coverage, its inputs (raw samples or other stored outputs), its build phase and its retention.
+- **Retention.** Each definition is kept for the largest `retention_ms` among its outputs. That value already includes range-evaluation spans. Instances whose concrete time selection ends before that horizon are evicted.
+
+**Contract with the Planner.** `InstallablePlan.stored_outputs` should carry each output's coverage: definition identity and relative selection. Then SDS identity, keys and lookups follow the Planner's semantics, and the runtime does not re-derive them from the DAG. Today the plan describes only raw-sample panes, by their time window. Describing every stored summary with its coverage is tracked in ASAPPlanner #781 and backend #837.
 
 ### Precompute engine
 
