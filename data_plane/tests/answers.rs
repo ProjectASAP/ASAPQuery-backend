@@ -356,3 +356,38 @@ async fn raw_range_reads_forward_auth_and_tenancy_headers() {
         .unwrap()
         .contains("fetching raw samples"));
 }
+
+/// A planned query at a time Prometheus rejects (not finite, or beyond the
+/// millisecond range) gets 400 like Prometheus, and the engine keeps
+/// running.
+#[tokio::test]
+async fn rejects_evaluation_times_out_of_range() {
+    let state = Arc::new(
+        DataPlane::new(
+            common::plan_json("example4b", true),
+            fake_prometheus(vec![]).await,
+            0,
+        )
+        .unwrap(),
+    );
+    let app = router(state.clone());
+    for time in ["-1e300", "1e300", "NaN", "inf"] {
+        let uri = format!(
+            "/api/v1/query?{}",
+            form_urlencoded::Serializer::new(String::new())
+                .append_pair("query", "quantile_over_time(0.99, latency_ms[60m])")
+                .append_pair("time", time)
+                .finish()
+        );
+        let response = app
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "time={time}");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["errorType"], "bad_data", "time={time}");
+    }
+    assert!(state.engine.is_running());
+}

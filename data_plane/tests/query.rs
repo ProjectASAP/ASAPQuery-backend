@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use asap_planner::InstallablePlan;
 use data_plane::precompute::{Precompute, PrecomputeOptions, RawSample};
-use data_plane::query::{QueryEngine, RawRange, ResultSample, Unanswered};
+use data_plane::query::{LabelMatcher, MatchOp, QueryEngine, RawRange, ResultSample, Unanswered};
 use data_plane::sds::Sds;
 
 const MINUTE: i64 = 60_000;
@@ -214,4 +214,100 @@ fn reports_what_it_cannot_answer() {
         f.query.raw_ranges(P99, 60 * MINUTE, store),
         Err(Unanswered::MissingPane(_))
     ));
+}
+
+/// Evaluation times at the ends of `i64` are not answered and do not panic:
+/// binding a window or pane to them would overflow.
+#[test]
+fn extreme_evaluation_times_are_not_answered() {
+    let f = fixture(common::plan("example4b", true));
+    for time_ms in [i64::MIN, i64::MIN + 1] {
+        assert!(matches!(
+            f.query.raw_ranges(P99, time_ms, &f.precompute.store),
+            Err(Unanswered::Unsupported(_))
+        ));
+    }
+    // The window ending at `i64::MAX` fits; binding it does not panic.
+    assert!(f
+        .query
+        .raw_ranges(P99, i64::MAX, &f.precompute.store)
+        .is_ok());
+    let panes = fixture(common::plan("example4b", false));
+    assert!(matches!(
+        panes
+            .query
+            .raw_ranges(P99, i64::MIN, &panes.precompute.store),
+        Err(Unanswered::Unsupported(_))
+    ));
+}
+
+/// Every query of examples 1, 3b and 4b, with and without raw data, answers
+/// exactly like the Planner's query-time reference for the same plan
+/// (nothing materialized) over the same samples.
+#[test]
+fn examples_answer_like_the_query_time_reference() {
+    let series: &[(&str, &[(&str, &str)])] = &[
+        ("latency_ms", &[("job", "a")]),
+        ("latency_ms", &[("job", "b")]),
+        ("http_requests_total", &[("job", "a"), ("instance", "1")]),
+        ("http_requests_total", &[("job", "a"), ("instance", "2")]),
+        ("http_requests_total", &[("job", "b"), ("instance", "1")]),
+    ];
+    // Samples through 70:45: the newest closed pane of every example ends
+    // at 70 min, the evaluation time.
+    let all = samples(series, MINUTE, 71 * MINUTE, |i, t| {
+        (i * 1000) as f64 + ((t / 15_000) % 240) as f64
+    });
+    for (example, raw) in [
+        ("example1", true),
+        ("example3b", true),
+        ("example3b", false),
+        ("example4b", true),
+        ("example4b", false),
+    ] {
+        let plan = common::plan(example, raw);
+        let reference = plan.query_time_reference().unwrap();
+        let mut installed = fixture(plan.clone());
+        installed.precompute.ingest(&all);
+        let by_reference = fixture(reference);
+        for query in plan.queries.iter().map(|q| q.query.as_str()) {
+            let expected = answer(&by_reference, query, 70 * MINUTE, &all);
+            assert!(!expected.is_empty(), "{example} raw={raw} {query}");
+            assert_eq!(
+                answer(&installed, query, 70 * MINUTE, &all),
+                expected,
+                "{example} raw={raw} {query}"
+            );
+        }
+    }
+}
+
+/// A raw window's label matchers go into the fetch, so Prometheus returns
+/// only the series the plan keeps.
+#[test]
+fn raw_ranges_carry_the_scans_label_matchers() {
+    let mut workload = common::workload("example4b");
+    workload.query_workload.repeating_queries.as_mut().unwrap()[0].query =
+        asap_executor::planner::workload::Query(
+            "quantile_over_time(0.99, latency_ms{job=\"a\"}[60m])".into(),
+        );
+    let plan = control_plane::plan_workload(&workload, &common::inputs(true)).unwrap();
+    let f = fixture(plan);
+    let (_, ranges) = f
+        .query
+        .raw_ranges(
+            "quantile_over_time(0.99, latency_ms{job=\"a\"}[60m])",
+            70 * MINUTE,
+            &f.precompute.store,
+        )
+        .unwrap();
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(
+        ranges[0].matchers,
+        vec![LabelMatcher {
+            name: "job".into(),
+            op: MatchOp::Equal,
+            value: "a".into(),
+        }]
+    );
 }

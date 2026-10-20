@@ -17,8 +17,9 @@ use std::sync::Arc;
 use asap_executor::operators::Operator;
 use asap_executor::physical_planner::{compile, CompiledPhysicalDAG, InputContract, Source};
 use asap_executor::planner::ir::physical_export::{PhysicalASAPDAG, RawSampleWindow};
+use asap_executor::planner::ir::scalar::{CompareOpKind, ScalarValue};
 use asap_executor::planner::ir::schema::{DataType, FieldDataType, Schema};
-use asap_executor::planner::ir::{NonASAPOp, Operator as IrOperator};
+use asap_executor::planner::ir::{NonASAPOp, Operator as IrOperator, ScalarExpr};
 use asap_executor::runtime::Scope;
 use asap_executor::values::{Batch, SchemaRef, Value};
 use asap_executor::{series_labels_of_output_row, RawSampleSelector};
@@ -27,13 +28,50 @@ use asap_planner::InstallablePlan;
 use crate::precompute::{executor_samples, run_root, RawSample};
 use crate::sds::{DefinitionId, Sds, Selection, SummaryStore};
 
-/// Raw samples a query needs: `metric`'s samples in `(start_ms, end_ms]`.
+/// Raw samples a query needs: `metric`'s samples in `(start_ms, end_ms]`
+/// that `matchers` keep.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawRange {
     pub node: u64,
     pub metric: String,
+    /// The window's `Scan` label matchers that PromQL can express, so the
+    /// fetch reads only the series the plan keeps. The selector applies
+    /// every matcher again, so one left out only widens the fetch.
+    pub matchers: Vec<LabelMatcher>,
     pub start_ms: i64,
     pub end_ms: i64,
+}
+
+/// A PromQL label matcher: `name op "value"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelMatcher {
+    pub name: String,
+    pub op: MatchOp,
+    pub value: String,
+}
+
+/// A PromQL label matching operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchOp {
+    /// `=`
+    Equal,
+    /// `!=`
+    NotEqual,
+    /// `=~`
+    Regex,
+    /// `!~`
+    NotRegex,
+}
+
+impl MatchOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MatchOp::Equal => "=",
+            MatchOp::NotEqual => "!=",
+            MatchOp::Regex => "=~",
+            MatchOp::NotRegex => "!~",
+        }
+    }
 }
 
 /// One series of an instant-query result.
@@ -65,6 +103,7 @@ struct StoredInput {
 
 struct RawInput {
     node: u64,
+    matchers: Vec<LabelMatcher>,
     /// The plan's `Scan` label matchers over the range's samples.
     selector: RawSampleSelector,
     schema: SchemaRef,
@@ -118,13 +157,17 @@ impl QueryEngine {
         let ranges = program
             .raw
             .iter()
-            .map(|input| RawRange {
-                node: input.node,
-                metric: input.selector.metric().to_string(),
-                start_ms: time_ms - input.offset_ms - input.range_ms,
-                end_ms: time_ms - input.offset_ms,
+            .map(|input| {
+                let (start_ms, end_ms) = window(time_ms, input.offset_ms, input.range_ms)?;
+                Ok(RawRange {
+                    node: input.node,
+                    metric: input.selector.metric().to_string(),
+                    matchers: input.matchers.clone(),
+                    start_ms,
+                    end_ms,
+                })
             })
-            .collect();
+            .collect::<Result<_, Unanswered>>()?;
         Ok((root, ranges))
     }
 
@@ -157,7 +200,10 @@ impl QueryEngine {
             let samples = raw.get(&input.node).map(Vec::as_slice).unwrap_or_default();
             let rows = input
                 .selector
-                .window_batch(time_ms - input.offset_ms, &executor_samples(samples))
+                .window_batch(
+                    window(time_ms, input.offset_ms, input.range_ms)?.1,
+                    &executor_samples(samples),
+                )
                 .map_err(failed)?;
             let source = Operator::source(input.schema.clone(), vec![rows]).map_err(failed)?;
             sources.insert(input.node, Box::new(source));
@@ -181,13 +227,23 @@ impl QueryEngine {
     }
 }
 
+/// `(start, end]` of a window `width_ms` wide ending `offset_ms` before
+/// `time_ms`, or why it does not fit in `i64` milliseconds.
+fn window(time_ms: i64, offset_ms: i64, width_ms: i64) -> Result<(i64, i64), Unanswered> {
+    let out_of_range =
+        || Unanswered::Unsupported(format!("evaluation time {time_ms} ms is out of range"));
+    let end = time_ms.checked_sub(offset_ms).ok_or_else(out_of_range)?;
+    let start = end.checked_sub(width_ms).ok_or_else(out_of_range)?;
+    Ok((start, end))
+}
+
 /// The stored pane `input` reads at `time_ms`.
 fn pane<'a>(
     input: &StoredInput,
     time_ms: i64,
     store: &'a SummaryStore<Batch>,
 ) -> Result<&'a Batch, Unanswered> {
-    let end = time_ms - input.offset_ms;
+    let (_, end) = window(time_ms, input.offset_ms, input.pane_ms)?;
     if end.rem_euclid(input.pane_ms) != 0 {
         return Err(Unanswered::MissingPane(format!(
             "{time_ms} is not on the {} ms pane grid",
@@ -244,6 +300,7 @@ fn program(
                     RawSampleSelector::new(dag, window).map_err(|e| format!("node {id}: {e}"))?;
                 raw.push(RawInput {
                     node: id,
+                    matchers: label_matchers(dag, window.scan_node_id as u64),
                     selector,
                     schema: Arc::new(nodes[&id].output_schema.clone()),
                     range_ms: window.width_ms,
@@ -272,6 +329,55 @@ fn program(
         raw,
         output: nodes[&root].output_schema.clone(),
     })
+}
+
+/// The label matchers of the `Scan` at `scan` that PromQL can express: a
+/// label column compared (`=`, `!=`, `=~`, `!~`) with a text literal.
+/// Other predicates are left out of the fetch; the selector applies them.
+fn label_matchers(dag: &PhysicalASAPDAG, scan: u64) -> Vec<LabelMatcher> {
+    let Some(node) = dag.nodes.iter().find(|n| n.id as u64 == scan) else {
+        return Vec::new();
+    };
+    let IrOperator::NonASAP(NonASAPOp::Scan {
+        predicates, schema, ..
+    }) = &node.payload
+    else {
+        return Vec::new();
+    };
+    predicates
+        .iter()
+        .filter_map(|predicate| {
+            let ScalarExpr::Compare {
+                left, op, right, ..
+            } = &predicate.0
+            else {
+                return None;
+            };
+            let (ScalarExpr::Column(column), ScalarExpr::Literal(ScalarValue::Utf8(value))) =
+                (left.as_ref(), right.as_ref())
+            else {
+                return None;
+            };
+            let op = match op {
+                CompareOpKind::Eq => MatchOp::Equal,
+                CompareOpKind::Ne => MatchOp::NotEqual,
+                CompareOpKind::Regex => MatchOp::Regex,
+                CompareOpKind::NotRegex => MatchOp::NotRegex,
+                _ => return None,
+            };
+            let name = &schema.fields.get(*column)?.name;
+            // Only Prometheus label names; the series identity column and
+            // other derived columns are not labels.
+            let is_label = !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !name.starts_with(|c: char| c.is_ascii_digit());
+            is_label.then(|| LabelMatcher {
+                name: name.clone(),
+                op,
+                value: value.clone(),
+            })
+        })
+        .collect()
 }
 
 /// PromQL vector samples from result rows: labels from the series identity
