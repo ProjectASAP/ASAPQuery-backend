@@ -7,12 +7,10 @@ edition = "2021"
 version = "0.1.0"
 
 [workspace.dependencies]
-# Keep every Planner crate on the same immutable revision. Alias upstream
-# asap-types as planner-types to name its origin at use sites.
-planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "ecea897f78640c377ce1d80846156f330f62dee2" }
-asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "ecea897f78640c377ce1d80846156f330f62dee2" }
-asap-logical-asap-optimization = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "ecea897f78640c377ce1d80846156f330f62dee2" }
-asap-plan-selection = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "ecea897f78640c377ce1d80846156f330f62dee2" }
+# The backend depends on two Planner crates, at one immutable revision:
+# `asap-planner` to plan and `asap-executor` to execute. Planner IR types
+# are reached through `asap_executor::planner`.
+asap-planner = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "ecea897f78640c377ce1d80846156f330f62dee2" }
 asap-executor = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "ecea897f78640c377ce1d80846156f330f62dee2" }
 
 serde = { version = "1.0", features = ["derive"] }

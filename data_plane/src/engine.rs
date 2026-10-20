@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use control_plane::InstalledPlan;
+use asap_planner::InstallablePlan;
 
 use crate::precompute::{Precompute, PrecomputeOptions, PrecomputeStats, RawSample};
 use crate::sds::Sds;
@@ -185,20 +185,19 @@ struct Engine {
 
 impl Engine {
     fn new(plan_json: &str, options: PrecomputeOptions) -> anyhow::Result<(Self, Vec<String>)> {
-        let plan: InstalledPlan = serde_json::from_str(plan_json)?;
+        let plan: InstallablePlan = serde_json::from_str(plan_json)?;
         plan.validate()?;
-        let dag = plan.dag.dag;
-        let frontier = Sds::ingestion_frontier(&dag)?;
-        let sds = Sds::from_dag(&dag, &frontier)?;
+        let sds = Sds::from_plan(&plan)?;
         tracing::info!(
             definitions = sds.definitions.len(),
             outputs = sds.outputs.len(),
             "stored summaries"
         );
+        let queries = plan.queries.iter().map(|q| q.query.clone()).collect();
         let engine = Self {
-            precompute: Precompute::new(dag, &sds, options)?,
+            precompute: Precompute::new(plan.dag.dag, &sds, options)?,
         };
-        Ok((engine, plan.queries))
+        Ok((engine, queries))
     }
 
     fn serve(mut self, commands: Receiver<Command>, shared: Shared) {

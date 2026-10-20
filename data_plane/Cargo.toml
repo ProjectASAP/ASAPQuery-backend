@@ -4,8 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-control_plane.workspace = true
-planner-types.workspace = true
+asap-planner.workspace = true
 asap-executor.workspace = true
 sha2 = "0.10"
 serde.workspace = true
@@ -23,7 +22,6 @@ snap = "1.1"
 futures = "0.3"
 
 [dev-dependencies]
+control_plane.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-# The tests check the SDS's frontier against the executor's own.
-asap-executor = { workspace = true, features = ["test-support"] }
