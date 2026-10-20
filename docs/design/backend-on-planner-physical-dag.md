@@ -9,7 +9,7 @@ ASAPPlanner turns a query workload and the deployment's inputs into one physical
 **Repositories.** The backend's code lives in ASAPQuery-backend for now and later merges into ASAPQuery. ASAPPlanner stays a separate repository, used as a pinned library.
 
 ```mermaid
-flowchart LR
+flowchart TB
   W[Workload + deployment inputs] --> PL
   subgraph CP[Control plane]
     PL[Call ASAPPlanner once] --> P[(InstallablePlan)]
