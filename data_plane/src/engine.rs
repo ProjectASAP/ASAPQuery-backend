@@ -249,6 +249,18 @@ impl Engine {
             outputs = sds.outputs.len(),
             "stored summaries"
         );
+        let query_run = sds
+            .definitions
+            .values()
+            .filter(|d| d.built_at == asap_planner::StoredOutputBuild::QueryRun)
+            .count();
+        if query_run > 0 {
+            tracing::warn!(
+                definitions = query_run,
+                "the plan keeps query-run summaries, which this data plane does not build yet; \
+                 queries that read them are forwarded"
+            );
+        }
         let queries = plan.queries.iter().map(|q| q.query.clone()).collect();
         let query = QueryEngine::new(&plan, &sds);
         let engine = Self {
