@@ -337,3 +337,18 @@ fn does_not_build_query_run_summaries() {
     assert_eq!(engine.stats.panes_built, 0);
     assert_eq!(engine.stats.samples_unrouted, 180);
 }
+
+/// Retention is measured from the newest evaluation the stored panes can
+/// serve, the end of the newest closed pane, not from the watermark: with
+/// the watermark at 74:45 the newest closed pane ends at 70 min, and an
+/// evaluation at 70 min still reads the pane ending at 20 min.
+#[test]
+fn keeps_every_pane_the_newest_served_evaluation_reads() {
+    let (mut engine, sds) = precompute(common::plan("example4b", false));
+    let id = sds.definitions.keys().next().unwrap().clone();
+    engine.ingest(&samples("latency_ms", &["a"], MINUTE, 75 * MINUTE));
+    for end in (2..=7).map(|i| i * PANE) {
+        assert!(engine.store.get(&id, end).is_some(), "pane ending at {end}");
+    }
+    assert_eq!(engine.stats.panes_skipped_expired, 0);
+}

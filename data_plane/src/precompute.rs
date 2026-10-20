@@ -277,8 +277,11 @@ impl Precompute {
             };
             let pane_ms = builder.definition.pane_ms;
             let id = &builder.definition.id;
-            // Panes ending before this are no longer read: skip them.
-            let oldest_kept_end = builder.definition.oldest_kept_end_ms(watermark);
+            // The newest evaluation stored panes can serve is at the end of
+            // the newest closed pane; panes ending before the oldest one it
+            // reads are no longer read: skip them.
+            let newest_closed_end = watermark.div_euclid(pane_ms).saturating_mul(pane_ms);
+            let oldest_kept_end = builder.definition.oldest_kept_end_ms(newest_closed_end);
             let Some(mut end) = built.checked_add(pane_ms) else {
                 continue;
             };
