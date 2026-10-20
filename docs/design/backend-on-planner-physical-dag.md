@@ -1,9 +1,9 @@
 # ASAPQuery-backend on ASAPPlanner's physical DAG
 
-ASAPPlanner turns a query workload and deployment inputs (such as runtime capabilities, prices, and measured costs) into one physical execution plan: a directed acyclic graph (DAG) of operators. In the target architecture, ASAPQuery-backend installs that plan, ingests samples, maintains the states specified by the plan, and executes its operators to answer queries. The comparison below identifies which parts are implemented on the current `main` branches. This document covers three things:
+ASAPPlanner turns a query workload and deployment inputs (such as runtime capabilities, prices, and measured costs) into one physical execution plan: a directed acyclic graph (DAG) of operators. ASAPQuery-backend installs that plan, ingests samples, maintains the summaries specified by the plan, and executes its operators to answer queries. Here, backend means the latest runtime PR stack through [#835](https://github.com/ProjectASAP/ASAPQuery-backend/pull/835), at `3158464f`, including its base PRs; these changes are not all merged into `main`. This document covers three things:
 
 1. the boundary between ASAPPlanner and ASAPQuery-backend;
-2. how the current backend implementation compares with ASAPQuery;
+2. how the latest backend runtime PR stack compares with ASAPQuery;
 3. the key points for merging the backend into ASAPQuery.
 
 **Repositories.** The backend's code lives in ASAPQuery-backend for now and later merges into ASAPQuery. ASAPPlanner stays a separate repository, used as a library pinned to a specific revision.
@@ -12,7 +12,7 @@ ASAPPlanner turns a query workload and deployment inputs (such as runtime capabi
 flowchart TB
   W[Workload + deployment inputs] --> PL
   subgraph CP[Control plane]
-    PL[Call ASAPPlanner once] --> P[(InstalledPlan)]
+    PL[Call ASAPPlanner once] --> P[(InstallablePlan)]
   end
   subgraph DP[Data plane]
     subgraph ING[Ingestion]
@@ -63,14 +63,17 @@ ASAPPlanner decides **what to compute**, **whether to compute it during ingestio
 
 **Planning interface: workload and deployment models → executable plan**
 
-Once per installed workload, the backend control plane supplies the query workload and deployment inputs (capabilities, costs, and data facts) to ASAPPlanner. The Planner selects a physical DAG. The control plane packages that DAG and its query text into `InstalledPlan`, the backend's current installation contract.
+Once per installed workload, the backend control plane supplies the query workload and deployment inputs (capabilities, costs, and data facts) to `asap_planner::plan_installable`. The Planner returns `InstallablePlan`, which the backend saves and installs directly.
 
-| `InstalledPlan` field | Meaning for the backend |
+| Plan field | Role in the latest runtime PR stack |
 | --- | --- |
-| `dag` | The selected physical DAG, including its operators, dependencies, and query roots, with pane chains expanded. |
-| `queries` | Query text in the same order as the DAG roots, associating each query with the root that produces its answer. |
+| `dag` | The selected operators and their dependencies. |
+| `queries` | Identifies each planned query and the DAG root that answers it. |
+| `stored_outputs` | Tells SDS and the engines which summaries to retain, whether ingestion or query execution builds them, their time coverage, and their retention duration. |
+| `query_time_raw_windows` | Tells the runtime which raw-sample windows to fetch for query execution. The latest runtime reads this metadata to bind inputs and size its local raw buffer. |
+| `selection` | Optional metadata identifying the selected candidate and its estimated price per second. Used for logging and reporting, rather than query computation. |
 
-There are no separate `stored_outputs`, `query_time_raw_windows`, or `selection` fields in this contract. Summary definitions and raw-sample read requirements are derived from the DAG. Candidate selection details and estimated costs belong to planning reports rather than the runtime installation contract.
+The DAG describes the computation. The stored-output and raw-window metadata make its storage and input requirements explicit, so the backend does not reconstruct them by walking the DAG. Selection metadata describes the planning decision and is separate from the computation itself.
 
 **Runtime interface: samples and summaries → query answers**
 
@@ -95,21 +98,24 @@ The Planner specifies **which summaries to compute and retain**. The operator li
 
 ## ASAPQuery and ASAPQuery-backend compared
 
-This table compares the current `main` branches: ASAPQuery at `5f0f00a` and ASAPQuery-backend at `eabf5ef0`. The architecture above describes the intended backend; the table distinguishes that design from what is implemented today.
+This table compares ASAPQuery `main` at `5f0f00a` with the latest backend runtime PR stack through [#835](https://github.com/ProjectASAP/ASAPQuery-backend/pull/835) at `3158464f`. Backend capabilities below include the implementation in those open PRs.
 
 | Concern | ASAPQuery | ASAPQuery-backend |
 | --- | --- | --- |
-| Role | A query accelerator with ingestion, summary construction, query execution, and a drop-in deployment. | A control plane integrated with ASAPPlanner, plus a data-plane service whose execution path is still being built. |
-| Planning | Uses its own `asap-planner-rs` to plan supported query patterns. | Runs ASAPPlanner Stages 1–3 with deployment capabilities and cost inputs, then exports the selected physical DAG. |
-| Plan contract | Aggregation configurations consumed by the existing query engine. | `InstalledPlan`: the selected physical DAG and the query text corresponding to each DAG root. |
-| Query execution | Executes supported queries through `SimpleEngine` and forwards queries it cannot answer. | Currently forwards every query to Prometheus; execution of the installed DAG is not implemented. |
-| Ingestion | Builds summaries from incoming samples. | Accepts, validates, and counts Remote Write samples, then discards them; Prometheus must receive its own copy. Summary construction is not implemented. |
-| Summary storage | Uses the query engine's summary store to serve accelerated queries. | Defines summaries from ingestion-time DAG outputs and shares definitions across time offsets. Runtime summary storage and retrieval are not implemented. |
-| Retaining query-time summaries | Summaries are built during ingestion. | Currently declares that retaining query-time results across evaluations is unsupported and rejects plans requiring it. |
-| Query languages | Supports PromQL and SQL, with additional adapters. | The control plane currently accepts PromQL workloads only. |
-| Deployment | Provides quickstart and drop-in deployments for an existing Prometheus/Grafana stack. | Provides plan generation and a Prometheus-compatible HTTP service; the planned acceleration path remains to be implemented. |
+| Planning | Uses its own `asap-planner-rs` to plan supported query patterns. | Calls ASAPPlanner Stages 1–3 to choose the physical DAG using deployment capabilities, costs, and accuracy targets. |
+| Plan contract | Aggregation configurations consumed by the existing query engine. | Installs the Planner's `InstallablePlan`, including its DAG, query roots, stored summaries, and raw-input requirements. |
+| Query execution | Uses `SimpleEngine` and execution paths for supported query patterns. | Compiles the installed DAG once and executes its roots using the shared columnar operator library; supports instant queries and range-query evaluation steps. |
+| When summaries are built | During ingestion. | During ingestion or at query time; retains query-time summaries across evaluations when the plan requires it. |
+| Ingestion | Sharded workers update summaries per sample; supports Remote Write and additional ingestion drivers. | Sharded Remote Write ingestion updates summary states per sample using the operator library's updaters. |
+| Summary sharing and storage | Uses the existing query engine's summary store and reference-shared states. | SDS identifies equivalent summary definitions across outputs and time offsets; immutable summaries are shared through `Arc` under an `RwLock`, with retention from the plan. |
+| Query-time raw samples | Accelerated queries use precomputed summaries; queries it cannot answer are forwarded. | Reads required raw windows from a local buffer, using Prometheus remote read for unavailable ranges. |
+| Concurrency and series identity | Sharded ingestion and interned labels in its existing runtime. | Sharded ingestion workers, a query thread pool, and series interned to dense IDs at decode. |
+| Cost inputs | Uses its own planner's configuration. | Supplies deployment costs and measured operation costs to ASAPPlanner; provides separate prediction reports for the selected plan. |
+| Fallback | Forwards queries it cannot answer to the upstream system. | Forwards unplanned queries and planned queries it cannot answer to Prometheus, with a reason for planned-query fallback. |
+| Query languages | Supports PromQL and SQL, with additional adapters. | The current control plane accepts PromQL workloads. |
+| Deployment and workload management | Provides quickstart and drop-in deployments, workload discovery, and runtime plan replacement. | Provides explicit workload planning and a Prometheus-compatible service; integration of ASAPQuery's discovery and plan replacement remains merge work. |
 
-The main difference today is that ASAPQuery has an operating acceleration path, while ASAPQuery-backend has the external Planner integration and plan-derived summary definitions. The merge aims to combine ASAPQuery's runtime with ASAPPlanner's selected DAG and shared operator library.
+The difference is how planning and execution are connected: ASAPQuery uses its existing planner and execution paths, while the backend runs ASAPPlanner's selected DAG with the shared operator library. Both build and query summaries; the backend additionally supports plan-directed query-time construction, retention, and raw-sample reads.
 
 ## Merging with ASAPQuery
 
@@ -139,10 +145,10 @@ The merged runtime keeps ASAPQuery's low-overhead data path and the backend's si
 
 **Remaining integration work**
 
-1. Connect Remote Write ingestion to the installed DAG's ingestion-time operators and store the summaries defined by SDS.
-2. Execute planned queries from their DAG roots, reading stored summaries and any required raw samples; forward queries the runtime cannot answer.
-3. Integrate ASAPQuery's ingestion drivers, scheduling, query tracking, plan replacement, and deployment support with that execution path.
-4. Validate answers against the shared operator library's reference execution and measure whole-system resource use against Prometheus alone. Feed measured costs into subsequent planning calls.
+1. Replace ASAPQuery's planner and query-pattern execution paths with the backend's `InstallablePlan` installation and compiled DAG execution.
+2. Connect ASAPQuery's additional ingestion drivers, workload discovery, query tracking, runtime plan replacement, and deployment support to that execution path.
+3. Preserve summary identity, retention, and per-sample update semantics across the combined runtime, and validate answers against the Planner's reference execution.
+4. Extend measured-cost coverage and validate candidate executability. The latest cost-feedback PR still reports gaps in the cost model and an exact quantile candidate that falls back after executor validation fails.
 
 **Open decisions**
 
