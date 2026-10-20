@@ -116,15 +116,21 @@ impl EngineHandle {
             return Err(IngestError::Stopped);
         }
         let count = samples.len() as u64;
-        let admitted =
-            self.queued_samples
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |queued| {
-                    queued
-                        .checked_add(count)
-                        .filter(|&total| total <= self.max_queued_samples)
-                });
-        if admitted.is_err() {
-            return Err(IngestError::Busy);
+        let mut queued = self.queued_samples.load(Ordering::SeqCst);
+        loop {
+            let total = queued
+                .checked_add(count)
+                .filter(|&total| total <= self.max_queued_samples)
+                .ok_or(IngestError::Busy)?;
+            match self.queued_samples.compare_exchange(
+                queued,
+                total,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(current) => queued = current,
+            }
         }
         self.commands.send(Command::Ingest(samples)).map_err(|_| {
             self.queued_samples.fetch_sub(count, Ordering::SeqCst);
