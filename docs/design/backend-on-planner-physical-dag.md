@@ -61,26 +61,30 @@ ASAPPlanner decides **what to compute**, **whether to compute it during ingestio
 | Unplanned queries | None | Forwarded to Prometheus |
 | Deployment inputs (capabilities, AWS Fargate prices, measured costs, data facts) | Consumes them | Supplies them |
 
-**The interface**
+**Planning interface: workload and deployment models → executable plan**
 
-```
-// Backend → Planner (once per installed workload; schematic interface)
-asap_planner::plan_installable(UserInput { workload, models }) -> InstallablePlan
+Once per installed workload, the backend supplies the query workload and deployment models (capabilities, costs, and data facts). The Planner returns `InstallablePlan`: the execution plan and metadata the backend needs to install it. This is the role of `asap_planner::plan_installable`; `UserInput` packages those inputs, and `models` refers to deployment models, not machine-learning models.
 
-InstallablePlan {
-    dag,                    // the selected physical ASAP DAG
-    queries,                // each query and the DAG root that answers it
-    stored_outputs,         // node, built_at (IngestionRun | QueryRun), pane window, retention_ms
-    query_time_raw_windows, // raw-sample windows read at query time
-    selection,              // selected candidate and its cost per second, for reporting
-}
+| Plan field | Meaning for the backend |
+| --- | --- |
+| `dag` | The operators to execute and their dependencies. |
+| `queries` | Maps each planned query to the DAG node that produces its answer. |
+| `stored_outputs` | Identifies which node outputs to store, whether to build them during ingestion or query execution (`built_at`: `IngestionRun` or `QueryRun`), the time interval each pane covers, and how long to retain it (`retention_ms`, in milliseconds). |
+| `query_time_raw_windows` | Specifies which time ranges of raw samples are needed during query execution. |
+| `selection` | Records the selected candidate and its estimated cost per second for reporting. |
 
-// Backend → operator library, while running
-RawSampleSelector               // which samples a pane or raw window takes
-StateColumnUpdater              // per-sample state update, merge across shards, seal
-Batch::try_from_columns         // a sealed state column becomes a stored pane
-compiled operators per DAG node
-```
+**Runtime interface: samples and stored panes → query answers**
+
+After installation, the backend uses the operator library to execute the plan. The following names refer to separate runtime helpers, not additional plan fields or calls to the Planner.
+
+| Runtime helper | Role |
+| --- | --- |
+| `RawSampleSelector` | Selects the raw samples that belong to a pane or query-time window. |
+| `StateColumnUpdater` | Updates aggregate or sketch states as samples arrive, merges states across shards, and seals them when a pane closes. |
+| `Batch::try_from_columns` | Packages sealed state columns into a batch that the backend can store as an immutable pane. |
+| Compiled operators for DAG nodes | Execute the operations specified by the plan, using input batches to produce output batches. This describes a group of operators, not a single API name. |
+
+The Planner specifies **which results to compute and retain**. The operator library supplies **the computation implementations**. The backend supplies **ingestion, scheduling, storage, and query serving**.
 
 **Rules**
 
