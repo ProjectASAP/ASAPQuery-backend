@@ -23,7 +23,7 @@ flowchart TB
       QE <--> PROM[Prometheus<br/>remote read, unplanned queries]
     end
     PE -->|Store summaries| SDS[(SDS<br/>Immutable summaries)]
-    QE -->|Read / store summaries| SDS
+    QE <-->|Read summaries / retain if planned| SDS
   end
 
   P -.-> PE
