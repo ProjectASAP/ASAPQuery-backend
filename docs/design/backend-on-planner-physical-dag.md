@@ -14,7 +14,9 @@ flowchart LR
   subgraph CP[Control plane]
     PL[Call ASAPPlanner once] --> P[(InstallablePlan)]
   end
-  P --> DP
+  P --> PE
+  P --> QE
+  P --> SDS
   subgraph DP[Data plane]
     RW[Remote Write] --> PE[Precompute engine<br/>per-sample state updates]
     PE --> SDS[(SDS<br/>immutable stored panes)]
