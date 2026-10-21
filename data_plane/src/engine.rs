@@ -2,13 +2,17 @@
 //! it. Planner IR holds `Rc`s, so the plan cannot be shared across the HTTP
 //! server's threads; handlers send the engine commands instead.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use asap_planner::InstallablePlan;
 
+use tokio::sync::oneshot;
+
 use crate::precompute::{Precompute, PrecomputeOptions, PrecomputeStats, RawSample};
+use crate::query::{BoundRawSampleWindow, QueryEngine, ResultSample, Unanswered};
 use crate::sds::Sds;
 
 /// How the engine thread ingests samples.
@@ -31,8 +35,21 @@ impl Default for EngineOptions {
     }
 }
 
+type Reply<T> = oneshot::Sender<Result<T, Unanswered>>;
+
 enum Command {
     Ingest(Vec<RawSample>),
+    BoundRawSampleWindows {
+        query: String,
+        time_ms: i64,
+        reply: Reply<(usize, Vec<BoundRawSampleWindow>)>,
+    },
+    Evaluate {
+        root: usize,
+        time_ms: i64,
+        raw: BTreeMap<u64, Vec<RawSample>>,
+        reply: Reply<Vec<ResultSample>>,
+    },
     Stop,
 }
 
@@ -135,6 +152,44 @@ impl EngineHandle {
         })
     }
 
+    /// The plan root answering `query` at `time_ms` and the raw samples it
+    /// needs; see [`QueryEngine::bound_raw_sample_windows`].
+    pub async fn bound_raw_sample_windows(
+        &self,
+        query: String,
+        time_ms: i64,
+    ) -> Result<(usize, Vec<BoundRawSampleWindow>), Unanswered> {
+        self.ask(|reply| Command::BoundRawSampleWindows {
+            query,
+            time_ms,
+            reply,
+        })
+        .await
+    }
+
+    /// Runs a root over stored panes and `raw`; see [`QueryEngine::evaluate`].
+    pub async fn evaluate(
+        &self,
+        root: usize,
+        time_ms: i64,
+        raw: BTreeMap<u64, Vec<RawSample>>,
+    ) -> Result<Vec<ResultSample>, Unanswered> {
+        self.ask(|reply| Command::Evaluate {
+            root,
+            time_ms,
+            raw,
+            reply,
+        })
+        .await
+    }
+
+    async fn ask<T>(&self, command: impl FnOnce(Reply<T>) -> Command) -> Result<T, Unanswered> {
+        let stopped = || Unanswered::Execution("the engine has stopped".into());
+        let (reply, answer) = oneshot::channel();
+        self.commands.send(command(reply)).map_err(|_| stopped())?;
+        answer.await.map_err(|_| stopped())?
+    }
+
     /// Whether the engine thread is still running.
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
@@ -181,6 +236,7 @@ struct Shared {
 
 struct Engine {
     precompute: Precompute,
+    query: QueryEngine,
 }
 
 impl Engine {
@@ -193,9 +249,23 @@ impl Engine {
             outputs = sds.outputs.len(),
             "stored summaries"
         );
+        let query_run = sds
+            .definitions
+            .values()
+            .filter(|d| d.built_at == asap_planner::StoredOutputBuild::QueryRun)
+            .count();
+        if query_run > 0 {
+            tracing::warn!(
+                definitions = query_run,
+                "the plan has stored outputs built in a QueryRun, which this data plane does not build yet; \
+                 queries that read them are forwarded"
+            );
+        }
         let queries = plan.queries.iter().map(|q| q.query.clone()).collect();
+        let query = QueryEngine::new(&plan, &sds);
         let engine = Self {
             precompute: Precompute::new(plan.dag.dag, &sds, options)?,
+            query,
         };
         Ok((engine, queries))
     }
@@ -209,6 +279,30 @@ impl Engine {
                     shared
                         .queued_samples
                         .fetch_sub(samples.len() as u64, Ordering::SeqCst);
+                }
+                Command::BoundRawSampleWindows {
+                    query,
+                    time_ms,
+                    reply,
+                } => {
+                    let _ = reply.send(self.query.bound_raw_sample_windows(
+                        &query,
+                        time_ms,
+                        &self.precompute.store,
+                    ));
+                }
+                Command::Evaluate {
+                    root,
+                    time_ms,
+                    raw,
+                    reply,
+                } => {
+                    let _ = reply.send(self.query.evaluate(
+                        root,
+                        time_ms,
+                        &self.precompute.store,
+                        &raw,
+                    ));
                 }
                 Command::Stop => break,
             }

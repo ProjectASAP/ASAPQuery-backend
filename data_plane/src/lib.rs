@@ -2,11 +2,14 @@
 //! the Prometheus query API for an installed plan.
 //!
 //! The installed plan is ASAPPlanner's selected `PhysicalASAPDAG`. The
-//! engine thread builds its ingestion-time outputs pane by pane; queries are
-//! still forwarded to Prometheus.
+//! engine thread builds its ingestion-time outputs pane by pane and answers
+//! the plan's instant queries from them; every other query, and any planned
+//! query it cannot answer, is forwarded to Prometheus.
 
 pub mod engine;
 pub mod precompute;
+pub mod prometheus;
+pub mod query;
 pub mod remote_write;
 pub mod sds;
 
@@ -23,9 +26,13 @@ use axum::routing::{get, post};
 use axum::Router;
 use engine::{EngineHandle, EngineOptions, IngestError};
 use precompute::RawSample;
+use prometheus::InstantQuery;
+use query::Unanswered;
 
-/// Response header naming what answered a query.
+/// Response header naming what answered a query: `plan` or `forwarded`.
 pub const EXECUTION_HEADER: &str = "x-asap-execution";
+/// Response header of a forwarded planned query: why the plan did not answer.
+pub const FORWARD_REASON_HEADER: &str = "x-asap-forward-reason";
 
 /// How long a forwarded query may take by default, matching Prometheus's
 /// default `--query.timeout` of two minutes.
@@ -177,6 +184,23 @@ async fn status(State(state): State<Arc<DataPlane>>) -> Response {
         .into_response()
 }
 
+/// `text` as a header value: characters a header cannot carry (controls and
+/// non-ASCII) become `?`.
+fn header_value(text: &str) -> HeaderValue {
+    let visible: String = text
+        .chars()
+        .map(|c| {
+            if c == ' ' || c.is_ascii_graphic() {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect();
+    HeaderValue::from_str(&visible).expect("visible ASCII is a valid header value")
+}
+
+/// Answers a planned instant query from the plan; forwards anything else.
 async fn query(
     state: State<Arc<DataPlane>>,
     method: Method,
@@ -184,7 +208,67 @@ async fn query(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    forward(state, "query", method, query, headers, body).await
+    let instant = match InstantQuery::parse(query.0.as_deref(), &body) {
+        Ok(Some(instant)) => instant,
+        Ok(None) => return forward(state, "query", method, query, headers, body).await,
+        Err(bad) => {
+            let body = axum::Json(prometheus::bad_data(&bad.to_string()));
+            return (StatusCode::BAD_REQUEST, body).into_response();
+        }
+    };
+    let reason = match answer(&state, instant, &headers).await {
+        Ok(response) => {
+            let mut response = axum::Json(response).into_response();
+            response
+                .headers_mut()
+                .insert(EXECUTION_HEADER, HeaderValue::from_static("plan"));
+            return response;
+        }
+        Err(Unanswered::NotPlanned(_)) => None,
+        Err(reason) => {
+            tracing::debug!(%reason, "forwarding a planned query");
+            Some(header_value(&reason.to_string()))
+        }
+    };
+    let mut response = forward(state, "query", method, query, headers, body).await;
+    if let Some(reason) = reason {
+        response.headers_mut().insert(FORWARD_REASON_HEADER, reason);
+    }
+    response
+}
+
+/// Runs a planned instant query. Bound raw-sample windows are read from Prometheus with
+/// the caller's end-to-end `headers`, as a forwarded query would be.
+async fn answer(
+    state: &DataPlane,
+    query: InstantQuery,
+    headers: &HeaderMap,
+) -> Result<serde_json::Value, Unanswered> {
+    let time_ms = query.time_ms.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64)
+    });
+    let (root, ranges) = state
+        .engine
+        .bound_raw_sample_windows(query.query, time_ms)
+        .await?;
+    let mut fetch_headers = forwarded_headers(headers);
+    // The raw read is a GET without the caller's body.
+    fetch_headers.remove(header::CONTENT_TYPE);
+    // The bound raw-sample windows are fetched concurrently.
+    let fetches = ranges.iter().map(|range| async {
+        prometheus::fetch(&state.client, &state.prometheus_url, &fetch_headers, range)
+            .await
+            .map(|samples| (range.node, samples))
+    });
+    let raw: BTreeMap<u64, Vec<RawSample>> = futures::future::try_join_all(fetches)
+        .await
+        .map_err(|e| Unanswered::Execution(format!("fetching raw samples: {e}")))?
+        .into_iter()
+        .collect();
+    let samples = state.engine.evaluate(root, time_ms, raw).await?;
+    Ok(prometheus::vector_response(time_ms, &samples))
 }
 
 async fn query_range(
@@ -287,4 +371,20 @@ async fn forward(
         .headers_mut()
         .insert(EXECUTION_HEADER, HeaderValue::from_static("forwarded"));
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A forward reason with characters a header cannot carry is still sent,
+    /// with those characters replaced.
+    #[test]
+    fn sanitizes_header_values() {
+        assert_eq!(
+            header_value("pane ending at 10 is missing"),
+            "pane ending at 10 is missing"
+        );
+        assert_eq!(header_value("bad\nlabel é"), "bad?label ?");
+    }
 }

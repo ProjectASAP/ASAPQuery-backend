@@ -119,7 +119,7 @@ fn identity_depends_on_the_source() {
 /// Outputs built in a query run and kept are stored summaries too: their
 /// definition says so, and no ingestion run builds them.
 #[test]
-fn query_run_outputs_are_query_run_definitions() {
+fn query_run_outputs_have_query_run_definitions() {
     let mut plan = plan("example4b", false);
     for output in &mut plan.stored_outputs {
         output.built_at = StoredOutputBuild::QueryRun;
@@ -132,7 +132,7 @@ fn query_run_outputs_are_query_run_definitions() {
     assert!(sds.ingestion_build_order().unwrap().is_empty());
 }
 
-/// A definition shared by an ingestion-run and a query-run output is built
+/// A definition shared by an `IngestionRun` and a `QueryRun` output is built
 /// at ingestion.
 #[test]
 fn ingestion_wins_when_outputs_share_a_definition() {
@@ -231,7 +231,7 @@ fn build_order_puts_inputs_first() {
     assert_eq!(order, ["c", "b", "a"]);
 }
 
-/// An ingestion-run definition cannot read a query-run one: that summary
+/// An `IngestionRun` definition cannot read a `QueryRun` one: that summary
 /// is only built when an evaluation needs it.
 #[test]
 fn build_order_refuses_ingestion_reading_query_run() {

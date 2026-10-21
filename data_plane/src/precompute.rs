@@ -141,7 +141,7 @@ impl Precompute {
         options: PrecomputeOptions,
     ) -> Result<Self, PrecomputeError> {
         let mut builders = Vec::new();
-        // Ingestion-run definitions in dependency order; query-run ones are
+        // `IngestionRun` definitions in dependency order; `QueryRun` ones are
         // the query engine's.
         let order = sds
             .ingestion_build_order()
@@ -353,17 +353,9 @@ fn build_pane(
         window_end_ms: end,
         revision: 1,
     };
-    // The selector takes owned label maps, so each sample's labels are
-    // copied once per pane build.
-    let samples: Vec<Sample> = samples
-        .iter()
-        .map(|s| Sample {
-            labels: (*s.labels).clone(),
-            timestamp_ms: s.timestamp_ms,
-            value: s.value,
-        })
-        .collect();
-    let selected = builder.selector.window_batch(end, &samples)?;
+    let selected = builder
+        .selector
+        .window_batch(end, &executor_samples(samples))?;
     let input: Source<'_> = Box::new(Operator::source(
         builder.raw_schema.clone(),
         vec![selected],
@@ -374,6 +366,19 @@ fn build_pane(
     let rows = run_root(&build, builder.definition.builder, scope)?;
     let schema = Arc::new(builder.definition.output_schema.clone());
     Ok(Batch::try_new(schema, rows)?)
+}
+
+/// `samples` as the executor's [`Sample`]s. The selector takes owned label
+/// maps, so each sample's labels are copied.
+pub fn executor_samples(samples: &[RawSample]) -> Vec<Sample> {
+    samples
+        .iter()
+        .map(|s| Sample {
+            labels: (*s.labels).clone(),
+            timestamp_ms: s.timestamp_ms,
+            value: s.value,
+        })
+        .collect()
 }
 
 /// Executes `root` of `dag` to completion and returns its rows.

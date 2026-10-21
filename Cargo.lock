@@ -1043,6 +1043,7 @@ dependencies = [
  "axum",
  "clap",
  "control_plane",
+ "form_urlencoded",
  "futures",
  "http-body-util",
  "prost",
