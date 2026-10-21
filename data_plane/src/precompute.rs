@@ -33,11 +33,11 @@ use futures::StreamExt;
 
 use asap_planner::StoredOutputBuild;
 
-use crate::per_sample::{OpenPanes as OpenStates, PerSampleSpec};
+use crate::per_sample::{OpenPanes as OpenStates, PerSampleSpec, Taken};
+use crate::raw_sample_window::RawSampleWindowBatcher;
 use crate::sds::{
     DefinitionId, Sds, Selection, SummaryDefinition, SummaryInstanceKey, SummaryStore,
 };
-use crate::series::SeriesWindow;
 use crate::series_ids::Series;
 
 /// One raw sample: its series (interned: its id and full label set,
@@ -69,6 +69,10 @@ pub struct PrecomputeStats {
     /// Samples of a pane already built or skipped, other than the first
     /// pane after startup.
     pub samples_dropped_late: u64,
+    /// Samples, of a stored output built per sample, whose time is not
+    /// after their series' previous sample in the pane (a resent sample,
+    /// for instance): dropped, as Prometheus drops them.
+    pub samples_dropped_duplicate: u64,
     /// Samples of the first pane after startup, which is never built.
     pub samples_skipped_first_pane: u64,
     /// Samples more than `max_future_ms` ahead of the wall clock.
@@ -110,11 +114,11 @@ impl Default for PrecomputeOptions {
 /// build produced (one, when built per sample). Batches share their
 /// buffers when cloned, so binding a stored pane to a query copies nothing.
 #[derive(Debug, Clone, Default)]
-pub struct Pane {
+pub struct SummaryInstance {
     pub batches: Vec<Batch>,
 }
 
-impl Pane {
+impl SummaryInstance {
     pub fn num_rows(&self) -> usize {
         self.batches.iter().map(Batch::num_rows).sum()
     }
@@ -135,7 +139,7 @@ pub struct SummaryBuild {
     /// The definition's `RawSampleWindow`: a coverage's raw samples to the
     /// build's input batch, column by column, with the `Scan`'s label
     /// matchers.
-    pub(crate) window: SeriesWindow,
+    pub(crate) window: RawSampleWindowBatcher,
     build: CompiledPhysicalDAG,
 }
 
@@ -158,7 +162,9 @@ impl SummaryBuild {
         }
         // `batch` is called with each coverage's end, so the window's
         // offset from evaluation time is not used.
-        let window = SeriesWindow::new(dag, &definition.window)?;
+        // A series is cached for as long as the definition's summaries are kept.
+        let keep_ms = definition.retention_ms.saturating_add(definition.pane_ms);
+        let window = RawSampleWindowBatcher::new(dag, &definition.window, keep_ms)?;
         let build = compile(
             dag,
             BTreeMap::from([(
@@ -186,17 +192,21 @@ impl SummaryBuild {
         end_ms: i64,
         samples: &[RawSample],
         scope: Scope,
-    ) -> Result<Pane, PrecomputeError> {
+    ) -> Result<SummaryInstance, PrecomputeError> {
         self.run_batch(self.window.batch(end_ms, samples)?, scope)
     }
 
     /// The build over `input`, a coverage's selected input batch.
-    pub(crate) fn run_batch(&self, input: Batch, scope: Scope) -> Result<Pane, PrecomputeError> {
+    pub(crate) fn run_batch(
+        &self,
+        input: Batch,
+        scope: Scope,
+    ) -> Result<SummaryInstance, PrecomputeError> {
         let input: Source<'_> = Box::new(Operator::source(input.schema().clone(), vec![input])?);
         let build = self
             .build
             .instantiate(BTreeMap::from([(self.definition.raw_input(), input)]))?;
-        Ok(Pane {
+        Ok(SummaryInstance {
             batches: run(&build, self.build.roots(), scope)?,
         })
     }
@@ -221,6 +231,7 @@ struct Builder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Outcome {
     Late,
+    Duplicate,
     FirstPane,
     Buffered,
 }
@@ -240,7 +251,7 @@ pub struct Precompute {
     /// The newest event-time barrier a producer declared: every pane ending
     /// at or before it is closed.
     barrier_ms: Option<i64>,
-    pub store: SummaryStore<Pane>,
+    pub store: SummaryStore<SummaryInstance>,
     pub stats: PrecomputeStats,
 }
 
@@ -431,13 +442,17 @@ impl Precompute {
                                 // as taken, as the plan's build takes and
                                 // then filters it.
                                 Some(spec) => {
-                                    if let Some(cells) = builder.summary.window.cells(sample) {
-                                        spec.update(&mut builder.states, &cells, sample, end);
+                                    let window = &builder.summary.window;
+                                    match spec.update(window, &mut builder.states, sample, end) {
+                                        Taken::Taken => Outcome::Buffered,
+                                        Taken::Duplicate => Outcome::Duplicate,
                                     }
                                 }
-                                None => builder.open.entry(end).or_default().push(sample.clone()),
+                                None => {
+                                    builder.open.entry(end).or_default().push(sample.clone());
+                                    Outcome::Buffered
+                                }
                             }
-                            Outcome::Buffered
                         }
                     }
                 };
@@ -448,6 +463,7 @@ impl Precompute {
                 Some(Outcome::Buffered) => self.stats.samples_accepted += 1,
                 Some(Outcome::FirstPane) => self.stats.samples_skipped_first_pane += 1,
                 Some(Outcome::Late) => self.stats.samples_dropped_late += 1,
+                Some(Outcome::Duplicate) => self.stats.samples_dropped_duplicate += 1,
             }
             self.newest_sample_ms = self.newest_sample_ms.max(Some(sample.timestamp_ms));
             if let Some(newest) = metric.and_then(|m| self.query_run_metrics.get_mut(m)) {
@@ -466,6 +482,11 @@ impl Precompute {
                 continue;
             };
             let pane_ms = builder.summary.definition.pane_ms;
+            let keep_ms = builder
+                .summary
+                .definition
+                .retention_ms
+                .saturating_add(pane_ms);
             let id = &builder.summary.definition.id;
             // The newest evaluation stored panes can serve is at the end of
             // the newest closed pane. Panes are kept for one extra pane
@@ -501,8 +522,8 @@ impl Precompute {
                 let built = match &builder.per_sample {
                     // The pane's states, sealed into one batch.
                     Some(spec) => spec
-                        .close(&builder.summary, &mut builder.states, end, &scope)
-                        .map(|batch| Pane {
+                        .close(&builder.summary, &mut builder.states, end, keep_ms, &scope)
+                        .map(|batch| SummaryInstance {
                             batches: vec![batch],
                         }),
                     None => {
@@ -575,4 +596,61 @@ pub fn run(
         }
         Ok(batches)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::series_ids::intern;
+
+    const MINUTE: i64 = 60_000;
+
+    fn sample(job: &str, timestamp_ms: i64) -> RawSample {
+        RawSample {
+            labels: intern(&BTreeMap::from([
+                ("__name__".to_string(), "latency_ms".to_string()),
+                ("job".to_string(), job.to_string()),
+            ])),
+            timestamp_ms,
+            value: 1.0,
+        }
+    }
+
+    /// Per-sample state follows the active series: an open pane holds a
+    /// state only for the series that took a sample in it, and a series
+    /// unseen for longer than the retention plus one pane is forgotten,
+    /// with its cached cells. Example 4b: 10-minute KLL panes kept 60 min.
+    #[test]
+    fn per_series_state_follows_the_active_series() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../examples/planner-layering-example4b.json");
+        let workload = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let mut inputs = control_plane::DeploymentInputs::default();
+        inputs.deployment_capabilities.raw_data_retained = false;
+        let plan = control_plane::plan_workload(&workload, &inputs).unwrap();
+        let sds = Sds::from_plan(&plan).unwrap();
+        let options = PrecomputeOptions {
+            allowed_lateness_ms: 0,
+            ..PrecomputeOptions::default()
+        };
+        let mut engine = Precompute::new(plan.dag.dag, &sds, options).unwrap();
+        assert_eq!((sds.definitions.len(), engine.builders.len(), engine.per_sample_definitions()), (1, 1, 1));
+        let jobs: Vec<String> = (0..10).map(|i| format!("job{i}")).collect();
+        let mut samples = Vec::new();
+        for t in (MINUTE..25 * MINUTE).step_by(15_000) {
+            samples.extend(jobs.iter().map(|job| sample(job, t)));
+        }
+        engine.ingest_at(&samples, 300 * MINUTE);
+        let builder = &engine.builders[0];
+        assert_eq!(builder.states.sizes(), (10, vec![10]), "(20, 30 min] open");
+        let only_a: Vec<RawSample> = (25 * MINUTE..200 * MINUTE)
+            .step_by(15_000)
+            .map(|t| sample("job0", t))
+            .collect();
+        engine.ingest_at(&only_a, 300 * MINUTE);
+        let builder = &engine.builders[0];
+        assert_eq!(builder.states.sizes(), (1, vec![1]));
+        assert!(builder.summary.window.cached_series() <= 1);
+        assert_eq!(engine.stats.panes_failed, 0);
+    }
 }

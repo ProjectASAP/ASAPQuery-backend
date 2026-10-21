@@ -9,6 +9,7 @@
 //! (`Batch::try_from_columns`): the columns the selector builds, without
 //! a `Sample` or a row per sample.
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use asap_executor::arrow::array::{
@@ -49,13 +50,15 @@ pub(crate) struct SeriesCells {
     pub(crate) texts: Vec<Option<Arc<str>>>,
 }
 
-/// Each series' cells, or `None` when the `Scan` does not select it, by
-/// series id.
-type SeriesCache = ahash::HashMap<u32, Option<Arc<SeriesCells>>>;
+/// Each series' cells, or `None` when the `Scan` does not select it, with
+/// the newest sample time the series was looked up with, by series id.
+type SeriesCache = ahash::HashMap<u32, (Option<Arc<SeriesCells>>, AtomicI64)>;
 
-/// One raw-sample window of the plan, prepared to turn samples into its
-/// input batch. Shared by every thread that reads the window.
-pub(crate) struct SeriesWindow {
+/// One `RawSampleWindow` of the plan, prepared to turn raw samples into its
+/// input batch. A series is forgotten once it has not been seen for
+/// `keep_ms`, so the cache holds the series of recent windows, not every
+/// series ever seen.
+pub(crate) struct RawSampleWindowBatcher {
     selector: RawSampleSelector,
     /// The `TimeRange`'s output schema, which the batch is in.
     pub(crate) schema: SchemaRef,
@@ -64,13 +67,19 @@ pub(crate) struct SeriesWindow {
     /// An instant selector keeps only each series' latest sample.
     latest_sample_per_series: bool,
     series: RwLock<SeriesCache>,
+    /// How long a series not seen stays cached, past the window's width.
+    keep_ms: i64,
+    /// The window end series were last forgotten at.
+    forgotten_at_ms: AtomicI64,
 }
 
-impl SeriesWindow {
-    /// The window `window` of `dag`.
+impl RawSampleWindowBatcher {
+    /// The window `window` of `dag`, which caches a series until it has
+    /// not been seen for `keep_ms` past the window's width.
     pub(crate) fn new(
         dag: &PhysicalASAPDAG,
         window: &RawSampleWindow,
+        keep_ms: i64,
     ) -> Result<Self, asap_executor::Error> {
         let invalid = |message: &str| asap_executor::Error::Invalid(message.into());
         let selector = RawSampleSelector::new(dag, window)?;
@@ -108,6 +117,8 @@ impl SeriesWindow {
             width_ms: window.width_ms,
             latest_sample_per_series: *kind == TimeRangeKind::Instant,
             series: RwLock::new(ahash::HashMap::default()),
+            keep_ms,
+            forgotten_at_ms: AtomicI64::new(i64::MIN),
         })
     }
 
@@ -119,20 +130,52 @@ impl SeriesWindow {
     /// The cells of `sample`'s series, or `None` when the `Scan` does not
     /// select it; computed once per series.
     pub(crate) fn cells(&self, sample: &RawSample) -> Option<Arc<SeriesCells>> {
-        if let Some(cells) = self
+        if let Some((cells, newest_ms)) = self
             .series
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(&sample.labels.id)
         {
+            newest_ms.fetch_max(sample.timestamp_ms, Ordering::Relaxed);
             return cells.clone();
         }
         let cells = self.series_cells(sample);
         self.series
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(sample.labels.id, cells.clone());
+            .insert(
+                sample.labels.id,
+                (cells.clone(), AtomicI64::new(sample.timestamp_ms)),
+            );
         cells
+    }
+
+    /// How many series are cached.
+    #[cfg(test)]
+    pub(crate) fn cached_series(&self) -> usize {
+        self.series.read().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Forgets the series whose newest sample is at or before `oldest_ms`.
+    pub(crate) fn forget_unseen(&self, oldest_ms: i64) {
+        self.forgotten_at_ms.fetch_max(oldest_ms, Ordering::Relaxed);
+        self.series
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, (_, newest_ms)| newest_ms.load(Ordering::Relaxed) > oldest_ms);
+    }
+
+    /// Forgets the series not seen for `keep_ms` past the width of the
+    /// window ending at `end_ms`, at most once per `keep_ms` of window ends,
+    /// so a scan of the cache is amortized over many windows.
+    fn forget_old(&self, end_ms: i64) {
+        let oldest_ms = end_ms
+            .saturating_sub(self.width_ms)
+            .saturating_sub(self.keep_ms);
+        let last = self.forgotten_at_ms.load(Ordering::Relaxed);
+        if oldest_ms > last.saturating_add(self.keep_ms.max(1)) {
+            self.forget_unseen(oldest_ms);
+        }
     }
 
     fn series_cells(&self, sample: &RawSample) -> Option<Arc<SeriesCells>> {
@@ -219,6 +262,7 @@ impl SeriesWindow {
                 }
             }
         }
+        self.forget_old(end_ms);
         self.batch_of(&points)
     }
 

@@ -2,7 +2,7 @@
 //! TimeRange(pane) -> SummaryAgg`, run one sample at a time, in columns.
 //!
 //! - **Per series, once:** the stateless prefix. The window's
-//!   [`SeriesWindow`] applies the `Scan`'s label matchers to the series and
+//!   [`RawSampleWindowBatcher`] applies the `Scan`'s label matchers to the series and
 //!   caches its text cells; the cells of the `SummaryAgg`'s group columns
 //!   are its group.
 //! - **Per sample:** the executor's `StateColumnUpdater` for the open pane
@@ -38,29 +38,12 @@ use asap_executor::values::{Batch, BatchColumn, SchemaRef};
 use asap_executor::StateColumnUpdater;
 
 use crate::precompute::{RawSample, SummaryBuild};
-use crate::series::{is_stale, text_column, SeriesCells, SERIES_IDENTITY_COLUMN};
+use crate::raw_sample_window::{
+    is_stale, text_column, RawSampleWindowBatcher, SeriesCells, SERIES_IDENTITY_COLUMN,
+};
 
 /// A group: its texts in the `SummaryAgg`'s group columns, in their order.
 type GroupKey = Arc<[Arc<str>]>;
-
-/// Groups numbered `0..`, in the order they are first seen.
-#[derive(Default)]
-struct GroupNumbers {
-    numbers: ahash::HashMap<GroupKey, u32>,
-    keys: Vec<GroupKey>,
-}
-
-impl GroupNumbers {
-    fn number(&mut self, key: &GroupKey) -> u32 {
-        if let Some(&number) = self.numbers.get(key) {
-            return number;
-        }
-        let number = self.keys.len() as u32;
-        self.keys.push(key.clone());
-        self.numbers.insert(key.clone(), number);
-        number
-    }
-}
 
 /// How a definition is built per sample; compiled once per definition.
 pub(crate) struct PerSampleSpec {
@@ -78,22 +61,62 @@ pub(crate) struct PerSampleSpec {
     time_offset_ms: OnceLock<i64>,
 }
 
+/// One series as a per-sample build has seen it.
+struct SeriesEntry {
+    /// Its group, or `None` when the `Scan` does not select it.
+    key: Option<GroupKey>,
+    /// Its newest sample time: a series unseen for longer than the
+    /// definition's retention is forgotten.
+    newest_ms: i64,
+    /// The open pane it last took a sample in, and its group number there,
+    /// so a run of samples into one pane looks the series up once.
+    pane: Option<(i64, u32)>,
+}
+
+/// One open pane: a summary state per series that took a sample in it.
+struct OpenPane {
+    updater: StateColumnUpdater,
+    /// Each group's key and newest sample time, by its number in the pane.
+    groups: Vec<(GroupKey, i64)>,
+    /// Group numbers, by series id.
+    numbers: ahash::HashMap<u32, u32>,
+}
+
+/// What a per-sample build did with one sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Taken {
+    /// Taken into its series' state, or not a sample of any (a stale
+    /// marker, or a series the `Scan` does not select).
+    Taken,
+    /// Not after its series' previous sample in the pane (a resent sample,
+    /// for instance): dropped, not failing the pane or counted twice.
+    Duplicate,
+}
+
 /// The open panes of a definition built per sample.
 #[derive(Default)]
 pub(crate) struct OpenPanes {
-    /// The numbers of the groups (series) seen.
-    numbers: GroupNumbers,
-    /// Each series' group key and number, by series id.
-    series_groups: ahash::HashMap<u32, (GroupKey, u32)>,
-    /// By pane end: its states and the groups that took a sample, or why it
-    /// failed.
-    panes: BTreeMap<i64, Result<(StateColumnUpdater, Vec<bool>), String>>,
+    /// Each series seen and not forgotten, by series id.
+    series: ahash::HashMap<u32, SeriesEntry>,
+    /// By pane end: its states, or why it failed.
+    panes: BTreeMap<i64, Result<OpenPane, String>>,
 }
 
 impl OpenPanes {
     /// Drops the open panes ending before `end_ms`, which are skipped.
     pub(crate) fn drop_before(&mut self, end_ms: i64) {
         self.panes = self.panes.split_off(&end_ms);
+    }
+
+    /// The series remembered, and each open pane's number of states.
+    #[cfg(test)]
+    pub(crate) fn sizes(&self) -> (usize, Vec<usize>) {
+        let states = self
+            .panes
+            .values()
+            .map(|pane| pane.as_ref().map_or(0, |p| p.updater.group_count()))
+            .collect();
+        (self.series.len(), states)
     }
 }
 
@@ -200,104 +223,131 @@ impl PerSampleSpec {
         })
     }
 
-    /// Updates the pane ending at `end_ms`, open in `open`, with a sample
-    /// of the series whose cached cells are `cells`.
+    /// Takes `sample` into the pane ending at `end_ms`, open in `open`:
+    /// its series' summary state there is updated in place. `window` gives
+    /// a series' group the first time it is seen.
     pub(crate) fn update(
         &self,
+        window: &RawSampleWindowBatcher,
         open: &mut OpenPanes,
-        cells: &Arc<SeriesCells>,
         sample: &RawSample,
         end_ms: i64,
-    ) {
+    ) -> Taken {
         // A stale marker ends a series; it is not a sample of its state.
         if is_stale(sample.value) {
-            return;
+            return Taken::Taken;
         }
-        let group = match open.series_groups.get(&sample.labels.id) {
-            Some(group) => Some(group.clone()),
-            None => {
-                let key: GroupKey = self
-                    .groups
+        let id = sample.labels.id;
+        let entry = open.series.entry(id).or_insert_with(|| SeriesEntry {
+            key: window.cells(sample).map(|cells| {
+                self.groups
                     .iter()
                     .map(|&c| cells.texts[c].clone().unwrap_or_else(|| Arc::from("")))
-                    .collect();
-                let number = open.numbers.number(&key);
-                open.series_groups
-                    .insert(sample.labels.id, (key.clone(), number));
-                Some((key, number))
-            }
+                    .collect()
+            }),
+            newest_ms: sample.timestamp_ms,
+            pane: None,
+        });
+        entry.newest_ms = entry.newest_ms.max(sample.timestamp_ms);
+        let Some(key) = &entry.key else {
+            return Taken::Taken;
         };
-        let Some((_, number)) = group else { return };
-        let entry = open.panes.entry(end_ms).or_insert_with(|| {
+        let pane = open.panes.entry(end_ms).or_insert_with(|| {
             StateColumnUpdater::new(&self.family)
-                .map(|updater| (updater, Vec::new()))
+                .map(|updater| OpenPane {
+                    updater,
+                    groups: Vec::new(),
+                    numbers: ahash::HashMap::default(),
+                })
                 .map_err(|e| e.to_string())
         });
-        let Ok((updater, touched)) = entry else {
-            return;
+        let Ok(pane) = pane else {
+            return Taken::Taken;
         };
-        let index = number as usize;
-        let result = updater
-            .ensure_groups(index + 1)
-            .and_then(|()| updater.update(number, sample.value, sample.timestamp_ms));
-        match result {
-            Ok(()) => {
-                if touched.len() <= index {
-                    touched.resize(index + 1, false);
-                }
-                touched[index] = true;
+        let number = match entry.pane {
+            Some((end, number)) if end == end_ms => Ok(number),
+            _ => match pane.numbers.get(&id) {
+                Some(&number) => Ok(number),
+                None => pane.updater.add_group().inspect(|&number| {
+                    pane.numbers.insert(id, number);
+                    pane.groups.push((key.clone(), i64::MIN));
+                }),
+            },
+        };
+        let result = number.and_then(|number| {
+            entry.pane = Some((end_ms, number));
+            let newest = &mut pane.groups[number as usize].1;
+            // As Prometheus does, a series' sample not after its previous one
+            // (a resent sample, for instance) is dropped: a counter's state
+            // refuses it, and any other state would count it twice.
+            if sample.timestamp_ms <= *newest {
+                return Ok(Taken::Duplicate);
             }
-            Err(error) => *entry = Err(error.to_string()),
+            *newest = sample.timestamp_ms;
+            pane.updater
+                .update(number, sample.value, sample.timestamp_ms)
+                .map(|()| Taken::Taken)
+        });
+        match result {
+            Ok(taken) => taken,
+            Err(error) => {
+                open.panes.insert(end_ms, Err(error.to_string()));
+                Taken::Taken
+            }
         }
     }
 
     /// The pane ending at `end_ms`, which closes: a row per group (series)
-    /// that took a sample.
+    /// that took a sample. Then the series not seen for longer than
+    /// `keep_ms` before the pane's end are forgotten.
     pub(crate) fn close(
         &self,
-        pane: &SummaryBuild,
+        build: &SummaryBuild,
         open: &mut OpenPanes,
         end_ms: i64,
+        keep_ms: i64,
         scope: &Scope,
     ) -> Result<Batch, String> {
-        let (updater, touched) = match open.panes.remove(&end_ms) {
-            Some(open_pane) => open_pane?,
+        let oldest_ms = end_ms.saturating_sub(keep_ms);
+        open.series.retain(|_, entry| entry.newest_ms > oldest_ms);
+        build.window.forget_unseen(oldest_ms);
+        let (updater, groups) = match open.panes.remove(&end_ms) {
+            Some(pane) => {
+                let pane = pane?;
+                (pane.updater, pane.groups)
+            }
             None => (
                 StateColumnUpdater::new(&self.family).map_err(|e| e.to_string())?,
                 Vec::new(),
             ),
         };
-        let touched: Vec<u32> = touched
-            .iter()
-            .enumerate()
-            .filter(|(_, &took)| took)
-            .map(|(number, _)| number as u32)
-            .collect();
-        self.pane_batch(pane, updater, &touched, &open.numbers.keys, end_ms, scope)
+        self.pane_batch(build, updater, &groups, end_ms, scope)
     }
 
-    /// The pane's batch: a row per touched group, in group key order as the
-    /// batch build emits them, with its texts, the pane's timestamp and its
-    /// state.
+    /// The pane's batch: a row per group, in group key order as the batch
+    /// build emits them, with its texts, the pane's timestamp and its state.
     fn pane_batch(
         &self,
-        pane: &SummaryBuild,
+        build: &SummaryBuild,
         updater: StateColumnUpdater,
-        touched: &[u32],
-        keys: &[GroupKey],
+        groups: &[(GroupKey, i64)],
         end_ms: i64,
         scope: &Scope,
     ) -> Result<Batch, String> {
-        let mut rows: Vec<(&GroupKey, u32)> = touched
+        let mut rows: Vec<(&GroupKey, u32)> = groups
             .iter()
-            .map(|&number| (&keys[number as usize], number))
+            .enumerate()
+            .map(|(number, (key, _))| (key, number as u32))
             .collect();
         rows.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        // Found once; a pane fails, and the next one tries again, until the
+        // build gives a timestamp.
         let offset = match self.time_offset_ms.get() {
             Some(offset) => *offset,
-            None => *self
-                .time_offset_ms
-                .get_or_init(|| self.calibrate(pane, end_ms, scope).unwrap_or(0)),
+            None => {
+                let offset = self.calibrate(build, end_ms, scope)?;
+                *self.time_offset_ms.get_or_init(|| offset)
+            }
         };
         let states = Arc::new(updater.seal());
         let columns = (0..self.output.fields.len())

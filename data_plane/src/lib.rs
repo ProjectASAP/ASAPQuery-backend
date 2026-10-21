@@ -11,9 +11,9 @@ mod per_sample;
 pub mod precompute;
 pub mod prometheus;
 pub mod query;
+mod raw_sample_window;
 pub mod remote_write;
 pub mod sds;
-mod series;
 pub mod series_ids;
 
 use std::collections::BTreeMap;
