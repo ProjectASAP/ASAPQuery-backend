@@ -1,6 +1,7 @@
-//! The engine thread: owns the installed plan and everything that executes
-//! it. Planner IR holds `Rc`s, so the plan cannot be shared across the HTTP
-//! server's threads; handlers send the engine commands instead.
+//! The engine thread: owns the installed plan, compiled once when it is
+//! installed, and everything that executes it; handlers send the engine
+//! commands. The compiled plan is `Send`, so it is compiled on the
+//! installing thread and moved to the engine thread.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -96,12 +97,12 @@ impl Drop for RunningGuard {
 }
 
 impl EngineHandle {
-    /// Starts the engine for the plan serialized in `plan_json`, parsed once
-    /// on the engine thread, and returns the plan's queries. Fails if the
+    /// Starts the engine for the plan serialized in `plan_json`, parsed and
+    /// compiled once, and returns the plan's queries. Fails if the
     /// plan is invalid or the data plane cannot execute it.
     pub fn spawn(plan_json: String, options: EngineOptions) -> anyhow::Result<(Self, Vec<String>)> {
         let (commands, receiver) = channel();
-        let (ready, started) = std::sync::mpsc::channel();
+        let (engine, queries) = Engine::new(&plan_json, options.precompute)?;
         let running = Arc::new(AtomicBool::new(true));
         let queued_samples = Arc::new(AtomicU64::new(0));
         let stats = Arc::new(Mutex::new(PrecomputeStats::default()));
@@ -116,17 +117,8 @@ impl EngineHandle {
             .name("engine".into())
             .spawn(move || {
                 let _guard = guard;
-                match Engine::new(&plan_json, options.precompute) {
-                    Ok((engine, queries)) => {
-                        let _ = ready.send(Ok(queries));
-                        engine.serve(receiver, shared);
-                    }
-                    Err(error) => {
-                        let _ = ready.send(Err(error));
-                    }
-                }
+                engine.serve(receiver, shared);
             })?;
-        let queries = started.recv()??;
         let handle = Self {
             commands,
             queued_samples,

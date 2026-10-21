@@ -7,11 +7,13 @@
 //! query it cannot answer, is forwarded to Prometheus.
 
 pub mod engine;
+mod per_sample;
 pub mod precompute;
 pub mod prometheus;
 pub mod query;
 pub mod remote_write;
 pub mod sds;
+mod series;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
