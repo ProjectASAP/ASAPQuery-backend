@@ -81,14 +81,21 @@ fn fetch(ranges: &[BoundRawSampleWindow], all: &[RawSample]) -> BTreeMap<u64, Ve
         .collect()
 }
 
-fn answer(f: &Fixture, query: &str, time_ms: i64, all: &[RawSample]) -> Vec<ResultSample> {
-    let (root, ranges) = f
+fn answer(f: &mut Fixture, query: &str, time_ms: i64, all: &[RawSample]) -> Vec<ResultSample> {
+    let prepared = f
         .query
-        .bound_raw_sample_windows(query, time_ms, &f.precompute.store)
+        .bound_raw_sample_windows(query, time_ms, &f.precompute.store, f.precompute.progress())
         .unwrap();
+    let raw = fetch(&prepared.windows, all);
     let mut result = f
         .query
-        .evaluate(root, time_ms, &f.precompute.store, &fetch(&ranges, all))
+        .evaluate(
+            prepared.root,
+            time_ms,
+            &mut f.precompute.store,
+            &prepared.progress,
+            &raw,
+        )
         .unwrap();
     result.sort_by(|a, b| a.labels.cmp(&b.labels));
     result
@@ -112,23 +119,40 @@ fn stored_panes_answer_like_a_single_build() {
     assert!(
         panes
             .query
-            .bound_raw_sample_windows(P99, 70 * MINUTE, &panes.precompute.store)
+            .bound_raw_sample_windows(
+                P99,
+                70 * MINUTE,
+                &panes.precompute.store,
+                Default::default()
+            )
             .is_err(),
         "no panes before ingestion"
     );
     panes.precompute.ingest(&all);
-    let (_, ranges) = panes
+    let ranges = panes
         .query
-        .bound_raw_sample_windows(P99, 70 * MINUTE, &panes.precompute.store)
-        .unwrap();
+        .bound_raw_sample_windows(
+            P99,
+            70 * MINUTE,
+            &panes.precompute.store,
+            Default::default(),
+        )
+        .unwrap()
+        .windows;
     assert!(ranges.is_empty(), "every input is a stored pane");
-    let from_panes = answer(&panes, P99, 70 * MINUTE, &all);
+    let from_panes = answer(&mut panes, P99, 70 * MINUTE, &all);
 
-    let single = fixture(common::plan("example4b", true));
-    let (_, ranges) = single
+    let mut single = fixture(common::plan("example4b", true));
+    let ranges = single
         .query
-        .bound_raw_sample_windows(P99, 70 * MINUTE, &single.precompute.store)
-        .unwrap();
+        .bound_raw_sample_windows(
+            P99,
+            70 * MINUTE,
+            &single.precompute.store,
+            Default::default(),
+        )
+        .unwrap()
+        .windows;
     assert_eq!(
         ranges
             .iter()
@@ -137,7 +161,7 @@ fn stored_panes_answer_like_a_single_build() {
         vec![(10 * MINUTE, 70 * MINUTE)],
         "one raw hour, left-open"
     );
-    let from_raw = answer(&single, P99, 70 * MINUTE, &all);
+    let from_raw = answer(&mut single, P99, 70 * MINUTE, &all);
 
     assert_eq!(from_panes, from_raw);
     assert_eq!(from_panes.len(), 2);
@@ -159,9 +183,9 @@ fn query_time_plans_read_raw_ranges() {
         ("http_requests_total", &[("job", "b"), ("instance", "1")]),
     ];
     let all = samples(series, 0, 10 * MINUTE, |_, t| t as f64 / 1000.0);
-    let f = fixture(common::plan("example1", true));
+    let mut f = fixture(common::plan("example1", true));
     let result = answer(
-        &f,
+        &mut f,
         "sum by (job) (rate(http_requests_total[1m]))",
         5 * MINUTE,
         &all,
@@ -177,7 +201,7 @@ fn query_time_plans_read_raw_ranges() {
     assert!((by_job[1].1 - 1.0).abs() < 1e-9, "{by_job:?}");
 
     let topk = answer(
-        &f,
+        &mut f,
         "topk by (job) (10, sum_over_time(http_requests_total[1m]))",
         5 * MINUTE,
         &all,
@@ -196,11 +220,13 @@ fn reports_what_it_cannot_answer() {
     let mut f = fixture(common::plan("example4b", false));
     let store = &f.precompute.store;
     assert!(matches!(
-        f.query.bound_raw_sample_windows("up", 70 * MINUTE, store),
+        f.query
+            .bound_raw_sample_windows("up", 70 * MINUTE, store, Default::default()),
         Err(Unanswered::NotPlanned(_))
     ));
     assert!(matches!(
-        f.query.bound_raw_sample_windows(P99, 70 * MINUTE, store),
+        f.query
+            .bound_raw_sample_windows(P99, 70 * MINUTE, store, Default::default()),
         Err(Unanswered::MissingPane(_))
     ));
     let all = samples(&[("latency_ms", &[])], MINUTE, 75 * MINUTE, |_, t| t as f64);
@@ -208,16 +234,17 @@ fn reports_what_it_cannot_answer() {
     let store = &f.precompute.store;
     assert!(f
         .query
-        .bound_raw_sample_windows(P99, 70 * MINUTE, store)
+        .bound_raw_sample_windows(P99, 70 * MINUTE, store, Default::default())
         .is_ok());
     assert!(matches!(
         f.query
-            .bound_raw_sample_windows(P99, 70 * MINUTE + 1, store),
+            .bound_raw_sample_windows(P99, 70 * MINUTE + 1, store, Default::default()),
         Err(Unanswered::MissingPane(_))
     ));
     // The pane ending at 10 min was skipped as possibly partial.
     assert!(matches!(
-        f.query.bound_raw_sample_windows(P99, 60 * MINUTE, store),
+        f.query
+            .bound_raw_sample_windows(P99, 60 * MINUTE, store, Default::default()),
         Err(Unanswered::MissingPane(_))
     ));
 }
@@ -230,20 +257,23 @@ fn extreme_evaluation_times_are_not_answered() {
     for time_ms in [i64::MIN, i64::MIN + 1] {
         assert!(matches!(
             f.query
-                .bound_raw_sample_windows(P99, time_ms, &f.precompute.store),
+                .bound_raw_sample_windows(P99, time_ms, &f.precompute.store, Default::default()),
             Err(Unanswered::Unsupported(_))
         ));
     }
     // The window ending at `i64::MAX` fits; binding it does not panic.
     assert!(f
         .query
-        .bound_raw_sample_windows(P99, i64::MAX, &f.precompute.store)
+        .bound_raw_sample_windows(P99, i64::MAX, &f.precompute.store, Default::default())
         .is_ok());
     let panes = fixture(common::plan("example4b", false));
     assert!(matches!(
-        panes
-            .query
-            .bound_raw_sample_windows(P99, i64::MIN, &panes.precompute.store),
+        panes.query.bound_raw_sample_windows(
+            P99,
+            i64::MIN,
+            &panes.precompute.store,
+            Default::default()
+        ),
         Err(Unanswered::Unsupported(_))
     ));
 }
@@ -276,12 +306,12 @@ fn examples_answer_like_the_query_time_reference() {
         let reference = plan.query_time_reference().unwrap();
         let mut installed = fixture(plan.clone());
         installed.precompute.ingest(&all);
-        let by_reference = fixture(reference);
+        let mut by_reference = fixture(reference);
         for query in plan.queries.iter().map(|q| q.query.as_str()) {
-            let expected = answer(&by_reference, query, 70 * MINUTE, &all);
+            let expected = answer(&mut by_reference, query, 70 * MINUTE, &all);
             assert!(!expected.is_empty(), "{example} raw={raw} {query}");
             assert_eq!(
-                answer(&installed, query, 70 * MINUTE, &all),
+                answer(&mut installed, query, 70 * MINUTE, &all),
                 expected,
                 "{example} raw={raw} {query}"
             );
@@ -300,14 +330,16 @@ fn bound_raw_sample_windows_carry_the_scans_label_matchers() {
         );
     let plan = control_plane::plan_workload(&workload, &common::inputs(true)).unwrap();
     let f = fixture(plan);
-    let (_, ranges) = f
+    let ranges = f
         .query
         .bound_raw_sample_windows(
             "quantile_over_time(0.99, latency_ms{job=\"a\"}[60m])",
             70 * MINUTE,
             &f.precompute.store,
+            Default::default(),
         )
-        .unwrap();
+        .unwrap()
+        .windows;
     assert_eq!(ranges.len(), 1);
     assert_eq!(
         ranges[0].matchers,

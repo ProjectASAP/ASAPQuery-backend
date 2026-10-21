@@ -116,7 +116,7 @@ fn identity_depends_on_the_source() {
     );
 }
 
-/// Outputs built in a query run and kept are stored summaries too: their
+/// Stored outputs built in a `QueryRun` are stored summaries too: their
 /// definition says so, and no ingestion run builds them.
 #[test]
 fn query_run_outputs_have_query_run_definitions() {
@@ -250,4 +250,28 @@ fn build_order_refuses_ingestion_reading_query_run() {
             input: DefinitionId("q".into()),
         })
     );
+}
+
+/// B3's five 1-minute KLL panes, stored outputs built in a `QueryRun`
+/// (`MatAtQueryKeptAcrossEvaluations`), are one `QueryRun` definition, each output reading the
+/// summary `i * 1min` before evaluation. Nothing is built at ingestion.
+#[test]
+fn query_run_outputs_share_one_definition() {
+    let sds = Sds::from_plan(&plan("example4-b3", true)).unwrap();
+    assert!(sds.ingestion_build_order().unwrap().is_empty());
+    let mut query_run = sds
+        .definitions
+        .values()
+        .filter(|d| d.built_at == StoredOutputBuild::QueryRun);
+    let definition = query_run.next().unwrap();
+    assert!(query_run.next().is_none());
+    assert_eq!(definition.pane_ms, 60_000);
+    let mut offsets: Vec<i64> = sds
+        .outputs
+        .values()
+        .filter(|(id, _)| id == &definition.id)
+        .map(|(_, binding)| binding.offset_ms)
+        .collect();
+    offsets.sort();
+    assert_eq!(offsets, (0..5).map(|i| i * 60_000).collect::<Vec<_>>());
 }

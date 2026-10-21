@@ -12,7 +12,9 @@ use asap_planner::InstallablePlan;
 use tokio::sync::oneshot;
 
 use crate::precompute::{Precompute, PrecomputeOptions, PrecomputeStats, RawSample};
-use crate::query::{BoundRawSampleWindow, QueryEngine, ResultSample, Unanswered};
+use crate::query::{
+    IngestionProgress, Prepared, QueryEngine, QueryRunStats, ResultSample, Unanswered,
+};
 use crate::sds::Sds;
 
 /// How the engine thread ingests samples.
@@ -42,11 +44,12 @@ enum Command {
     BoundRawSampleWindows {
         query: String,
         time_ms: i64,
-        reply: Reply<(usize, Vec<BoundRawSampleWindow>)>,
+        reply: Reply<Prepared>,
     },
     Evaluate {
         root: usize,
         time_ms: i64,
+        progress: IngestionProgress,
         raw: BTreeMap<u64, Vec<RawSample>>,
         reply: Reply<Vec<ResultSample>>,
     },
@@ -75,6 +78,8 @@ pub struct EngineHandle {
     running: Arc<AtomicBool>,
     /// The counters as of the last command the engine ran.
     stats: Arc<Mutex<PrecomputeStats>>,
+    /// The stored output built in a `QueryRun` counters as of the last evaluation.
+    query_run_stats: Arc<Mutex<QueryRunStats>>,
 }
 
 /// Marks the engine stopped when its thread exits, panics included.
@@ -96,9 +101,11 @@ impl EngineHandle {
         let running = Arc::new(AtomicBool::new(true));
         let queued_samples = Arc::new(AtomicU64::new(0));
         let stats = Arc::new(Mutex::new(PrecomputeStats::default()));
+        let query_run_stats = Arc::new(Mutex::new(QueryRunStats::default()));
         let shared = Shared {
             queued_samples: queued_samples.clone(),
             stats: stats.clone(),
+            query_run_stats: query_run_stats.clone(),
         };
         let guard = RunningGuard(running.clone());
         std::thread::Builder::new()
@@ -122,6 +129,7 @@ impl EngineHandle {
             max_queued_samples: options.max_queued_samples,
             running,
             stats,
+            query_run_stats,
         };
         Ok((handle, queries))
     }
@@ -158,7 +166,7 @@ impl EngineHandle {
         &self,
         query: String,
         time_ms: i64,
-    ) -> Result<(usize, Vec<BoundRawSampleWindow>), Unanswered> {
+    ) -> Result<Prepared, Unanswered> {
         self.ask(|reply| Command::BoundRawSampleWindows {
             query,
             time_ms,
@@ -167,20 +175,30 @@ impl EngineHandle {
         .await
     }
 
-    /// Runs a root over stored panes and `raw`; see [`QueryEngine::evaluate`].
+    /// Runs a prepared root over stored summaries and `raw`; see
+    /// [`QueryEngine::evaluate`].
     pub async fn evaluate(
         &self,
-        root: usize,
+        prepared: Prepared,
         time_ms: i64,
         raw: BTreeMap<u64, Vec<RawSample>>,
     ) -> Result<Vec<ResultSample>, Unanswered> {
         self.ask(|reply| Command::Evaluate {
-            root,
+            root: prepared.root,
             time_ms,
+            progress: prepared.progress,
             raw,
             reply,
         })
         .await
+    }
+
+    /// The stored output built in a `QueryRun` counters as of the last evaluation.
+    pub fn query_run_stats(&self) -> QueryRunStats {
+        *self
+            .query_run_stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     async fn ask<T>(&self, command: impl FnOnce(Reply<T>) -> Command) -> Result<T, Unanswered> {
@@ -232,6 +250,7 @@ fn admit(queued: u64, count: u64, max_queued: u64) -> Result<u64, IngestError> {
 struct Shared {
     queued_samples: Arc<AtomicU64>,
     stats: Arc<Mutex<PrecomputeStats>>,
+    query_run_stats: Arc<Mutex<QueryRunStats>>,
 }
 
 struct Engine {
@@ -249,18 +268,6 @@ impl Engine {
             outputs = sds.outputs.len(),
             "stored summaries"
         );
-        let query_run = sds
-            .definitions
-            .values()
-            .filter(|d| d.built_at == asap_planner::StoredOutputBuild::QueryRun)
-            .count();
-        if query_run > 0 {
-            tracing::warn!(
-                definitions = query_run,
-                "the plan has stored outputs built in a QueryRun, which this data plane does not build yet; \
-                 queries that read them are forwarded"
-            );
-        }
         let queries = plan.queries.iter().map(|q| q.query.clone()).collect();
         let query = QueryEngine::new(&plan, &sds);
         let engine = Self {
@@ -289,20 +296,30 @@ impl Engine {
                         &query,
                         time_ms,
                         &self.precompute.store,
+                        self.precompute.progress(),
                     ));
                 }
                 Command::Evaluate {
                     root,
                     time_ms,
+                    progress,
                     raw,
                     reply,
                 } => {
-                    let _ = reply.send(self.query.evaluate(
+                    let answer = self.query.evaluate(
                         root,
                         time_ms,
-                        &self.precompute.store,
+                        &mut self.precompute.store,
+                        &progress,
                         &raw,
-                    ));
+                    );
+                    // Published before the reply, so a caller that awaited
+                    // the evaluation reads its counters.
+                    *shared
+                        .query_run_stats
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = self.query.query_run_stats;
+                    let _ = reply.send(answer);
                 }
                 Command::Stop => break,
             }
