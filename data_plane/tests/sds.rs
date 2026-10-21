@@ -143,32 +143,47 @@ fn build_order_follows_stored_inputs() {
     assert_eq!(sds.ingestion_build_order(), Err(SdsError::Cycle(id)));
 }
 
-/// Panes are found by definition and end, and evicted once no query needs
-/// them.
+/// Panes are found by definition, width and end, and evicted once no query
+/// needs them. Panes of one definition id with two widths (`a`'s 60 and 30)
+/// are kept apart: neither is found or evicted as the other.
 #[test]
 fn store_finds_and_evicts_panes() {
-    let (a, b) = (
-        DefinitionKey::unconstrained(DefinitionId("a".into())),
-        DefinitionKey::unconstrained(DefinitionId("b".into())),
+    let (a, a30, b) = (
+        DefinitionKey::unconstrained(DefinitionId("a".into()), 60),
+        DefinitionKey::unconstrained(DefinitionId("a".into()), 30),
+        DefinitionKey::unconstrained(DefinitionId("b".into()), 60),
     );
     let mut store = SummaryStore::new();
     for end in [60, 120, 180] {
         store.insert(
-            SummaryInstanceKey::new(a.id.clone(), Selection::ending_at(end)),
+            SummaryInstanceKey::new(a.id.clone(), a.selection_ending_at(end)),
             format!("a{end}"),
         );
     }
     store.insert(
-        SummaryInstanceKey::new(b.id.clone(), Selection::ending_at(60)),
+        SummaryInstanceKey::new(a30.id.clone(), a30.selection_ending_at(120)),
+        "a30-120".to_string(),
+    );
+    store.insert(
+        SummaryInstanceKey::new(b.id.clone(), Selection::ending_at(60, 60)),
         "b60".to_string(),
     );
     assert_eq!(store.get_pane(&a, 120).map(String::as_str), Some("a120"));
+    assert_eq!(
+        store.get_pane(&a30, 120).map(String::as_str),
+        Some("a30-120")
+    );
+    assert_eq!(store.get_pane(&a30, 60), None);
     assert_eq!(store.get_pane(&a, 90), None);
-    store.evict_before(&a.id, &Selection::ending_at(180));
+    store.evict_before(&a.id, &a.selection_ending_at(180));
     assert_eq!(store.get_pane(&a, 120), None);
     assert_eq!(store.get_pane(&a, 180).map(String::as_str), Some("a180"));
+    assert_eq!(
+        store.get_pane(&a30, 120).map(String::as_str),
+        Some("a30-120")
+    );
     assert_eq!(store.get_pane(&b, 60).map(String::as_str), Some("b60"));
-    assert_eq!(store.len(), 2);
+    assert_eq!(store.len(), 3);
 }
 
 /// `definition` under another identity, reading `stored_inputs`.
@@ -181,7 +196,9 @@ fn renamed(
     definition.id = DefinitionId(name.into());
     definition.stored_inputs = stored_inputs
         .iter()
-        .map(|input| DefinitionKey::unconstrained(DefinitionId(input.to_string())))
+        .map(|input| {
+            DefinitionKey::unconstrained(DefinitionId(input.to_string()), definition.pane_ms)
+        })
         .collect();
     definition
 }
@@ -224,8 +241,8 @@ fn build_order_refuses_ingestion_reading_query_run() {
     assert_eq!(
         sds.ingestion_build_order(),
         Err(SdsError::IngestionReadsQueryRun {
-            definition: DefinitionKey::unconstrained(DefinitionId("i".into())),
-            input: DefinitionKey::unconstrained(DefinitionId("q".into())),
+            definition: DefinitionKey::unconstrained(DefinitionId("i".into()), template.pane_ms),
+            input: DefinitionKey::unconstrained(DefinitionId("q".into()), template.pane_ms),
         })
     );
 }

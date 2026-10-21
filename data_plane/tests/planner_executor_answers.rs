@@ -52,7 +52,8 @@ fn plan_without_raw_samples(
 }
 
 /// A data plane running `plan` with `--no-forward`, its panes built from
-/// `points` written by Remote Write and closed by the barrier at
+/// `points` written by Remote Write, one request per second, and closed by
+/// the barrier at
 /// `EVALUATION_MS`.
 async fn run(plan: &InstallablePlan, points: &[Point]) -> (Router, Arc<DataPlane>) {
     let options = EngineOptions {
@@ -69,39 +70,49 @@ async fn run(plan: &InstallablePlan, points: &[Point]) -> (Router, Arc<DataPlane
         .unwrap(),
     );
     let app = router(state.clone());
-    let mut by_series: BTreeMap<&Labels, Vec<Sample>> = BTreeMap::new();
+    // One Remote Write request per second of event time, in time order, as
+    // a paced feeder sends them: a pane longer than a second takes its
+    // samples over several requests.
+    let mut by_second: BTreeMap<i64, BTreeMap<&Labels, Vec<Sample>>> = BTreeMap::new();
     for point in points {
-        by_series.entry(&point.labels).or_default().push(Sample {
-            timestamp: point.timestamp_ms,
-            value: point.value,
-        });
+        by_second
+            .entry(point.timestamp_ms.div_euclid(1000))
+            .or_default()
+            .entry(&point.labels)
+            .or_default()
+            .push(Sample {
+                timestamp: point.timestamp_ms,
+                value: point.value,
+            });
     }
-    let timeseries = by_series
-        .into_iter()
-        .map(|(labels, mut samples)| {
-            samples.sort_by_key(|s| s.timestamp);
-            TimeSeries {
-                labels: labels
-                    .iter()
-                    .map(|(name, value)| Label {
-                        name: name.clone(),
-                        value: value.clone(),
-                    })
-                    .collect(),
-                samples,
-            }
-        })
-        .collect();
-    let written = app
-        .clone()
-        .oneshot(
-            Request::post("/api/v1/write")
-                .body(Body::from(encode(&WriteRequest { timeseries })))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(written.status(), StatusCode::NO_CONTENT);
+    for by_series in by_second.into_values() {
+        let timeseries = by_series
+            .into_iter()
+            .map(|(labels, mut samples)| {
+                samples.sort_by_key(|s| s.timestamp);
+                TimeSeries {
+                    labels: labels
+                        .iter()
+                        .map(|(name, value)| Label {
+                            name: name.clone(),
+                            value: value.clone(),
+                        })
+                        .collect(),
+                    samples,
+                }
+            })
+            .collect();
+        let written = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/write")
+                    .body(Body::from(encode(&WriteRequest { timeseries })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(written.status(), StatusCode::NO_CONTENT);
+    }
     for _ in 0..1000 {
         if state.engine.queued_samples() == 0 {
             break;
@@ -688,5 +699,88 @@ async fn jointly_planned_fine_and_coarse_sums_answer_exactly() {
             (value - exact).abs() < 1e-9,
             "{labels:?}: {value} vs {exact}"
         );
+    }
+}
+
+/// ASAPQuery's seed-862 top-k sums over one metric and two windows,
+/// planned jointly: `[1m]` every second and `[20m]` every 30 s. The plan
+/// stores per-series sums of one definition id in 1-second panes for the
+/// first and 30-second panes for the second, with the same (no) label
+/// constraints. Each query merges its own panes: every series' answer is
+/// its sum over its query's whole window.
+#[tokio::test]
+async fn panes_of_one_definition_and_two_widths_are_stored_apart() {
+    let queries = [
+        (
+            "topk by (region, service) (4, sum_over_time(data[1m]))",
+            1000,
+            60.0,
+        ),
+        (
+            "topk by (region, service) (4, sum_over_time(data[20m]))",
+            30000,
+            1200.0,
+        ),
+    ];
+    let entries: Vec<String> = queries
+        .iter()
+        .map(|(query, interval, _)| {
+            format!(
+                r#"{{"query": {query:?}, "demand": {{"fixed_interval": {interval}}},
+                  "requirements": {{"accuracy": {{"max_error": 0.05, "failure_probability": 0.3,
+                      "accuracy_scope": "whole_result"}}}},
+                  "predictability": {{"predictable": {{"known_at": null}}}}}}"#
+            )
+        })
+        .collect();
+    let workload: PlanningWorkload = serde_json::from_str(&format!(
+        r#"{{"query_workload": {{"language": "promql", "repeating_queries": [{}]}},
+            "data_workload": {{"arrival": {{"ingesting": {{"rows_per_second": 10000.0}}}},
+              "sources": {{"data": {{"series_count": 1000, "sample_interval": 100,
+                  "metric_type": "gauge", "values_non_negative": true}}}}}}}}"#,
+        entries.join(",")
+    ))
+    .unwrap();
+    let plan = plan_without_raw_samples(&workload, true);
+    // One definition id, two pane widths.
+    let mut widths: BTreeMap<&str, std::collections::BTreeSet<i64>> = BTreeMap::new();
+    for output in &plan.stored_outputs {
+        for window in &output.inputs.raw_sample_windows {
+            widths
+                .entry(output.coverage.definition_id.as_str())
+                .or_default()
+                .insert(window.width_ms);
+        }
+    }
+    assert!(
+        widths.values().any(|w| w.len() == 2),
+        "the case this tests: {widths:?}"
+    );
+    // Two series in one (region, service), ten samples per second each
+    // over the last 21 minutes (the first minute, before the window, opens
+    // the panes): 0.1 and 0.2, so 1 and 2 per second.
+    let mut points = Vec::new();
+    for (instance, value) in [("a", 0.1), ("b", 0.2)] {
+        for step in 0..12_600 {
+            points.push(Point {
+                labels: labels(&[
+                    ("__name__", "data"),
+                    ("instance", instance),
+                    ("region", "r"),
+                    ("service", "s"),
+                ]),
+                timestamp_ms: EVALUATION_MS - 1_260_000 + 50 + step * 100,
+                value,
+            });
+        }
+    }
+    let (app, _) = run(&plan, &points).await;
+    for (query, _, seconds) in queries {
+        let answered = answer(&app, query).await;
+        let values: Vec<f64> = answered.iter().map(|(_, v)| *v).collect();
+        assert_eq!(values.len(), 2, "{query}: {answered:?}");
+        for (value, want) in values.iter().zip([seconds, 2.0 * seconds]) {
+            assert!((value - want).abs() < 1e-6, "{query}: {answered:?}");
+        }
     }
 }

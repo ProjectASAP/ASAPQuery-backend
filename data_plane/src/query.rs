@@ -35,7 +35,7 @@ use asap_planner::{InstallablePlan, StoredOutputBuild};
 
 use crate::precompute::{run, RawSample, SummaryBuild, SummaryInstance};
 use crate::raw_sample_window::RawSampleWindowBatcher;
-use crate::sds::{DefinitionKey, Sds, Selection, SummaryInstanceKey, SummaryStore};
+use crate::sds::{DefinitionKey, Sds, SummaryInstanceKey, SummaryStore};
 
 /// A bound raw-sample window: a `RawSampleWindow` of the plan bound to one
 /// evaluation time, i.e. `metric`'s raw samples in `(start_ms, end_ms]`
@@ -279,7 +279,7 @@ impl QueryEngine {
             if store
                 .get(
                     &input.definition.id,
-                    &selection_of(&input.definition, end_ms),
+                    &input.definition.selection_ending_at(end_ms),
                 )
                 .is_none()
             {
@@ -343,7 +343,7 @@ impl QueryEngine {
                 .as_ref()
                 .expect("compiled roots read only `QueryRun` definitions that build");
             let (_, end_ms) = window(time_ms, input.offset_ms, build.definition.pane_ms)?;
-            let selection = selection_of(&input.definition, end_ms);
+            let selection = input.definition.selection_ending_at(end_ms);
             let summary = match store.get(&input.definition.id, &selection) {
                 Some(summary) => {
                     self.query_run_stats.reused += 1;
@@ -443,14 +443,6 @@ impl QueryEngine {
     }
 }
 
-/// The concrete selection of `definition`'s pane ending at `end_ms`.
-fn selection_of(definition: &DefinitionKey, end_ms: i64) -> Selection {
-    Selection {
-        labels: definition.labels.clone(),
-        end_ms,
-    }
-}
-
 /// `(start, end]` of a window `width_ms` wide ending `offset_ms` before
 /// `time_ms`, or why it does not fit in `i64` milliseconds.
 fn window(time_ms: i64, offset_ms: i64, width_ms: i64) -> Result<(i64, i64), Unanswered> {
@@ -475,7 +467,10 @@ fn pane<'a>(
         )));
     }
     store
-        .get(&input.definition.id, &selection_of(&input.definition, end))
+        .get(
+            &input.definition.id,
+            &input.definition.selection_ending_at(end),
+        )
         .ok_or_else(|| {
             Unanswered::MissingPane(format!(
                 "pane ending at {end} of {:?} is not stored",

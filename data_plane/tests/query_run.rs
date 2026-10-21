@@ -37,7 +37,7 @@ fn fixture(plan: &InstallablePlan) -> Fixture {
         .values()
         .find(|d| d.built_at == StoredOutputBuild::QueryRun)
         .map(|d| d.key())
-        .unwrap_or_else(|| DefinitionKey::unconstrained(DefinitionId(String::new())));
+        .unwrap_or_else(|| DefinitionKey::unconstrained(DefinitionId(String::new()), 0));
     Fixture {
         engine: QueryEngine::new(plan, &sds),
         store: SummaryStore::new(),

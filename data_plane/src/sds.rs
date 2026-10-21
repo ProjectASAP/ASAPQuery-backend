@@ -9,14 +9,16 @@
 //! `retention_ms`.
 //!
 //! A definition's identity is the plan's definition id. Outputs with the same
-//! definition id and the same label constraints in their selection differ
-//! only in time, so they share one [`SummaryDefinition`]: the data plane
-//! builds each pane once and every output reads the one it needs. Outputs
-//! with the same definition id but other label constraints are other
-//! [`SummaryDefinition`]s ([`DefinitionKey`]). A summary instance is keyed by
-//! its definition id and its concrete [`Selection`]: those label constraints
-//! and the time interval `(end - width, end]` the plan's relative time binds
-//! to at evaluation time.
+//! definition id, the same label constraints in their selection and the
+//! same pane width differ only in where their time interval ends, so they
+//! share one [`SummaryDefinition`]: the data plane builds each pane once and
+//! every output reads the one it needs. Outputs with the same definition id
+//! but other label constraints or another pane width (e.g. one query's
+//! 1-second panes and another's 30-second panes of the same per-series sum)
+//! are other [`SummaryDefinition`]s ([`DefinitionKey`]). A summary instance
+//! is keyed by its definition id and its concrete [`Selection`]: those label
+//! constraints and the time interval `(end - width, end]` the plan's
+//! relative time binds to at evaluation time.
 //!
 //! A stored output may be built from other stored outputs (rollups over time
 //! or across series). [`Sds::ingestion_build_order`] orders definitions so
@@ -44,20 +46,22 @@ pub struct DefinitionId(pub String);
 /// plan's JSON form; empty when it has none.
 pub type LabelConstraints = Arc<str>;
 
-/// One [`SummaryDefinition`] of the SDS: a definition id and the label
-/// constraints its outputs share.
+/// One [`SummaryDefinition`] of the SDS: a definition id, and the label
+/// constraints and pane width its outputs share.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DefinitionKey {
     pub id: DefinitionId,
     pub labels: LabelConstraints,
+    pub pane_ms: i64,
 }
 
 impl DefinitionKey {
-    /// `id` with no label constraints.
-    pub fn unconstrained(id: DefinitionId) -> Self {
+    /// `id`'s panes `pane_ms` wide with no label constraints.
+    pub fn unconstrained(id: DefinitionId, pane_ms: i64) -> Self {
         Self {
             id,
             labels: Arc::from(""),
+            pane_ms,
         }
     }
 }
@@ -99,15 +103,13 @@ impl SummaryDefinition {
         DefinitionKey {
             id: self.id.clone(),
             labels: self.labels.clone(),
+            pane_ms: self.pane_ms,
         }
     }
 
     /// The concrete selection of its pane ending at `end_ms`.
     pub fn selection_ending_at(&self, end_ms: i64) -> Selection {
-        Selection {
-            labels: self.labels.clone(),
-            end_ms,
-        }
+        self.key().selection_ending_at(end_ms)
     }
 
     /// The builder's `TimeRange`, which one pane's raw samples feed.
@@ -201,6 +203,7 @@ impl Sds {
             let key = DefinitionKey {
                 id: DefinitionId(output.coverage.definition_id.clone()),
                 labels: label_constraints(selection),
+                pane_ms: end - start,
             };
             let retention_ms = i64::try_from(output.retention_ms)
                 .map_err(|_| SdsError::RetentionOverflow(node))?;
@@ -211,7 +214,7 @@ impl Sds {
                         id: key.id.clone(),
                         labels: key.labels.clone(),
                         built_at: output.built_at,
-                        pane_ms: end - start,
+                        pane_ms: key.pane_ms,
                         builder: node,
                         window: window.clone(),
                         output_schema,
@@ -335,20 +338,32 @@ fn label_constraints(selection: &SelectionBox) -> LabelConstraints {
 }
 
 /// The concrete selection of one summary instance: its definition's label
-/// constraints and the time interval `(end_ms - width, end_ms]` the plan's
-/// relative time binds to at evaluation time, the width being its
-/// definition's pane width.
+/// constraints and the time interval `(end_ms - pane_ms, end_ms]` the
+/// plan's relative time binds to at evaluation time.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Selection {
     pub labels: LabelConstraints,
+    pub pane_ms: i64,
     pub end_ms: i64,
 }
 
 impl Selection {
-    /// The pane ending at `end_ms`, with no label constraints.
-    pub fn ending_at(end_ms: i64) -> Self {
+    /// The pane `(end_ms - pane_ms, end_ms]`, with no label constraints.
+    pub fn ending_at(end_ms: i64, pane_ms: i64) -> Self {
         Self {
             labels: Arc::from(""),
+            pane_ms,
+            end_ms,
+        }
+    }
+}
+
+impl DefinitionKey {
+    /// The concrete selection of this definition's pane ending at `end_ms`.
+    pub fn selection_ending_at(&self, end_ms: i64) -> Selection {
+        Selection {
+            labels: self.labels.clone(),
+            pane_ms: self.pane_ms,
             end_ms,
         }
     }
@@ -405,24 +420,18 @@ impl<S> SummaryStore<S> {
 
     /// The instance of `definition`'s pane ending at `end_ms`, if stored.
     pub fn get_pane(&self, definition: &DefinitionKey, end_ms: i64) -> Option<&S> {
-        self.get(
-            &definition.id,
-            &Selection {
-                labels: definition.labels.clone(),
-                end_ms,
-            },
-        )
+        self.get(&definition.id, &definition.selection_ending_at(end_ms))
     }
 
     /// Drops the instances of `definition` with `oldest`'s label constraints
-    /// whose pane ends before `oldest`'s.
+    /// and pane width whose pane ends before `oldest`'s.
     pub fn evict_before(&mut self, definition: &DefinitionId, oldest: &Selection) {
         let Some(instances) = self.instances.get_mut(definition) else {
             return;
         };
         let from = Selection {
-            labels: oldest.labels.clone(),
             end_ms: i64::MIN,
+            ..oldest.clone()
         };
         let expired: Vec<Selection> = instances
             .range(from..oldest.clone())
