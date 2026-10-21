@@ -106,3 +106,20 @@ fn selects_stored_outputs_built_in_a_query_run() {
     assert_eq!(query_run.len(), 5, "five one-minute summaries");
     assert!(query_run.iter().all(|o| o.pane.width_ms == 60_000));
 }
+
+/// A workload is planned whole or refused: when one query has no plan the
+/// data plane can execute (here a raw instant selector, without raw data at
+/// query time), no plan is written, so no query is left for Prometheus to
+/// compute.
+#[test]
+fn refuses_a_workload_with_a_query_it_cannot_plan() {
+    let mut workload = example("example4b");
+    let queries = workload.query_workload.repeating_queries.as_mut().unwrap();
+    let mut unplannable = queries[0].clone();
+    unplannable.query = serde_json::from_value(serde_json::json!("latency_ms")).unwrap();
+    queries.push(unplannable);
+    let mut inputs = DeploymentInputs::default();
+    inputs.deployment_capabilities.raw_data_retained = false;
+    let error = plan_workload(&workload, &inputs).unwrap_err();
+    assert!(matches!(error, PlanError::Planning(_)), "{error}");
+}
