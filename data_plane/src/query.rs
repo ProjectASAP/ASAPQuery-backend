@@ -29,12 +29,13 @@ use asap_executor::planner::ir::scalar::{CompareOpKind, ScalarValue};
 use asap_executor::planner::ir::schema::{DataType, FieldDataType, Schema};
 use asap_executor::planner::ir::{NonASAPOp, Operator as IrOperator, ScalarExpr};
 use asap_executor::runtime::Scope;
+use asap_executor::series_labels_of_output_row;
 use asap_executor::values::{Batch, SchemaRef, Value};
-use asap_executor::{series_labels_of_output_row, RawSampleSelector};
 use asap_planner::{InstallablePlan, StoredOutputBuild};
 
-use crate::precompute::{executor_samples, run_root, RawSample, SummaryBuild};
+use crate::precompute::{run, Pane, RawSample, SummaryBuild};
 use crate::sds::{DefinitionId, Sds, Selection, SummaryInstanceKey, SummaryStore};
+use crate::series::SeriesWindow;
 
 /// A bound raw-sample window: a `RawSampleWindow` of the plan bound to one
 /// evaluation time, i.e. `metric`'s raw samples in `(start_ms, end_ms]`
@@ -105,6 +106,8 @@ pub enum Unanswered {
 
 struct StoredInput {
     node: u64,
+    /// The output's schema, which its panes' rows are in.
+    schema: SchemaRef,
     definition: DefinitionId,
     offset_ms: i64,
     pane_ms: i64,
@@ -114,8 +117,7 @@ struct RawInput {
     node: u64,
     matchers: Vec<LabelMatcher>,
     /// The plan's `Scan` label matchers over the range's samples.
-    selector: RawSampleSelector,
-    schema: SchemaRef,
+    series: SeriesWindow,
     range_ms: i64,
     offset_ms: i64,
 }
@@ -123,6 +125,7 @@ struct RawInput {
 /// A stored output built in a `QueryRun` (`MatAtQueryKeptAcrossEvaluations`).
 struct QueryRunInput {
     node: u64,
+    schema: SchemaRef,
     definition: DefinitionId,
     offset_ms: i64,
     /// The output's own `TimeRange`, which its coverage's samples feed.
@@ -242,7 +245,7 @@ impl QueryEngine {
         &self,
         query: &str,
         time_ms: i64,
-        store: &SummaryStore<Batch>,
+        store: &SummaryStore<Pane>,
         progress: IngestionProgress,
     ) -> Result<Prepared, Unanswered> {
         let (root, program) = self.program(query)?;
@@ -256,7 +259,7 @@ impl QueryEngine {
                 let (start_ms, end_ms) = window(time_ms, input.offset_ms, input.range_ms)?;
                 Ok(BoundRawSampleWindow {
                     node: input.node,
-                    metric: input.selector.metric().to_string(),
+                    metric: input.series.metric().to_string(),
                     matchers: input.matchers.clone(),
                     start_ms,
                     end_ms,
@@ -308,7 +311,7 @@ impl QueryEngine {
         &mut self,
         root: usize,
         time_ms: i64,
-        store: &mut SummaryStore<Batch>,
+        store: &mut SummaryStore<Pane>,
         progress: &IngestionProgress,
         raw: &BTreeMap<u64, Vec<RawSample>>,
     ) -> Result<Vec<ResultSample>, Unanswered> {
@@ -325,7 +328,7 @@ impl QueryEngine {
         for input in &program.stored {
             let pane = pane(input, time_ms, store)?;
             let source =
-                Operator::source(pane.schema().clone(), vec![pane.clone()]).map_err(failed)?;
+                Operator::source(input.schema.clone(), pane.batches.clone()).map_err(failed)?;
             sources.insert(input.node, Box::new(source));
         }
         for input in &program.query_run {
@@ -376,8 +379,7 @@ impl QueryEngine {
                     summary
                 }
             };
-            let source =
-                Operator::source(summary.schema().clone(), vec![summary]).map_err(failed)?;
+            let source = Operator::source(input.schema.clone(), summary.batches).map_err(failed)?;
             sources.insert(input.node, Box::new(source));
         }
         if let Some(watermark) = progress.watermark_ms {
@@ -394,19 +396,15 @@ impl QueryEngine {
         }
         for input in &program.raw {
             let samples = raw.get(&input.node).map(Vec::as_slice).unwrap_or_default();
-            let rows = input
-                .selector
-                .window_batch(
-                    window(time_ms, input.offset_ms, input.range_ms)?.1,
-                    &executor_samples(samples),
-                )
-                .map_err(failed)?;
-            let source = Operator::source(input.schema.clone(), vec![rows]).map_err(failed)?;
+            let (_, end_ms) = window(time_ms, input.offset_ms, input.range_ms)?;
+            let rows = input.series.batch(end_ms, samples).map_err(failed)?;
+            let source =
+                Operator::source(input.series.schema.clone(), vec![rows]).map_err(failed)?;
             sources.insert(input.node, Box::new(source));
         }
         let dag = program.compiled.instantiate(sources).map_err(failed)?;
-        let rows = run_root(&dag, program.compiled.roots()[0], scope).map_err(failed)?;
-        result_samples(&program.output, rows)
+        let batches = run(&dag, program.compiled.roots(), scope).map_err(failed)?;
+        result_samples(&program.output, &batches)
     }
 
     /// The build of a `QueryRun` definition a compiled root reads.
@@ -444,8 +442,8 @@ fn window(time_ms: i64, offset_ms: i64, width_ms: i64) -> Result<(i64, i64), Una
 fn pane<'a>(
     input: &StoredInput,
     time_ms: i64,
-    store: &'a SummaryStore<Batch>,
-) -> Result<&'a Batch, Unanswered> {
+    store: &'a SummaryStore<Pane>,
+) -> Result<&'a Pane, Unanswered> {
     let (_, end) = window(time_ms, input.offset_ms, input.pane_ms)?;
     if end.rem_euclid(input.pane_ms) != 0 {
         return Err(Unanswered::MissingPane(format!(
@@ -490,6 +488,7 @@ fn program(
             match sds.definitions[definition].built_at {
                 StoredOutputBuild::IngestionRun => stored.push(StoredInput {
                     node: id,
+                    schema: Arc::new(nodes[&id].output_schema.clone()),
                     definition: definition.clone(),
                     offset_ms: binding.offset_ms,
                     pane_ms: sds.definitions[definition].pane_ms,
@@ -500,6 +499,7 @@ fn program(
                         .map_err(Clone::clone)?;
                     query_run.push(QueryRunInput {
                         node: id,
+                        schema: Arc::new(nodes[&id].output_schema.clone()),
                         definition: definition.clone(),
                         offset_ms: binding.offset_ms,
                         raw_input: binding.raw_input,
@@ -513,13 +513,12 @@ fn program(
                 let window = windows.get(&id).ok_or_else(|| {
                     format!("node {id}: a TimeRange the plan lists no window for")
                 })?;
-                let selector =
-                    RawSampleSelector::new(dag, window).map_err(|e| format!("node {id}: {e}"))?;
+                let series =
+                    SeriesWindow::new(dag, window).map_err(|e| format!("node {id}: {e}"))?;
                 raw.push(RawInput {
                     node: id,
                     matchers: label_matchers(dag, window.scan_node_id as u64),
-                    selector,
-                    schema: Arc::new(nodes[&id].output_schema.clone()),
+                    series,
                     range_ms: window.width_ms,
                     offset_ms: window.end_offset_ms,
                 });
@@ -541,7 +540,10 @@ fn program(
         inputs.insert(node, InputContract::bounded(schema));
     }
     for input in &raw {
-        inputs.insert(input.node, InputContract::bounded(input.schema.clone()));
+        inputs.insert(
+            input.node,
+            InputContract::bounded(input.series.schema.clone()),
+        );
     }
     let compiled = compile(dag, inputs, &[root]).map_err(|e| e.to_string())?;
     let mut query_run_fetch_node: BTreeMap<DefinitionId, u64> = BTreeMap::new();
@@ -610,9 +612,11 @@ fn label_matchers(dag: &PhysicalASAPDAG, scan: u64) -> Vec<LabelMatcher> {
         .collect()
 }
 
-/// PromQL vector samples from result rows: labels from the series identity
-/// and the other text columns, the value from the one `Float64` column.
-fn result_samples(schema: &Schema, rows: Vec<Vec<Value>>) -> Result<Vec<ResultSample>, Unanswered> {
+/// PromQL vector samples from a root's result batches: labels from the
+/// series identity and the other text columns, the value from the one
+/// `Float64` column. The one place rows are read: the answer's JSON
+/// encoding.
+fn result_samples(schema: &Schema, batches: &[Batch]) -> Result<Vec<ResultSample>, Unanswered> {
     let unsupported = |reason: &str| Unanswered::Unsupported(format!("result rows: {reason}"));
     let values: Vec<usize> = schema
         .fields
@@ -624,7 +628,9 @@ fn result_samples(schema: &Schema, rows: Vec<Vec<Value>>) -> Result<Vec<ResultSa
     let [value] = values[..] else {
         return Err(unsupported("expected one Float64 value column"));
     };
-    rows.into_iter()
+    batches
+        .iter()
+        .flat_map(Batch::to_rows)
         .map(|row| {
             let labels = series_labels_of_output_row(schema, &row)
                 .map_err(|e| Unanswered::Execution(e.to_string()))?;

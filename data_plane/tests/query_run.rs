@@ -8,9 +8,9 @@ mod common;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use asap_executor::values::Batch;
 use asap_planner::{InstallablePlan, StoredOutputBuild};
 use data_plane::engine::{EngineHandle, EngineOptions};
+use data_plane::precompute::Pane;
 use data_plane::precompute::RawSample;
 use data_plane::query::{
     BoundRawSampleWindow, IngestionProgress, QueryEngine, QueryRunStats, ResultSample,
@@ -23,7 +23,7 @@ const P99: &str = "quantile_over_time(0.99, latency_ms[5m])";
 /// A query engine and the SDS store its stored outputs built in a `QueryRun` go to.
 struct Fixture {
     engine: QueryEngine,
-    store: SummaryStore<Batch>,
+    store: SummaryStore<Pane>,
     definition: DefinitionId,
 }
 
