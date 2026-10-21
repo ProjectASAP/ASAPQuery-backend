@@ -32,7 +32,8 @@ use precompute::RawSample;
 use prometheus::InstantQuery;
 use query::Unanswered;
 
-/// Response header naming what answered a query: `plan` or `forwarded`.
+/// Response header naming what answered a query: `plan` or `forwarded`, or
+/// `refused` when `--no-forward` refused to forward it.
 pub const EXECUTION_HEADER: &str = "x-asap-execution";
 /// Response header of a forwarded planned query: why the plan did not answer.
 pub const FORWARD_REASON_HEADER: &str = "x-asap-forward-reason";
@@ -50,6 +51,9 @@ pub struct DataPlane {
     pub limits: remote_write::Limits,
     /// Samples accepted since startup.
     pub samples: AtomicU64,
+    /// Never forward a query to Prometheus: a query the plan cannot answer
+    /// gets an error with the reason ([`EngineOptions::no_forward`]).
+    pub no_forward: bool,
     client: reqwest::Client,
 }
 
@@ -76,6 +80,7 @@ impl DataPlane {
     ) -> anyhow::Result<Self> {
         let (engine, queries) = EngineHandle::spawn(plan_json, options)?;
         Ok(Self {
+            no_forward: options.no_forward,
             queries,
             engine,
             prometheus_url: prometheus_url.trim_end_matches('/').to_string(),
@@ -262,6 +267,9 @@ async fn query(
 ) -> Response {
     let instant = match InstantQuery::parse(query.0.as_deref(), &body) {
         Ok(Some(instant)) => instant,
+        Ok(None) if state.no_forward => {
+            return not_answered("the request has no query parameter");
+        }
         Ok(None) => return forward(state, "query", method, query, headers, body).await,
         Err(bad) => {
             let body = axum::Json(prometheus::bad_data(&bad.to_string()));
@@ -276,6 +284,7 @@ async fn query(
                 .insert(EXECUTION_HEADER, HeaderValue::from_static("plan"));
             return response;
         }
+        Err(reason) if state.no_forward => return not_answered(&reason.to_string()),
         Err(Unanswered::NotPlanned(_)) => None,
         Err(reason) => {
             tracing::debug!(%reason, "forwarding a planned query");
@@ -331,7 +340,23 @@ async fn query_range(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if state.no_forward {
+        return not_answered("the data plane does not answer range queries yet");
+    }
     forward(state, "query_range", method, query, headers, body).await
+}
+
+/// With `--no-forward`, the answer to a query the plan does not answer: a
+/// Prometheus `execution` error (422) with `reason`, the reason a
+/// forwarded query's `x-asap-forward-reason` would carry, and
+/// `x-asap-execution: refused`. Prometheus receives no query.
+fn not_answered(reason: &str) -> Response {
+    let body = serde_json::json!({"status": "error", "errorType": "execution", "error": reason});
+    let mut response = (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(body)).into_response();
+    response
+        .headers_mut()
+        .insert(EXECUTION_HEADER, HeaderValue::from_static("refused"));
+    response
 }
 
 /// Request headers not forwarded: hop-by-hop headers (RFC 9110 section 7.6.1),

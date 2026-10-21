@@ -407,6 +407,14 @@ impl QueryEngine {
         result_samples(&program.output, &batches)
     }
 
+    /// The planned queries the engine cannot run, with why.
+    pub fn unexecutable(&self) -> Vec<(String, String)> {
+        self.roots
+            .iter()
+            .filter_map(|(query, program)| Some((query.clone(), program.as_ref().err()?.clone())))
+            .collect()
+    }
+
     /// The build of a `QueryRun` definition a compiled root reads.
     fn query_run_build(&self, definition: &DefinitionId) -> &SummaryBuild {
         self.query_run_builds[definition]

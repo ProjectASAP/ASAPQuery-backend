@@ -30,6 +30,12 @@ struct Args {
     /// Samples queued for the engine beyond which Remote Write gets 503.
     #[arg(long, default_value_t = EngineOptions::default().max_queued_samples)]
     max_queued_samples: u64,
+    /// Never forward a query to Prometheus: refuse a plan with a query the
+    /// data plane cannot run, and answer any query the plan does not answer
+    /// with an error giving the reason. Raw samples are still read from
+    /// Prometheus.
+    #[arg(long)]
+    no_forward: bool,
 }
 
 #[tokio::main]
@@ -49,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
                     max_future_ms: args.max_future_ms,
                 },
                 max_queued_samples: args.max_queued_samples,
+                no_forward: args.no_forward,
             },
         )?
         .with_forward_timeout(Duration::from_secs(args.forward_timeout_seconds)),

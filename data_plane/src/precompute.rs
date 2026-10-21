@@ -634,7 +634,14 @@ mod tests {
             ..PrecomputeOptions::default()
         };
         let mut engine = Precompute::new(plan.dag.dag, &sds, options).unwrap();
-        assert_eq!((sds.definitions.len(), engine.builders.len(), engine.per_sample_definitions()), (1, 1, 1));
+        assert_eq!(
+            (
+                sds.definitions.len(),
+                engine.builders.len(),
+                engine.per_sample_definitions()
+            ),
+            (1, 1, 1)
+        );
         let jobs: Vec<String> = (0..10).map(|i| format!("job{i}")).collect();
         let mut samples = Vec::new();
         for t in (MINUTE..25 * MINUTE).step_by(15_000) {

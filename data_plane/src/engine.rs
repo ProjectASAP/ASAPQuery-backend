@@ -26,6 +26,10 @@ pub struct EngineOptions {
     /// Samples queued for the engine, not yet ingested, beyond which Remote
     /// Write is refused with 503 so senders retry.
     pub max_queued_samples: u64,
+    /// Every answer must be computed from the plan: a plan with a query the
+    /// query engine cannot run is refused at install, and the data plane
+    /// never forwards a query to Prometheus (`--no-forward`).
+    pub no_forward: bool,
 }
 
 impl Default for EngineOptions {
@@ -34,6 +38,7 @@ impl Default for EngineOptions {
             precompute: PrecomputeOptions::default(),
             // Two Remote Write requests of the default sample limit.
             max_queued_samples: 2_000_000,
+            no_forward: false,
         }
     }
 }
@@ -102,7 +107,7 @@ impl EngineHandle {
     /// plan is invalid or the data plane cannot execute it.
     pub fn spawn(plan_json: String, options: EngineOptions) -> anyhow::Result<(Self, Vec<String>)> {
         let (commands, receiver) = channel();
-        let (engine, queries) = Engine::new(&plan_json, options.precompute)?;
+        let (engine, queries) = Engine::new(&plan_json, options)?;
         let running = Arc::new(AtomicBool::new(true));
         let queued_samples = Arc::new(AtomicU64::new(0));
         let stats = Arc::new(Mutex::new(PrecomputeStats::default()));
@@ -270,7 +275,7 @@ struct Engine {
 }
 
 impl Engine {
-    fn new(plan_json: &str, options: PrecomputeOptions) -> anyhow::Result<(Self, Vec<String>)> {
+    fn new(plan_json: &str, options: EngineOptions) -> anyhow::Result<(Self, Vec<String>)> {
         let plan: InstallablePlan = serde_json::from_str(plan_json)?;
         plan.validate()?;
         let sds = Sds::from_plan(&plan)?;
@@ -281,8 +286,19 @@ impl Engine {
         );
         let queries = plan.queries.iter().map(|q| q.query.clone()).collect();
         let query = QueryEngine::new(&plan, &sds);
+        let unexecutable = query.unexecutable();
+        if options.no_forward && !unexecutable.is_empty() {
+            let reasons: Vec<String> = unexecutable
+                .iter()
+                .map(|(query, reason)| format!("{query:?}: {reason}"))
+                .collect();
+            anyhow::bail!(
+                "--no-forward refuses a plan with queries the data plane cannot run: {}",
+                reasons.join("; ")
+            );
+        }
         let engine = Self {
-            precompute: Precompute::new(plan.dag.dag, &sds, options)?,
+            precompute: Precompute::new(plan.dag.dag, &sds, options.precompute)?,
             query,
         };
         Ok((engine, queries))

@@ -106,6 +106,16 @@ with cost model 1 and illustrative unit costs.
 `--forward-timeout-seconds` bounds each forwarded query (default 120, matching
 Prometheus's default query timeout); a query that runs longer gets 502.
 
+`--no-forward` makes every answer ASAP's: the data plane never sends a query
+to Prometheus for computation. It refuses to start with a plan that has a
+query it cannot run, and answers any query the plan does not answer (not
+planned, a pane not stored, an evaluation time off the pane grid, a range
+query) with a Prometheus `execution` error (422, `x-asap-execution: refused`)
+whose `error` is the reason a forwarded query's `x-asap-forward-reason` would
+give. Raw samples for query-time windows are still read from Prometheus. The
+control plane writes a plan only when every workload query has one the data
+plane can execute; otherwise it fails.
+
 ## Development
 
 ```sh
