@@ -5,12 +5,11 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use asap_executor::planner::ir::schema::{FieldDataType, SketchStatistic};
 use asap_executor::summary_kernels::exact::ExactAccumulator;
 use asap_executor::values::Value;
-use data_plane::precompute::{Pane, Precompute, PrecomputeOptions, RawSample};
+use data_plane::precompute::{Precompute, PrecomputeOptions, RawSample, SummaryInstance};
 use data_plane::sds::Sds;
 use data_plane::sds::Selection;
 
@@ -28,7 +27,7 @@ fn options() -> PrecomputeOptions {
 fn samples(metric: &str, jobs: usize, from: i64, to: i64) -> Vec<RawSample> {
     let series: Vec<_> = (0..jobs)
         .map(|j| {
-            Arc::new(BTreeMap::from([
+            data_plane::series_ids::intern(&BTreeMap::from([
                 ("__name__".to_string(), metric.to_string()),
                 ("job".to_string(), format!("job{j}")),
                 ("instance".to_string(), format!("{}", j % 3)),
@@ -71,7 +70,7 @@ fn state_of(value: &Value) -> Vec<u8> {
 
 /// Every cell of `pane` as comparable data, its rows sorted. (Tests read
 /// rows to compare them; the data plane does not.)
-fn cells(pane: &Pane) -> Vec<Vec<Vec<u8>>> {
+fn cells(pane: &SummaryInstance) -> Vec<Vec<Vec<u8>>> {
     let mut rows: Vec<Vec<Vec<u8>>> = pane
         .to_rows()
         .into_iter()
@@ -166,4 +165,39 @@ fn per_sample_panes_apply_label_matchers() {
     );
     assert_eq!(cells(&expected).len(), 2, "jobs 1 and 4 are instance 1");
     assert_eq!(cells(&actual), cells(&expected));
+}
+
+/// A resent sample (a Remote Write retry, for instance) is not
+/// after its series' previous sample: it is dropped and counted, and the
+/// pane is built as without it, instead of failing.
+#[test]
+fn a_resent_sample_is_dropped_not_failing_or_doubling_the_pane() {
+    let plan = common::plan("example1", false);
+    let sds = Sds::from_plan(&plan).unwrap();
+    let all = samples("http_requests_total", 3, MINUTE, 3 * MINUTE + 1);
+    let mut resent = all.clone();
+    let again = resent[10].clone();
+    resent.insert(11, again);
+    let mut batch = Precompute::batch(&plan.dag.dag, &sds, options()).unwrap();
+    batch.ingest(&all);
+    let mut per_sample = Precompute::new(plan.dag.dag.clone(), &sds, options()).unwrap();
+    assert_eq!(per_sample.per_sample_definitions(), sds.definitions.len());
+    per_sample.ingest(&resent);
+    assert_eq!(per_sample.stats.samples_dropped_duplicate, 1);
+    assert_eq!(per_sample.stats.panes_failed, 0);
+    assert_eq!(per_sample.stats.panes_built, batch.stats.panes_built);
+    for definition in sds.definitions.values() {
+        let mut end = 0;
+        while end <= 3 * MINUTE {
+            let selection = Selection::ending_at(end);
+            let expected = batch.store.get(&definition.id, selection);
+            let actual = per_sample.store.get(&definition.id, selection);
+            assert_eq!(
+                actual.map(cells),
+                expected.map(cells),
+                "pane ending at {end}"
+            );
+            end += definition.pane_ms;
+        }
+    }
 }

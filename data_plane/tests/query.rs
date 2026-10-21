@@ -1,7 +1,6 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use asap_planner::InstallablePlan;
 use data_plane::precompute::{Precompute, PrecomputeOptions, RawSample};
@@ -42,7 +41,7 @@ fn samples(
         .map(|(metric, labels)| {
             let mut map = BTreeMap::from([("__name__".to_string(), metric.to_string())]);
             map.extend(labels.iter().map(|(k, v)| (k.to_string(), v.to_string())));
-            Arc::new(map)
+            data_plane::series_ids::intern(&map)
         })
         .collect();
     (from..to)

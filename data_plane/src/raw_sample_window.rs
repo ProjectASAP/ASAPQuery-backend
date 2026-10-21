@@ -9,7 +9,7 @@
 //! (`Batch::try_from_columns`): the columns the selector builds, without
 //! a `Sample` or a row per sample.
 
-use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use asap_executor::arrow::array::{
@@ -50,12 +50,15 @@ pub(crate) struct SeriesCells {
     pub(crate) texts: Vec<Option<Arc<str>>>,
 }
 
-/// Each series' cells, or `None` when the `Scan` does not select it.
-type SeriesCache = HashMap<Arc<BTreeMap<String, String>>, Option<Arc<SeriesCells>>>;
+/// Each series' cells, or `None` when the `Scan` does not select it, with
+/// the newest sample time the series was looked up with, by series id.
+type SeriesCache = ahash::HashMap<u32, (Option<Arc<SeriesCells>>, AtomicI64)>;
 
-/// One raw-sample window of the plan, prepared to turn samples into its
-/// input batch. Shared by every thread that reads the window.
-pub(crate) struct SeriesWindow {
+/// One `RawSampleWindow` of the plan, prepared to turn raw samples into its
+/// input batch. A series is forgotten once it has not been seen for
+/// `keep_ms`, so the cache holds the series of recent windows, not every
+/// series ever seen.
+pub(crate) struct RawSampleWindowBatcher {
     selector: RawSampleSelector,
     /// The `TimeRange`'s output schema, which the batch is in.
     pub(crate) schema: SchemaRef,
@@ -64,13 +67,19 @@ pub(crate) struct SeriesWindow {
     /// An instant selector keeps only each series' latest sample.
     latest_sample_per_series: bool,
     series: RwLock<SeriesCache>,
+    /// How long a series not seen stays cached, past the window's width.
+    keep_ms: i64,
+    /// The window end series were last forgotten at.
+    forgotten_at_ms: AtomicI64,
 }
 
-impl SeriesWindow {
-    /// The window `window` of `dag`.
+impl RawSampleWindowBatcher {
+    /// The window `window` of `dag`, which caches a series until it has
+    /// not been seen for `keep_ms` past the window's width.
     pub(crate) fn new(
         dag: &PhysicalASAPDAG,
         window: &RawSampleWindow,
+        keep_ms: i64,
     ) -> Result<Self, asap_executor::Error> {
         let invalid = |message: &str| asap_executor::Error::Invalid(message.into());
         let selector = RawSampleSelector::new(dag, window)?;
@@ -107,7 +116,9 @@ impl SeriesWindow {
             kinds,
             width_ms: window.width_ms,
             latest_sample_per_series: *kind == TimeRangeKind::Instant,
-            series: RwLock::new(HashMap::new()),
+            series: RwLock::new(ahash::HashMap::default()),
+            keep_ms,
+            forgotten_at_ms: AtomicI64::new(i64::MIN),
         })
     }
 
@@ -119,27 +130,59 @@ impl SeriesWindow {
     /// The cells of `sample`'s series, or `None` when the `Scan` does not
     /// select it; computed once per series.
     pub(crate) fn cells(&self, sample: &RawSample) -> Option<Arc<SeriesCells>> {
-        if let Some(cells) = self
+        if let Some((cells, newest_ms)) = self
             .series
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&sample.labels)
+            .get(&sample.labels.id)
         {
+            newest_ms.fetch_max(sample.timestamp_ms, Ordering::Relaxed);
             return cells.clone();
         }
         let cells = self.series_cells(sample);
         self.series
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(sample.labels.clone(), cells.clone());
+            .insert(
+                sample.labels.id,
+                (cells.clone(), AtomicI64::new(sample.timestamp_ms)),
+            );
         cells
+    }
+
+    /// How many series are cached.
+    #[cfg(test)]
+    pub(crate) fn cached_series(&self) -> usize {
+        self.series.read().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Forgets the series whose newest sample is at or before `oldest_ms`.
+    pub(crate) fn forget_unseen(&self, oldest_ms: i64) {
+        self.forgotten_at_ms.fetch_max(oldest_ms, Ordering::Relaxed);
+        self.series
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, (_, newest_ms)| newest_ms.load(Ordering::Relaxed) > oldest_ms);
+    }
+
+    /// Forgets the series not seen for `keep_ms` past the width of the
+    /// window ending at `end_ms`, at most once per `keep_ms` of window ends,
+    /// so a scan of the cache is amortized over many windows.
+    fn forget_old(&self, end_ms: i64) {
+        let oldest_ms = end_ms
+            .saturating_sub(self.width_ms)
+            .saturating_sub(self.keep_ms);
+        let last = self.forgotten_at_ms.load(Ordering::Relaxed);
+        if oldest_ms > last.saturating_add(self.keep_ms.max(1)) {
+            self.forget_unseen(oldest_ms);
+        }
     }
 
     fn series_cells(&self, sample: &RawSample) -> Option<Arc<SeriesCells>> {
         // The selector applies the Scan's matchers to the series' labels;
         // the value is not the sample's, which may be a stale marker.
         let one = Sample {
-            labels: (*sample.labels).clone(),
+            labels: (**sample.labels).clone(),
             timestamp_ms: sample.timestamp_ms,
             value: 0.0,
         };
@@ -187,33 +230,30 @@ impl SeriesWindow {
             .filter(|s| start_ms < s.timestamp_ms && s.timestamp_ms <= end_ms);
         let mut points: Vec<(Arc<SeriesCells>, i64, f64)> = Vec::new();
         if self.latest_sample_per_series {
-            let mut latest: BTreeMap<&BTreeMap<String, String>, &RawSample> = BTreeMap::new();
+            let mut latest: ahash::HashMap<u32, &RawSample> = ahash::HashMap::default();
             for sample in in_window {
-                let entry = latest.entry(&sample.labels).or_insert(sample);
+                let entry = latest.entry(sample.labels.id).or_insert(sample);
                 if sample.timestamp_ms >= entry.timestamp_ms {
                     *entry = sample;
                 }
             }
             // In label order, as the selector emits them.
-            for sample in latest.into_values().filter(|s| !is_stale(s.value)) {
+            let mut latest: Vec<&RawSample> = latest.into_values().collect();
+            latest.sort_unstable_by(|a, b| a.labels.cmp(&b.labels));
+            for sample in latest.into_iter().filter(|s| !is_stale(s.value)) {
                 if let Some(cells) = self.cells(sample) {
                     points.push((cells, sample.timestamp_ms, sample.value));
                 }
             }
         } else {
             // Samples of one series are together: look each up once.
-            let mut current: Option<(&Arc<BTreeMap<String, String>>, Option<Arc<SeriesCells>>)> =
-                None;
+            let mut current: Option<(u32, Option<Arc<SeriesCells>>)> = None;
             for sample in in_window.filter(|s| !is_stale(s.value)) {
                 let cells = match &current {
-                    Some((labels, cells))
-                        if Arc::ptr_eq(labels, &sample.labels) || **labels == sample.labels =>
-                    {
-                        cells.clone()
-                    }
+                    Some((id, cells)) if *id == sample.labels.id => cells.clone(),
                     _ => {
                         let cells = self.cells(sample);
-                        current = Some((&sample.labels, cells.clone()));
+                        current = Some((sample.labels.id, cells.clone()));
                         cells
                     }
                 };
@@ -222,6 +262,7 @@ impl SeriesWindow {
                 }
             }
         }
+        self.forget_old(end_ms);
         self.batch_of(&points)
     }
 
@@ -260,7 +301,7 @@ impl SeriesWindow {
 pub(crate) fn text_column<'a>(
     texts: impl Iterator<Item = &'a str>,
 ) -> Result<ArrayRef, asap_executor::Error> {
-    let mut codes: HashMap<&str, u32> = HashMap::new();
+    let mut codes: ahash::HashMap<&str, u32> = ahash::HashMap::default();
     let mut values: Vec<&str> = Vec::new();
     let keys: UInt32Array = texts
         .map(|text| {

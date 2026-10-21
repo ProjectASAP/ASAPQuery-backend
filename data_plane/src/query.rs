@@ -33,9 +33,9 @@ use asap_executor::series_labels_of_output_row;
 use asap_executor::values::{Batch, SchemaRef, Value};
 use asap_planner::{InstallablePlan, StoredOutputBuild};
 
-use crate::precompute::{run, Pane, RawSample, SummaryBuild};
+use crate::precompute::{run, RawSample, SummaryBuild, SummaryInstance};
+use crate::raw_sample_window::RawSampleWindowBatcher;
 use crate::sds::{DefinitionId, Sds, Selection, SummaryInstanceKey, SummaryStore};
-use crate::series::SeriesWindow;
 
 /// A bound raw-sample window: a `RawSampleWindow` of the plan bound to one
 /// evaluation time, i.e. `metric`'s raw samples in `(start_ms, end_ms]`
@@ -117,7 +117,7 @@ struct RawInput {
     node: u64,
     matchers: Vec<LabelMatcher>,
     /// The plan's `Scan` label matchers over the range's samples.
-    series: SeriesWindow,
+    series: RawSampleWindowBatcher,
     range_ms: i64,
     offset_ms: i64,
 }
@@ -245,7 +245,7 @@ impl QueryEngine {
         &self,
         query: &str,
         time_ms: i64,
-        store: &SummaryStore<Pane>,
+        store: &SummaryStore<SummaryInstance>,
         progress: IngestionProgress,
     ) -> Result<Prepared, Unanswered> {
         let (root, program) = self.program(query)?;
@@ -311,7 +311,7 @@ impl QueryEngine {
         &mut self,
         root: usize,
         time_ms: i64,
-        store: &mut SummaryStore<Pane>,
+        store: &mut SummaryStore<SummaryInstance>,
         progress: &IngestionProgress,
         raw: &BTreeMap<u64, Vec<RawSample>>,
     ) -> Result<Vec<ResultSample>, Unanswered> {
@@ -442,8 +442,8 @@ fn window(time_ms: i64, offset_ms: i64, width_ms: i64) -> Result<(i64, i64), Una
 fn pane<'a>(
     input: &StoredInput,
     time_ms: i64,
-    store: &'a SummaryStore<Pane>,
-) -> Result<&'a Pane, Unanswered> {
+    store: &'a SummaryStore<SummaryInstance>,
+) -> Result<&'a SummaryInstance, Unanswered> {
     let (_, end) = window(time_ms, input.offset_ms, input.pane_ms)?;
     if end.rem_euclid(input.pane_ms) != 0 {
         return Err(Unanswered::MissingPane(format!(
@@ -477,6 +477,14 @@ fn program(
             .or_default()
             .push(edge.producer as u64);
     }
+    // A query-time window caches a series for as long as any summary is
+    // kept.
+    let longest_retention_ms = sds
+        .definitions
+        .values()
+        .map(|d| d.retention_ms)
+        .max()
+        .unwrap_or(0);
     let (mut stored, mut query_run, mut raw) = (Vec::new(), Vec::new(), Vec::new());
     let mut pending = vec![root];
     let mut seen = BTreeSet::new();
@@ -513,8 +521,8 @@ fn program(
                 let window = windows.get(&id).ok_or_else(|| {
                     format!("node {id}: a TimeRange the plan lists no window for")
                 })?;
-                let series =
-                    SeriesWindow::new(dag, window).map_err(|e| format!("node {id}: {e}"))?;
+                let series = RawSampleWindowBatcher::new(dag, window, longest_retention_ms)
+                    .map_err(|e| format!("node {id}: {e}"))?;
                 raw.push(RawInput {
                     node: id,
                     matchers: label_matchers(dag, window.scan_node_id as u64),
