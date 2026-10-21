@@ -501,3 +501,102 @@ fn query_run_metrics_are_bounded_like_routed_samples() {
     assert_eq!(engine.stats.samples_query_run_only, 1);
     assert_eq!(engine.watermark_ms(), Some(now));
 }
+
+/// An event-time barrier closes the last pane of a series that stopped
+/// sending, without a later sample.
+#[test]
+fn barrier_closes_the_last_pane_of_a_stopped_series() {
+    let (mut engine, sds) = precompute(common::plan("example4b", false));
+    let id = sds.definitions.keys().next().unwrap().clone();
+    engine.ingest_at(
+        &samples("latency_ms", &["a"], MINUTE, 25 * MINUTE),
+        31 * MINUTE,
+    );
+    assert!(engine
+        .store
+        .get(&id, Selection::ending_at(2 * PANE))
+        .is_some());
+    assert!(
+        engine
+            .store
+            .get(&id, Selection::ending_at(3 * PANE))
+            .is_none(),
+        "(20, 30 min] open"
+    );
+    assert_eq!(engine.advance_watermark_at(3 * PANE, 31 * MINUTE), 3 * PANE);
+    assert_eq!(
+        engine
+            .store
+            .get(&id, Selection::ending_at(3 * PANE))
+            .unwrap()
+            .num_rows(),
+        1
+    );
+}
+
+/// A repeated or lower barrier does nothing, and a barrier ahead of the
+/// wall clock is capped at it.
+#[test]
+fn barrier_is_monotonic_and_capped_at_the_wall_clock() {
+    let (mut engine, sds) = precompute(common::plan("example4b", false));
+    let id = sds.definitions.keys().next().unwrap().clone();
+    engine.ingest_at(
+        &samples("latency_ms", &["a"], MINUTE, 25 * MINUTE),
+        31 * MINUTE,
+    );
+    assert_eq!(
+        engine.advance_watermark_at(4 * PANE, 31 * MINUTE),
+        31 * MINUTE
+    );
+    assert!(engine
+        .store
+        .get(&id, Selection::ending_at(3 * PANE))
+        .is_some());
+    assert!(
+        engine
+            .store
+            .get(&id, Selection::ending_at(4 * PANE))
+            .is_none(),
+        "capped at 31 min"
+    );
+    let stats = engine.stats;
+    assert_eq!(
+        engine.advance_watermark_at(31 * MINUTE, 31 * MINUTE),
+        31 * MINUTE
+    );
+    assert_eq!(
+        engine.advance_watermark_at(2 * PANE, 31 * MINUTE),
+        31 * MINUTE
+    );
+    assert_eq!(engine.stats, stats);
+}
+
+/// A barrier at `i64::MAX` terminates and builds only retained panes.
+#[test]
+fn barrier_at_i64_max_terminates() {
+    let (mut engine, _) = precompute(common::plan("example4b", false));
+    engine.ingest_at(
+        &samples("latency_ms", &["a"], MINUTE, 25 * MINUTE),
+        i64::MAX,
+    );
+    let built = engine.stats.panes_built;
+    assert_eq!(engine.advance_watermark_at(i64::MAX, i64::MAX), i64::MAX);
+    assert!(engine.stats.panes_built - built <= 7);
+}
+
+/// Input stays open after a barrier: a later sample is accepted, and one at
+/// or before the barrier counts as late.
+#[test]
+fn input_stays_open_after_a_barrier() {
+    let (mut engine, _) = precompute(common::plan("example4b", false));
+    engine.ingest_at(
+        &samples("latency_ms", &["a"], MINUTE, 25 * MINUTE),
+        31 * MINUTE,
+    );
+    engine.advance_watermark_at(3 * PANE, 31 * MINUTE);
+    let accepted = engine.stats.samples_accepted;
+    engine.ingest_at(&[sample("latency_ms", "a", 35 * MINUTE, 1.0)], 36 * MINUTE);
+    assert_eq!(engine.stats.samples_accepted, accepted + 1);
+    engine.ingest_at(&[sample("latency_ms", "a", 29 * MINUTE, 1.0)], 36 * MINUTE);
+    assert_eq!(engine.stats.samples_dropped_late, 1);
+}

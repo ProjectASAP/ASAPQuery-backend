@@ -53,6 +53,18 @@ are dropped. Remote Write gets 503 when admitting it would leave more than
 stopped, which also makes `/-/ready` fail. `/api/v1/status/asap` reports the
 engine's sample and pane counters as JSON.
 
+A producer can close panes without waiting for later samples:
+`POST /api/v1/precompute/watermark?time_ms=T` states that every sample at or
+before `T` has been written. After the writes acknowledged before it have
+been ingested, every pane ending at or before `T` (capped at the wall clock)
+is closed, so the last pane of a series that stopped sending is built and
+served. A repeated or lower `T` does nothing and input stays open. A sample
+that arrives later for a pane the barrier closed (one ending at or before
+`T`) counts as late; a later sample in a pane still open is accepted, even if
+it is at or before `T`. The response is `{"barrier_ms": B}`, the barrier in
+force: `T` capped at the wall clock, or an earlier higher barrier. With several producers,
+send the barrier only after all of them have written through `T`.
+
 An instant query whose text is one of the plan's queries is answered by the
 plan (`x-asap-execution: plan`) at its evaluation time `T`. Stored outputs
 built in an `IngestionRun` are read from the SDS as the panes ending at

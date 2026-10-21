@@ -106,6 +106,7 @@ pub fn router(state: Arc<DataPlane>) -> Router {
         .route("/api/v1/query", get(query).post(query))
         .route("/api/v1/query_range", get(query_range).post(query_range))
         .route("/api/v1/status/asap", get(status))
+        .route("/api/v1/precompute/watermark", post(watermark))
         .route("/-/ready", get(ready))
         .with_state(state)
 }
@@ -156,6 +157,54 @@ async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
             }
         }
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+
+/// `POST /api/v1/precompute/watermark?time_ms=T`: the producer states that
+/// every sample at or before `T` has been written. Once the engine has run
+/// every write acknowledged before this request, every pane with
+/// `end <= T` is closed, so the last pane of a series that stopped sending
+/// is built without a later sample. `T` is capped at the wall clock; a
+/// repeated or lower `T` does nothing. A sample that arrives later for a
+/// pane the barrier closed counts as late. Input stays open. With several
+/// producers, call it only after all of them have written through `T`.
+/// Answers `{"barrier_ms": B}`, the barrier in force (`T` capped at the wall
+/// clock, or a higher earlier barrier); 400 `bad_data` with the reason when
+/// `time_ms` is missing or not an integer.
+async fn watermark(State(state): State<Arc<DataPlane>>, RawQuery(query): RawQuery) -> Response {
+    let time_ms = form_urlencoded::parse(query.unwrap_or_default().as_bytes())
+        .find(|(name, _)| name == "time_ms")
+        .map(|(_, value)| value.into_owned());
+    let time_ms = match time_ms.as_deref().map(str::parse::<i64>) {
+        Some(Ok(time_ms)) => time_ms,
+        Some(Err(_)) => {
+            let reason = format!(
+                "invalid parameter \"time_ms\": {:?} is not an integer number of milliseconds",
+                time_ms.unwrap_or_default()
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(prometheus::bad_data(&reason)),
+            )
+                .into_response();
+        }
+        None => {
+            let reason = "missing parameter \"time_ms\" (integer milliseconds)";
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(prometheus::bad_data(reason)),
+            )
+                .into_response();
+        }
+    };
+    match state.engine.advance_watermark(time_ms).await {
+        Ok(barrier_ms) => {
+            axum::Json(serde_json::json!({ "barrier_ms": barrier_ms })).into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "event-time barrier refused");
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
     }
 }
 
