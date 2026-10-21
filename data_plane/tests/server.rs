@@ -306,7 +306,9 @@ async fn admits_a_large_request_into_an_empty_queue() {
     assert_eq!(state.samples.load(Ordering::Relaxed), 3);
 }
 
-/// A Remote Write request without samples is accepted and not queued.
+/// A Remote Write request without raw samples is accepted and not queued.
+/// The engine is stopped first, so queueing the request would fail it with
+/// 500 instead of 204.
 #[tokio::test]
 async fn does_not_queue_empty_requests() {
     let state = data_plane("http://unused".into());
@@ -318,8 +320,12 @@ async fn does_not_queue_empty_requests() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    // A stopped engine refuses samples, but there is nothing to refuse.
+    // Without this, a slow stop leaves the engine running, it accepts the
+    // empty request, and the test passes even if the request was queued.
+    assert!(!state.engine.is_running());
     assert_eq!(write(&app, 0).await, StatusCode::NO_CONTENT);
+    assert_eq!(state.engine.queued_samples(), 0);
+    assert_eq!(state.samples.load(Ordering::Relaxed), 0);
 }
 
 /// Once the engine thread has stopped, Remote Write gets 500 instead of a
