@@ -9,7 +9,6 @@
 //! (`Batch::try_from_columns`): the columns the selector builds, without
 //! a `Sample` or a row per sample.
 
-use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 use asap_executor::arrow::array::{
@@ -50,8 +49,9 @@ pub(crate) struct SeriesCells {
     pub(crate) texts: Vec<Option<Arc<str>>>,
 }
 
-/// Each series' cells, or `None` when the `Scan` does not select it.
-type SeriesCache = HashMap<Arc<BTreeMap<String, String>>, Option<Arc<SeriesCells>>>;
+/// Each series' cells, or `None` when the `Scan` does not select it, by
+/// series id.
+type SeriesCache = ahash::HashMap<u32, Option<Arc<SeriesCells>>>;
 
 /// One raw-sample window of the plan, prepared to turn samples into its
 /// input batch. Shared by every thread that reads the window.
@@ -107,7 +107,7 @@ impl SeriesWindow {
             kinds,
             width_ms: window.width_ms,
             latest_sample_per_series: *kind == TimeRangeKind::Instant,
-            series: RwLock::new(HashMap::new()),
+            series: RwLock::new(ahash::HashMap::default()),
         })
     }
 
@@ -123,7 +123,7 @@ impl SeriesWindow {
             .series
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&sample.labels)
+            .get(&sample.labels.id)
         {
             return cells.clone();
         }
@@ -131,7 +131,7 @@ impl SeriesWindow {
         self.series
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(sample.labels.clone(), cells.clone());
+            .insert(sample.labels.id, cells.clone());
         cells
     }
 
@@ -139,7 +139,7 @@ impl SeriesWindow {
         // The selector applies the Scan's matchers to the series' labels;
         // the value is not the sample's, which may be a stale marker.
         let one = Sample {
-            labels: (*sample.labels).clone(),
+            labels: (**sample.labels).clone(),
             timestamp_ms: sample.timestamp_ms,
             value: 0.0,
         };
@@ -187,33 +187,30 @@ impl SeriesWindow {
             .filter(|s| start_ms < s.timestamp_ms && s.timestamp_ms <= end_ms);
         let mut points: Vec<(Arc<SeriesCells>, i64, f64)> = Vec::new();
         if self.latest_sample_per_series {
-            let mut latest: BTreeMap<&BTreeMap<String, String>, &RawSample> = BTreeMap::new();
+            let mut latest: ahash::HashMap<u32, &RawSample> = ahash::HashMap::default();
             for sample in in_window {
-                let entry = latest.entry(&sample.labels).or_insert(sample);
+                let entry = latest.entry(sample.labels.id).or_insert(sample);
                 if sample.timestamp_ms >= entry.timestamp_ms {
                     *entry = sample;
                 }
             }
             // In label order, as the selector emits them.
-            for sample in latest.into_values().filter(|s| !is_stale(s.value)) {
+            let mut latest: Vec<&RawSample> = latest.into_values().collect();
+            latest.sort_unstable_by(|a, b| a.labels.cmp(&b.labels));
+            for sample in latest.into_iter().filter(|s| !is_stale(s.value)) {
                 if let Some(cells) = self.cells(sample) {
                     points.push((cells, sample.timestamp_ms, sample.value));
                 }
             }
         } else {
             // Samples of one series are together: look each up once.
-            let mut current: Option<(&Arc<BTreeMap<String, String>>, Option<Arc<SeriesCells>>)> =
-                None;
+            let mut current: Option<(u32, Option<Arc<SeriesCells>>)> = None;
             for sample in in_window.filter(|s| !is_stale(s.value)) {
                 let cells = match &current {
-                    Some((labels, cells))
-                        if Arc::ptr_eq(labels, &sample.labels) || **labels == sample.labels =>
-                    {
-                        cells.clone()
-                    }
+                    Some((id, cells)) if *id == sample.labels.id => cells.clone(),
                     _ => {
                         let cells = self.cells(sample);
-                        current = Some((&sample.labels, cells.clone()));
+                        current = Some((sample.labels.id, cells.clone()));
                         cells
                     }
                 };
@@ -260,7 +257,7 @@ impl SeriesWindow {
 pub(crate) fn text_column<'a>(
     texts: impl Iterator<Item = &'a str>,
 ) -> Result<ArrayRef, asap_executor::Error> {
-    let mut codes: HashMap<&str, u32> = HashMap::new();
+    let mut codes: ahash::HashMap<&str, u32> = ahash::HashMap::default();
     let mut values: Vec<&str> = Vec::new();
     let keys: UInt32Array = texts
         .map(|text| {

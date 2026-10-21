@@ -14,6 +14,7 @@ pub mod query;
 pub mod remote_write;
 pub mod sds;
 mod series;
+pub mod series_ids;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -118,13 +119,12 @@ async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
         Ok(request) => {
             let mut samples = Vec::new();
             for series in request.timeseries {
-                let labels: Arc<BTreeMap<String, String>> = Arc::new(
-                    series
-                        .labels
-                        .into_iter()
-                        .map(|label| (label.name, label.value))
-                        .collect(),
-                );
+                let pairs: Vec<(&str, &str)> = series
+                    .labels
+                    .iter()
+                    .map(|label| (label.name.as_str(), label.value.as_str()))
+                    .collect();
+                let labels = series_ids::intern_pairs(&pairs);
                 // Stale markers are kept: the executor's sample selector
                 // drops them from range windows and ends instant selectors.
                 samples.extend(series.samples.into_iter().map(|s| RawSample {

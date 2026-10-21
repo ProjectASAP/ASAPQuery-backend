@@ -2,7 +2,6 @@
 //! parameters and results, and fetching raw samples for query-time ranges.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use serde_json::{json, Value};
 
@@ -159,7 +158,7 @@ pub async fn fetch(
     let mut samples = Vec::new();
     for series in series {
         let labels: BTreeMap<String, String> = serde_json::from_value(series["metric"].clone())?;
-        let labels = Arc::new(labels);
+        let labels = crate::series_ids::intern(&labels);
         for point in series["values"].as_array().ok_or_else(malformed)? {
             let seconds = point[0].as_f64().ok_or_else(malformed)?;
             let value = point[1].as_str().ok_or_else(malformed)?;

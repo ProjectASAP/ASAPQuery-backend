@@ -22,7 +22,7 @@
 //! time, or groups that are not series. The
 //! Planner places no such build at ingestion time for the PromQL examples.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 use asap_executor::arrow::array::{Array, TimestampMillisecondArray, UInt32Array};
@@ -46,7 +46,7 @@ type GroupKey = Arc<[Arc<str>]>;
 /// Groups numbered `0..`, in the order they are first seen.
 #[derive(Default)]
 struct GroupNumbers {
-    numbers: HashMap<GroupKey, u32>,
+    numbers: ahash::HashMap<GroupKey, u32>,
     keys: Vec<GroupKey>,
 }
 
@@ -83,8 +83,8 @@ pub(crate) struct PerSampleSpec {
 pub(crate) struct OpenPanes {
     /// The numbers of the groups (series) seen.
     numbers: GroupNumbers,
-    /// Each series' group key and number.
-    series_groups: HashMap<Arc<BTreeMap<String, String>>, (GroupKey, u32)>,
+    /// Each series' group key and number, by series id.
+    series_groups: ahash::HashMap<u32, (GroupKey, u32)>,
     /// By pane end: its states and the groups that took a sample, or why it
     /// failed.
     panes: BTreeMap<i64, Result<(StateColumnUpdater, Vec<bool>), String>>,
@@ -213,7 +213,7 @@ impl PerSampleSpec {
         if is_stale(sample.value) {
             return;
         }
-        let group = match open.series_groups.get(&sample.labels) {
+        let group = match open.series_groups.get(&sample.labels.id) {
             Some(group) => Some(group.clone()),
             None => {
                 let key: GroupKey = self
@@ -223,7 +223,7 @@ impl PerSampleSpec {
                     .collect();
                 let number = open.numbers.number(&key);
                 open.series_groups
-                    .insert(sample.labels.clone(), (key.clone(), number));
+                    .insert(sample.labels.id, (key.clone(), number));
                 Some((key, number))
             }
         };

@@ -38,12 +38,13 @@ use crate::sds::{
     DefinitionId, Sds, Selection, SummaryDefinition, SummaryInstanceKey, SummaryStore,
 };
 use crate::series::SeriesWindow;
+use crate::series_ids::Series;
 
-/// One raw sample: its series' full label set (including `__name__`), time
-/// and value.
+/// One raw sample: its series (interned: its id and full label set,
+/// `__name__` included), time and value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawSample {
-    pub labels: Arc<BTreeMap<String, String>>,
+    pub labels: Arc<Series>,
     pub timestamp_ms: i64,
     pub value: f64,
 }
@@ -395,7 +396,7 @@ impl Precompute {
         self.newest_clock_ms = self.newest_clock_ms.max(Some(now_ms));
         let latest_allowed_ms = now_ms.saturating_add(self.max_future_ms);
         for sample in samples {
-            let metric = sample.labels.get("__name__").map(String::as_str);
+            let metric = Some(&*sample.labels.metric).filter(|m| !m.is_empty());
             let query_run = metric.is_some_and(|m| self.query_run_metrics.contains_key(m));
             if !query_run
                 && !self

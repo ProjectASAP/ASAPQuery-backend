@@ -5,7 +5,6 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use asap_executor::planner::ir::schema::{FieldDataType, SketchStatistic};
 use asap_executor::summary_kernels::exact::ExactAccumulator;
@@ -28,7 +27,7 @@ fn options() -> PrecomputeOptions {
 fn samples(metric: &str, jobs: usize, from: i64, to: i64) -> Vec<RawSample> {
     let series: Vec<_> = (0..jobs)
         .map(|j| {
-            Arc::new(BTreeMap::from([
+            data_plane::series_ids::intern(&BTreeMap::from([
                 ("__name__".to_string(), metric.to_string()),
                 ("job".to_string(), format!("job{j}")),
                 ("instance".to_string(), format!("{}", j % 3)),
