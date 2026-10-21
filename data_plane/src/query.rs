@@ -35,7 +35,7 @@ use asap_planner::{InstallablePlan, StoredOutputBuild};
 
 use crate::precompute::{run, RawSample, SummaryBuild, SummaryInstance};
 use crate::raw_sample_window::RawSampleWindowBatcher;
-use crate::sds::{DefinitionId, Sds, Selection, SummaryInstanceKey, SummaryStore};
+use crate::sds::{DefinitionKey, Sds, SummaryInstanceKey, SummaryStore};
 
 /// A bound raw-sample window: a `RawSampleWindow` of the plan bound to one
 /// evaluation time, i.e. `metric`'s raw samples in `(start_ms, end_ms]`
@@ -108,7 +108,7 @@ struct StoredInput {
     node: u64,
     /// The output's schema, which its panes' rows are in.
     schema: SchemaRef,
-    definition: DefinitionId,
+    definition: DefinitionKey,
     offset_ms: i64,
     pane_ms: i64,
 }
@@ -126,7 +126,7 @@ struct RawInput {
 struct QueryRunInput {
     node: u64,
     schema: SchemaRef,
-    definition: DefinitionId,
+    definition: DefinitionKey,
     offset_ms: i64,
     /// The output's own `TimeRange`, which its coverage's samples feed.
     raw_input: u64,
@@ -138,7 +138,7 @@ struct Program {
     query_run: Vec<QueryRunInput>,
     /// For each `QueryRun` definition the root reads, the node its one
     /// fetch is keyed by: the lowest `TimeRange` among its outputs.
-    query_run_fetch_node: BTreeMap<DefinitionId, u64>,
+    query_run_fetch_node: BTreeMap<DefinitionKey, u64>,
     raw: Vec<RawInput>,
     output: Schema,
 }
@@ -187,10 +187,10 @@ pub struct QueryEngine {
     pub query_run_stats: QueryRunStats,
     /// How each `QueryRun` definition's summaries are built, or why they
     /// cannot be.
-    query_run_builds: BTreeMap<DefinitionId, Result<SummaryBuild, String>>,
+    query_run_builds: BTreeMap<DefinitionKey, Result<SummaryBuild, String>>,
     /// The label matchers of each `QueryRun` definition's `Scan`, pushed into
     /// its fetch.
-    query_run_matchers: BTreeMap<DefinitionId, Vec<LabelMatcher>>,
+    query_run_matchers: BTreeMap<DefinitionKey, Vec<LabelMatcher>>,
     /// Each query, with its compiled root or why it cannot run.
     roots: Vec<(String, Result<Program, String>)>,
 }
@@ -209,7 +209,7 @@ impl QueryEngine {
             .filter(|d| d.built_at == StoredOutputBuild::QueryRun)
             .map(|d| {
                 let build = SummaryBuild::new(dag, d).map_err(|e| e.to_string());
-                (d.id.clone(), build)
+                (d.key(), build)
             })
             .collect();
         let roots = plan
@@ -223,8 +223,12 @@ impl QueryEngine {
         let query_run_matchers = query_run_builds
             .keys()
             .map(|id| {
-                let scan = sds.definitions[id].window.scan_node_id as u64;
-                (id.clone(), label_matchers(dag, scan))
+                let matchers = sds.definitions[id]
+                    .window
+                    .as_ref()
+                    .map(|w| label_matchers(dag, w.scan_node_id as u64))
+                    .unwrap_or_default();
+                (id.clone(), matchers)
             })
             .collect();
         Self {
@@ -268,12 +272,15 @@ impl QueryEngine {
             .collect::<Result<_, Unanswered>>()?;
         // One fetch per `QueryRun` definition, covering all its missing
         // summaries.
-        let mut missing: BTreeMap<&DefinitionId, (i64, i64)> = BTreeMap::new();
+        let mut missing: BTreeMap<&DefinitionKey, (i64, i64)> = BTreeMap::new();
         for input in &program.query_run {
             let build = self.query_run_build(&input.definition);
             let (start_ms, end_ms) = window(time_ms, input.offset_ms, build.definition.pane_ms)?;
             if store
-                .get(&input.definition, Selection::ending_at(end_ms))
+                .get(
+                    &input.definition.id,
+                    &input.definition.selection_ending_at(end_ms),
+                )
                 .is_none()
             {
                 let span = missing
@@ -336,8 +343,8 @@ impl QueryEngine {
                 .as_ref()
                 .expect("compiled roots read only `QueryRun` definitions that build");
             let (_, end_ms) = window(time_ms, input.offset_ms, build.definition.pane_ms)?;
-            let selection = Selection::ending_at(end_ms);
-            let summary = match store.get(&input.definition, selection) {
+            let selection = input.definition.selection_ending_at(end_ms);
+            let summary = match store.get(&input.definition.id, &selection) {
                 Some(summary) => {
                     self.query_run_stats.reused += 1;
                     summary.clone()
@@ -372,7 +379,7 @@ impl QueryEngine {
                             self.query_run_stats.stored_while_metric_behind += 1;
                         }
                         store.insert(
-                            SummaryInstanceKey::new(input.definition.clone(), selection),
+                            SummaryInstanceKey::new(input.definition.id.clone(), selection),
                             summary.clone(),
                         );
                     }
@@ -391,7 +398,7 @@ impl QueryEngine {
                 let newest_closed_end = watermark.div_euclid(pane_ms).saturating_mul(pane_ms);
                 let oldest =
                     definition.oldest_kept_end_ms(newest_closed_end.saturating_sub(pane_ms));
-                store.evict_before(&definition.id, Selection::ending_at(oldest));
+                store.evict_before(&definition.id, &definition.selection_ending_at(oldest));
             }
         }
         for input in &program.raw {
@@ -416,7 +423,7 @@ impl QueryEngine {
     }
 
     /// The build of a `QueryRun` definition a compiled root reads.
-    fn query_run_build(&self, definition: &DefinitionId) -> &SummaryBuild {
+    fn query_run_build(&self, definition: &DefinitionKey) -> &SummaryBuild {
         self.query_run_builds[definition]
             .as_ref()
             .expect("compiled roots read only `QueryRun` definitions that build")
@@ -460,7 +467,10 @@ fn pane<'a>(
         )));
     }
     store
-        .get(&input.definition, Selection::ending_at(end))
+        .get(
+            &input.definition.id,
+            &input.definition.selection_ending_at(end),
+        )
         .ok_or_else(|| {
             Unanswered::MissingPane(format!(
                 "pane ending at {end} of {:?} is not stored",
@@ -473,7 +483,7 @@ fn pane<'a>(
 fn program(
     dag: &PhysicalASAPDAG,
     sds: &Sds,
-    query_run_builds: &BTreeMap<DefinitionId, Result<SummaryBuild, String>>,
+    query_run_builds: &BTreeMap<DefinitionKey, Result<SummaryBuild, String>>,
     windows: &HashMap<u64, &RawSampleWindow>,
     root: u64,
 ) -> Result<Program, String> {
@@ -562,7 +572,7 @@ fn program(
         );
     }
     let compiled = compile(dag, inputs, &[root]).map_err(|e| e.to_string())?;
-    let mut query_run_fetch_node: BTreeMap<DefinitionId, u64> = BTreeMap::new();
+    let mut query_run_fetch_node: BTreeMap<DefinitionKey, u64> = BTreeMap::new();
     for input in &query_run {
         let node = query_run_fetch_node
             .entry(input.definition.clone())

@@ -12,7 +12,9 @@
 //! under ingestion scope. The output is stored and never changes; samples
 //! older than a closed pane are dropped. The first pane a definition sees
 //! may have started before the data plane did, so it is never built:
-//! queries that need it are not answered from stored panes.
+//! queries that need it are not answered from stored panes. A producer that
+//! declares where its stream starts (`stream_start_ms`) makes a first pane
+//! starting at or after that point complete, and it is built.
 //!
 //! Only samples of a metric some definition reads move the watermark, and a
 //! sample further ahead of the wall clock than `max_future_ms` is dropped, so
@@ -35,9 +37,7 @@ use asap_planner::StoredOutputBuild;
 
 use crate::per_sample::{OpenPanes as OpenStates, PerSampleSpec, Taken};
 use crate::raw_sample_window::RawSampleWindowBatcher;
-use crate::sds::{
-    DefinitionId, Sds, Selection, SummaryDefinition, SummaryInstanceKey, SummaryStore,
-};
+use crate::sds::{DefinitionId, Sds, SummaryDefinition, SummaryInstanceKey, SummaryStore};
 use crate::series_ids::Series;
 
 /// One raw sample: its series (interned: its id and full label set,
@@ -99,6 +99,11 @@ pub struct PrecomputeOptions {
     pub allowed_lateness_ms: u64,
     /// Samples further ahead of the wall clock than this are dropped.
     pub max_future_ms: u64,
+    /// Where the producer's stream starts: every raw sample at or after it
+    /// reaches the data plane. A definition's first pane is then built when
+    /// it starts at or after it. `None`: the first pane may have started
+    /// before the data plane did, so it is never built.
+    pub stream_start_ms: Option<i64>,
 }
 
 impl Default for PrecomputeOptions {
@@ -106,6 +111,7 @@ impl Default for PrecomputeOptions {
         Self {
             allowed_lateness_ms: 15_000,
             max_future_ms: 5 * 60_000,
+            stream_start_ms: None,
         }
     }
 }
@@ -140,6 +146,8 @@ pub struct SummaryBuild {
     /// build's input batch, column by column, with the `Scan`'s label
     /// matchers.
     pub(crate) window: RawSampleWindowBatcher,
+    /// The `TimeRange` node the window's batch feeds.
+    raw_input: u64,
     build: CompiledPhysicalDAG,
 }
 
@@ -164,17 +172,19 @@ impl SummaryBuild {
         // offset from evaluation time is not used.
         // A series is cached for as long as the definition's summaries are kept.
         let keep_ms = definition.retention_ms.saturating_add(definition.pane_ms);
-        let window = RawSampleWindowBatcher::new(dag, &definition.window, keep_ms)?;
+        let Some(raw) = &definition.window else {
+            return Err(error("reads no raw-sample window".into()));
+        };
+        let raw_input = raw.time_range_node_id as u64;
+        let window = RawSampleWindowBatcher::new(dag, raw, keep_ms)?;
         let build = compile(
             dag,
-            BTreeMap::from([(
-                definition.raw_input(),
-                InputContract::bounded(window.schema.clone()),
-            )]),
+            BTreeMap::from([(raw_input, InputContract::bounded(window.schema.clone()))]),
             &[definition.builder],
         )?;
         Ok(Self {
             definition: definition.clone(),
+            raw_input,
             window,
             build,
         })
@@ -205,7 +215,7 @@ impl SummaryBuild {
         let input: Source<'_> = Box::new(Operator::source(input.schema().clone(), vec![input])?);
         let build = self
             .build
-            .instantiate(BTreeMap::from([(self.definition.raw_input(), input)]))?;
+            .instantiate(BTreeMap::from([(self.raw_input, input)]))?;
         Ok(SummaryInstance {
             batches: run(&build, self.build.roots(), scope)?,
         })
@@ -243,6 +253,7 @@ pub struct Precompute {
     query_run_metrics: BTreeMap<String, Option<i64>>,
     allowed_lateness_ms: i64,
     max_future_ms: i64,
+    stream_start_ms: Option<i64>,
     newest_sample_ms: Option<i64>,
     /// The newest wall-clock time an ingest ran at: the watermark never
     /// passes it, so a series stamped ahead of the others cannot close
@@ -321,7 +332,10 @@ impl Precompute {
         let mut query_run_metrics = BTreeMap::new();
         for definition in sds.definitions.values() {
             if definition.built_at == StoredOutputBuild::QueryRun {
-                match RawSampleSelector::new(&dag, &definition.window) {
+                let Some(window) = &definition.window else {
+                    continue;
+                };
+                match RawSampleSelector::new(&dag, window) {
                     Ok(selector) => {
                         query_run_metrics.insert(selector.metric().to_string(), None);
                     }
@@ -338,6 +352,7 @@ impl Precompute {
             query_run_metrics,
             allowed_lateness_ms: millis(options.allowed_lateness_ms),
             max_future_ms: millis(options.max_future_ms),
+            stream_start_ms: options.stream_start_ms,
             newest_sample_ms: None,
             newest_clock_ms: None,
             barrier_ms: None,
@@ -430,8 +445,16 @@ impl Precompute {
                 let this = match pane_end(sample.timestamp_ms, builder.summary.definition.pane_ms) {
                     None => Outcome::Late,
                     Some(end) => {
-                        let first = *builder.first_pane_end.get_or_insert(end);
-                        let built = *builder.built_through.get_or_insert(end);
+                        let pane_ms = builder.summary.definition.pane_ms;
+                        // A first pane that starts at or after the declared
+                        // stream start is complete: nothing is skipped, and
+                        // the panes from it on are built.
+                        let complete = self
+                            .stream_start_ms
+                            .is_some_and(|start| end - pane_ms >= start);
+                        let skipped = if complete { end - pane_ms } else { end };
+                        let first = *builder.first_pane_end.get_or_insert(skipped);
+                        let built = *builder.built_through.get_or_insert(skipped);
                         if end == first {
                             Outcome::FirstPane
                         } else if end <= built {
@@ -537,7 +560,10 @@ impl Precompute {
                 match built {
                     Ok(state) => {
                         self.store.insert(
-                            SummaryInstanceKey::new(id.clone(), Selection::ending_at(end)),
+                            SummaryInstanceKey::new(
+                                id.clone(),
+                                builder.summary.definition.selection_ending_at(end),
+                            ),
                             state,
                         );
                         self.stats.panes_built += 1;
@@ -553,8 +579,13 @@ impl Precompute {
                     None => break,
                 }
             }
-            self.store
-                .evict_before(id, Selection::ending_at(oldest_kept_end));
+            self.store.evict_before(
+                id,
+                &builder
+                    .summary
+                    .definition
+                    .selection_ending_at(oldest_kept_end),
+            );
         }
     }
 }

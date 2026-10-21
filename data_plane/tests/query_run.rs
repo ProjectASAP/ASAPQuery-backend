@@ -14,7 +14,7 @@ use data_plane::precompute::SummaryInstance;
 use data_plane::query::{
     BoundRawSampleWindow, IngestionProgress, QueryEngine, QueryRunStats, ResultSample,
 };
-use data_plane::sds::{DefinitionId, Sds, Selection, SummaryStore};
+use data_plane::sds::{DefinitionId, DefinitionKey, Sds, SummaryStore};
 
 const MINUTE: i64 = 60_000;
 const P99: &str = "quantile_over_time(0.99, latency_ms[5m])";
@@ -23,7 +23,7 @@ const P99: &str = "quantile_over_time(0.99, latency_ms[5m])";
 struct Fixture {
     engine: QueryEngine,
     store: SummaryStore<SummaryInstance>,
-    definition: DefinitionId,
+    definition: DefinitionKey,
 }
 
 fn fixture(plan: &InstallablePlan) -> Fixture {
@@ -36,8 +36,8 @@ fn fixture(plan: &InstallablePlan) -> Fixture {
         .definitions
         .values()
         .find(|d| d.built_at == StoredOutputBuild::QueryRun)
-        .map(|d| d.id.clone())
-        .unwrap_or_else(|| DefinitionId(String::new()));
+        .map(|d| d.key())
+        .unwrap_or_else(|| DefinitionKey::unconstrained(DefinitionId(String::new()), 0));
     Fixture {
         engine: QueryEngine::new(plan, &sds),
         store: SummaryStore::new(),
@@ -50,11 +50,7 @@ impl Fixture {
     fn ends(&self) -> Vec<i64> {
         (0..=30)
             .map(|m| m * MINUTE)
-            .filter(|end| {
-                self.store
-                    .get(&self.definition, Selection::ending_at(*end))
-                    .is_some()
-            })
+            .filter(|end| self.store.get_pane(&self.definition, *end).is_some())
             .map(|end| end / MINUTE)
             .collect()
     }

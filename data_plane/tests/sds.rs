@@ -1,9 +1,11 @@
 mod common;
 
 use asap_executor::planner::ir::{NonASAPOp, Operator};
-use asap_planner::{InstallablePlan, StoredOutputBuild};
+use asap_planner::StoredOutputBuild;
 use common::plan;
-use data_plane::sds::{DefinitionId, Sds, SdsError, Selection, SummaryInstanceKey, SummaryStore};
+use data_plane::sds::{
+    DefinitionId, DefinitionKey, Sds, SdsError, Selection, SummaryInstanceKey, SummaryStore,
+};
 
 /// Example 4b's six ingestion-time KLL panes are one definition with a
 /// 10-minute pane; each output reads the pane `i * 10min` before evaluation,
@@ -19,7 +21,7 @@ fn example4b_panes_share_one_definition() {
         .outputs
         .values()
         .map(|(id, binding)| {
-            assert_eq!(id, &definition.id);
+            assert_eq!(id, &definition.key());
             binding.offset_ms
         })
         .collect();
@@ -32,7 +34,7 @@ fn example4b_panes_share_one_definition() {
         .dag
         .nodes
         .iter()
-        .find(|n| n.id as u64 == definition.raw_input())
+        .find(|n| Some(n.id as u64) == definition.raw_input())
         .unwrap();
     assert!(matches!(
         raw.payload,
@@ -59,61 +61,46 @@ fn query_time_plans_have_no_definitions() {
     assert_eq!(Sds::from_plan(&plan).unwrap(), Sds::default());
 }
 
-/// `plan` with every node id shifted by 100.
-fn renumbered(plan: &InstallablePlan) -> InstallablePlan {
-    let mut plan = plan.clone();
-    let renumber = |id: &usize| id + 100;
-    let dag = &mut plan.dag.dag;
-    for node in &mut dag.nodes {
-        node.id = renumber(&node.id);
-        node.payload = node.payload.map_children(renumber);
+/// A definition's identity is the plan's definition id, the same for every
+/// output whose selection differs only in time.
+#[test]
+fn identity_is_the_plans_definition_id() {
+    let plan = plan("example4b", false);
+    let sds = Sds::from_plan(&plan).unwrap();
+    let definition = sds.definitions.values().next().unwrap();
+    for output in &plan.stored_outputs {
+        assert_eq!(definition.id.0, output.coverage.definition_id);
     }
-    for edge in &mut dag.edges {
-        edge.producer = renumber(&edge.producer);
-        edge.consumer = renumber(&edge.consumer);
-    }
-    dag.roots = dag.roots.iter().map(renumber).collect();
-    for output in &mut plan.stored_outputs {
-        output.node_id = renumber(&output.node_id);
-        output.pane.time_range_node_id = renumber(&output.pane.time_range_node_id);
-        output.pane.scan_node_id = renumber(&output.pane.scan_node_id);
-    }
-    plan
+    assert_eq!(&*definition.labels, "", "no label constraints");
 }
 
-/// Identity depends on what is computed, not on how nodes are numbered.
+/// Outputs with the same definition id but other label constraints in
+/// their selection are other definitions, and their summary instances other
+/// keys: the plan's definition id leaves the selection out.
 #[test]
-fn identity_ignores_node_numbering() {
-    let plan = plan("example4b", false);
-    let ids = |sds: Sds| sds.definitions.into_keys().collect::<Vec<_>>();
-    assert_eq!(
-        ids(Sds::from_plan(&renumbered(&plan)).unwrap()),
-        ids(Sds::from_plan(&plan).unwrap())
-    );
-}
-
-/// The same computation over another metric is another definition.
-#[test]
-fn identity_depends_on_the_source() {
-    let plan = plan("example4b", false);
-    let other: InstallablePlan = serde_json::from_str(
-        &serde_json::to_string(&plan)
-            .unwrap()
-            .replace("latency_ms", "other"),
-    )
-    .unwrap();
-    assert_ne!(
-        Sds::from_plan(&other)
-            .unwrap()
-            .definitions
-            .into_keys()
-            .next(),
-        Sds::from_plan(&plan)
-            .unwrap()
-            .definitions
-            .into_keys()
-            .next()
-    );
+fn label_constraints_separate_definitions_of_one_id() {
+    let mut json = serde_json::to_value(common::workload("example4b")).unwrap();
+    let queries = json["query_workload"]["repeating_queries"]
+        .as_array_mut()
+        .unwrap();
+    let mut other = queries[0].clone();
+    queries[0]["query"] = "quantile_over_time(0.99, latency_ms{job=\"a\"}[60m])".into();
+    other["query"] = "quantile_over_time(0.99, latency_ms{job=\"b\"}[60m])".into();
+    queries.push(other);
+    let workload = serde_json::from_value(json).unwrap();
+    let plan = control_plane::plan_workload(&workload, &common::inputs(false)).unwrap();
+    let sds = Sds::from_plan(&plan).unwrap();
+    assert_eq!(sds.definitions.len(), 2, "{:?}", sds.definitions.keys());
+    let keys: Vec<&DefinitionKey> = sds.definitions.keys().collect();
+    assert_eq!(keys[0].id, keys[1].id, "one definition id");
+    assert_ne!(keys[0].labels, keys[1].labels);
+    let mut store = SummaryStore::new();
+    for (i, key) in keys.iter().enumerate() {
+        let selection = sds.definitions[*key].selection_ending_at(600_000);
+        store.insert(SummaryInstanceKey::new(key.id.clone(), selection), i);
+    }
+    assert_eq!(store.get_pane(keys[0], 600_000), Some(&0));
+    assert_eq!(store.get_pane(keys[1], 600_000), Some(&1));
 }
 
 /// Stored outputs built in a `QueryRun` are stored summaries too: their
@@ -141,10 +128,7 @@ fn ingestion_wins_when_outputs_share_a_definition() {
     let sds = Sds::from_plan(&plan).unwrap();
     let definition = sds.definitions.values().next().unwrap();
     assert_eq!(definition.built_at, StoredOutputBuild::IngestionRun);
-    assert_eq!(
-        sds.ingestion_build_order().unwrap(),
-        vec![definition.id.clone()]
-    );
+    assert_eq!(sds.ingestion_build_order().unwrap(), vec![definition.key()]);
 }
 
 /// Every stored output reads raw samples today, so no definition has stored
@@ -154,43 +138,52 @@ fn build_order_follows_stored_inputs() {
     let mut sds = Sds::from_plan(&plan("example4b", false)).unwrap();
     let definition = sds.definitions.values_mut().next().unwrap();
     assert!(definition.stored_inputs.is_empty());
-    let id = definition.id.clone();
+    let id = definition.key();
     definition.stored_inputs = vec![id.clone()];
     assert_eq!(sds.ingestion_build_order(), Err(SdsError::Cycle(id)));
 }
 
-/// Panes are found by definition and end, and evicted once no query needs
-/// them.
+/// Panes are found by definition, width and end, and evicted once no query
+/// needs them. Panes of one definition id with two widths (`a`'s 60 and 30)
+/// are kept apart: neither is found or evicted as the other.
 #[test]
 fn store_finds_and_evicts_panes() {
-    let (a, b) = (DefinitionId("a".into()), DefinitionId("b".into()));
+    let (a, a30, b) = (
+        DefinitionKey::unconstrained(DefinitionId("a".into()), 60),
+        DefinitionKey::unconstrained(DefinitionId("a".into()), 30),
+        DefinitionKey::unconstrained(DefinitionId("b".into()), 60),
+    );
     let mut store = SummaryStore::new();
     for end in [60, 120, 180] {
         store.insert(
-            SummaryInstanceKey::new(a.clone(), Selection::ending_at(end)),
+            SummaryInstanceKey::new(a.id.clone(), a.selection_ending_at(end)),
             format!("a{end}"),
         );
     }
     store.insert(
-        SummaryInstanceKey::new(b.clone(), Selection::ending_at(60)),
+        SummaryInstanceKey::new(a30.id.clone(), a30.selection_ending_at(120)),
+        "a30-120".to_string(),
+    );
+    store.insert(
+        SummaryInstanceKey::new(b.id.clone(), Selection::ending_at(60, 60)),
         "b60".to_string(),
     );
+    assert_eq!(store.get_pane(&a, 120).map(String::as_str), Some("a120"));
     assert_eq!(
-        store.get(&a, Selection::ending_at(120)).map(String::as_str),
-        Some("a120")
+        store.get_pane(&a30, 120).map(String::as_str),
+        Some("a30-120")
     );
-    assert_eq!(store.get(&a, Selection::ending_at(90)), None);
-    store.evict_before(&a, Selection::ending_at(180));
-    assert_eq!(store.get(&a, Selection::ending_at(120)), None);
+    assert_eq!(store.get_pane(&a30, 60), None);
+    assert_eq!(store.get_pane(&a, 90), None);
+    store.evict_before(&a.id, &a.selection_ending_at(180));
+    assert_eq!(store.get_pane(&a, 120), None);
+    assert_eq!(store.get_pane(&a, 180).map(String::as_str), Some("a180"));
     assert_eq!(
-        store.get(&a, Selection::ending_at(180)).map(String::as_str),
-        Some("a180")
+        store.get_pane(&a30, 120).map(String::as_str),
+        Some("a30-120")
     );
-    assert_eq!(
-        store.get(&b, Selection::ending_at(60)).map(String::as_str),
-        Some("b60")
-    );
-    assert_eq!(store.len(), 2);
+    assert_eq!(store.get_pane(&b, 60).map(String::as_str), Some("b60"));
+    assert_eq!(store.len(), 3);
 }
 
 /// `definition` under another identity, reading `stored_inputs`.
@@ -203,7 +196,9 @@ fn renamed(
     definition.id = DefinitionId(name.into());
     definition.stored_inputs = stored_inputs
         .iter()
-        .map(|input| DefinitionId(input.to_string()))
+        .map(|input| {
+            DefinitionKey::unconstrained(DefinitionId(input.to_string()), definition.pane_ms)
+        })
         .collect();
     definition
 }
@@ -220,13 +215,13 @@ fn build_order_puts_inputs_first() {
         renamed(template, "b", &["c"]),
         renamed(template, "c", &[]),
     ] {
-        sds.definitions.insert(definition.id.clone(), definition);
+        sds.definitions.insert(definition.key(), definition);
     }
     let order: Vec<String> = sds
         .ingestion_build_order()
         .unwrap()
         .into_iter()
-        .map(|id| id.0)
+        .map(|key| key.id.0)
         .collect();
     assert_eq!(order, ["c", "b", "a"]);
 }
@@ -241,13 +236,13 @@ fn build_order_refuses_ingestion_reading_query_run() {
     query_run.built_at = StoredOutputBuild::QueryRun;
     let mut sds = Sds::default();
     for definition in [renamed(template, "i", &["q"]), query_run] {
-        sds.definitions.insert(definition.id.clone(), definition);
+        sds.definitions.insert(definition.key(), definition);
     }
     assert_eq!(
         sds.ingestion_build_order(),
         Err(SdsError::IngestionReadsQueryRun {
-            definition: DefinitionId("i".into()),
-            input: DefinitionId("q".into()),
+            definition: DefinitionKey::unconstrained(DefinitionId("i".into()), template.pane_ms),
+            input: DefinitionKey::unconstrained(DefinitionId("q".into()), template.pane_ms),
         })
     );
 }
@@ -269,7 +264,7 @@ fn query_run_outputs_share_one_definition() {
     let mut offsets: Vec<i64> = sds
         .outputs
         .values()
-        .filter(|(id, _)| id == &definition.id)
+        .filter(|(id, _)| id == &definition.key())
         .map(|(_, binding)| binding.offset_ms)
         .collect();
     offsets.sort();

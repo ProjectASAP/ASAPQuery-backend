@@ -50,8 +50,11 @@ fn example4b_stores_panes_with_the_planners_retention() {
         .stored_outputs
         .iter()
         .map(|output| {
-            assert_eq!(output.pane.width_ms, 600_000);
-            output.pane.end_offset_ms
+            let [window] = output.inputs.raw_sample_windows.as_slice() else {
+                panic!("one raw-sample window: {output:?}");
+            };
+            assert_eq!(window.width_ms, 600_000);
+            window.end_offset_ms
         })
         .collect();
     offsets.sort();
@@ -104,7 +107,11 @@ fn selects_stored_outputs_built_in_a_query_run() {
         .filter(|o| o.built_at == asap_planner::StoredOutputBuild::QueryRun)
         .collect();
     assert_eq!(query_run.len(), 5, "five one-minute summaries");
-    assert!(query_run.iter().all(|o| o.pane.width_ms == 60_000));
+    assert!(query_run.iter().all(|o| o
+        .inputs
+        .raw_sample_windows
+        .iter()
+        .all(|w| w.width_ms == 60_000)));
 }
 
 /// A workload is planned whole or refused: when one query has no plan the
@@ -122,4 +129,38 @@ fn refuses_a_workload_with_a_query_it_cannot_plan() {
     inputs.deployment_capabilities.raw_data_retained = false;
     let error = plan_workload(&workload, &inputs).unwrap_err();
     assert!(matches!(error, PlanError::Planning(_)), "{error}");
+}
+
+/// The MVP benchmark's p99 query over a gauge not declared non-negative:
+/// without raw data, every candidate fails a check (the exact ones scan raw
+/// samples at query time, the merged DDSketch panes carry no bound through
+/// `avg`), so planning fails. With `ignore_accuracy_guarantees`, loaded from
+/// the Planner's settings JSON as `--plan-selection-settings` reads it, the
+/// cheapest sketch plan is selected and the report marks the query as
+/// accepted without a guarantee.
+#[test]
+fn ignoring_accuracy_guarantees_plans_the_undeclared_p99_query() {
+    let workload: PlanningWorkload = serde_json::from_str(
+        r#"{"query_workload": {"language": "promql", "repeating_queries": [{
+              "query": "avg by (region, service, job) (quantile_over_time(0.99, data[100s]))",
+              "demand": {"fixed_interval": 1000},
+              "requirements": {"accuracy": {"max_error": 0.05, "failure_probability": 0.3,
+                  "accuracy_scope": "whole_result"}},
+              "predictability": {"predictable": {"known_at": null}}}]},
+            "data_workload": {"arrival": {"ingesting": {"rows_per_second": 10000.0}},
+              "sources": {"data": {"series_count": 1000, "metric_type": "gauge",
+                  "sample_interval": 100}}}}"#,
+    )
+    .unwrap();
+    let mut inputs = DeploymentInputs::default();
+    inputs.deployment_capabilities.raw_data_retained = false;
+    let error = plan_workload(&workload, &inputs).unwrap_err();
+    assert!(matches!(error, PlanError::Planning(_)), "{error}");
+
+    inputs.plan_selection =
+        serde_json::from_str(r#"{"ignore_accuracy_guarantees": true}"#).unwrap();
+    let plan = plan_workload(&workload, &inputs).unwrap();
+    assert!(!plan.stored_outputs.is_empty(), "panes built at ingestion");
+    let selection = plan.selection.as_ref().unwrap();
+    assert_eq!(selection.queries_accepted_without_guarantee, [0]);
 }
