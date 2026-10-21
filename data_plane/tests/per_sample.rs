@@ -11,7 +11,6 @@ use asap_executor::summary_kernels::exact::ExactAccumulator;
 use asap_executor::values::Value;
 use data_plane::precompute::{Precompute, PrecomputeOptions, RawSample, SummaryInstance};
 use data_plane::sds::Sds;
-use data_plane::sds::Selection;
 
 const MINUTE: i64 = 60_000;
 
@@ -116,9 +115,9 @@ fn per_sample_panes_equal_the_batch_build() {
             for definition in sds.definitions.values() {
                 let mut end = 0;
                 while end <= to {
-                    let selection = Selection::ending_at(end);
-                    let expected = batch.store.get(&definition.id, selection);
-                    let actual = per_sample.store.get(&definition.id, selection);
+                    let selection = definition.selection_ending_at(end);
+                    let expected = batch.store.get(&definition.id, &selection);
+                    let actual = per_sample.store.get(&definition.id, &selection);
                     assert_eq!(actual.is_some(), expected.is_some(), "{example} pane {end}");
                     if let (Some(actual), Some(expected)) = (actual, expected) {
                         for batch in actual.batches.iter().chain(&expected.batches) {
@@ -154,14 +153,8 @@ fn per_sample_panes_apply_label_matchers() {
     let mut batch = Precompute::batch(&plan.dag.dag, &sds, options()).unwrap();
     batch.ingest(&all);
     let (actual, expected) = (
-        per_sample
-            .store
-            .get(&id, Selection::ending_at(20 * MINUTE))
-            .unwrap(),
-        batch
-            .store
-            .get(&id, Selection::ending_at(20 * MINUTE))
-            .unwrap(),
+        per_sample.store.get_pane(&id, 20 * MINUTE).unwrap(),
+        batch.store.get_pane(&id, 20 * MINUTE).unwrap(),
     );
     assert_eq!(cells(&expected).len(), 2, "jobs 1 and 4 are instance 1");
     assert_eq!(cells(&actual), cells(&expected));
@@ -189,9 +182,9 @@ fn a_resent_sample_is_dropped_not_failing_or_doubling_the_pane() {
     for definition in sds.definitions.values() {
         let mut end = 0;
         while end <= 3 * MINUTE {
-            let selection = Selection::ending_at(end);
-            let expected = batch.store.get(&definition.id, selection);
-            let actual = per_sample.store.get(&definition.id, selection);
+            let selection = definition.selection_ending_at(end);
+            let expected = batch.store.get(&definition.id, &selection);
+            let actual = per_sample.store.get(&definition.id, &selection);
             assert_eq!(
                 actual.map(cells),
                 expected.map(cells),

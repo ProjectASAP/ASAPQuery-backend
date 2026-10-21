@@ -6,7 +6,6 @@ edition.workspace = true
 [dependencies]
 asap-planner.workspace = true
 asap-executor.workspace = true
-sha2 = "0.10"
 ahash = "0.8"
 serde.workspace = true
 serde_json.workspace = true

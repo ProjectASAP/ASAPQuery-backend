@@ -35,9 +35,7 @@ use asap_planner::StoredOutputBuild;
 
 use crate::per_sample::{OpenPanes as OpenStates, PerSampleSpec, Taken};
 use crate::raw_sample_window::RawSampleWindowBatcher;
-use crate::sds::{
-    DefinitionId, Sds, Selection, SummaryDefinition, SummaryInstanceKey, SummaryStore,
-};
+use crate::sds::{DefinitionId, Sds, SummaryDefinition, SummaryInstanceKey, SummaryStore};
 use crate::series_ids::Series;
 
 /// One raw sample: its series (interned: its id and full label set,
@@ -140,6 +138,8 @@ pub struct SummaryBuild {
     /// build's input batch, column by column, with the `Scan`'s label
     /// matchers.
     pub(crate) window: RawSampleWindowBatcher,
+    /// The `TimeRange` node the window's batch feeds.
+    raw_input: u64,
     build: CompiledPhysicalDAG,
 }
 
@@ -164,17 +164,19 @@ impl SummaryBuild {
         // offset from evaluation time is not used.
         // A series is cached for as long as the definition's summaries are kept.
         let keep_ms = definition.retention_ms.saturating_add(definition.pane_ms);
-        let window = RawSampleWindowBatcher::new(dag, &definition.window, keep_ms)?;
+        let Some(raw) = &definition.window else {
+            return Err(error("reads no raw-sample window".into()));
+        };
+        let raw_input = raw.time_range_node_id as u64;
+        let window = RawSampleWindowBatcher::new(dag, raw, keep_ms)?;
         let build = compile(
             dag,
-            BTreeMap::from([(
-                definition.raw_input(),
-                InputContract::bounded(window.schema.clone()),
-            )]),
+            BTreeMap::from([(raw_input, InputContract::bounded(window.schema.clone()))]),
             &[definition.builder],
         )?;
         Ok(Self {
             definition: definition.clone(),
+            raw_input,
             window,
             build,
         })
@@ -205,7 +207,7 @@ impl SummaryBuild {
         let input: Source<'_> = Box::new(Operator::source(input.schema().clone(), vec![input])?);
         let build = self
             .build
-            .instantiate(BTreeMap::from([(self.definition.raw_input(), input)]))?;
+            .instantiate(BTreeMap::from([(self.raw_input, input)]))?;
         Ok(SummaryInstance {
             batches: run(&build, self.build.roots(), scope)?,
         })
@@ -321,7 +323,10 @@ impl Precompute {
         let mut query_run_metrics = BTreeMap::new();
         for definition in sds.definitions.values() {
             if definition.built_at == StoredOutputBuild::QueryRun {
-                match RawSampleSelector::new(&dag, &definition.window) {
+                let Some(window) = &definition.window else {
+                    continue;
+                };
+                match RawSampleSelector::new(&dag, window) {
                     Ok(selector) => {
                         query_run_metrics.insert(selector.metric().to_string(), None);
                     }
@@ -537,7 +542,10 @@ impl Precompute {
                 match built {
                     Ok(state) => {
                         self.store.insert(
-                            SummaryInstanceKey::new(id.clone(), Selection::ending_at(end)),
+                            SummaryInstanceKey::new(
+                                id.clone(),
+                                builder.summary.definition.selection_ending_at(end),
+                            ),
                             state,
                         );
                         self.stats.panes_built += 1;
@@ -553,8 +561,13 @@ impl Precompute {
                     None => break,
                 }
             }
-            self.store
-                .evict_before(id, Selection::ending_at(oldest_kept_end));
+            self.store.evict_before(
+                id,
+                &builder
+                    .summary
+                    .definition
+                    .selection_ending_at(oldest_kept_end),
+            );
         }
     }
 }

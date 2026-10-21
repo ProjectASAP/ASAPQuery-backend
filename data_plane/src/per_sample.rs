@@ -125,6 +125,8 @@ impl PerSampleSpec {
     /// keeps the batch build.
     pub(crate) fn new(dag: &PhysicalASAPDAG, pane: &SummaryBuild) -> Option<Self> {
         let definition = &pane.definition;
+        let window = definition.window.as_ref()?;
+        let raw_input = window.time_range_node_id as u64;
         let node = |id: u64| dag.nodes.iter().find(|n| n.id as u64 == id);
         let builder = node(definition.builder)?;
         let inputs: Vec<u64> = dag
@@ -133,7 +135,7 @@ impl PerSampleSpec {
             .filter(|e| e.consumer as u64 == definition.builder)
             .map(|e| e.producer as u64)
             .collect();
-        if inputs != [definition.raw_input()] {
+        if inputs != [raw_input] {
             return None;
         }
         let Operator::ASAP(ASAPOp::SummaryAgg {
@@ -150,7 +152,7 @@ impl PerSampleSpec {
         if update.item.is_some() || *grouping != GroupingStrategy::PerSubpopulationInstance {
             return None;
         }
-        let input = &node(definition.raw_input())?.output_schema;
+        let input = &node(raw_input)?.output_schema;
         let SummaryInputExpr::Column(column) = &update.weight else {
             return None;
         };
@@ -177,7 +179,7 @@ impl PerSampleSpec {
             return None;
         }
         // The cached prefix holds only if the matchers read labels alone.
-        let scan = node(definition.window.scan_node_id as u64)?;
+        let scan = node(window.scan_node_id as u64)?;
         let Operator::NonASAP(NonASAPOp::Scan { predicates, .. }) = &scan.payload else {
             return None;
         };

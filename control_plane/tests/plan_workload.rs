@@ -50,8 +50,11 @@ fn example4b_stores_panes_with_the_planners_retention() {
         .stored_outputs
         .iter()
         .map(|output| {
-            assert_eq!(output.pane.width_ms, 600_000);
-            output.pane.end_offset_ms
+            let [window] = output.inputs.raw_sample_windows.as_slice() else {
+                panic!("one raw-sample window: {output:?}");
+            };
+            assert_eq!(window.width_ms, 600_000);
+            window.end_offset_ms
         })
         .collect();
     offsets.sort();
@@ -104,7 +107,11 @@ fn selects_stored_outputs_built_in_a_query_run() {
         .filter(|o| o.built_at == asap_planner::StoredOutputBuild::QueryRun)
         .collect();
     assert_eq!(query_run.len(), 5, "five one-minute summaries");
-    assert!(query_run.iter().all(|o| o.pane.width_ms == 60_000));
+    assert!(query_run.iter().all(|o| o
+        .inputs
+        .raw_sample_windows
+        .iter()
+        .all(|w| w.width_ms == 60_000)));
 }
 
 /// A workload is planned whole or refused: when one query has no plan the
