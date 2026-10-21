@@ -66,7 +66,8 @@ This document, the backend's code and its PR descriptions use ASAPPlanner's term
 | raw sample | Backend | One value of one series at one timestamp, as received over Remote Write. Not a sampling-based approximation. |
 | summary instance | Backend | One stored summary state with its concrete `selection` (relative time bound to an absolute interval). |
 | SDS | Backend | The backend's store of summary instances, keyed by (`definition` identity, concrete `selection`). |
-| watermark | Backend | The newest routed raw sample's time, capped at the wall clock, minus the allowed lateness. Panes that end at or before it are closed. |
+| ingestion worker, shard | Backend | Ingestion is split across N ingestion workers by series id; a worker's shard is the set of series routed to it. Each worker owns its open-pane states. |
+| watermark | Backend | Per worker: the newest raw sample it received, capped at the wall clock, minus the allowed lateness. The global watermark is the minimum over the workers that hold it: every worker that has been sent samples and is not idle. Panes ending at or before the global watermark are closed. |
 | forward | Backend | Answer a query with Prometheus instead of the plan, with the reason in `x-asap-forward-reason`. |
 | event-time barrier | Backend | A producer's statement that every raw sample up to time `T` has been written (`POST /api/v1/precompute/watermark?time_ms=T`). It closes every pane that ends at or before `T`. |
 | bound raw-sample window | Backend | A `RawSampleWindow` bound to one evaluation time: the absolute interval `(T − offset − width, T − offset]`. |
