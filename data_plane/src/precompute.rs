@@ -12,7 +12,9 @@
 //! under ingestion scope. The output is stored and never changes; samples
 //! older than a closed pane are dropped. The first pane a definition sees
 //! may have started before the data plane did, so it is never built:
-//! queries that need it are not answered from stored panes.
+//! queries that need it are not answered from stored panes. A producer that
+//! declares where its stream starts (`stream_start_ms`) makes a first pane
+//! starting at or after that point complete, and it is built.
 //!
 //! Only samples of a metric some definition reads move the watermark, and a
 //! sample further ahead of the wall clock than `max_future_ms` is dropped, so
@@ -97,6 +99,11 @@ pub struct PrecomputeOptions {
     pub allowed_lateness_ms: u64,
     /// Samples further ahead of the wall clock than this are dropped.
     pub max_future_ms: u64,
+    /// Where the producer's stream starts: every raw sample at or after it
+    /// reaches the data plane. A definition's first pane is then built when
+    /// it starts at or after it. `None`: the first pane may have started
+    /// before the data plane did, so it is never built.
+    pub stream_start_ms: Option<i64>,
 }
 
 impl Default for PrecomputeOptions {
@@ -104,6 +111,7 @@ impl Default for PrecomputeOptions {
         Self {
             allowed_lateness_ms: 15_000,
             max_future_ms: 5 * 60_000,
+            stream_start_ms: None,
         }
     }
 }
@@ -245,6 +253,7 @@ pub struct Precompute {
     query_run_metrics: BTreeMap<String, Option<i64>>,
     allowed_lateness_ms: i64,
     max_future_ms: i64,
+    stream_start_ms: Option<i64>,
     newest_sample_ms: Option<i64>,
     /// The newest wall-clock time an ingest ran at: the watermark never
     /// passes it, so a series stamped ahead of the others cannot close
@@ -343,6 +352,7 @@ impl Precompute {
             query_run_metrics,
             allowed_lateness_ms: millis(options.allowed_lateness_ms),
             max_future_ms: millis(options.max_future_ms),
+            stream_start_ms: options.stream_start_ms,
             newest_sample_ms: None,
             newest_clock_ms: None,
             barrier_ms: None,
@@ -435,8 +445,16 @@ impl Precompute {
                 let this = match pane_end(sample.timestamp_ms, builder.summary.definition.pane_ms) {
                     None => Outcome::Late,
                     Some(end) => {
-                        let first = *builder.first_pane_end.get_or_insert(end);
-                        let built = *builder.built_through.get_or_insert(end);
+                        let pane_ms = builder.summary.definition.pane_ms;
+                        // A first pane that starts at or after the declared
+                        // stream start is complete: nothing is skipped, and
+                        // the panes from it on are built.
+                        let complete = self
+                            .stream_start_ms
+                            .is_some_and(|start| end - pane_ms >= start);
+                        let skipped = if complete { end - pane_ms } else { end };
+                        let first = *builder.first_pane_end.get_or_insert(skipped);
+                        let built = *builder.built_through.get_or_insert(skipped);
                         if end == first {
                             Outcome::FirstPane
                         } else if end <= built {

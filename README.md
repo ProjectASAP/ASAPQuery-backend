@@ -112,6 +112,12 @@ accuracy guarantee, so candidates are compared on cost alone; the plan's
 `selection.queries_accepted_without_guarantee` lists the queries accepted
 only because of it.
 
+`--stream-start-ms T` declares that the producers write every raw sample at
+or after `T`: the first pane of each stored output that starts at or after
+`T` is complete and is built. Without it, the first pane each stored output
+sees may have started before the data plane did, so it is skipped and a
+query whose window needs it is not answered from the plan.
+
 `--forward-timeout-seconds` bounds each forwarded query (default 120, matching
 Prometheus's default query timeout); a query that runs longer gets 502.
 

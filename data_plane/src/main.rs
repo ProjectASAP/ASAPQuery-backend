@@ -27,6 +27,12 @@ struct Args {
     /// Samples further ahead of the wall clock than this are dropped.
     #[arg(long, default_value_t = PrecomputeOptions::default().max_future_ms)]
     max_future_ms: u64,
+    /// Where the producers' stream starts (ms since the epoch): every raw
+    /// sample at or after it is written to the data plane, so a first pane
+    /// that starts at or after it is complete and is built. By default the
+    /// first pane each definition sees is skipped.
+    #[arg(long)]
+    stream_start_ms: Option<i64>,
     /// Samples queued for the engine beyond which Remote Write gets 503.
     #[arg(long, default_value_t = EngineOptions::default().max_queued_samples)]
     max_queued_samples: u64,
@@ -53,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
                 precompute: PrecomputeOptions {
                     allowed_lateness_ms: args.allowed_lateness_ms,
                     max_future_ms: args.max_future_ms,
+                    stream_start_ms: args.stream_start_ms,
                 },
                 max_queued_samples: args.max_queued_samples,
                 no_forward: args.no_forward,

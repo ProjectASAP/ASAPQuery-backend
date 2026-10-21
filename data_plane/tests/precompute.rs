@@ -488,3 +488,48 @@ fn input_stays_open_after_a_barrier() {
     engine.ingest_at(&[sample("latency_ms", "a", 29 * MINUTE, 1.0)], 36 * MINUTE);
     assert_eq!(engine.stats.samples_dropped_late, 1);
 }
+
+/// A producer that declares where its stream starts (`stream_start_ms`):
+/// every sample at or after it reaches the data plane. The first pane seen
+/// is then complete when it starts at or after the declared start, and is
+/// built; one that starts before it is still skipped.
+#[test]
+fn the_first_pane_is_built_when_it_starts_at_the_declared_stream_start() {
+    let plan = common::plan("example4b", false);
+    let sds = Sds::from_plan(&plan).unwrap();
+    let id = sds.definitions.keys().next().unwrap().clone();
+    let with_start = |stream_start_ms| {
+        let options = PrecomputeOptions {
+            allowed_lateness_ms: 0,
+            stream_start_ms: Some(stream_start_ms),
+            ..PrecomputeOptions::default()
+        };
+        Precompute::new(plan.dag.dag.clone(), &sds, options).unwrap()
+    };
+    // The stream starts at the pane boundary 10 min: pane (10, 20 min] is
+    // complete.
+    let mut engine = with_start(PANE);
+    engine.ingest(&samples(
+        "latency_ms",
+        &["a", "b"],
+        PANE + 15_000,
+        35 * MINUTE,
+    ));
+    let pane = engine
+        .store
+        .get_pane(&id, 2 * PANE)
+        .expect("first pane built");
+    assert_eq!(pane.num_rows(), 2);
+    assert_eq!(engine.stats.samples_skipped_first_pane, 0);
+    // The stream starts at 15 min, inside (10, 20 min]: that pane may have
+    // missed samples before 15 min, so it is skipped.
+    let mut engine = with_start(PANE + 5 * MINUTE);
+    engine.ingest(&samples(
+        "latency_ms",
+        &["a", "b"],
+        PANE + 5 * MINUTE,
+        35 * MINUTE,
+    ));
+    assert!(engine.store.get_pane(&id, 2 * PANE).is_none());
+    assert!(engine.store.get_pane(&id, 3 * PANE).is_some());
+}
