@@ -63,6 +63,7 @@ This document, the backend's code and its PR descriptions use ASAPPlanner's term
 | `InstallablePlan`, `StoredOutput`, `StoredOutputBuild` (`IngestionRun`, `QueryRun`), `RawSampleWindow`, `retention_ms` | Planner (`asap_planner`) | The plan a runtime installs, its stored outputs, which run builds each one, the raw-sample windows read at query time, and how long each output is kept. |
 | evaluation time, `RangeEvaluation` (step, span) | Planner (workload) | The time `T` a query is answered for, and the steps of a range query. |
 | pane, pane chain | Planner | A summary over one left-open time interval `(end − width, end]`; the panes that make up a window. |
+| per-sample ingestion | Backend | Updating each open pane's summary state in place as each raw sample arrives (`StateColumnUpdater`), then sealing it into a summary instance when the pane closes. It gives the same state as building the pane from all its raw samples at once. |
 | raw sample | Backend | One value of one series at one timestamp, as received over Remote Write. Not a sampling-based approximation. |
 | summary instance | Backend | One stored summary state with its concrete `selection` (relative time bound to an absolute interval). |
 | SDS | Backend | The backend's store of summary instances, keyed by (`definition` identity, concrete `selection`). |
