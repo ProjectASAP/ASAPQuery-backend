@@ -10,8 +10,8 @@ version = "0.1.0"
 # The backend depends on two Planner crates, at one immutable revision:
 # `asap-planner` to plan and `asap-executor` to execute. Planner IR types
 # are reached through `asap_executor::planner`.
-asap-planner = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "ef52e175d75f074b2634e6e332b4ec47f8d02fc0", default-features = false, features = ["promql"] }
-asap-executor = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "ef52e175d75f074b2634e6e332b4ec47f8d02fc0" }
+asap-planner = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "05fb36e4e9ff0b8e2ff6d43685785117ec0b9225", default-features = false, features = ["promql"] }
+asap-executor = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "05fb36e4e9ff0b8e2ff6d43685785117ec0b9225" }
 
 serde = { version = "1.0", features = ["derive"] }
 # `float_roundtrip`: a plan file reloads to the plan it was written from

@@ -252,7 +252,7 @@ dependencies = [
 [[package]]
 name = "asap-executor"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ef52e175d75f074b2634e6e332b4ec47f8d02fc0#ef52e175d75f074b2634e6e332b4ec47f8d02fc0"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=05fb36e4e9ff0b8e2ff6d43685785117ec0b9225#05fb36e4e9ff0b8e2ff6d43685785117ec0b9225"
 dependencies = [
  "ahash",
  "arrow",
@@ -270,7 +270,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-common"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ef52e175d75f074b2634e6e332b4ec47f8d02fc0#ef52e175d75f074b2634e6e332b4ec47f8d02fc0"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=05fb36e4e9ff0b8e2ff6d43685785117ec0b9225#05fb36e4e9ff0b8e2ff6d43685785117ec0b9225"
 dependencies = [
  "asap-types",
  "serde",
@@ -280,7 +280,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-promql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ef52e175d75f074b2634e6e332b4ec47f8d02fc0#ef52e175d75f074b2634e6e332b4ec47f8d02fc0"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=05fb36e4e9ff0b8e2ff6d43685785117ec0b9225#05fb36e4e9ff0b8e2ff6d43685785117ec0b9225"
 dependencies = [
  "asap-frontend-common",
  "asap-types",
@@ -290,7 +290,7 @@ dependencies = [
 [[package]]
 name = "asap-logical-asap-optimization"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ef52e175d75f074b2634e6e332b4ec47f8d02fc0#ef52e175d75f074b2634e6e332b4ec47f8d02fc0"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=05fb36e4e9ff0b8e2ff6d43685785117ec0b9225#05fb36e4e9ff0b8e2ff6d43685785117ec0b9225"
 dependencies = [
  "asap-types",
  "asap_sketchlib",
@@ -302,7 +302,7 @@ dependencies = [
 [[package]]
 name = "asap-physical-asap-optimization"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ef52e175d75f074b2634e6e332b4ec47f8d02fc0#ef52e175d75f074b2634e6e332b4ec47f8d02fc0"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=05fb36e4e9ff0b8e2ff6d43685785117ec0b9225#05fb36e4e9ff0b8e2ff6d43685785117ec0b9225"
 dependencies = [
  "asap-logical-asap-optimization",
  "asap-types",
@@ -312,7 +312,7 @@ dependencies = [
 [[package]]
 name = "asap-plan-selection"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ef52e175d75f074b2634e6e332b4ec47f8d02fc0#ef52e175d75f074b2634e6e332b4ec47f8d02fc0"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=05fb36e4e9ff0b8e2ff6d43685785117ec0b9225#05fb36e4e9ff0b8e2ff6d43685785117ec0b9225"
 dependencies = [
  "asap-logical-asap-optimization",
  "asap-physical-asap-optimization",
@@ -326,7 +326,7 @@ dependencies = [
 [[package]]
 name = "asap-planner"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ef52e175d75f074b2634e6e332b4ec47f8d02fc0#ef52e175d75f074b2634e6e332b4ec47f8d02fc0"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=05fb36e4e9ff0b8e2ff6d43685785117ec0b9225#05fb36e4e9ff0b8e2ff6d43685785117ec0b9225"
 dependencies = [
  "asap-executor",
  "asap-frontend-promql",
@@ -341,7 +341,7 @@ dependencies = [
 [[package]]
 name = "asap-types"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ef52e175d75f074b2634e6e332b4ec47f8d02fc0#ef52e175d75f074b2634e6e332b4ec47f8d02fc0"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=05fb36e4e9ff0b8e2ff6d43685785117ec0b9225#05fb36e4e9ff0b8e2ff6d43685785117ec0b9225"
 dependencies = [
  "serde",
  "serde_json",
