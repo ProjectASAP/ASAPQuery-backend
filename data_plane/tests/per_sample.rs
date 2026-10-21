@@ -123,7 +123,7 @@ fn per_sample_panes_equal_the_batch_build() {
                         for batch in actual.batches.iter().chain(&expected.batches) {
                             assert_eq!(**batch.schema(), definition.output_schema);
                         }
-                        assert_eq!(cells(&actual), cells(&expected), "{example} pane {end}");
+                        assert_eq!(cells(actual), cells(expected), "{example} pane {end}");
                         compared += usize::from(expected.num_rows() > 0);
                     }
                     end += definition.pane_ms;
@@ -156,8 +156,8 @@ fn per_sample_panes_apply_label_matchers() {
         per_sample.store.get_pane(&id, 20 * MINUTE).unwrap(),
         batch.store.get_pane(&id, 20 * MINUTE).unwrap(),
     );
-    assert_eq!(cells(&expected).len(), 2, "jobs 1 and 4 are instance 1");
-    assert_eq!(cells(&actual), cells(&expected));
+    assert_eq!(cells(expected).len(), 2, "jobs 1 and 4 are instance 1");
+    assert_eq!(cells(actual), cells(expected));
 }
 
 /// A resent sample (a Remote Write retry, for instance) is not

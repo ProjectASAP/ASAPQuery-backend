@@ -252,7 +252,7 @@ dependencies = [
 [[package]]
 name = "asap-executor"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=4111e62014aa1944fa546075a4b161fe390a2439#4111e62014aa1944fa546075a4b161fe390a2439"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ef52e175d75f074b2634e6e332b4ec47f8d02fc0#ef52e175d75f074b2634e6e332b4ec47f8d02fc0"
 dependencies = [
  "ahash",
  "arrow",
@@ -270,7 +270,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-common"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=4111e62014aa1944fa546075a4b161fe390a2439#4111e62014aa1944fa546075a4b161fe390a2439"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ef52e175d75f074b2634e6e332b4ec47f8d02fc0#ef52e175d75f074b2634e6e332b4ec47f8d02fc0"
 dependencies = [
  "asap-types",
  "serde",
@@ -280,7 +280,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-promql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=4111e62014aa1944fa546075a4b161fe390a2439#4111e62014aa1944fa546075a4b161fe390a2439"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ef52e175d75f074b2634e6e332b4ec47f8d02fc0#ef52e175d75f074b2634e6e332b4ec47f8d02fc0"
 dependencies = [
  "asap-frontend-common",
  "asap-types",
@@ -290,7 +290,7 @@ dependencies = [
 [[package]]
 name = "asap-logical-asap-optimization"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=4111e62014aa1944fa546075a4b161fe390a2439#4111e62014aa1944fa546075a4b161fe390a2439"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ef52e175d75f074b2634e6e332b4ec47f8d02fc0#ef52e175d75f074b2634e6e332b4ec47f8d02fc0"
 dependencies = [
  "asap-types",
  "asap_sketchlib",
@@ -302,7 +302,7 @@ dependencies = [
 [[package]]
 name = "asap-physical-asap-optimization"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=4111e62014aa1944fa546075a4b161fe390a2439#4111e62014aa1944fa546075a4b161fe390a2439"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ef52e175d75f074b2634e6e332b4ec47f8d02fc0#ef52e175d75f074b2634e6e332b4ec47f8d02fc0"
 dependencies = [
  "asap-logical-asap-optimization",
  "asap-types",
@@ -312,7 +312,7 @@ dependencies = [
 [[package]]
 name = "asap-plan-selection"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=4111e62014aa1944fa546075a4b161fe390a2439#4111e62014aa1944fa546075a4b161fe390a2439"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ef52e175d75f074b2634e6e332b4ec47f8d02fc0#ef52e175d75f074b2634e6e332b4ec47f8d02fc0"
 dependencies = [
  "asap-logical-asap-optimization",
  "asap-physical-asap-optimization",
@@ -326,7 +326,7 @@ dependencies = [
 [[package]]
 name = "asap-planner"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=4111e62014aa1944fa546075a4b161fe390a2439#4111e62014aa1944fa546075a4b161fe390a2439"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ef52e175d75f074b2634e6e332b4ec47f8d02fc0#ef52e175d75f074b2634e6e332b4ec47f8d02fc0"
 dependencies = [
  "asap-executor",
  "asap-frontend-promql",
@@ -341,7 +341,7 @@ dependencies = [
 [[package]]
 name = "asap-types"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=4111e62014aa1944fa546075a4b161fe390a2439#4111e62014aa1944fa546075a4b161fe390a2439"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=ef52e175d75f074b2634e6e332b4ec47f8d02fc0#ef52e175d75f074b2634e6e332b4ec47f8d02fc0"
 dependencies = [
  "serde",
  "serde_json",
@@ -350,20 +350,15 @@ dependencies = [
 
 [[package]]
 name = "asap_sketchlib"
-version = "0.3.0"
-source = "git+https://github.com/ProjectASAP/asap_sketchlib?rev=3f44cf1c2d823b844c17796f24408e03863149ee#3f44cf1c2d823b844c17796f24408e03863149ee"
+version = "0.4.0"
+source = "git+https://github.com/ProjectASAP/asap_sketchlib?rev=63e565506426020c505ef0b84e0c91f450d09e7c#63e565506426020c505ef0b84e0c91f450d09e7c"
 dependencies = [
- "bincode",
- "bytes",
- "prost",
  "rand 0.9.5",
  "rmp-serde",
  "serde",
- "serde-big-array",
  "serde_bytes",
  "smallvec",
  "twox-hash",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -1884,15 +1879,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde-big-array"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11fc7cc2c76d73e0f27ee52abbd64eec84d46f370c88371120433196934e4b7f"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "serde_bytes"
 version = "0.11.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2710,12 +2696,6 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
-
-[[package]]
-name = "xxhash-rust"
-version = "0.8.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 
 [[package]]
 name = "yoke"

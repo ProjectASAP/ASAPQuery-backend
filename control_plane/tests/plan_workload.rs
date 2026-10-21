@@ -130,3 +130,37 @@ fn refuses_a_workload_with_a_query_it_cannot_plan() {
     let error = plan_workload(&workload, &inputs).unwrap_err();
     assert!(matches!(error, PlanError::Planning(_)), "{error}");
 }
+
+/// The MVP benchmark's p99 query over a gauge not declared non-negative:
+/// without raw data, every candidate fails a check (the exact ones scan raw
+/// samples at query time, the merged DDSketch panes carry no bound through
+/// `avg`), so planning fails. With `ignore_accuracy_guarantees`, loaded from
+/// the Planner's settings JSON as `--plan-selection-settings` reads it, the
+/// cheapest sketch plan is selected and the report marks the query as
+/// accepted without a guarantee.
+#[test]
+fn ignoring_accuracy_guarantees_plans_the_undeclared_p99_query() {
+    let workload: PlanningWorkload = serde_json::from_str(
+        r#"{"query_workload": {"language": "promql", "repeating_queries": [{
+              "query": "avg by (region, service, job) (quantile_over_time(0.99, data[100s]))",
+              "demand": {"fixed_interval": 1000},
+              "requirements": {"accuracy": {"max_error": 0.05, "failure_probability": 0.3,
+                  "accuracy_scope": "whole_result"}},
+              "predictability": {"predictable": {"known_at": null}}}]},
+            "data_workload": {"arrival": {"ingesting": {"rows_per_second": 10000.0}},
+              "sources": {"data": {"series_count": 1000, "metric_type": "gauge",
+                  "sample_interval": 100}}}}"#,
+    )
+    .unwrap();
+    let mut inputs = DeploymentInputs::default();
+    inputs.deployment_capabilities.raw_data_retained = false;
+    let error = plan_workload(&workload, &inputs).unwrap_err();
+    assert!(matches!(error, PlanError::Planning(_)), "{error}");
+
+    inputs.plan_selection =
+        serde_json::from_str(r#"{"ignore_accuracy_guarantees": true}"#).unwrap();
+    let plan = plan_workload(&workload, &inputs).unwrap();
+    assert!(!plan.stored_outputs.is_empty(), "panes built at ingestion");
+    let selection = plan.selection.as_ref().unwrap();
+    assert_eq!(selection.queries_accepted_without_guarantee, [0]);
+}

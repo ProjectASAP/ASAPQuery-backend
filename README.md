@@ -99,9 +99,18 @@ cargo run -p data_plane -- --plan plan.json --prometheus-url http://localhost:90
 `DeploymentCapabilities`: every summary the Planner can build, raw data kept
 in Prometheus, and stored outputs built in a `QueryRun` (`MatAtQueryKeptAcrossEvaluations`). For example
 `{"raw_data_retained": false}` makes the Planner build every input at
-ingestion time. `--measured-operation-costs costs.json` gives Stage 3 the
-deployment's measured sketch operation costs; otherwise it prices every node
-with cost model 1 and illustrative unit costs.
+ingestion time.
+
+`--plan-selection-settings settings.json` replaces the Planner's default
+`PlanSelectionSettings` (Stage 3's cost model, resource speed, measured
+operation costs and `ignore_accuracy_guarantees`); an omitted field keeps its
+default, cost model 1 with illustrative unit costs.
+`--measured-operation-costs costs.json` gives Stage 3 the deployment's
+measured operation costs (`MeasuredOperationCosts`).
+`--ignore-accuracy-guarantees` accepts every query output whatever its
+accuracy guarantee, so candidates are compared on cost alone; the plan's
+`selection.queries_accepted_without_guarantee` lists the queries accepted
+only because of it.
 
 `--forward-timeout-seconds` bounds each forwarded query (default 120, matching
 Prometheus's default query timeout); a query that runs longer gets 502.

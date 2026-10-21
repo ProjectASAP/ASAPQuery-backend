@@ -15,11 +15,23 @@ struct Args {
     /// backend's data plane executes and keeps.
     #[arg(long)]
     deployment_capabilities: Option<PathBuf>,
-    /// Planner `MeasuredOperationCost` list (JSON) that Stage 3 prices
-    /// sketch operations from; by default every node is priced from the
+    /// Planner `PlanSelectionSettings` (JSON): Stage 3's cost model,
+    /// resource speed, measured operation costs and whether accuracy
+    /// guarantees are ignored; an omitted field takes the Planner's
+    /// default.
+    #[arg(long)]
+    plan_selection_settings: Option<PathBuf>,
+    /// Planner `MeasuredOperationCosts` (JSON, or the earlier list of
+    /// `MeasuredOperationCost`) that Stage 3 prices operators from, in place
+    /// of the settings' table; by default every node is priced from the
     /// Planner's formulas.
     #[arg(long)]
     measured_operation_costs: Option<PathBuf>,
+    /// Accept every query output regardless of its accuracy guarantee
+    /// (`PlanSelectionSettings::ignore_accuracy_guarantees`): candidates are
+    /// compared on cost alone; executability checks still apply.
+    #[arg(long)]
+    ignore_accuracy_guarantees: bool,
     /// Where to write the plan the data plane installs.
     #[arg(long)]
     out: PathBuf,
@@ -41,11 +53,23 @@ fn main() -> anyhow::Result<()> {
     if let Some(path) = &args.deployment_capabilities {
         inputs.deployment_capabilities = read_json(path)?;
     }
+    if let Some(path) = &args.plan_selection_settings {
+        inputs.plan_selection = read_json(path)?;
+    }
     if let Some(path) = &args.measured_operation_costs {
         inputs.plan_selection.measured_operation_costs = read_json(path)?;
     }
+    inputs.plan_selection.ignore_accuracy_guarantees |= args.ignore_accuracy_guarantees;
     let plan = plan_workload(&workload, &inputs)?;
     save_plan(&plan, &args.out)?;
+    if let Some(selection) = &plan.selection {
+        if !selection.queries_accepted_without_guarantee.is_empty() {
+            println!(
+                "queries accepted without an accuracy guarantee (workload indices): {:?}",
+                selection.queries_accepted_without_guarantee
+            );
+        }
+    }
     println!(
         "wrote {} ({} queries, {} nodes)",
         args.out.display(),
