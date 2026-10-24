@@ -252,7 +252,7 @@ dependencies = [
 [[package]]
 name = "asap-executor"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=05fb36e4e9ff0b8e2ff6d43685785117ec0b9225#05fb36e4e9ff0b8e2ff6d43685785117ec0b9225"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=5697d056bad159a4ebdfdc5f81e19be5528bf240#5697d056bad159a4ebdfdc5f81e19be5528bf240"
 dependencies = [
  "ahash",
  "arrow",
@@ -270,7 +270,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-common"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=05fb36e4e9ff0b8e2ff6d43685785117ec0b9225#05fb36e4e9ff0b8e2ff6d43685785117ec0b9225"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=5697d056bad159a4ebdfdc5f81e19be5528bf240#5697d056bad159a4ebdfdc5f81e19be5528bf240"
 dependencies = [
  "asap-types",
  "serde",
@@ -280,7 +280,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-promql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=05fb36e4e9ff0b8e2ff6d43685785117ec0b9225#05fb36e4e9ff0b8e2ff6d43685785117ec0b9225"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=5697d056bad159a4ebdfdc5f81e19be5528bf240#5697d056bad159a4ebdfdc5f81e19be5528bf240"
 dependencies = [
  "asap-frontend-common",
  "asap-types",
@@ -290,7 +290,7 @@ dependencies = [
 [[package]]
 name = "asap-logical-asap-optimization"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=05fb36e4e9ff0b8e2ff6d43685785117ec0b9225#05fb36e4e9ff0b8e2ff6d43685785117ec0b9225"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=5697d056bad159a4ebdfdc5f81e19be5528bf240#5697d056bad159a4ebdfdc5f81e19be5528bf240"
 dependencies = [
  "asap-types",
  "asap_sketchlib",
@@ -302,7 +302,7 @@ dependencies = [
 [[package]]
 name = "asap-physical-asap-optimization"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=05fb36e4e9ff0b8e2ff6d43685785117ec0b9225#05fb36e4e9ff0b8e2ff6d43685785117ec0b9225"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=5697d056bad159a4ebdfdc5f81e19be5528bf240#5697d056bad159a4ebdfdc5f81e19be5528bf240"
 dependencies = [
  "asap-logical-asap-optimization",
  "asap-types",
@@ -312,12 +312,14 @@ dependencies = [
 [[package]]
 name = "asap-plan-selection"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=05fb36e4e9ff0b8e2ff6d43685785117ec0b9225#05fb36e4e9ff0b8e2ff6d43685785117ec0b9225"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=5697d056bad159a4ebdfdc5f81e19be5528bf240#5697d056bad159a4ebdfdc5f81e19be5528bf240"
 dependencies = [
  "asap-logical-asap-optimization",
  "asap-physical-asap-optimization",
  "asap-types",
  "asap_sketchlib",
+ "good_lp",
+ "highs",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -326,7 +328,7 @@ dependencies = [
 [[package]]
 name = "asap-planner"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=05fb36e4e9ff0b8e2ff6d43685785117ec0b9225#05fb36e4e9ff0b8e2ff6d43685785117ec0b9225"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=5697d056bad159a4ebdfdc5f81e19be5528bf240#5697d056bad159a4ebdfdc5f81e19be5528bf240"
 dependencies = [
  "asap-executor",
  "asap-frontend-promql",
@@ -341,7 +343,7 @@ dependencies = [
 [[package]]
 name = "asap-types"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=05fb36e4e9ff0b8e2ff6d43685785117ec0b9225#05fb36e4e9ff0b8e2ff6d43685785117ec0b9225"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=5697d056bad159a4ebdfdc5f81e19be5528bf240#5697d056bad159a4ebdfdc5f81e19be5528bf240"
 dependencies = [
  "serde",
  "serde_json",
@@ -464,6 +466,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "bindgen"
+version = "0.72.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
+dependencies = [
+ "bitflags",
+ "cexpr",
+ "clang-sys",
+ "itertools 0.13.0",
+ "log",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash",
+ "shlex 1.3.0",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -494,7 +516,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "005ec2760ca554fae18df7a11195552ec576cd665632a881bc011d5bb2fd4d80"
 dependencies = [
  "find-msvc-tools",
- "shlex",
+ "shlex 2.0.1",
+]
+
+[[package]]
+name = "cexpr"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fac387a98bb7c37292057cffc56d62ecb629900026402633ae9160df93a8766"
+dependencies = [
+ "nom",
 ]
 
 [[package]]
@@ -548,6 +579,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "clang-sys"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "157a8ba7b480713b56f4c09fd13fc3e0a22a5dfab8097ba61cbc5feef950788a"
+dependencies = [
+ "glob",
+ "libc",
+ "libloading",
+]
+
+[[package]]
 name = "clap"
 version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -586,6 +628,15 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "colorchoice"
@@ -882,6 +933,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "glob"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+
+[[package]]
+name = "good_lp"
+version = "1.15.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4255eb1d65eea322f73a326038f2bcec19dae13ca50fa557da19b03274b4d56"
+dependencies = [
+ "fnv",
+ "highs",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -904,6 +971,26 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "highs"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dfc791427e78fdc1a0a37983f79c20f86a0b7b7dfdb5d6a57a6f72d77cd9074"
+dependencies = [
+ "highs-sys",
+ "log",
+]
+
+[[package]]
+name = "highs-sys"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4da0c52322648e2360a5a8896d23301fa5ed99ed7607c5faf229bd0bbb30d3f"
+dependencies = [
+ "bindgen",
+ "cmake",
+]
 
 [[package]]
 name = "http"
@@ -1162,6 +1249,15 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "itertools"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
@@ -1254,6 +1350,16 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "libm"
@@ -1370,6 +1476,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
+name = "minimal-lexical"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
 name = "mio"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1378,6 +1490,16 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "nom"
+version = "7.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
+dependencies = [
+ "memchr",
+ "minimal-lexical",
 ]
 
 [[package]]
@@ -1524,6 +1646,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "prettyplease"
+version = "0.2.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
+dependencies = [
+ "proc-macro2",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1562,7 +1694,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -1952,6 +2084,12 @@ checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
 ]
+
+[[package]]
+name = "shlex"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shlex"
