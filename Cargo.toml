@@ -10,7 +10,7 @@ version = "0.1.0"
 # The backend depends on two Planner crates, at one immutable revision:
 # `asap-planner` to plan and `asap-executor` to execute. Planner IR types
 # are reached through `asap_executor::planner`.
-asap-planner = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "05fb36e4e9ff0b8e2ff6d43685785117ec0b9225", default-features = false, features = ["promql"] }
+asap-planner = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "05fb36e4e9ff0b8e2ff6d43685785117ec0b9225" }
 asap-executor = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "05fb36e4e9ff0b8e2ff6d43685785117ec0b9225" }
 
 serde = { version = "1.0", features = ["derive"] }
