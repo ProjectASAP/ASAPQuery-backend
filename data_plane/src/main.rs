@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use data_plane::engine::EngineOptions;
-use data_plane::precompute::PrecomputeOptions;
+use data_plane::ingestion::IngestionOptions;
 use data_plane::{router, DataPlane, DEFAULT_FORWARD_TIMEOUT};
 
 /// Serve Remote Write ingestion and the Prometheus query API for a plan.
@@ -21,27 +21,34 @@ struct Args {
     forward_timeout_seconds: u64,
     #[arg(long, default_value = "0.0.0.0:8088")]
     listen: String,
-    /// How long after the newest sample passes a pane's end it is built.
-    #[arg(long, default_value_t = PrecomputeOptions::default().allowed_lateness_ms)]
+    /// How long after the newest sample passes a window's end it is refreshed.
+    #[arg(long, default_value_t = IngestionOptions::default().allowed_lateness_ms)]
     allowed_lateness_ms: u64,
     /// Samples further ahead of the wall clock than this are dropped.
-    #[arg(long, default_value_t = PrecomputeOptions::default().max_future_ms)]
+    #[arg(long, default_value_t = IngestionOptions::default().max_future_ms)]
     max_future_ms: u64,
     /// Where the producers' stream starts (ms since the epoch): every raw
-    /// sample at or after it is written to the data plane, so a first pane
-    /// that starts at or after it is complete and is built. By default the
-    /// first pane each definition sees is skipped.
+    /// sample at or after it is written to the data plane, so a first window
+    /// that starts at or after it is complete and is refreshed. By default
+    /// the first window each refresh group sees is skipped.
     #[arg(long)]
     stream_start_ms: Option<i64>,
+    /// How much longer than the plan's retention views and raw samples are
+    /// kept, so a query this far behind the newest refreshed window is still
+    /// answered.
+    #[arg(long, default_value_t = IngestionOptions::default().view_retention_margin_ms)]
+    view_retention_margin_ms: u64,
     /// Samples queued for the engine beyond which Remote Write gets 503.
     #[arg(long, default_value_t = EngineOptions::default().max_queued_samples)]
     max_queued_samples: u64,
     /// Never forward a query to Prometheus: refuse a plan with a query the
     /// data plane cannot run, and answer any query the plan does not answer
-    /// with an error giving the reason. Raw samples are still read from
-    /// Prometheus.
+    /// with an error giving the reason.
     #[arg(long)]
     no_forward: bool,
+    /// The most bytes one ingestion or query run may hold.
+    #[arg(long, default_value_t = EngineOptions::default().run_memory_limit_bytes)]
+    run_memory_limit_bytes: usize,
 }
 
 #[tokio::main]
@@ -56,13 +63,15 @@ async fn main() -> anyhow::Result<()> {
             plan,
             args.prometheus_url,
             EngineOptions {
-                precompute: PrecomputeOptions {
+                ingestion: IngestionOptions {
                     allowed_lateness_ms: args.allowed_lateness_ms,
                     max_future_ms: args.max_future_ms,
                     stream_start_ms: args.stream_start_ms,
+                    view_retention_margin_ms: args.view_retention_margin_ms,
                 },
                 max_queued_samples: args.max_queued_samples,
                 no_forward: args.no_forward,
+                run_memory_limit_bytes: args.run_memory_limit_bytes,
             },
         )?
         .with_forward_timeout(Duration::from_secs(args.forward_timeout_seconds)),

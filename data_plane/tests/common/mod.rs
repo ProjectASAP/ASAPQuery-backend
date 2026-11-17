@@ -22,7 +22,9 @@ pub fn workload(example: &str) -> PlanningWorkload {
 /// keeps raw data or not.
 #[allow(dead_code)]
 pub fn plan(example: &str, raw_data_retained: bool) -> InstallablePlan {
-    plan_workload(&workload(example), &inputs(raw_data_retained)).unwrap()
+    plan_workload(&workload(example), &inputs(raw_data_retained))
+        .unwrap()
+        .0
 }
 
 #[allow(dead_code)]

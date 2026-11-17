@@ -369,11 +369,10 @@ async fn reports_sample_counters() {
     }
     assert_eq!(body["engine_running"], true);
     assert_eq!(body["samples_queued"], 0);
-    let counters = &body["precompute"];
+    let counters = &body["ingestion"];
     let total: u64 = [
         "samples_accepted",
         "samples_dropped_late",
-        "samples_skipped_first_pane",
         "samples_dropped_future",
         "samples_unrouted",
     ]

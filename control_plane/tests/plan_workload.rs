@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use asap_planner::{InstallablePlan, MaterializedViewRefresh};
 use asap_planner::{InstallablePlanError, PlanningWorkload};
 use control_plane::{load_plan, plan_workload, save_plan, DeploymentInputs, PlanError};
 
@@ -7,6 +8,10 @@ fn example(name: &str) -> PlanningWorkload {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(format!("../examples/planner-layering-{name}.json"));
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+fn plan(workload: &PlanningWorkload, inputs: &DeploymentInputs) -> InstallablePlan {
+    plan_workload(workload, inputs).unwrap().0
 }
 
 fn temp_path(name: &str) -> PathBuf {
@@ -18,49 +23,45 @@ fn temp_path(name: &str) -> PathBuf {
 #[test]
 fn plans_example1_and_round_trips_the_plan() {
     let workload = example("example1");
-    let plan = plan_workload(&workload, &DeploymentInputs::default()).unwrap();
+    let plan = plan(&workload, &DeploymentInputs::default());
     assert_eq!(
-        plan.queries
-            .iter()
-            .map(|q| q.query.clone())
-            .collect::<Vec<_>>(),
+        plan.query_texts,
         workload
             .query_workload
             .entries()
             .map(|entry| entry.query.0)
             .collect::<Vec<_>>()
     );
-    assert_eq!(plan.dag.dag.roots.len(), 2);
+    assert_eq!(plan.dag.roots.len(), 2);
     let path = temp_path("example1.json");
     save_plan(&plan, &path).unwrap();
-    assert_eq!(load_plan(&path).unwrap(), plan);
+    // The plan file carries what a runtime installs; in-memory provenance
+    // (`selected_physical_candidate`) is not part of it.
+    assert_eq!(
+        serde_json::to_value(load_plan(&path).unwrap()).unwrap(),
+        serde_json::to_value(&plan).unwrap()
+    );
     std::fs::remove_file(path).unwrap();
 }
 
-/// Example 4b without raw data stores its six 10-minute panes, built at
-/// ingestion, each kept as long as the Planner states: 60 minutes back for
-/// the oldest pane the 60-minute range reads.
+/// Example 4b without raw data keeps its 60-minute range as a chain of
+/// tumbling windows refreshed at ingestion, retained for the 60 minutes the
+/// range reads back, and scans no raw data at query time.
 #[test]
-fn example4b_stores_panes_with_the_planners_retention() {
+fn example4b_keeps_tumbling_windows_with_the_planners_retention() {
     let mut inputs = DeploymentInputs::default();
     inputs.deployment_capabilities.raw_data_retained = false;
-    let plan = plan_workload(&example("example4b"), &inputs).unwrap();
-    assert_eq!(plan.stored_outputs.len(), 6);
-    let mut offsets: Vec<i64> = plan
-        .stored_outputs
+    let plan = plan(&example("example4b"), &inputs);
+    let views = plan.materialized_views().unwrap();
+    assert!(!views.is_empty());
+    assert!(views
         .iter()
-        .map(|output| {
-            let [window] = output.inputs.raw_sample_windows.as_slice() else {
-                panic!("one raw-sample window: {output:?}");
-            };
-            assert_eq!(window.width_ms, 600_000);
-            window.end_offset_ms
-        })
-        .collect();
-    offsets.sort();
-    assert_eq!(offsets, (0..6).map(|i| i * 600_000).collect::<Vec<_>>());
-    let retention = plan.stored_outputs.iter().map(|o| o.retention_ms).max();
-    assert_eq!(retention, Some(3_600_000));
+        .all(|v| v.refresh() == MaterializedViewRefresh::AtIngestion));
+    assert_eq!(
+        views.iter().map(|v| v.retention_ms()).max(),
+        Some(3_600_000)
+    );
+    assert!(plan.raw_data_retention().unwrap().is_empty());
 }
 
 /// Only PromQL workloads are planned; the Planner's PromQL frontend refuses
@@ -79,8 +80,8 @@ fn rejects_sql_workloads() {
 /// A plan whose queries do not match the DAG's roots is not installed.
 #[test]
 fn load_rejects_a_plan_without_a_query_per_root() {
-    let mut plan = plan_workload(&example("example1"), &DeploymentInputs::default()).unwrap();
-    plan.queries.pop();
+    let mut plan = plan(&example("example1"), &DeploymentInputs::default());
+    plan.query_texts.pop();
     let path = temp_path("mismatched.json");
     save_plan(&plan, &path).unwrap();
     assert!(matches!(
@@ -92,26 +93,19 @@ fn load_rejects_a_plan_without_a_query_per_root() {
     std::fs::remove_file(path).unwrap();
 }
 
-/// The backend retains query-time results (`query_time_results_retained`),
-/// so for a few series sampled every millisecond the Planner selects #509
-/// Example 4's B3: five 1-minute KLL panes, stored outputs built in a
-/// `QueryRun` (`MatAtQueryKeptAcrossEvaluations`).
+/// The data plane refreshes no view on first read, so the backend keeps
+/// no query-time result across evaluations: #509 Example 4's B3 workload
+/// gets no view refreshed on first read.
 #[test]
-fn selects_stored_outputs_built_in_a_query_run() {
+fn plans_no_view_refreshed_on_first_read() {
     let inputs = DeploymentInputs::default();
-    assert!(inputs.deployment_capabilities.query_time_results_retained);
-    let plan = plan_workload(&example("example4-b3"), &inputs).unwrap();
-    let query_run: Vec<_> = plan
-        .stored_outputs
+    assert!(!inputs.deployment_capabilities.query_time_results_retained);
+    let plan = plan(&example("example4-b3"), &inputs);
+    assert!(plan
+        .materialized_views()
+        .unwrap()
         .iter()
-        .filter(|o| o.built_at == asap_planner::StoredOutputBuild::QueryRun)
-        .collect();
-    assert_eq!(query_run.len(), 5, "five one-minute summaries");
-    assert!(query_run.iter().all(|o| o
-        .inputs
-        .raw_sample_windows
-        .iter()
-        .all(|w| w.width_ms == 60_000)));
+        .all(|v| v.refresh() != MaterializedViewRefresh::OnFirstRead));
 }
 
 /// A workload is planned whole or refused: when one query has no plan the
@@ -134,16 +128,14 @@ fn refuses_a_workload_with_a_query_it_cannot_plan() {
 /// The MVP benchmark's p99 query over a gauge not declared non-negative:
 /// without raw data, every candidate fails a check (the exact ones scan raw
 /// samples at query time, the merged DDSketch panes carry no bound through
-/// `avg`), so planning fails. With `ignore_accuracy_guarantees`, loaded from
-/// the Planner's settings JSON as `--plan-selection-settings` reads it, the
-/// cheapest sketch plan is selected and the report marks the query as
-/// accepted without a guarantee.
+/// `avg`), so planning fails. With `ignore_accuracy_guarantees` the
+/// cheapest sketch plan is selected: tumbling windows kept at ingestion.
 #[test]
 fn ignoring_accuracy_guarantees_plans_the_undeclared_p99_query() {
     let workload: PlanningWorkload = serde_json::from_str(
         r#"{"query_workload": {"language": "promql", "repeating_queries": [{
               "query": "avg by (region, service, job) (quantile_over_time(0.99, data[100s]))",
-              "demand": {"fixed_interval": 1000},
+              "demand": {"fixed_interval_at": {"interval": 1000, "evaluation_phase": 0}},
               "requirements": {"accuracy": {"max_error": 0.05, "failure_probability": 0.3,
                   "accuracy_scope": "whole_result"}},
               "predictability": {"predictable": {"known_at": null}}}]},
@@ -157,10 +149,7 @@ fn ignoring_accuracy_guarantees_plans_the_undeclared_p99_query() {
     let error = plan_workload(&workload, &inputs).unwrap_err();
     assert!(matches!(error, PlanError::Planning(_)), "{error}");
 
-    inputs.plan_selection =
-        serde_json::from_str(r#"{"ignore_accuracy_guarantees": true}"#).unwrap();
-    let plan = plan_workload(&workload, &inputs).unwrap();
-    assert!(!plan.stored_outputs.is_empty(), "panes built at ingestion");
-    let selection = plan.selection.as_ref().unwrap();
-    assert_eq!(selection.queries_accepted_without_guarantee, [0]);
+    inputs.ignore_accuracy_guarantees = true;
+    let plan = plan(&workload, &inputs);
+    assert!(!plan.materialized_views().unwrap().is_empty());
 }

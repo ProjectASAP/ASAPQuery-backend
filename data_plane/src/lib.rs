@@ -1,22 +1,21 @@
 //! Backend data plane: receives Prometheus Remote Write samples and serves
 //! the Prometheus query API for an installed plan.
 //!
-//! The installed plan is ASAPPlanner's selected `PhysicalASAPDAG`. The
-//! engine thread builds its ingestion-time outputs pane by pane and answers
-//! the plan's instant queries from them; every other query, and any planned
-//! query it cannot answer, is forwarded to Prometheus.
+//! The installed plan is ASAPPlanner's `InstallablePlan`: one selected
+//! physical ASAP DAG. The engine thread stores the raw samples its `Scan`s
+//! read, refreshes its materialized views in ingestion runs, and answers
+//! the plan's instant queries with query runs, all through the Planner's
+//! executor; every other query, and any planned query it cannot answer, is
+//! forwarded to Prometheus (or refused with `--no-forward`).
 
 pub mod engine;
-mod per_sample;
-pub mod precompute;
+pub mod ingestion;
 pub mod prometheus;
 pub mod query;
-mod raw_sample_window;
 pub mod remote_write;
-pub mod sds;
 pub mod series_ids;
+pub mod store;
 
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,9 +27,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use engine::{EngineHandle, EngineOptions, IngestError};
-use precompute::RawSample;
 use prometheus::InstantQuery;
 use query::Unanswered;
+use store::RawSample;
 
 /// Response header naming what answered a query: `plan` or `forwarded`, or
 /// `refused` when `--no-forward` refused to forward it.
@@ -58,17 +57,16 @@ pub struct DataPlane {
 }
 
 impl DataPlane {
-    /// Installs the plan serialized in `plan_json` (a
-    /// `asap_planner::InstallablePlan`) with [`EngineOptions::default`], except
-    /// that panes close `allowed_lateness_ms` after the newest sample passes
-    /// them.
+    /// Installs the plan file `plan_json` (an `asap_planner::InstallablePlan`)
+    /// with [`EngineOptions::default`], except that windows close
+    /// `allowed_lateness_ms` after the newest sample passes them.
     pub fn new(
         plan_json: String,
         prometheus_url: String,
         allowed_lateness_ms: u64,
     ) -> anyhow::Result<Self> {
         let mut options = EngineOptions::default();
-        options.precompute.allowed_lateness_ms = allowed_lateness_ms;
+        options.ingestion.allowed_lateness_ms = allowed_lateness_ms;
         Self::with_options(plan_json, prometheus_url, options)
     }
 
@@ -169,11 +167,11 @@ async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
 
 /// `POST /api/v1/precompute/watermark?time_ms=T`: the producer states that
 /// every sample at or before `T` has been written. Once the engine has run
-/// every write acknowledged before this request, every pane with
-/// `end <= T` is closed, so the last pane of a series that stopped sending
-/// is built without a later sample. `T` is capped at the wall clock; a
+/// every write acknowledged before this request, every window with
+/// `end <= T` is closed, so the last window of a series that stopped sending
+/// is refreshed without a later sample. `T` is capped at the wall clock; a
 /// repeated or lower `T` does nothing. A sample that arrives later for a
-/// pane the barrier closed counts as late. Input stays open. With several
+/// window the barrier closed counts as late. Input stays open. With several
 /// producers, call it only after all of them have written through `T`.
 /// Answers `{"barrier_ms": B}`, the barrier in force (`T` capped at the wall
 /// clock, or a higher earlier barrier); 400 `bad_data` with the reason when
@@ -225,14 +223,13 @@ async fn ready(State(state): State<Arc<DataPlane>>) -> StatusCode {
     }
 }
 
-/// The data plane's counters, as JSON: the precompute engine's sample and
-/// pane counters, the samples queued for it, and whether it runs.
+/// The data plane's counters, as JSON: ingestion's sample and window
+/// counters, the samples queued for it, and whether it runs.
 async fn status(State(state): State<Arc<DataPlane>>) -> Response {
     let body = serde_json::json!({
         "engine_running": state.engine.is_running(),
         "samples_queued": state.engine.queued_samples(),
-        "precompute": state.engine.stats(),
-        "query_run": state.engine.query_run_stats(),
+        "ingestion": state.engine.stats(),
     });
     (
         [(header::CONTENT_TYPE, "application/json")],
@@ -276,7 +273,7 @@ async fn query(
             return (StatusCode::BAD_REQUEST, body).into_response();
         }
     };
-    let reason = match answer(&state, instant, &headers).await {
+    let reason = match answer(&state, instant).await {
         Ok(response) => {
             let mut response = axum::Json(response).into_response();
             response
@@ -298,38 +295,10 @@ async fn query(
     response
 }
 
-/// Runs a planned instant query. Bound raw-sample windows are read from Prometheus with
-/// the caller's end-to-end `headers`, as a forwarded query would be.
-async fn answer(
-    state: &DataPlane,
-    query: InstantQuery,
-    headers: &HeaderMap,
-) -> Result<serde_json::Value, Unanswered> {
-    let time_ms = query.time_ms.unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as i64)
-    });
-    let prepared = state
-        .engine
-        .bound_raw_sample_windows(query.query, time_ms)
-        .await?;
-    let ranges = &prepared.windows;
-    let mut fetch_headers = forwarded_headers(headers);
-    // The raw read is a GET without the caller's body.
-    fetch_headers.remove(header::CONTENT_TYPE);
-    // The bound raw-sample windows are fetched concurrently.
-    let fetches = ranges.iter().map(|range| async {
-        prometheus::fetch(&state.client, &state.prometheus_url, &fetch_headers, range)
-            .await
-            .map(|samples| (range.node, samples))
-    });
-    let raw: BTreeMap<u64, Vec<RawSample>> = futures::future::try_join_all(fetches)
-        .await
-        .map_err(|e| Unanswered::Execution(format!("fetching raw samples: {e}")))?
-        .into_iter()
-        .collect();
-    let samples = state.engine.evaluate(prepared, time_ms, raw).await?;
+/// Runs a planned instant query at its time, or now.
+async fn answer(state: &DataPlane, query: InstantQuery) -> Result<serde_json::Value, Unanswered> {
+    let time_ms = query.time_ms.unwrap_or_else(ingestion::wall_clock_ms);
+    let samples = state.engine.evaluate(query.query, time_ms).await?;
     Ok(prometheus::vector_response(time_ms, &samples))
 }
 

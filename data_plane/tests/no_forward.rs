@@ -72,7 +72,7 @@ fn instant(query: &str, time_ms: i64) -> String {
     )
 }
 
-/// With the flag, an unplanned query, an evaluation whose pane is missing
+/// With the flag, an unplanned query, an evaluation whose windows are missing
 /// and a range query each get a Prometheus `execution` error with the
 /// reason, and the stand-in Prometheus receives no request.
 #[tokio::test]
@@ -92,13 +92,13 @@ async fn refuses_what_the_plan_cannot_answer_without_asking_prometheus() {
         "{body}"
     );
 
-    // Nothing was written, so the panes the query reads are not stored.
+    // Nothing was written, so the windows the query reads are not stored.
     let query = "quantile_over_time(0.99, latency_ms[60m])";
     let (status, execution, body) = get(&app, &instant(query, 70 * MINUTE)).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(execution.as_deref(), Some("refused"));
     assert!(
-        body["error"].as_str().unwrap().contains("not stored"),
+        body["error"].as_str().unwrap().contains("no rows tiling"),
         "{body}"
     );
 
@@ -131,19 +131,16 @@ async fn forwards_without_the_flag() {
 #[test]
 fn refuses_to_install_a_plan_with_a_query_it_cannot_run() {
     let mut plan = common::plan("example1", true);
-    // A label matcher on a column the `Scan` does not have: the selector of
-    // its raw-sample window does not compile, so the queries that read it
-    // cannot run.
-    let scan = plan.query_time_raw_windows[0].scan_node_id;
+    // A predicate on a column the `Scan` does not have: the queries that
+    // read it do not compile.
     let node = plan
-        .dag
         .dag
         .nodes
         .iter_mut()
-        .find(|n| n.id == scan)
+        .find(|n| matches!(n.payload, Operator::NonASAP(NonASAPOp::Scan { .. })))
         .unwrap();
     let Operator::NonASAP(NonASAPOp::Scan { predicates, .. }) = &mut node.payload else {
-        panic!("not a Scan");
+        unreachable!();
     };
     predicates.push(Predicate(ScalarExpr::Column(99)));
     plan.validate().unwrap();

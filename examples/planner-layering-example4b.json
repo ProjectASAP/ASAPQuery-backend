@@ -6,7 +6,7 @@
       {
         "query": "quantile_over_time(0.99, latency_ms[60m])",
         "demand": {
-          "fixed_interval": 600000
+          "fixed_interval_at": {"interval": 600000, "evaluation_phase": 0}
         },
         "requirements": {
           "accuracy": {
