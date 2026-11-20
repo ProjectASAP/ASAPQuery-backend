@@ -102,5 +102,6 @@ pub fn backend_capabilities() -> DeploymentCapabilities {
         supported_summaries: None,
         raw_data_retained: true,
         query_time_results_retained: false,
+        ..DeploymentCapabilities::default()
     }
 }

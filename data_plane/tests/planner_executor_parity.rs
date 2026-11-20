@@ -315,8 +315,13 @@ fn raw_tables(plan: &InstallablePlan, points: &[Point]) -> InMemoryDataStore {
             })
             .collect();
         let batch = Batch::try_new(schema.clone(), rows).unwrap();
+        let source = Source::TimeSeries { metric };
         store = store
-            .with_raw_data(Source::TimeSeries { metric }, schema, vec![batch])
+            .with_appended_raw_data(source.clone(), schema, None)
+            .unwrap();
+        // One batch covering every time: every read returns it whole.
+        store
+            .append_raw_data(&source, (i64::MIN, i64::MAX), vec![batch])
             .unwrap();
     }
     store

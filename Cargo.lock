@@ -333,17 +333,18 @@ dependencies = [
 [[package]]
 name = "asap-accuracy"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1760a69f5f4431151317018a977b577e4e08c3d1#1760a69f5f4431151317018a977b577e4e08c3d1"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1b18ad921c1a49e206d08d47ab2aee10cece8336#1b18ad921c1a49e206d08d47ab2aee10cece8336"
 dependencies = [
  "asap-types",
  "asap_sketchlib",
+ "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "asap-cost"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1760a69f5f4431151317018a977b577e4e08c3d1#1760a69f5f4431151317018a977b577e4e08c3d1"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1b18ad921c1a49e206d08d47ab2aee10cece8336#1b18ad921c1a49e206d08d47ab2aee10cece8336"
 dependencies = [
  "asap-types",
  "asap_sketchlib",
@@ -355,7 +356,7 @@ dependencies = [
 [[package]]
 name = "asap-executor"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1760a69f5f4431151317018a977b577e4e08c3d1#1760a69f5f4431151317018a977b577e4e08c3d1"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1b18ad921c1a49e206d08d47ab2aee10cece8336#1b18ad921c1a49e206d08d47ab2aee10cece8336"
 dependencies = [
  "ahash",
  "arrow",
@@ -367,12 +368,13 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "xxhash-rust",
 ]
 
 [[package]]
 name = "asap-frontend-common"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1760a69f5f4431151317018a977b577e4e08c3d1#1760a69f5f4431151317018a977b577e4e08c3d1"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1b18ad921c1a49e206d08d47ab2aee10cece8336#1b18ad921c1a49e206d08d47ab2aee10cece8336"
 dependencies = [
  "asap-types",
  "serde",
@@ -382,7 +384,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-metricsql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1760a69f5f4431151317018a977b577e4e08c3d1#1760a69f5f4431151317018a977b577e4e08c3d1"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1b18ad921c1a49e206d08d47ab2aee10cece8336#1b18ad921c1a49e206d08d47ab2aee10cece8336"
 dependencies = [
  "asap-frontend-common",
  "asap-types",
@@ -393,7 +395,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-promql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1760a69f5f4431151317018a977b577e4e08c3d1#1760a69f5f4431151317018a977b577e4e08c3d1"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1b18ad921c1a49e206d08d47ab2aee10cece8336#1b18ad921c1a49e206d08d47ab2aee10cece8336"
 dependencies = [
  "asap-frontend-common",
  "asap-types",
@@ -403,7 +405,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-sql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1760a69f5f4431151317018a977b577e4e08c3d1#1760a69f5f4431151317018a977b577e4e08c3d1"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1b18ad921c1a49e206d08d47ab2aee10cece8336#1b18ad921c1a49e206d08d47ab2aee10cece8336"
 dependencies = [
  "asap-frontend-common",
  "asap-sql-function-catalog",
@@ -415,7 +417,7 @@ dependencies = [
 [[package]]
 name = "asap-planner"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1760a69f5f4431151317018a977b577e4e08c3d1#1760a69f5f4431151317018a977b577e4e08c3d1"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1b18ad921c1a49e206d08d47ab2aee10cece8336#1b18ad921c1a49e206d08d47ab2aee10cece8336"
 dependencies = [
  "asap-accuracy",
  "asap-cost",
@@ -437,12 +439,12 @@ dependencies = [
 [[package]]
 name = "asap-sql-function-catalog"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1760a69f5f4431151317018a977b577e4e08c3d1#1760a69f5f4431151317018a977b577e4e08c3d1"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1b18ad921c1a49e206d08d47ab2aee10cece8336#1b18ad921c1a49e206d08d47ab2aee10cece8336"
 
 [[package]]
 name = "asap-stage0-memo"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1760a69f5f4431151317018a977b577e4e08c3d1#1760a69f5f4431151317018a977b577e4e08c3d1"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1b18ad921c1a49e206d08d47ab2aee10cece8336#1b18ad921c1a49e206d08d47ab2aee10cece8336"
 dependencies = [
  "asap-types",
 ]
@@ -450,7 +452,7 @@ dependencies = [
 [[package]]
 name = "asap-stage1-pass1-per-computation-candidates"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1760a69f5f4431151317018a977b577e4e08c3d1#1760a69f5f4431151317018a977b577e4e08c3d1"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1b18ad921c1a49e206d08d47ab2aee10cece8336#1b18ad921c1a49e206d08d47ab2aee10cece8336"
 dependencies = [
  "asap-types",
  "thiserror 2.0.20",
@@ -459,7 +461,7 @@ dependencies = [
 [[package]]
 name = "asap-stage1-pass2-reuse-candidates"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1760a69f5f4431151317018a977b577e4e08c3d1#1760a69f5f4431151317018a977b577e4e08c3d1"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1b18ad921c1a49e206d08d47ab2aee10cece8336#1b18ad921c1a49e206d08d47ab2aee10cece8336"
 dependencies = [
  "asap-accuracy",
  "asap-types",
@@ -469,7 +471,7 @@ dependencies = [
 [[package]]
 name = "asap-stage2-physical-optimization"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1760a69f5f4431151317018a977b577e4e08c3d1#1760a69f5f4431151317018a977b577e4e08c3d1"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1b18ad921c1a49e206d08d47ab2aee10cece8336#1b18ad921c1a49e206d08d47ab2aee10cece8336"
 dependencies = [
  "asap-types",
 ]
@@ -477,7 +479,7 @@ dependencies = [
 [[package]]
 name = "asap-stage3-plan-selection"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1760a69f5f4431151317018a977b577e4e08c3d1#1760a69f5f4431151317018a977b577e4e08c3d1"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1b18ad921c1a49e206d08d47ab2aee10cece8336#1b18ad921c1a49e206d08d47ab2aee10cece8336"
 dependencies = [
  "asap-accuracy",
  "asap-cost",
@@ -492,7 +494,7 @@ dependencies = [
 [[package]]
 name = "asap-types"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1760a69f5f4431151317018a977b577e4e08c3d1#1760a69f5f4431151317018a977b577e4e08c3d1"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1b18ad921c1a49e206d08d47ab2aee10cece8336#1b18ad921c1a49e206d08d47ab2aee10cece8336"
 dependencies = [
  "asap_sketchlib",
  "serde",
@@ -1625,7 +1627,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2465,7 +2467,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "metricsql_common"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1760a69f5f4431151317018a977b577e4e08c3d1#1760a69f5f4431151317018a977b577e4e08c3d1"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1b18ad921c1a49e206d08d47ab2aee10cece8336#1b18ad921c1a49e206d08d47ab2aee10cece8336"
 dependencies = [
  "chrono",
 ]
@@ -2473,7 +2475,7 @@ dependencies = [
 [[package]]
 name = "metricsql_parser"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1760a69f5f4431151317018a977b577e4e08c3d1#1760a69f5f4431151317018a977b577e4e08c3d1"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=1b18ad921c1a49e206d08d47ab2aee10cece8336#1b18ad921c1a49e206d08d47ab2aee10cece8336"
 dependencies = [
  "ahash",
  "chrono",
@@ -2920,7 +2922,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3168,7 +3170,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3525,7 +3527,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4063,7 +4065,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
