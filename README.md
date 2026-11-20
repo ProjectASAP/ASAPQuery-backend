@@ -97,11 +97,13 @@ still queued (a barrier does). What runs once is the plan's decision: a
 query-time `OneEvaluation` node that several queries read is computed once
 per evaluation time, by the first query that needs it while the others
 wait, and kept in the view store's query-time partition for
-`--query-time-results-retention-ms` (default 60 s) behind the newest
-evaluation time (`--no-shared-results` computes it in every query's run,
-for comparison). A plan that would compute any other node in several
-queries' runs is refused. Queries may hold up to `--query-threads`
-times the run memory limit.
+`--query-time-results-retention-ms` (default 60 s) behind the watermark;
+only at a time the watermark has passed, whose inputs are complete
+(`--no-shared-results` computes it in every query's run, for comparison).
+A plan that would compute any other node in several queries' runs is
+refused. Runs in progress hold up to `--query-threads` times the run
+memory limit, plus the query-time results (`--query-time-results-max-bytes`)
+and queued requests.
 
 **Measurements.** `GET /metrics` exports, in the Prometheus text format,
 the thread CPU and wall time of each phase
@@ -114,9 +116,9 @@ name. `scripts/profile.sh` records a flamegraph of a running data plane;
 measures ingest throughput in process.
 
 A range query (`/api/v1/query_range`) whose text is one of the plan's
-queries is answered with one evaluation per step, the steps in parallel on
-the query workers, as a Prometheus matrix; it is not answered if any step
-is not. Plan a dashboard's range requests with the workload's
+queries is answered with one evaluation per step, at most one step per
+query worker at a time, as a Prometheus matrix; it is not answered if any
+step is not, and the remaining steps are then not run. Plan a dashboard's range requests with the workload's
 `range_evaluation` (`{"step_ms": 60000, "span_ms": 3600000}`), so the plan
 delivers every step time.
 

@@ -372,15 +372,28 @@ async fn answer_range(
     state: &DataPlane,
     range: RangeQuery,
 ) -> Result<serde_json::Value, Unanswered> {
+    use futures::{StreamExt, TryStreamExt};
+    let started = std::time::Instant::now();
     let query = &range.query;
-    let steps = range.times_ms().map(|time_ms| async move {
-        let samples = state.engine.evaluate(query.clone(), time_ms).await?;
-        Ok::<_, Unanswered>((time_ms, samples))
-    });
-    let steps = futures::future::join_all(steps)
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+    // At most one step per query worker in flight, so a long range neither
+    // floods the workers' queue nor starves instant queries; the first
+    // failed step, or the client going away, drops the rest unrun.
+    let steps: Vec<_> = futures::stream::iter(range.times_ms())
+        .map(|time_ms| async move {
+            let samples = state
+                .engine
+                .evaluate_range_step(query.clone(), time_ms)
+                .await?;
+            Ok::<_, Unanswered>((time_ms, samples))
+        })
+        .buffered(state.engine.query_threads())
+        .try_collect()
+        .await?;
+    if let Some(metrics) = state.engine.metrics().query(query) {
+        metrics
+            .range_latency
+            .observe(started.elapsed().as_secs_f64());
+    }
     Ok(prometheus::matrix_response(&steps))
 }
 

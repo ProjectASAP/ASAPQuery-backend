@@ -180,7 +180,12 @@ impl QueryEngine {
             .as_ref()
             .map_err(|reason| Unanswered::Unsupported(reason.clone()))?;
         let (raw_data, views) = store.snapshot();
-        let batches = self.output(root, time_ms, &raw_data, &views)?;
+        let snapshot = Snapshot {
+            raw_data,
+            views,
+            watermark_ms: store.watermark_ms(),
+        };
+        let batches = self.output(root, time_ms, &snapshot)?;
         let compiled = &self.runs[&root].compiled;
         let schema = compiled
             .output_schema(root as u64)
@@ -195,14 +200,15 @@ impl QueryEngine {
         &self,
         node: PhysicalASAPNodeId,
         time_ms: i64,
-        raw_data: &Arc<RawData>,
-        views: &Arc<ViewStore>,
+        snapshot: &Snapshot,
     ) -> Result<Arc<Vec<Batch>>, Unanswered> {
         if self.shared.contains(&node) {
             self.results
-                .get_or_compute(node, time_ms, || self.run(node, time_ms, raw_data, views))
+                .get_or_compute(node, time_ms, snapshot.watermark_ms, || {
+                    self.run(node, time_ms, snapshot)
+                })
         } else {
-            self.run(node, time_ms, raw_data, views).map(Arc::new)
+            self.run(node, time_ms, snapshot).map(Arc::new)
         }
     }
 
@@ -212,17 +218,16 @@ impl QueryEngine {
         &self,
         node: PhysicalASAPNodeId,
         time_ms: i64,
-        raw_data: &Arc<RawData>,
-        views: &Arc<ViewStore>,
+        snapshot: &Snapshot,
     ) -> Result<Vec<Batch>, Unanswered> {
         let run = &self.runs[&node];
         let mut shared = HashMap::new();
         for &read in &run.reads {
-            shared.insert(read, self.output(read, time_ms, raw_data, views)?);
+            shared.insert(read, self.output(read, time_ms, snapshot)?);
         }
         let run_store = Arc::new(RunStore::with_query_time_results(
-            raw_data.clone(),
-            views.clone(),
+            snapshot.raw_data.clone(),
+            snapshot.views.clone(),
             shared,
         ));
         run_compiled(&run.compiled, run_store.clone(), time_ms, &self.limits).map_err(|error| {
@@ -232,6 +237,14 @@ impl QueryEngine {
             }
         })
     }
+}
+
+/// What one evaluation reads: the raw data and views published when it
+/// started, and the watermark then.
+struct Snapshot {
+    raw_data: Arc<RawData>,
+    views: Arc<ViewStore>,
+    watermark_ms: Option<i64>,
 }
 
 /// Whether `node`'s run, and every shared node's run it reads, compiled.

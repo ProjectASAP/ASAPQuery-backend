@@ -118,7 +118,8 @@ impl RangeQuery {
                 "invalid parameter \"end\": end timestamp must not be before start time".into(),
             ));
         }
-        if (end_ms - start_ms) / step_ms >= MAX_RANGE_STEPS {
+        // As Prometheus: refused when (end - start) / step exceeds it.
+        if (end_ms - start_ms) / step_ms > MAX_RANGE_STEPS {
             return Err(BadRange(format!(
                 "exceeded maximum resolution of {MAX_RANGE_STEPS} points per timeseries. Try decreasing the query resolution (?step=XX)"
             )));
@@ -277,7 +278,7 @@ mod tests {
             "query=up&start=0&end=60&step=0",
             "query=up&start=0&end=60&step=x",
             "query=up&start=60&end=0&step=1",
-            "query=up&start=0&end=11000&step=1",
+            "query=up&start=0&end=11001&step=1",
             "query=up&start=1e300&end=1e300&step=1",
         ] {
             assert!(RangeQuery::parse(Some(bad), b"").is_err(), "{bad}");

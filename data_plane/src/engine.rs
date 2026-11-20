@@ -133,6 +133,7 @@ pub struct EngineHandle {
     /// Queries for the worker threads.
     queries: Sender<QueryJob>,
     query: Arc<QueryEngine>,
+    query_threads: usize,
     shared: Arc<Shared>,
     max_queued_samples: u64,
 }
@@ -246,6 +247,7 @@ impl EngineHandle {
             commands,
             queries,
             query,
+            query_threads: options.query_threads.max(1),
             shared,
             max_queued_samples: options.max_queued_samples,
         };
@@ -286,22 +288,49 @@ impl EngineHandle {
         query: String,
         time_ms: i64,
     ) -> Result<Vec<ResultSample>, Unanswered> {
-        let stopped = || Unanswered::Execution("the query workers have stopped".into());
         let started = std::time::Instant::now();
         let metrics = self.shared.metrics.query(&query);
+        let answer = self.run_on_worker(query, time_ms, false).await;
+        if let Some(metrics) = metrics {
+            metrics.latency.observe(started.elapsed().as_secs_f64());
+        }
+        answer
+    }
+
+    /// Evaluates one step of a range query: as [`Self::evaluate`], counted
+    /// as a range step rather than an instant query. A step whose future is
+    /// dropped before a worker takes it (the range failed or its client
+    /// went away) is not run.
+    pub async fn evaluate_range_step(
+        &self,
+        query: String,
+        time_ms: i64,
+    ) -> Result<Vec<ResultSample>, Unanswered> {
+        self.run_on_worker(query, time_ms, true).await
+    }
+
+    async fn run_on_worker(
+        &self,
+        query: String,
+        time_ms: i64,
+        range_step: bool,
+    ) -> Result<Vec<ResultSample>, Unanswered> {
+        let stopped = || Unanswered::Execution("the query workers have stopped".into());
         let (reply, answer) = oneshot::channel();
         self.queries
             .send(QueryJob {
                 query,
                 time_ms,
+                range_step,
                 reply,
             })
             .map_err(|_| stopped())?;
-        let answer = answer.await.map_err(|_| stopped())?;
-        if let Some(metrics) = metrics {
-            metrics.latency.observe(started.elapsed().as_secs_f64());
-        }
-        answer
+        answer.await.map_err(|_| stopped())?
+    }
+
+    /// The query worker threads: the most query runs at once.
+    pub fn query_threads(&self) -> usize {
+        self.query_threads
     }
 
     /// How many query-time `OneEvaluation` nodes several queries share.
@@ -407,6 +436,8 @@ fn admit(queued: u64, count: u64, max_queued: u64) -> Result<u64, IngestError> {
 struct QueryJob {
     query: String,
     time_ms: i64,
+    /// One step of a range query.
+    range_step: bool,
     reply: Reply<Vec<ResultSample>>,
 }
 
@@ -444,10 +475,31 @@ fn spawn_query_workers(
                     Ok(job) => job,
                     Err(_) => break,
                 };
+                // Nobody waits for it any more (a failed range, a client
+                // that went away).
+                if job.reply.is_closed() {
+                    continue;
+                }
                 let timer = Timer::start();
-                let answer = query.evaluate(&job.query, job.time_ms, &shared.published);
+                // A bug in one run must not take the worker down: it
+                // answers that run with the error and keeps serving.
+                let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    query.evaluate(&job.query, job.time_ms, &shared.published)
+                }))
+                .unwrap_or_else(|panic| {
+                    let reason = panic
+                        .downcast_ref::<&str>()
+                        .map(ToString::to_string)
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_default();
+                    tracing::error!(query = %job.query, time_ms = job.time_ms, %reason, "query run panicked");
+                    Err(Unanswered::Execution(format!("the query run panicked: {reason}")))
+                });
                 if let Some(metrics) = shared.metrics.query(&job.query) {
-                    metrics.run.record(timer);
+                    match job.range_step {
+                        false => metrics.run.record(timer),
+                        true => metrics.range_step_run.record(timer),
+                    };
                 }
                 let _ = job.reply.send(answer);
             })?;
@@ -538,7 +590,9 @@ fn serve_ingest(
         // The refreshes queued hold the raw data as it was when their
         // windows closed; eviction changes a copy.
         ingestion.evict(Arc::make_mut(&mut raw_data));
-        shared.published.publish_raw_data(raw_data.clone());
+        shared
+            .published
+            .publish_raw_data(raw_data.clone(), ingestion.watermark_ms());
         let metrics = &shared.metrics;
         if let Some(watermark_ms) = ingestion.watermark_ms() {
             metrics.watermark_ms.store(watermark_ms, Ordering::Relaxed);

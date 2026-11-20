@@ -1,10 +1,9 @@
 //! Series interning: each label set is mapped to one shared [`Series`], with
-//! a `u32` id, once, when Remote Write (or a raw-sample fetch from
-//! Prometheus) delivers it. Everything downstream (the per-series cells of
-//! each raw-sample window, the per-sample group numbers, the latest sample
-//! per series of an instant selector) keys by the id, and the metric is read
-//! from the series, so no stage builds, hashes or compares a label map per
-//! sample.
+//! a `u32` id, once, when Remote Write delivers it, and its identity text
+//! (the canonical JSON of its labels) is computed then. The raw store's
+//! chunks hold each row's series as an index into their series, and the
+//! metric is read from the series, so no stage builds, hashes or compares a
+//! label map per sample.
 //!
 //! The interner is process-wide: ids are the same for a label set whichever
 //! request, worker or query thread meets it. It never forgets a series.

@@ -107,37 +107,35 @@ impl Latency {
             .fetch_add((seconds * 1e9) as u64, Ordering::Relaxed);
     }
 
-    fn render(&self, out: &mut String, labels: &str) {
+    fn render(&self, out: &mut String, name: &str, labels: &str) {
         let mut cumulative = 0;
         for (bound, bucket) in LATENCY_BUCKETS_S.iter().zip(&self.buckets) {
             cumulative += bucket.load(Ordering::Relaxed);
-            let _ = writeln!(
-                out,
-                "asap_query_latency_seconds_bucket{{{labels},le=\"{bound}\"}} {cumulative}"
-            );
+            let _ = writeln!(out, "{name}_bucket{{{labels},le=\"{bound}\"}} {cumulative}");
         }
         let count = self.count.load(Ordering::Relaxed);
+        let _ = writeln!(out, "{name}_bucket{{{labels},le=\"+Inf\"}} {count}");
         let _ = writeln!(
             out,
-            "asap_query_latency_seconds_bucket{{{labels},le=\"+Inf\"}} {count}"
-        );
-        let _ = writeln!(
-            out,
-            "asap_query_latency_seconds_sum{{{labels}}} {}",
+            "{name}_sum{{{labels}}} {}",
             self.sum_ns.load(Ordering::Relaxed) as f64 / 1e9
         );
-        let _ = writeln!(out, "asap_query_latency_seconds_count{{{labels}}} {count}");
+        let _ = writeln!(out, "{name}_count{{{labels}}} {count}");
     }
 }
 
 /// One planned query's measurements.
 #[derive(Default)]
 pub struct QueryMetrics {
-    /// The query run, on its worker thread.
+    /// The query run of an instant query, on its worker thread.
     pub run: PhaseStats,
-    /// From the request reaching the engine to its answer, queueing for a
-    /// worker included.
+    /// From an instant request reaching the engine to its answer, queueing
+    /// for a worker included.
     pub latency: Latency,
+    /// The query run of one step of a range query.
+    pub range_step_run: PhaseStats,
+    /// From a range request reaching the data plane to its answer.
+    pub range_latency: Latency,
 }
 
 /// Every measurement the engine's threads record.
@@ -251,17 +249,33 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
     for (query, query_metrics) in &metrics.queries {
         let labels = format!("phase=\"query\",query=\"{}\"", escape(query));
         query_metrics.run.render(&mut out, &labels);
+        let labels = format!("phase=\"query_range_step\",query=\"{}\"", escape(query));
+        query_metrics.range_step_run.render(&mut out, &labels);
     }
 
     family(
         &mut out,
         "asap_query_latency_seconds",
         "histogram",
-        "Planned query latency in the engine, queueing for a worker included.",
+        "Planned instant query latency in the engine, queueing for a worker included.",
     );
     for (query, query_metrics) in &metrics.queries {
         let labels = format!("query=\"{}\"", escape(query));
-        query_metrics.latency.render(&mut out, &labels);
+        query_metrics
+            .latency
+            .render(&mut out, "asap_query_latency_seconds", &labels);
+    }
+    family(
+        &mut out,
+        "asap_range_query_latency_seconds",
+        "histogram",
+        "Planned range query latency, every step included.",
+    );
+    for (query, query_metrics) in &metrics.queries {
+        let labels = format!("query=\"{}\"", escape(query));
+        query_metrics
+            .range_latency
+            .render(&mut out, "asap_range_query_latency_seconds", &labels);
     }
 
     family(
@@ -446,7 +460,7 @@ fn resident_bytes() -> Option<u64> {
 
 /// CPU seconds of each live thread, summed by name with trailing digits
 /// removed (`query-0`, `query-1`, … are `query-`).
-fn thread_cpu_seconds() -> BTreeMap<String, f64> {
+pub fn thread_cpu_seconds() -> BTreeMap<String, f64> {
     // SAFETY: sysconf has no preconditions.
     let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
     let mut by_name = BTreeMap::new();

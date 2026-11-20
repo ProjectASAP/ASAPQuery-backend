@@ -342,7 +342,7 @@ impl Ingestion {
     ) -> Vec<ClosedWindow> {
         self.newest_clock_ms = self.newest_clock_ms.max(Some(now_ms));
         let latest_allowed_ms = now_ms.saturating_add(millis(self.options.max_future_ms));
-        let mut oldest_kept: HashMap<String, Option<i64>> = HashMap::new();
+        let mut oldest_kept: HashMap<std::sync::Arc<str>, Option<i64>> = HashMap::new();
         let mut accepted = Vec::with_capacity(samples.len());
         for sample in samples {
             let metric = sample.labels.metric.clone();
@@ -356,7 +356,7 @@ impl Ingestion {
             }
             self.start_groups(&metric, sample.timestamp_ms);
             let cutoff = *oldest_kept
-                .entry(metric.to_string())
+                .entry(metric.clone())
                 .or_insert_with(|| self.oldest_kept_ms(&metric));
             if cutoff.is_some_and(|cutoff| sample.timestamp_ms <= cutoff) {
                 self.stats.samples_dropped_late += 1;

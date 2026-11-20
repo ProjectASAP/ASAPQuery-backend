@@ -30,7 +30,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use asap_executor::arrow::array::{
     Array, ArrayRef, DictionaryArray, Float64Array, StringArray, TimestampMillisecondArray,
@@ -70,8 +70,9 @@ struct Chunk {
     /// The chunk's distinct series, in order of their first row.
     series: Vec<Arc<Series>>,
     /// Each series' identity text, by code: the dictionary of the series
-    /// identity column, shared by every read.
-    identities: ArrayRef,
+    /// identity column, built by the first read that needs it and shared by
+    /// every later one.
+    identities: std::sync::OnceLock<ArrayRef>,
     /// The oldest and newest sample time.
     time_bounds_ms: (i64, i64),
 }
@@ -92,15 +93,12 @@ impl Chunk {
             codes.push(code);
         }
         let time_bounds_ms = (*times.iter().min()?, *times.iter().max()?);
-        let identities: ArrayRef = Arc::new(StringArray::from_iter_values(
-            series.iter().map(|s| &*s.identity),
-        ));
         Some(Self {
             time: TimestampMillisecondArray::from(times),
             value: Float64Array::from(values),
             codes: UInt32Array::from(codes),
             series,
-            identities,
+            identities: std::sync::OnceLock::new(),
             time_bounds_ms,
         })
     }
@@ -118,11 +116,23 @@ impl Chunk {
         self.time.len()
     }
 
+    /// Each series' identity text, by code.
+    fn identities(&self) -> &ArrayRef {
+        self.identities.get_or_init(|| {
+            Arc::new(StringArray::from_iter_values(
+                self.series.iter().map(|s| &*s.identity),
+            ))
+        })
+    }
+
     fn bytes(&self) -> usize {
         self.time.get_array_memory_size()
             + self.value.get_array_memory_size()
             + self.codes.get_array_memory_size()
-            + self.identities.get_array_memory_size()
+            + self
+                .identities
+                .get()
+                .map_or(0, |identities| identities.get_array_memory_size())
             + self.series.len() * std::mem::size_of::<Arc<Series>>()
     }
 
@@ -143,7 +153,7 @@ impl Chunk {
             ColumnKind::Time => Arc::new(self.time.clone()),
             ColumnKind::Value => Arc::new(self.value.clone()),
             ColumnKind::SeriesIdentity => Arc::new(
-                DictionaryArray::try_new(self.codes.clone(), self.identities.clone())
+                DictionaryArray::try_new(self.codes.clone(), self.identities().clone())
                     .map_err(|e| Error::Invalid(e.to_string()))?,
             ),
             ColumnKind::Label(name) => {
@@ -565,18 +575,32 @@ impl ViewStore {
 /// The newest published snapshot of the store, which every query run reads.
 pub struct PublishedStore {
     snapshot: RwLock<(Arc<RawData>, Arc<ViewStore>)>,
+    /// The watermark as of the raw data published, `i64::MIN` before the
+    /// first: no sample at or before it is expected any more.
+    watermark_ms: std::sync::atomic::AtomicI64,
 }
 
 impl PublishedStore {
     pub fn new(raw_data: Arc<RawData>) -> Self {
         Self {
             snapshot: RwLock::new((raw_data, Arc::default())),
+            watermark_ms: std::sync::atomic::AtomicI64::new(i64::MIN),
         }
     }
 
-    /// Makes `raw_data` what new runs read.
-    pub fn publish_raw_data(&self, raw_data: Arc<RawData>) {
+    /// Makes `raw_data`, complete through `watermark_ms`, what new runs
+    /// read.
+    pub fn publish_raw_data(&self, raw_data: Arc<RawData>, watermark_ms: Option<i64>) {
         self.snapshot.write().unwrap_or_else(|e| e.into_inner()).0 = raw_data;
+        if let Some(watermark_ms) = watermark_ms {
+            self.watermark_ms.fetch_max(watermark_ms, Ordering::SeqCst);
+        }
+    }
+
+    /// The watermark as of the raw data published; `None` before the
+    /// first.
+    pub fn watermark_ms(&self) -> Option<i64> {
+        Some(self.watermark_ms.load(Ordering::SeqCst)).filter(|&w| w != i64::MIN)
     }
 
     /// Makes `views` what new runs read.
@@ -591,33 +615,34 @@ impl PublishedStore {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
-
-    /// The snapshot one run reads: the newest published.
-    pub fn run_store(&self) -> Arc<RunStore> {
-        let (raw_data, views) = self
-            .snapshot
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        Arc::new(RunStore::new(raw_data, views))
-    }
 }
 
-/// One query-time result: empty while it is being computed or after its
-/// computation failed; the rows and their bytes once computed.
-type QueryTimeEntry = Arc<Mutex<Option<(Arc<Vec<Batch>>, usize)>>>;
+/// One query-time result's state.
+enum ResultState<E> {
+    /// Its first reader is computing it; others wait on the entry.
+    Computing,
+    /// Computed: the rows and their bytes.
+    Done(Arc<Vec<Batch>>, usize),
+    /// Its computation failed; the readers that waited get the error.
+    Failed(E),
+}
+
+/// One query-time result and the condition its waiters wait on.
+type QueryTimeEntry<E> = Arc<(Mutex<ResultState<E>>, Condvar)>;
 
 /// The materialized view store's query-time partition: the output of each
 /// query-time `OneEvaluation` node at one evaluation time `T`, shared by
 /// every query run at `T` that reads it, keyed by `(T, node)`. Query
 /// workers write it during their runs, so unlike the ingestion-time views
 /// it is not a published snapshot. A missing result is computed by the
-/// first run that needs it, while the others wait for it (single flight).
-/// A result is kept while `T` is within `retention_ms` of the newest
-/// evaluation time computed, and the oldest are dropped while more than
-/// `max_bytes` are held.
-pub struct QueryTimeResults {
-    entries: Mutex<BTreeMap<(i64, PhysicalASAPNodeId), QueryTimeEntry>>,
+/// first run that needs it while the others wait for it (single flight);
+/// a failure reaches the runs that waited and is not kept. Only a result
+/// at a time the watermark has passed is kept (its inputs are complete);
+/// one at a later time is computed by each run that needs it. A result is
+/// kept while `T` is within `retention_ms` of the watermark, and the
+/// oldest are dropped while more than `max_bytes` are held.
+pub struct QueryTimeResults<E = crate::query::Unanswered> {
+    entries: Mutex<BTreeMap<(i64, PhysicalASAPNodeId), QueryTimeEntry<E>>>,
     retention_ms: i64,
     max_bytes: usize,
     bytes: AtomicU64,
@@ -625,7 +650,7 @@ pub struct QueryTimeResults {
     hits: AtomicU64,
 }
 
-impl QueryTimeResults {
+impl<E: Clone> QueryTimeResults<E> {
     pub fn new(retention_ms: i64, max_bytes: usize) -> Self {
         Self {
             entries: Mutex::default(),
@@ -638,48 +663,82 @@ impl QueryTimeResults {
     }
 
     /// `node`'s output at `time_ms`: stored, or computed now by `compute`
-    /// (once, however many runs ask at once). A failed computation is not
-    /// stored, so the next run asking computes again.
-    pub fn get_or_compute<E>(
+    /// (once, however many runs ask at once, when `time_ms` is at or
+    /// before `watermark_ms`; by each run otherwise).
+    pub fn get_or_compute(
         &self,
         node: PhysicalASAPNodeId,
         time_ms: i64,
+        watermark_ms: Option<i64>,
         compute: impl FnOnce() -> Result<Vec<Batch>, E>,
     ) -> Result<Arc<Vec<Batch>>, E> {
-        let entry = {
+        if watermark_ms.is_none_or(|watermark| time_ms > watermark) {
+            self.computes.fetch_add(1, Ordering::Relaxed);
+            return compute().map(Arc::new);
+        }
+        let (entry, computer) = {
             let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-            let entry = entries.entry((time_ms, node)).or_default().clone();
-            self.drop_old(&mut entries, time_ms);
-            entry
+            match entries.get(&(time_ms, node)) {
+                Some(entry) => (entry.clone(), false),
+                None => {
+                    let entry: QueryTimeEntry<E> =
+                        Arc::new((Mutex::new(ResultState::Computing), Condvar::new()));
+                    entries.insert((time_ms, node), entry.clone());
+                    (entry, true)
+                }
+            }
         };
-        let mut result = entry.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((batches, _)) = &*result {
+        let (state, done) = &*entry;
+        if !computer {
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            while matches!(*state, ResultState::Computing) {
+                state = done.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
             self.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(batches.clone());
+            return match &*state {
+                ResultState::Done(batches, _) => Ok(batches.clone()),
+                ResultState::Failed(error) => Err(error.clone()),
+                ResultState::Computing => unreachable!("waited above"),
+            };
         }
         self.computes.fetch_add(1, Ordering::Relaxed);
-        let batches = Arc::new(compute()?);
-        let bytes = batches.iter().map(Batch::memory_bytes).sum::<usize>();
-        *result = Some((batches.clone(), bytes));
-        drop(result);
-        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        let result = compute().map(Arc::new);
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        self.drop_old(&mut entries, time_ms);
-        Ok(batches)
+        let held = entries
+            .get(&(time_ms, node))
+            .is_some_and(|held| Arc::ptr_eq(held, &entry));
+        {
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            *state = match &result {
+                Ok(batches) => {
+                    let bytes = batches.iter().map(Batch::memory_bytes).sum::<usize>();
+                    if held {
+                        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+                    }
+                    ResultState::Done(batches.clone(), bytes)
+                }
+                Err(error) => ResultState::Failed(error.clone()),
+            };
+            done.notify_all();
+        }
+        if result.is_err() && held {
+            entries.remove(&(time_ms, node));
+        }
+        if let Some(watermark_ms) = watermark_ms {
+            self.drop_old(&mut entries, watermark_ms);
+        }
+        result
     }
 
-    /// Drops the results older than the retention before the newest
-    /// evaluation time, then the oldest while more than `max_bytes` are
-    /// held; never one being computed, nor `(keep_ms, _)`.
+    /// Drops the results more than the retention behind `watermark_ms`,
+    /// then the oldest while more than `max_bytes` are held; never one
+    /// being computed (its computer finds it gone and does not count it).
     fn drop_old(
         &self,
-        entries: &mut BTreeMap<(i64, PhysicalASAPNodeId), QueryTimeEntry>,
-        keep_ms: i64,
+        entries: &mut BTreeMap<(i64, PhysicalASAPNodeId), QueryTimeEntry<E>>,
+        watermark_ms: i64,
     ) {
-        let Some(&(newest_ms, _)) = entries.keys().next_back() else {
-            return;
-        };
-        let oldest_kept_ms = newest_ms.saturating_sub(self.retention_ms);
+        let oldest_kept_ms = watermark_ms.saturating_sub(self.retention_ms);
         let keys: Vec<(i64, PhysicalASAPNodeId)> = entries.keys().copied().collect();
         for key in keys {
             let expired = key.0 < oldest_kept_ms;
@@ -687,15 +746,16 @@ impl QueryTimeResults {
             if !expired && !over {
                 break;
             }
-            if key.0 == keep_ms {
-                continue;
-            }
-            // An entry being computed is kept: its computer adds its bytes.
-            let Ok(result) = entries[&key].try_lock() else {
-                continue;
+            let bytes = {
+                let Ok(state) = entries[&key].0.try_lock() else {
+                    continue;
+                };
+                match &*state {
+                    ResultState::Computing => continue,
+                    ResultState::Done(_, bytes) => *bytes,
+                    ResultState::Failed(_) => 0,
+                }
             };
-            let bytes = result.as_ref().map_or(0, |(_, bytes)| *bytes);
-            drop(result);
             entries.remove(&key);
             self.bytes.fetch_sub(bytes as u64, Ordering::Relaxed);
         }
@@ -715,12 +775,13 @@ impl QueryTimeResults {
         self.len() == 0
     }
 
-    /// Results computed so far.
+    /// Results computed so far (misses), kept or not.
     pub fn computes(&self) -> u64 {
         self.computes.load(Ordering::Relaxed)
     }
 
-    /// Reads served by a result already computed.
+    /// Reads served by a result another run computed, waiting for it if
+    /// needed.
     pub fn hits(&self) -> u64 {
         self.hits.load(Ordering::Relaxed)
     }
@@ -931,25 +992,73 @@ mod tests {
         }
     }
 
-    /// A query-time result is computed once and then read; a failed
-    /// computation is not kept; results older than the retention before
-    /// the newest evaluation time are dropped.
+    /// A query-time result at a time the watermark has passed is computed
+    /// once and then read; one past the watermark is not kept; a failed
+    /// computation is not kept; results more than the retention behind the
+    /// watermark are dropped and their bytes released.
     #[test]
     fn query_time_results_are_computed_once_and_expire() {
-        let results = QueryTimeResults::new(10_000, usize::MAX);
+        let results = QueryTimeResults::<()>::new(10_000, usize::MAX);
         let ok = || Ok::<_, ()>(Vec::new());
-        results.get_or_compute(7, 1_000, ok).unwrap();
-        results.get_or_compute(7, 1_000, ok).unwrap();
+        let watermark = Some(1_000);
+        results.get_or_compute(7, 1_000, watermark, ok).unwrap();
+        results.get_or_compute(7, 1_000, watermark, ok).unwrap();
         assert_eq!((results.computes(), results.hits()), (1, 1));
+        // Past the watermark (a client's far-future time): not kept.
+        results.get_or_compute(7, 99_000, watermark, ok).unwrap();
+        results.get_or_compute(7, 99_000, watermark, ok).unwrap();
+        assert_eq!((results.computes(), results.len()), (3, 1));
         assert!(results
-            .get_or_compute(8, 1_000, || Err::<Vec<Batch>, _>(()))
+            .get_or_compute(8, 1_000, watermark, || Err(()))
             .is_err());
-        results.get_or_compute(8, 1_000, ok).unwrap();
-        assert_eq!(results.computes(), 3);
-        results.get_or_compute(7, 11_000, ok).unwrap();
-        assert_eq!(results.len(), 3);
-        results.get_or_compute(7, 11_001, ok).unwrap();
-        // (1_000, 7) and (1_000, 8) are more than 10 s older than 11_001.
+        assert_eq!(results.len(), 1);
+        results.get_or_compute(8, 1_000, watermark, ok).unwrap();
         assert_eq!(results.len(), 2);
+        // Retention counts back from the watermark, not from client times.
+        results.get_or_compute(7, 11_000, Some(11_000), ok).unwrap();
+        assert_eq!(results.len(), 3);
+        results.get_or_compute(7, 11_001, Some(11_001), ok).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results.bytes(), 0);
+    }
+
+    /// Runs waiting for a result being computed get its value, or its
+    /// failure, without computing it themselves.
+    #[test]
+    fn waiters_share_the_computers_result_or_failure() {
+        for fails in [false, true] {
+            let results = Arc::new(QueryTimeResults::<&'static str>::new(10_000, usize::MAX));
+            let (started, wait_started) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let computer = {
+                let results = results.clone();
+                std::thread::spawn(move || {
+                    results.get_or_compute(1, 0, Some(0), || {
+                        started.send(()).unwrap();
+                        released.recv().unwrap();
+                        if fails {
+                            Err("failed")
+                        } else {
+                            Ok(Vec::new())
+                        }
+                    })
+                })
+            };
+            wait_started.recv().unwrap();
+            let waiter = {
+                let results = results.clone();
+                std::thread::spawn(move || {
+                    results.get_or_compute(1, 0, Some(0), || panic!("the waiter computed"))
+                })
+            };
+            // Let the waiter block on the entry before the result is set.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            release.send(()).unwrap();
+            let (first, second) = (computer.join().unwrap(), waiter.join().unwrap());
+            assert_eq!(first.is_err(), fails);
+            assert_eq!(second.is_err(), fails);
+            assert_eq!(results.computes(), 1);
+            assert_eq!(results.len(), usize::from(!fails));
+        }
     }
 }

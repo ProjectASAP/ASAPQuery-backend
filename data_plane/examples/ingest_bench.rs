@@ -1,17 +1,19 @@
 //! Ingest throughput of the data plane, in process: plans a mixed workload
 //! (`tests/workloads/random-mixed-seed-862-01.json`) for `SERIES` series of
 //! its `data` metric, scraped every second, then sends `SECONDS` seconds of
-//! samples by Remote Write (one request per scrape) as fast as the data
+//! samples by Remote Write (`REQUESTS` requests per scrape, each with a
+//! slice of the series; 1 by default) as fast as the data
 //! plane takes them, retrying on 503, and ends with an event-time barrier
 //! at the last sample, so every closed window is refreshed. Prints samples
 //! per second of wall time, until every write is acknowledged and until
 //! every window is refreshed, and the CPU time of each thread, by name.
 //! `PLAN` is `raw` (raw samples kept, the default) or `views` (none kept:
-//! every query reads materialized views).
+//! every query reads materialized views). Views are persisted to a fresh
+//! temporary directory, as the data plane does by default, unless
+//! `PERSIST` is `memory`.
 //!
-//! `cargo run --release -p data_plane --example ingest_bench -- SERIES SECONDS [PLAN]`
+//! `cargo run --release -p data_plane --example ingest_bench -- SERIES SECONDS [PLAN] [REQUESTS] [PERSIST]`
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -20,30 +22,10 @@ use axum::http::{Request, StatusCode};
 use control_plane::{plan_workload, DeploymentInputs};
 use data_plane::engine::EngineOptions;
 use data_plane::ingestion::IngestionOptions;
+use data_plane::metrics::thread_cpu_seconds;
 use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use data_plane::{router, DataPlane};
 use tower::ServiceExt;
-
-/// CPU seconds of each live thread of this process, summed by name.
-fn thread_cpu_seconds() -> BTreeMap<String, f64> {
-    let ticks = 100.0; // USER_HZ on Linux
-    let mut by_name = BTreeMap::new();
-    for task in std::fs::read_dir("/proc/self/task").into_iter().flatten() {
-        let path = task.unwrap().path();
-        let (Ok(comm), Ok(stat)) = (
-            std::fs::read_to_string(path.join("comm")),
-            std::fs::read_to_string(path.join("stat")),
-        ) else {
-            continue;
-        };
-        // Fields after the parenthesized name: state is field 3, utime 14, stime 15.
-        let fields: Vec<&str> = stat[stat.rfind(')').unwrap() + 2..].split(' ').collect();
-        let cpu = (fields[11].parse::<f64>().unwrap() + fields[12].parse::<f64>().unwrap()) / ticks;
-        let name = comm.trim().trim_end_matches(|c: char| c.is_ascii_digit());
-        *by_name.entry(name.to_string()).or_insert(0.0) += cpu;
-    }
-    by_name
-}
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -51,6 +33,12 @@ async fn main() {
     let series: usize = args.get(1).map_or(1000, |a| a.parse().unwrap());
     let seconds: i64 = args.get(2).map_or(300, |a| a.parse().unwrap());
     let raw_data_retained = args.get(3).is_none_or(|a| a == "raw");
+    let requests_per_scrape: usize = args.get(4).map_or(1, |a| a.parse().unwrap());
+    let view_dir = (args.get(5).map(String::as_str) != Some("memory")).then(|| {
+        let dir = std::env::temp_dir().join(format!("ingest-bench-views-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    });
 
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -86,8 +74,17 @@ async fn main() {
             stream_start_ms: Some(start_ms),
             ..IngestionOptions::default()
         },
+        view_dir: view_dir.clone(),
         ..EngineOptions::default()
     };
+    println!(
+        "{requests_per_scrape} request(s) per scrape, views {}",
+        if view_dir.is_some() {
+            "persisted"
+        } else {
+            "in memory"
+        }
+    );
     let state = Arc::new(
         DataPlane::with_options(
             serde_json::to_string(&plan).unwrap(),
@@ -115,21 +112,28 @@ async fn main() {
             .collect()
         })
         .collect();
+    let slice = series.div_ceil(requests_per_scrape.max(1));
     let bodies: Vec<Vec<u8>> = (1..=seconds)
-        .map(|second| {
+        .flat_map(|second| {
             let timestamp = start_ms + second * 1000;
-            let timeseries = labels
-                .iter()
+            labels
+                .chunks(slice)
                 .enumerate()
-                .map(|(i, labels)| TimeSeries {
-                    labels: labels.clone(),
-                    samples: vec![Sample {
-                        timestamp,
-                        value: ((i as i64 * 7 + second) % 100) as f64,
-                    }],
+                .map(|(chunk, labels)| {
+                    let timeseries = labels
+                        .iter()
+                        .enumerate()
+                        .map(|(i, labels)| TimeSeries {
+                            labels: labels.clone(),
+                            samples: vec![Sample {
+                                timestamp,
+                                value: (((chunk * slice + i) as i64 * 7 + second) % 100) as f64,
+                            }],
+                        })
+                        .collect();
+                    encode(&WriteRequest { timeseries })
                 })
-                .collect();
-            encode(&WriteRequest { timeseries })
+                .collect::<Vec<_>>()
         })
         .collect();
 
@@ -191,4 +195,17 @@ async fn main() {
         }
     }
     println!("  cpu {:<24} {total:8.2} s", "(all threads)");
+    let metrics = state.engine.render_metrics();
+    for name in [
+        "asap_view_persisted_bytes_total",
+        "asap_view_sync_seconds_total",
+        "asap_view_windows_not_persisted_total",
+    ] {
+        if let Some(line) = metrics.lines().find(|l| l.starts_with(&format!("{name} "))) {
+            println!("  {line}");
+        }
+    }
+    if let Some(dir) = view_dir {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

@@ -179,3 +179,50 @@ async fn refuses_an_unplanned_range_query() {
         "{body}"
     );
 }
+
+/// A range's steps are counted as range steps and its latency as a range
+/// query's, not as instant queries.
+#[tokio::test(flavor = "multi_thread")]
+async fn range_steps_are_measured_apart_from_instant_queries() {
+    let options = EngineOptions {
+        no_forward: true,
+        ingestion: IngestionOptions {
+            allowed_lateness_ms: 0,
+            stream_start_ms: Some(0),
+            ..IngestionOptions::default()
+        },
+        ..EngineOptions::default()
+    };
+    let state = Arc::new(
+        DataPlane::with_options(plan_json(), "http://127.0.0.1:1".into(), options).unwrap(),
+    );
+    let app = router(state.clone());
+    let (status, _, body) = get(
+        &app,
+        format!(
+            "/api/v1/query_range?query={}&start=30&end=60&step=10",
+            encoded(QUERY)
+        ),
+    )
+    .await;
+    // Nothing written: every step is missing its windows, and the range
+    // stops at the first one.
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let metrics = state.engine.render_metrics();
+    let line = |prefix: &str| {
+        metrics
+            .lines()
+            .find(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("{prefix} missing from\n{metrics}"))
+            .to_string()
+    };
+    let steps: u64 = line("asap_phase_runs_total{phase=\"query_range_step\"")
+        .rsplit(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=4).contains(&steps), "{steps} steps run");
+    assert!(line("asap_phase_runs_total{phase=\"query\",").ends_with(" 0"));
+    assert!(line("asap_query_latency_seconds_count{").ends_with(" 0"));
+}
