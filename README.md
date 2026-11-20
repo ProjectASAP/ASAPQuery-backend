@@ -44,7 +44,7 @@ through its `DataStore` interface:
 `precompute` thread refreshes the closed windows' views, and `query-N`
 worker threads (`--query-threads`, default one per core) answer queries,
 each over the newest published snapshot of the store. See
-[docs/design/data-plane-runtime.md](docs/design/data-plane-runtime.md).
+[docs/design/data-plane-demo.md](docs/design/data-plane-demo.md).
 
 **Ingestion.** The plan lists its views refreshed at ingestion by refresh
 group (`InstallablePlan::ingestion_refresh_groups`): views with one window
