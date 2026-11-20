@@ -27,13 +27,16 @@ use asap_planner::InstallablePlan;
 
 use tokio::sync::oneshot;
 
-use crate::ingestion::{ClosedWindow, Ingestion, IngestionOptions, IngestionStats, Precompute};
+use crate::ingestion::{
+    ClosedWindow, Ingestion, IngestionOptions, IngestionStats, Precompute, Refreshed,
+};
 use crate::metrics::{Gauges, Metrics, Timer};
+use crate::persist::ViewFiles;
 use crate::query::{QueryEngine, ResultSample, Unanswered};
 use crate::store::{PublishedStore, QueryTimeResults, RawData, RawSample, RunStore, ViewStore};
 
 /// How the engine ingests samples and runs queries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineOptions {
     /// Lateness, future bound and first-window checks of ingestion.
     pub ingestion: IngestionOptions,
@@ -64,6 +67,9 @@ pub struct EngineOptions {
     /// The most bytes of query-time results kept; the oldest are dropped
     /// first.
     pub query_time_results_max_bytes: usize,
+    /// Where the materialized views are persisted and loaded from at
+    /// startup ([`crate::persist`]); `None`: kept in memory only.
+    pub view_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for EngineOptions {
@@ -79,6 +85,7 @@ impl Default for EngineOptions {
             share_one_evaluation_results: true,
             query_time_results_retention_ms: 60_000,
             query_time_results_max_bytes: 1 << 30,
+            view_dir: None,
         }
     }
 }
@@ -164,7 +171,17 @@ impl EngineHandle {
     /// compiled once, and returns the plan's queries. Fails if the plan is
     /// invalid or the data plane cannot execute it.
     pub fn spawn(plan_json: String, options: EngineOptions) -> anyhow::Result<(Self, Vec<String>)> {
-        let (ingestion, precompute, query, query_texts) = install(&plan_json, options)?;
+        let (ingestion, precompute, query, query_texts) = install(&plan_json, &options)?;
+        let mut views = ViewStore::default();
+        let files = match &options.view_dir {
+            Some(dir) => {
+                let files = ViewFiles::open(dir)?;
+                let loaded = files.load(&precompute.views(), &mut views)?;
+                tracing::info!(dir = %dir.display(), windows = loaded, "loaded persisted views");
+                Some((files, loaded))
+            }
+            None => None,
+        };
         let raw_data = Arc::new(ingestion.raw_data());
         let groups: Vec<(i64, Vec<String>)> = precompute
             .groups()
@@ -194,13 +211,26 @@ impl EngineHandle {
                 let _guard = ingest_guard;
                 serve_ingest(ingestion, raw_data, command_receiver, jobs, &ingest_shared);
             })?;
+        let views = Arc::new(views);
+        shared.published.publish_views(views.clone());
+        shared
+            .metrics
+            .view_bytes
+            .store(views.bytes() as u64, Ordering::Relaxed);
+        let files = files.map(|(files, loaded)| {
+            shared
+                .metrics
+                .view_windows_loaded
+                .store(loaded, Ordering::Relaxed);
+            files
+        });
         let precompute_guard = RunningGuard(running);
         let precompute_shared = shared.clone();
         std::thread::Builder::new()
             .name("precompute".into())
             .spawn(move || {
                 let _guard = precompute_guard;
-                serve_precompute(precompute, job_receiver, &precompute_shared);
+                serve_precompute(precompute, views, files, job_receiver, &precompute_shared);
             })?;
         let query = Arc::new(query);
         spawn_query_workers(
@@ -426,7 +456,7 @@ fn spawn_query_workers(
 /// refresh runs, queries and query texts.
 fn install(
     plan_json: &str,
-    options: EngineOptions,
+    options: &EngineOptions,
 ) -> anyhow::Result<(Ingestion, Precompute, QueryEngine, Vec<String>)> {
     let plan = InstallablePlan::from_json(plan_json)?;
     plan.validate()?;
@@ -565,8 +595,13 @@ fn queue_refreshes(
 
 /// The precompute thread: refreshes each queued window in order over its
 /// copy of the views, publishing them after each.
-fn serve_precompute(precompute: Precompute, jobs: Receiver<PrecomputeJob>, shared: &Shared) {
-    let mut views: Arc<ViewStore> = Arc::default();
+fn serve_precompute(
+    precompute: Precompute,
+    mut views: Arc<ViewStore>,
+    mut files: Option<ViewFiles>,
+    jobs: Receiver<PrecomputeJob>,
+    shared: &Shared,
+) {
     for job in jobs {
         match job {
             PrecomputeJob::Refresh { window, raw_data } => {
@@ -576,8 +611,10 @@ fn serve_precompute(precompute: Precompute, jobs: Receiver<PrecomputeJob>, share
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
                     let timer = Timer::start();
-                    let result = precompute.refresh(window, raw_data, &mut views);
-                    shared.metrics.precompute[window.group].1.record(timer);
+                    let result = precompute.refresh(window, raw_data, &mut views, files.as_mut());
+                    if result != Ok(Refreshed::AlreadyStored) {
+                        shared.metrics.precompute[window.group].1.record(timer);
+                    }
                     result
                 };
                 shared.published.publish_views(views.clone());
@@ -588,7 +625,20 @@ fn serve_precompute(precompute: Precompute, jobs: Receiver<PrecomputeJob>, share
                 {
                     let mut stats = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
                     match result {
-                        Ok(()) => stats.windows_refreshed += 1,
+                        Ok(Refreshed::Ran(written)) => {
+                            stats.windows_refreshed += 1;
+                            let metrics = &shared.metrics;
+                            metrics
+                                .view_persisted_bytes
+                                .fetch_add(written.bytes, Ordering::Relaxed);
+                            metrics
+                                .view_sync_ns
+                                .fetch_add(written.sync_ns, Ordering::Relaxed);
+                            metrics
+                                .view_windows_not_persisted
+                                .fetch_add(written.not_persisted, Ordering::Relaxed);
+                        }
+                        Ok(Refreshed::AlreadyStored) => stats.windows_already_stored += 1,
                         Err(error) => {
                             tracing::error!(group = window.group, end = window.end_ms, %error, "ingestion run failed");
                             stats.windows_failed += 1;

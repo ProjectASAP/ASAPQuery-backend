@@ -37,8 +37,10 @@ use asap_executor::planner::plan::materialized_view::{
 };
 use asap_executor::planner::plan::physical_asap_dag::{PhysicalASAPDAG, PhysicalASAPNodeId};
 use asap_executor::runtime::{Limits, RunContext, Scope};
+use asap_executor::values::SchemaRef;
 use futures::executor::block_on;
 
+use crate::persist::{ViewFiles, Written};
 use crate::store::{RawData, RawSample, RunStore, ViewStore};
 
 /// How ingestion treats sample times.
@@ -96,6 +98,9 @@ pub struct IngestionStats {
     pub windows_skipped_first: u64,
     /// Windows not refreshed because they would already be dropped.
     pub windows_skipped_expired: u64,
+    /// Windows not refreshed because every view of the group already
+    /// stores them (loaded from the view files at startup).
+    pub windows_already_stored: u64,
 }
 
 /// Why a plan cannot be ingested.
@@ -491,6 +496,15 @@ impl Ingestion {
     }
 }
 
+/// What a refresh did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refreshed {
+    /// Ran the window and stored its rows; what it wrote to the view files.
+    Ran(Written),
+    /// Every view of the group already stores the window.
+    AlreadyStored,
+}
+
 /// The ingestion runs of the plan's refresh groups.
 pub struct Precompute {
     runs: Vec<RefreshGroupRun>,
@@ -500,16 +514,26 @@ pub struct Precompute {
 impl Precompute {
     /// Runs `window`'s group's views in one ingestion run over
     /// `(end - W, end]`, reading `raw_data` (as it was when the window
-    /// closed) and `views`, and appends each view's rows to `views`.
+    /// closed) and `views`, appends each view's rows to `views` and, with
+    /// `files`, to its file. A window every view of the group already
+    /// stores (loaded from files at startup) is not run again.
     pub fn refresh(
         &self,
         window: ClosedWindow,
         raw_data: Arc<RawData>,
         views: &mut Arc<ViewStore>,
-    ) -> Result<(), asap_executor::Error> {
+        files: Option<&mut ViewFiles>,
+    ) -> Result<Refreshed, asap_executor::Error> {
         let group = &self.runs[window.group];
         let end = window.end_ms;
         let start = end - group.width_ms;
+        if group.views.iter().all(|view| {
+            views
+                .stored_through(view.node_id)
+                .is_some_and(|stored| stored >= end)
+        }) {
+            return Ok(Refreshed::AlreadyStored);
+        }
         let outputs = {
             let store = Arc::new(RunStore::new(raw_data, views.clone()));
             let instance = group.compiled.instantiate(store)?;
@@ -531,14 +555,43 @@ impl Precompute {
             .zip(outputs)
             .collect();
         let views = Arc::make_mut(views);
+        let mut written = Written::default();
+        let mut files = files;
         for view in &group.views {
-            let batches = by_root
+            let batches: Vec<_> = by_root
                 .get(&(view.node_id as u64))
                 .map(|batches| batches.iter().map(|batch| (**batch).clone()).collect())
                 .unwrap_or_default();
+            if let Some(files) = files.as_deref_mut() {
+                match files.append(view.node_id, (start, end), &batches) {
+                    Ok(view_written) => {
+                        written.bytes += view_written.bytes;
+                        written.sync_ns += view_written.sync_ns;
+                        written.not_persisted += view_written.not_persisted;
+                    }
+                    Err(error) => {
+                        tracing::error!(view = view.node_id, end, %error, "persisting a view window failed");
+                        written.not_persisted += 1;
+                    }
+                }
+            }
             views.append(view, (start, end), batches)?;
         }
-        Ok(())
+        Ok(Refreshed::Ran(written))
+    }
+
+    /// Each view the refreshes append to (with its retention margin) and
+    /// its output schema, to load them from files.
+    pub fn views(&self) -> Vec<(MaterializedView, SchemaRef)> {
+        self.runs
+            .iter()
+            .flat_map(|run| {
+                run.views.iter().filter_map(|view| {
+                    let schema = run.compiled.output_schema(view.node_id as u64).ok()?;
+                    Some((view.clone(), schema))
+                })
+            })
+            .collect()
     }
 
     /// Each refresh group's window width and views, in plan order.

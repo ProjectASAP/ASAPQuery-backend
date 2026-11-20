@@ -12,6 +12,7 @@
 pub mod engine;
 pub mod ingestion;
 pub mod metrics;
+pub mod persist;
 pub mod prometheus;
 pub mod query;
 pub mod remote_write;
@@ -78,9 +79,10 @@ impl DataPlane {
         prometheus_url: String,
         options: EngineOptions,
     ) -> anyhow::Result<Self> {
+        let no_forward = options.no_forward;
         let (engine, queries) = EngineHandle::spawn(plan_json, options)?;
         Ok(Self {
-            no_forward: options.no_forward,
+            no_forward,
             queries,
             engine,
             prometheus_url: prometheus_url.trim_end_matches('/').to_string(),

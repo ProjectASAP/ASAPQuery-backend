@@ -68,6 +68,13 @@ struct Args {
     /// The most bytes of query-time results kept.
     #[arg(long, default_value_t = EngineOptions::default().query_time_results_max_bytes)]
     query_time_results_max_bytes: usize,
+    /// Where the materialized views are persisted (one file per view) and
+    /// loaded from at startup.
+    #[arg(long, default_value = "asap-views")]
+    view_dir: PathBuf,
+    /// Keep the materialized views in memory only.
+    #[arg(long)]
+    no_view_persistence: bool,
 }
 
 #[tokio::main]
@@ -96,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
                 share_one_evaluation_results: !args.no_shared_results,
                 query_time_results_retention_ms: args.query_time_results_retention_ms,
                 query_time_results_max_bytes: args.query_time_results_max_bytes,
+                view_dir: (!args.no_view_persistence).then_some(args.view_dir),
             },
         )?
         .with_forward_timeout(Duration::from_secs(args.forward_timeout_seconds)),

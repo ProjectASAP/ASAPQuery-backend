@@ -964,6 +964,7 @@ dependencies = [
  "libc",
  "prost",
  "reqwest",
+ "rmp-serde",
  "serde",
  "serde_json",
  "snap",

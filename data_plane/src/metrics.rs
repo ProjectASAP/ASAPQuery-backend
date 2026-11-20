@@ -157,6 +157,14 @@ pub struct Metrics {
     pub raw_data_samples: AtomicU64,
     pub raw_data_panes: AtomicU64,
     pub view_bytes: AtomicU64,
+    /// Bytes written to the view files.
+    pub view_persisted_bytes: AtomicU64,
+    /// Time spent syncing the view files.
+    pub view_sync_ns: AtomicU64,
+    /// View windows not written to the files (a sketch state, or an error).
+    pub view_windows_not_persisted: AtomicU64,
+    /// View windows loaded from the files at startup.
+    pub view_windows_loaded: AtomicU64,
 }
 
 impl Metrics {
@@ -186,6 +194,10 @@ impl Metrics {
             raw_data_samples: AtomicU64::new(0),
             raw_data_panes: AtomicU64::new(0),
             view_bytes: AtomicU64::new(0),
+            view_persisted_bytes: AtomicU64::new(0),
+            view_sync_ns: AtomicU64::new(0),
+            view_windows_not_persisted: AtomicU64::new(0),
+            view_windows_loaded: AtomicU64::new(0),
         }
     }
 
@@ -278,6 +290,7 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
         ("failed", stats.windows_failed),
         ("skipped_first", stats.windows_skipped_first),
         ("skipped_expired", stats.windows_skipped_expired),
+        ("already_stored", stats.windows_already_stored),
     ] {
         let _ = writeln!(out, "asap_windows_total{{outcome=\"{outcome}\"}} {count}");
     }
@@ -334,6 +347,31 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
         "Bytes of materialized view rows held.",
         load(&metrics.view_bytes),
     );
+    for (name, help, value) in [
+        (
+            "asap_view_persisted_bytes_total",
+            "Bytes written to the view files.",
+            load(&metrics.view_persisted_bytes),
+        ),
+        (
+            "asap_view_sync_seconds_total",
+            "Time spent syncing the view files.",
+            load(&metrics.view_sync_ns) / 1e9,
+        ),
+        (
+            "asap_view_windows_not_persisted_total",
+            "View windows not written to the view files (a sketch state, or an error).",
+            load(&metrics.view_windows_not_persisted),
+        ),
+        (
+            "asap_view_windows_loaded_total",
+            "View windows loaded from the view files at startup.",
+            load(&metrics.view_windows_loaded),
+        ),
+    ] {
+        family(&mut out, name, "counter", help);
+        let _ = writeln!(out, "{name} {value}");
+    }
     let results = gauges.query_time_results;
     gauge(
         &mut out,

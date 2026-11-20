@@ -503,6 +503,11 @@ impl ViewStore {
         Ok(())
     }
 
+    /// The end of `view`'s newest stored rows.
+    pub fn stored_through(&self, view: PhysicalASAPNodeId) -> Option<i64> {
+        self.by_view.get(&view)?.last().map(|((_, end), _)| *end)
+    }
+
     /// Bytes of the stored rows.
     pub fn bytes(&self) -> usize {
         self.by_view

@@ -120,6 +120,15 @@ is not. Plan a dashboard's range requests with the workload's
 `range_evaluation` (`{"step_ms": 60000, "span_ms": 3600000}`), so the plan
 delivers every step time.
 
+**Persistence.** Each materialized view is appended to its own file in
+`--view-dir` (default `asap-views`; `--no-view-persistence` keeps views in
+memory only), one record per refreshed window, synced before the next
+window is refreshed. At startup the records within each view's retention
+are loaded back, and a window already loaded is not refreshed again. Raw
+samples and open windows are not persisted. Views holding sketch states
+are not persisted yet (no byte encoding for them);
+`asap_view_windows_not_persisted_total` counts those windows.
+
 Not supported yet: views refreshed on first read (so the backend declares
 `query_time_results_retained: false`), SQL.
 
