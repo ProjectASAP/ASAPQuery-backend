@@ -42,7 +42,7 @@ use asap_executor::planner::plan::materialized_view::MaterializedView;
 use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
 use asap_executor::runtime::{OutputStream, RunContext};
 use asap_executor::sources::{DataStore, MaterializedViewRequest, RawDataRequest};
-use asap_executor::values::{Batch, BatchColumn};
+use asap_executor::values::{Batch, BatchColumn, SchemaRef};
 use asap_executor::Error;
 use futures::{stream, StreamExt};
 
@@ -302,8 +302,14 @@ impl RawData {
 
     /// `metric`'s samples in `time_range_ms` (`(start, end]`, every sample
     /// when `None`) as batches of `request`'s schema: one per chunk of the
-    /// panes overlapping the range, the open pane's included.
-    fn read(&self, metric: &str, request: &RawDataRequest) -> Result<Vec<Batch>, Error> {
+    /// panes overlapping the range, the open pane's included. A chunk read
+    /// whole is converted once per `reads` and shared by its later reads.
+    fn read(
+        &self,
+        metric: &str,
+        request: &RawDataRequest,
+        reads: Option<&RawReads>,
+    ) -> Result<Vec<Batch>, Error> {
         let columns = column_kinds(metric, request)?;
         let Some(metric) = self.by_metric.get(metric) else {
             return Ok(Vec::new());
@@ -321,17 +327,73 @@ impl RawData {
             Bound::Excluded(end.saturating_add(self.pane_width_ms)),
         ));
         let mut batches = Vec::new();
-        for chunk in panes.flat_map(|(_, pane)| pane) {
-            let Some(chunk) = chunk.in_range((start, end)) else {
+        for stored in panes.flat_map(|(_, pane)| pane) {
+            let Some(chunk) = stored.in_range((start, end)) else {
                 continue;
             };
-            let columns = columns
-                .iter()
-                .map(|kind| chunk.column(kind).map(BatchColumn::Plain))
-                .collect::<Result<Vec<_>, Error>>()?;
-            batches.push(Batch::try_from_columns(request.schema.clone(), columns)?);
+            let convert = || -> Result<Batch, Error> {
+                let columns = columns
+                    .iter()
+                    .map(|kind| chunk.column(kind).map(BatchColumn::Plain))
+                    .collect::<Result<Vec<_>, Error>>()?;
+                Batch::try_from_columns(request.schema.clone(), columns)
+            };
+            let batch = match reads {
+                Some(reads) if Arc::ptr_eq(stored, &chunk) => {
+                    reads.get_or_convert(stored, request.schema, convert)?
+                }
+                _ => convert()?,
+            };
+            batches.push(batch);
         }
         Ok(batches)
+    }
+}
+
+/// Raw-data chunks already converted to batches, for the evaluations of
+/// one range request: every step reads the same snapshot, and a chunk read
+/// whole by several steps is converted once (its label columns built,
+/// its series identities attached) rather than once per step.
+pub struct RawReads {
+    /// By chunk and request schema, in shards by chunk so the query
+    /// workers rarely wait for each other; each entry holds the chunk and
+    /// the schema, so their addresses are not reused while it is kept.
+    shards: Vec<Mutex<ConvertedChunks>>,
+}
+
+type ConvertedChunks = HashMap<(usize, usize), (Arc<Chunk>, SchemaRef, Batch)>;
+
+impl Default for RawReads {
+    fn default() -> Self {
+        Self {
+            shards: (0..64).map(|_| Mutex::default()).collect(),
+        }
+    }
+}
+
+impl RawReads {
+    fn get_or_convert(
+        &self,
+        chunk: &Arc<Chunk>,
+        schema: &SchemaRef,
+        convert: impl FnOnce() -> Result<Batch, Error>,
+    ) -> Result<Batch, Error> {
+        let key = (Arc::as_ptr(chunk) as usize, Arc::as_ptr(schema) as usize);
+        // Chunks are at least 8-byte aligned: shard by the bits above.
+        let shard = &self.shards[(key.0 >> 4) % self.shards.len()];
+        if let Some((_, _, batch)) = shard.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return Ok(batch.clone());
+        }
+        // Converted outside the lock; a step converting the same chunk at
+        // the same time keeps the first batch stored.
+        let batch = convert()?;
+        Ok(shard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+            .or_insert_with(|| (chunk.clone(), schema.clone(), batch))
+            .2
+            .clone())
     }
 }
 
@@ -384,6 +446,8 @@ pub type RawShards = Arc<Vec<Arc<RawData>>>;
 pub struct RunStore {
     raw_data: RawShards,
     views: Arc<ViewStore>,
+    /// Chunks converted by the other evaluations of the same range request.
+    raw_reads: Option<Arc<RawReads>>,
     /// The query-time results the run reads, by node: each computed for
     /// the run's evaluation time before the run starts and held by the run.
     query_time_results: HashMap<PhysicalASAPNodeId, Arc<Vec<Batch>>>,
@@ -392,18 +456,21 @@ pub struct RunStore {
 
 impl RunStore {
     pub fn new(raw_data: RawShards, views: Arc<ViewStore>) -> Self {
-        Self::with_query_time_results(raw_data, views, HashMap::new())
+        Self::with_query_time_results(raw_data, views, None, HashMap::new())
     }
 
-    /// A run reading `query_time_results` besides the views and raw data.
+    /// A run reading `query_time_results` besides the views and raw data,
+    /// sharing converted raw chunks through `raw_reads`.
     pub fn with_query_time_results(
         raw_data: RawShards,
         views: Arc<ViewStore>,
+        raw_reads: Option<Arc<RawReads>>,
         query_time_results: HashMap<PhysicalASAPNodeId, Arc<Vec<Batch>>>,
     ) -> Self {
         Self {
             raw_data,
             views,
+            raw_reads,
             query_time_results,
             missing_view_rows: Mutex::new(None),
         }
@@ -432,7 +499,7 @@ impl DataStore for RunStore {
         };
         let mut batches = Vec::new();
         for shard in self.raw_data.iter() {
-            batches.extend(shard.read(metric, request)?);
+            batches.extend(shard.read(metric, request, self.raw_reads.as_deref())?);
         }
         Ok(stream::iter(batches)
             .map(move |batch| {
@@ -551,13 +618,15 @@ impl ViewStore {
             ))
         };
         let rows = self.by_view.get(&view.node_id).ok_or_else(missing)?;
-        let selected: Vec<&ViewWindow> = rows
-            .iter()
-            .filter(|((row_start, row_end), _)| *row_start >= start && *row_end <= end)
-            .collect();
+        // Rows are disjoint and oldest first, so the rows inside the range
+        // are one slice: from the first starting at or after `start` to
+        // the last ending at or before `end`.
+        let first = rows.partition_point(|((row_start, _), _)| *row_start < start);
+        let past_last = rows.partition_point(|((_, row_end), _)| *row_end <= end);
+        let selected: &[ViewWindow] = rows.get(first..past_last).unwrap_or_default();
         // The selected ranges, oldest first, must tile `(start, end]`.
         let mut covered_to = start;
-        for ((row_start, row_end), _) in &selected {
+        for ((row_start, row_end), _) in selected {
             if *row_start != covered_to {
                 return Err(missing());
             }
@@ -567,7 +636,7 @@ impl ViewStore {
             return Err(missing());
         }
         Ok(
-            stream::iter(selected.into_iter().flat_map(|(_, b)| b.iter().cloned()))
+            stream::iter(selected.iter().flat_map(|(_, b)| b.iter().cloned()))
                 .map(move |batch| {
                     if context.is_cancelled() {
                         return Err(Error::Cancelled);
@@ -917,13 +986,14 @@ mod tests {
         raw: &RawData,
         schema: &Arc<Schema>,
         range: Option<(i64, i64)>,
+        reads: Option<&RawReads>,
     ) -> Vec<Vec<Value>> {
         let request = RawDataRequest {
             time_range_ms: range,
             schema,
             predicates: &[],
         };
-        raw.read("m_store_test", &request)
+        raw.read("m_store_test", &request, reads)
             .unwrap()
             .iter()
             .flat_map(Batch::to_rows)
@@ -932,7 +1002,8 @@ mod tests {
 
     /// A columnar read returns the rows the row-wise read returned, for
     /// ranges inside one pane, across panes (the open one included) and
-    /// unbounded, before and after panes are compacted.
+    /// unbounded, before and after panes are compacted; and so do reads
+    /// that share converted chunks, as a range request's steps do.
     #[test]
     fn columnar_read_returns_the_row_read_rows() {
         let schema = schema();
@@ -954,13 +1025,19 @@ mod tests {
             if sealed {
                 raw.seal_through(20_000);
             }
+            let shared = RawReads::default();
             for range in ranges {
-                assert_eq!(
-                    sorted(read_rows(&raw, &schema, range)),
-                    sorted(row_read(&all, &schema, range)),
-                    "range {range:?}, sealed {sealed}"
-                );
+                for reads in [None, Some(&shared), Some(&shared)] {
+                    assert_eq!(
+                        sorted(read_rows(&raw, &schema, range, reads)),
+                        sorted(row_read(&all, &schema, range)),
+                        "range {range:?}, sealed {sealed}, shared {}",
+                        reads.is_some()
+                    );
+                }
             }
+            let converted: usize = shared.shards.iter().map(|s| s.lock().unwrap().len()).sum();
+            assert_eq!(converted, raw.chunks().count(), "each chunk converted once");
         }
         // A closed pane is compacted into one chunk; the open ones are not.
         let panes = &raw.by_metric["m_store_test"].panes;
@@ -993,8 +1070,53 @@ mod tests {
             .collect();
         for range in [None, Some((0, 14_000))] {
             assert_eq!(
-                sorted(read_rows(&raw, &schema, range)),
+                sorted(read_rows(&raw, &schema, range, None)),
                 sorted(row_read(&kept, &schema, range)),
+            );
+        }
+    }
+
+    /// A view read returns exactly the stored windows that tile the
+    /// requested range, and fails when they do not.
+    #[test]
+    fn view_reads_select_the_windows_tiling_the_range() {
+        let view: MaterializedView = serde_json::from_value(serde_json::json!({
+            "node_id": 1,
+            "refresh": "on_first_read",
+            "coverage": {"definition_id": "test-view", "selection": []},
+            "inputs": {"materialized_views": []},
+            "retention_ms": 1_000_000,
+        }))
+        .unwrap();
+        let mut views = ViewStore::default();
+        for end in [10, 20, 30, 40] {
+            views.append(&view, (end - 10, end), Vec::new()).unwrap();
+        }
+        let context = RunContext::new(
+            asap_executor::runtime::Scope::Query {
+                evaluation_time_ms: 40,
+            },
+            asap_executor::runtime::Limits::default(),
+        )
+        .unwrap();
+        let schema = schema();
+        for (range, tiled) in [
+            ((10, 30), true),
+            ((0, 40), true),
+            ((30, 40), true),
+            ((5, 30), false),
+            ((10, 35), false),
+            ((40, 50), false),
+            ((-10, 0), false),
+        ] {
+            let request = MaterializedViewRequest {
+                time_range_ms: range,
+                schema: &schema,
+            };
+            assert_eq!(
+                views.read(&view, &request, context.clone()).is_ok(),
+                tiled,
+                "{range:?}"
             );
         }
     }

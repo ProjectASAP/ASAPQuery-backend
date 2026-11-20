@@ -32,7 +32,7 @@ use crate::ingestion::{
 };
 use crate::metrics::{Gauges, Metrics, Timer};
 use crate::persist::{plan_hash, ViewFiles};
-use crate::query::{QueryEngine, Unanswered};
+use crate::query::{QueryEngine, Snapshot, Unanswered};
 use crate::result_cache::{Answer, ResultCache};
 use crate::store::{
     PublishedStore, QueryTimeResults, RawData, RawSample, RawShards, RunStore, ViewStore,
@@ -425,23 +425,30 @@ impl EngineHandle {
     pub async fn evaluate(&self, query: String, time_ms: i64) -> Result<Answer, Unanswered> {
         let started = std::time::Instant::now();
         let metrics = self.shared.metrics.query(&query);
-        let answer = self.run_on_worker(query, time_ms, false).await;
+        let answer = self.run_on_worker(query, time_ms, None).await;
         if let Some(metrics) = metrics {
             metrics.latency.observe(started.elapsed().as_secs_f64());
         }
         answer
     }
 
-    /// Evaluates one step of a range query: as [`Self::evaluate`], counted
-    /// as a range step rather than an instant query. A step whose future is
-    /// dropped before a worker takes it (the range failed or its client
-    /// went away) is not run.
+    /// Evaluates one step of a range query over `snapshot`, which every
+    /// step of the request reads ([`Self::snapshot`]): as
+    /// [`Self::evaluate`], counted as a range step rather than an instant
+    /// query. A step whose future is dropped before a worker takes it (the
+    /// range failed or its client went away) is not run.
     pub async fn evaluate_range_step(
         &self,
         query: String,
         time_ms: i64,
+        snapshot: Arc<Snapshot>,
     ) -> Result<Answer, Unanswered> {
-        self.run_on_worker(query, time_ms, true).await
+        self.run_on_worker(query, time_ms, Some(snapshot)).await
+    }
+
+    /// The newest published store, for the steps of one range request.
+    pub fn snapshot(&self) -> Arc<Snapshot> {
+        Arc::new(self.query.snapshot(&self.shared.published))
     }
 
     /// The result cache's answer to the planned `query` at `time_ms`, if
@@ -454,7 +461,7 @@ impl EngineHandle {
         &self,
         query: String,
         time_ms: i64,
-        range_step: bool,
+        range_step: Option<Arc<Snapshot>>,
     ) -> Result<Answer, Unanswered> {
         let stopped = || Unanswered::Execution("the query workers have stopped".into());
         let (reply, answer) = oneshot::channel();
@@ -617,8 +624,8 @@ fn admit(queued: u64, count: u64, max_queued: u64) -> Result<u64, IngestError> {
 struct QueryJob {
     query: String,
     time_ms: i64,
-    /// One step of a range query.
-    range_step: bool,
+    /// One step of a range query, and the snapshot every step reads.
+    range_step: Option<Arc<Snapshot>>,
     reply: Reply<Answer>,
 }
 
@@ -665,7 +672,11 @@ fn spawn_query_workers(
                 // A bug in one run must not take the worker down: it
                 // answers that run with the error and keeps serving.
                 let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    query.evaluate(&job.query, job.time_ms, &shared.published)
+                    let snapshot = match &job.range_step {
+                        Some(snapshot) => snapshot.clone(),
+                        None => Arc::new(query.snapshot(&shared.published)),
+                    };
+                    query.evaluate(&job.query, job.time_ms, &snapshot)
                 }))
                 .unwrap_or_else(|panic| {
                     let reason = panic
@@ -678,8 +689,8 @@ fn spawn_query_workers(
                 });
                 if let Some(metrics) = shared.metrics.query(&job.query) {
                     match job.range_step {
-                        false => metrics.run.record(timer),
-                        true => metrics.range_step_run.record(timer),
+                        None => metrics.run.record(timer),
+                        Some(_) => metrics.range_step_run.record(timer),
                     };
                 }
                 let _ = job.reply.send(answer);

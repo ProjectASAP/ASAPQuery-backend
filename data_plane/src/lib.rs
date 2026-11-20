@@ -368,21 +368,27 @@ async fn answer_range(
         .map(|time_ms| (time_ms, state.engine.cached(query, time_ms)))
         .collect();
     let from_cache = cached.iter().filter(|(_, hit)| hit.is_some()).count();
+    // Every step reads the same snapshot, so the raw data they share is
+    // converted once ([`store::RawReads`]).
+    let snapshot = state.engine.snapshot();
     // At most one step per query worker in flight, so a long range neither
     // floods the workers' queue nor starves instant queries; the first
     // failed step, or the client going away, drops the rest unrun.
     let steps: Vec<_> = futures::stream::iter(cached)
-        .map(|(time_ms, hit)| async move {
-            let samples = match hit {
-                Some(samples) => samples,
-                None => {
-                    state
-                        .engine
-                        .evaluate_range_step(query.clone(), time_ms)
-                        .await?
-                }
-            };
-            Ok::<_, Unanswered>((time_ms, samples))
+        .map(|(time_ms, hit)| {
+            let snapshot = snapshot.clone();
+            async move {
+                let samples = match hit {
+                    Some(samples) => samples,
+                    None => {
+                        state
+                            .engine
+                            .evaluate_range_step(query.clone(), time_ms, snapshot)
+                            .await?
+                    }
+                };
+                Ok::<_, Unanswered>((time_ms, samples))
+            }
         })
         .buffered(state.engine.query_threads())
         .try_collect()

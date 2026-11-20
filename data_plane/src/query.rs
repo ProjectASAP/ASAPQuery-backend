@@ -35,7 +35,7 @@ use futures::executor::block_on;
 use futures::StreamExt;
 
 use crate::result_cache::{Answer, ResultCache};
-use crate::store::{PublishedStore, QueryTimeResults, RawShards, RunStore, ViewStore};
+use crate::store::{PublishedStore, QueryTimeResults, RawReads, RawShards, RunStore, ViewStore};
 
 /// One series of an instant-query result.
 #[derive(Debug, Clone, PartialEq)]
@@ -202,8 +202,24 @@ impl QueryEngine {
         self.result_cache.as_ref()
     }
 
-    /// Answers `query` at `time_ms` from the newest snapshot of `store`,
-    /// and keeps the answer in the result cache when it is final: the run
+    /// What evaluations starting now read: the newest snapshot of `store`.
+    /// The evaluations of one range request share one, so each raw chunk
+    /// they read whole is converted once.
+    pub fn snapshot(&self, store: &PublishedStore) -> Snapshot {
+        // The watermark first: raw data is published before the watermark
+        // that covers it, so the snapshot read next holds every sample at
+        // or before this watermark.
+        let watermark_ms = store.watermark_ms();
+        let (raw_data, views) = store.snapshot();
+        Snapshot {
+            raw_data,
+            views,
+            watermark_ms,
+            raw_reads: Arc::default(),
+        }
+    }
+
+    /// Answers `query` at `time_ms` from `snapshot`, and keeps the answer in the result cache when it is final: the run
     /// succeeded, so every view window it read was stored (a window is
     /// appended once, when the watermark closes it, and never changes),
     /// and, when the root reads raw data through a `Scan`, `time_ms` is at
@@ -214,20 +230,11 @@ impl QueryEngine {
         &self,
         query: &str,
         time_ms: i64,
-        store: &PublishedStore,
+        snapshot: &Snapshot,
     ) -> Result<Answer, Unanswered> {
         let root = self.root(query)?;
-        // The watermark first: raw data is published before the watermark
-        // that covers it, so the snapshot read next holds every sample at
-        // or before this watermark.
-        let watermark_ms = store.watermark_ms();
-        let (raw_data, views) = store.snapshot();
-        let snapshot = Snapshot {
-            raw_data,
-            views,
-            watermark_ms,
-        };
-        let batches = self.output(root, time_ms, &snapshot)?;
+        let watermark_ms = snapshot.watermark_ms;
+        let batches = self.output(root, time_ms, snapshot)?;
         let compiled = &self.runs[&root].compiled;
         let schema = compiled
             .output_schema(root as u64)
@@ -278,6 +285,7 @@ impl QueryEngine {
         let run_store = Arc::new(RunStore::with_query_time_results(
             snapshot.raw_data.clone(),
             snapshot.views.clone(),
+            Some(snapshot.raw_reads.clone()),
             shared,
         ));
         run_compiled(&run.compiled, run_store.clone(), time_ms, &self.limits).map_err(|error| {
@@ -289,12 +297,13 @@ impl QueryEngine {
     }
 }
 
-/// What one evaluation reads: the raw data and views published when it
-/// started, and the watermark then.
-struct Snapshot {
+/// What evaluations read: the raw data and views published when they
+/// started, the watermark then, and the raw chunks they converted so far.
+pub struct Snapshot {
     raw_data: RawShards,
     views: Arc<ViewStore>,
     watermark_ms: Option<i64>,
+    raw_reads: Arc<RawReads>,
 }
 
 /// Whether `node`'s run, and every shared node's run it reads, compiled.
