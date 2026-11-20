@@ -10,8 +10,8 @@ version = "0.1.0"
 # The backend depends on two Planner crates, at one immutable revision:
 # `asap-planner` to plan and `asap-executor` to execute. Planner IR types
 # are reached through `asap_executor::planner`.
-asap-planner = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "1b18ad921c1a49e206d08d47ab2aee10cece8336" }
-asap-executor = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "1b18ad921c1a49e206d08d47ab2aee10cece8336" }
+asap-planner = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "056da65788a8cf5f2352698511a68b6a0f6c3cce" }
+asap-executor = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "056da65788a8cf5f2352698511a68b6a0f6c3cce" }
 # The sketch library the Planner's executor pins, for the byte encodings of
 # the sketch states the data plane persists; keep it at the Planner's rev.
 asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", rev = "21b63578c2e612e153f5aaa4d3848f1035a13c60" }

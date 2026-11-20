@@ -15,10 +15,11 @@
 //! A row's plain values are stored as the executor's `Value`s, an exact
 //! state (sum, count, min, max, rate, increase) by its serde form, and a
 //! sketch state by `asap_sketchlib`'s ASAPv1 bytes with the kernel it
-//! rebuilds: DDSketch, KLL, Count-Min, KMV and Hydra-KLL. A HyperLogLog,
-//! UnivMon, weighted-frequency (Count-Min with heap) or Hydra-Count-Min
-//! state has no public way to rebuild its kernel, so a view holding one is
-//! not persisted (counted in `asap_view_windows_not_persisted_total`).
+//! rebuilds, through each kernel's `sketch()` and `restore_from_disk`. A
+//! Hydra-Count-Min grid, shared by every group of a build, is stored once
+//! per record. A UnivMon whose heaps mix key types has no ASAPv1 encoding,
+//! so a view holding one is not persisted (counted in
+//! `asap_view_windows_not_persisted_total`).
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -30,13 +31,20 @@ use std::time::{Duration, Instant};
 use asap_executor::planner::plan::materialized_view::MaterializedView;
 use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
 use asap_executor::summary_kernels::exact::ExactAccumulator;
+use asap_executor::summary_kernels::univmon::UnivMonAccumulator;
+use asap_executor::summary_kernels::weighted_frequency::{FrequencySketch, WeightedFrequency};
 use asap_executor::summary_kernels::{
-    CountMinSketchAccumulator, DDSketchAccumulator, DatasketchesKLLAccumulator,
-    HydraKllSketchAccumulator, IncreaseAccumulator, KmvAccumulator,
+    CountMinSketchAccumulator, DDSketchAccumulator, DatasketchesKLLAccumulator, HllRegisters,
+    HllSketchAccumulator, HydraCms, HydraCmsGroup, HydraKllSketchAccumulator, IncreaseAccumulator,
+    KmvAccumulator,
 };
 use asap_executor::values::{Batch, SchemaRef, Value};
 use asap_executor::AggregateCore;
-use asap_sketchlib::{CountMinF64, DdSketch, Hydra, Kll, Kmv};
+use asap_sketchlib::sketches::hll::HyperLogLogImpl;
+use asap_sketchlib::{
+    Classic, CountMinF64, CountMinSketch, CountMinSketchWithHeap, CountSketch, CountSketchWithHeap,
+    DdSketch, Hydra, Kll, Kmv, UnivMon,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::store::ViewStore;
@@ -53,7 +61,8 @@ struct Header {
     group: usize,
 }
 
-/// The kernels whose sketch state is stored as ASAPv1 bytes.
+/// The kernels whose sketch state is stored as ASAPv1 bytes, with what
+/// rebuilding one needs beyond the bytes.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SketchKernel {
     DDSketch,
@@ -61,6 +70,22 @@ pub enum SketchKernel {
     CountMin,
     Kmv,
     HydraKll,
+    /// HyperLogLog at a precision.
+    Hll(u8),
+    WeightedFrequency(FrequencyKind),
+    UnivMon {
+        max_key_bytes: usize,
+        inserted_key_bytes: usize,
+    },
+}
+
+/// Which sketch a weighted-frequency state keeps.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrequencyKind {
+    Cms,
+    CountSketch,
+    CmsHeap,
+    CountSketchHeap,
 }
 
 /// One stored value of a view row.
@@ -76,6 +101,12 @@ enum StoredValue {
         #[serde(with = "serde_bytes")]
         asapv1: Vec<u8>,
     },
+    /// A Hydra-Count-Min group: its group name, and its grid by index in
+    /// the record's grids (one grid serves every group of a build).
+    HydraCmsGroup {
+        grid: u32,
+        group: String,
+    },
 }
 
 /// One refreshed window of a group: the rows of each view appended.
@@ -87,11 +118,19 @@ struct Record {
     /// label values and series identities are written once per file.
     #[serde(default)]
     new_texts: Vec<String>,
+    /// The Hydra-Count-Min grids its rows read, as ASAPv1 bytes, each once.
+    #[serde(default)]
+    hydra_cms_grids: Vec<serde_bytes::ByteBuf>,
     views: Vec<(PhysicalASAPNodeId, Vec<Vec<StoredValue>>)>,
 }
 
 /// One view's stored rows of one window: `(start, end, rows)`.
-type StoredWindow = (i64, i64, Vec<Vec<StoredValue>>);
+type StoredWindow = (
+    i64,
+    i64,
+    Vec<Vec<StoredValue>>,
+    Arc<Vec<Option<Arc<HydraCms>>>>,
+);
 
 /// What persisting one window wrote.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -196,13 +235,16 @@ impl ViewFiles {
             dictionary,
             new: Vec::new(),
             new_index: std::collections::HashMap::new(),
+            grids: Grids::default(),
         };
         for (view, batches) in views {
             let mark = texts.new.len();
+            let grids_mark = texts.grids.bytes.len();
             match encode_rows(batches, &mut texts) {
                 Some(rows) => stored.push((*view, rows)),
                 None => {
                     texts.forget_after(mark);
+                    texts.grids.forget_after(grids_mark);
                     written.not_persisted += 1;
                 }
             }
@@ -215,6 +257,12 @@ impl ViewFiles {
             start_ms,
             end_ms,
             new_texts: new_texts.iter().map(|t| t.to_string()).collect(),
+            hydra_cms_grids: texts
+                .grids
+                .bytes
+                .into_iter()
+                .map(serde_bytes::ByteBuf::from)
+                .collect(),
             views: stored,
         };
         let file = match self.files.entry(group) {
@@ -268,11 +316,24 @@ impl ViewFiles {
             let mut by_view: BTreeMap<PhysicalASAPNodeId, Vec<StoredWindow>> = BTreeMap::new();
             for record in records {
                 texts.extend(record.new_texts.iter().map(|t| Arc::from(t.as_str())));
+                // A record's grids are rebuilt once and shared by its rows.
+                let grids: Arc<Vec<Option<Arc<HydraCms>>>> = Arc::new(
+                    record
+                        .hydra_cms_grids
+                        .iter()
+                        .map(|bytes| {
+                            let grid = Hydra::from_asapv1(bytes).ok()?;
+                            HydraCms::restore_from_disk(grid).ok().map(Arc::new)
+                        })
+                        .collect(),
+                );
                 for (view, rows) in record.views {
-                    by_view
-                        .entry(view)
-                        .or_default()
-                        .push((record.start_ms, record.end_ms, rows));
+                    by_view.entry(view).or_default().push((
+                        record.start_ms,
+                        record.end_ms,
+                        rows,
+                        grids.clone(),
+                    ));
                 }
             }
             let dictionary = self.dictionaries.entry(group).or_default();
@@ -289,11 +350,11 @@ impl ViewFiles {
                 };
                 let retention_ms = i64::try_from(view.retention_ms()).unwrap_or(i64::MAX);
                 let oldest_kept_end = newest_end.saturating_sub(retention_ms);
-                for (start, end, rows) in own {
+                for (start, end, rows, grids) in own {
                     if end <= oldest_kept_end && end != newest_end {
                         continue;
                     }
-                    let Some(batch) = decode_rows(schema, rows, &texts) else {
+                    let Some(batch) = decode_rows(schema, rows, &texts, &grids) else {
                         tracing::warn!(
                             view = view.node_id,
                             start,
@@ -384,13 +445,86 @@ fn read_frames(file: File) -> std::io::Result<(Vec<Vec<u8>>, u64)> {
     Ok((frames, good_len))
 }
 
-/// `state` as stored bytes, when its kernel can be rebuilt from them.
-fn encode_state(state: &dyn AggregateCore) -> Option<StoredValue> {
+/// Each HyperLogLog precision's sketch type, from the executor's
+/// `HllRegisters`.
+macro_rules! hll_precisions {
+    ($($variant:ident($storage:ident, $precision:literal)),* $(,)?) => {
+        /// The precision and ASAPv1 bytes of an HLL state.
+        fn encode_hll(registers: &HllRegisters) -> Option<(u8, Vec<u8>)> {
+            match registers {
+                $(HllRegisters::$variant(hll) => Some(($precision, hll.to_asapv1().ok()?)),)*
+            }
+        }
+
+        /// The HLL state of `precision` the bytes encode.
+        fn decode_hll(precision: u8, asapv1: &[u8]) -> Option<HllRegisters> {
+            use asap_executor::summary_kernels::hll_sketch::hll_registers::*;
+            match precision {
+                $($precision => Some(HllRegisters::$variant(
+                    HyperLogLogImpl::<Classic, $storage>::from_asapv1(asapv1).ok()?,
+                )),)*
+                _ => None,
+            }
+        }
+    };
+}
+
+hll_precisions!(
+    P4(HllRegistersP4, 4),
+    P5(HllRegistersP5, 5),
+    P6(HllRegistersP6, 6),
+    P7(HllRegistersP7, 7),
+    P8(HllRegistersP8, 8),
+    P9(HllRegistersP9, 9),
+    P10(HllRegistersP10, 10),
+    P11(HllRegistersP11, 11),
+    P12(HllRegistersP12, 12),
+    P13(HllRegistersP13, 13),
+    P14(HllRegistersP14, 14),
+    P15(HllRegistersP15, 15),
+    P16(HllRegistersP16, 16),
+    P17(HllRegistersP17, 17),
+    P18(HllRegistersP18, 18),
+);
+
+/// The Hydra-Count-Min grids of one record, each stored once.
+#[derive(Default)]
+struct Grids {
+    bytes: Vec<Vec<u8>>,
+    /// Each grid's index, by its address.
+    index: std::collections::HashMap<usize, u32>,
+}
+
+impl Grids {
+    /// `grid`'s index, its bytes stored on first sight; `None` when it does
+    /// not encode.
+    fn index(&mut self, grid: &Arc<HydraCms>) -> Option<u32> {
+        let address = Arc::as_ptr(grid) as usize;
+        if let Some(&index) = self.index.get(&address) {
+            return Some(index);
+        }
+        let bytes = grid.sketch().to_asapv1().ok()?;
+        let index = self.bytes.len() as u32;
+        self.bytes.push(bytes);
+        self.index.insert(address, index);
+        Some(index)
+    }
+
+    /// Drops the grids after the first `mark` (a view left out).
+    fn forget_after(&mut self, mark: usize) {
+        self.bytes.truncate(mark);
+        self.index.retain(|_, index| (*index as usize) < mark);
+    }
+}
+
+/// `state` as stored bytes, when its kernel can be rebuilt from them; a
+/// Hydra-Count-Min group's grid goes to `grids`.
+fn encode_state(state: &dyn AggregateCore, grids: &mut Grids) -> Option<StoredValue> {
     let any = state.as_any();
-    let sketch = |kernel, bytes: Result<Vec<u8>, _>| {
+    let sketch = |kernel, bytes: Option<Vec<u8>>| {
         Some(StoredValue::Sketch {
             kernel,
-            asapv1: bytes.ok()?,
+            asapv1: bytes?,
         })
     };
     if let Some(exact) = any.downcast_ref::<ExactAccumulator>() {
@@ -398,15 +532,42 @@ fn encode_state(state: &dyn AggregateCore) -> Option<StoredValue> {
     } else if let Some(increase) = any.downcast_ref::<IncreaseAccumulator>() {
         Some(StoredValue::Increase(increase.clone()))
     } else if let Some(dd) = any.downcast_ref::<DDSketchAccumulator>() {
-        sketch(SketchKernel::DDSketch, dd.inner.to_asapv1())
+        sketch(SketchKernel::DDSketch, dd.sketch().to_asapv1().ok())
     } else if let Some(kll) = any.downcast_ref::<DatasketchesKLLAccumulator>() {
-        sketch(SketchKernel::Kll, kll.inner.to_asapv1())
+        sketch(SketchKernel::Kll, kll.sketch().to_asapv1().ok())
     } else if let Some(cms) = any.downcast_ref::<CountMinSketchAccumulator>() {
-        sketch(SketchKernel::CountMin, cms.inner.to_asapv1())
+        sketch(SketchKernel::CountMin, cms.sketch().to_asapv1().ok())
     } else if let Some(kmv) = any.downcast_ref::<KmvAccumulator>() {
-        sketch(SketchKernel::Kmv, kmv.inner.to_asapv1())
+        sketch(SketchKernel::Kmv, kmv.sketch().to_asapv1().ok())
     } else if let Some(hydra) = any.downcast_ref::<HydraKllSketchAccumulator>() {
-        sketch(SketchKernel::HydraKll, hydra.inner.to_asapv1())
+        sketch(SketchKernel::HydraKll, hydra.sketch().to_asapv1().ok())
+    } else if let Some(hll) = any.downcast_ref::<HllSketchAccumulator>() {
+        let (precision, bytes) = encode_hll(hll.sketch())?;
+        sketch(SketchKernel::Hll(precision), Some(bytes))
+    } else if let Some(frequency) = any.downcast_ref::<WeightedFrequency>() {
+        let (kind, bytes) = match frequency.sketch() {
+            FrequencySketch::Cms(s) => (FrequencyKind::Cms, s.to_asapv1().ok()?),
+            FrequencySketch::CountSketch(s) => (FrequencyKind::CountSketch, s.to_asapv1().ok()?),
+            FrequencySketch::CmsHeap(s) => (FrequencyKind::CmsHeap, s.to_asapv1().ok()?),
+            FrequencySketch::CountSketchHeap(s) => {
+                (FrequencyKind::CountSketchHeap, s.to_asapv1().ok()?)
+            }
+        };
+        sketch(SketchKernel::WeightedFrequency(kind), Some(bytes))
+    } else if let Some(univmon) = any.downcast_ref::<UnivMonAccumulator>() {
+        // A UnivMon whose heaps mix key types has no ASAPv1 encoding.
+        sketch(
+            SketchKernel::UnivMon {
+                max_key_bytes: univmon.max_key_bytes(),
+                inserted_key_bytes: univmon.inserted_key_bytes(),
+            },
+            univmon.sketch().to_asapv1().ok(),
+        )
+    } else if let Some(group) = any.downcast_ref::<HydraCmsGroup>() {
+        Some(StoredValue::HydraCmsGroup {
+            grid: grids.index(&group.grid)?,
+            group: group.group.clone(),
+        })
     } else {
         None
     }
@@ -415,28 +576,60 @@ fn encode_state(state: &dyn AggregateCore) -> Option<StoredValue> {
 /// The kernel state `kernel` rebuilds from `asapv1`.
 pub fn decode_sketch(kernel: SketchKernel, asapv1: &[u8]) -> Option<Arc<dyn AggregateCore>> {
     Some(match kernel {
-        SketchKernel::DDSketch => Arc::new(DDSketchAccumulator {
-            inner: DdSketch::from_asapv1(asapv1).ok()?,
-        }),
-        SketchKernel::Kll => Arc::new(DatasketchesKLLAccumulator {
-            inner: Kll::from_asapv1(asapv1).ok()?,
-        }),
-        SketchKernel::CountMin => Arc::new(CountMinSketchAccumulator {
-            inner: CountMinF64::from_asapv1(asapv1).ok()?,
-        }),
-        SketchKernel::Kmv => Arc::new(KmvAccumulator {
-            inner: Kmv::from_asapv1(asapv1).ok()?,
-        }),
-        SketchKernel::HydraKll => Arc::new(HydraKllSketchAccumulator {
-            inner: Hydra::from_asapv1(asapv1).ok()?,
-        }),
+        SketchKernel::DDSketch => Arc::new(
+            DDSketchAccumulator::restore_from_disk(DdSketch::from_asapv1(asapv1).ok()?).ok()?,
+        ),
+        SketchKernel::Kll => Arc::new(
+            DatasketchesKLLAccumulator::restore_from_disk(Kll::from_asapv1(asapv1).ok()?).ok()?,
+        ),
+        SketchKernel::CountMin => Arc::new(
+            CountMinSketchAccumulator::restore_from_disk(CountMinF64::from_asapv1(asapv1).ok()?)
+                .ok()?,
+        ),
+        SketchKernel::Kmv => {
+            Arc::new(KmvAccumulator::restore_from_disk(Kmv::from_asapv1(asapv1).ok()?).ok()?)
+        }
+        SketchKernel::HydraKll => Arc::new(
+            HydraKllSketchAccumulator::restore_from_disk(Hydra::from_asapv1(asapv1).ok()?).ok()?,
+        ),
+        SketchKernel::Hll(precision) => {
+            Arc::new(HllSketchAccumulator::restore_from_disk(decode_hll(precision, asapv1)?).ok()?)
+        }
+        SketchKernel::WeightedFrequency(kind) => {
+            let sketch = match kind {
+                FrequencyKind::Cms => {
+                    FrequencySketch::Cms(CountMinSketch::from_asapv1(asapv1).ok()?)
+                }
+                FrequencyKind::CountSketch => {
+                    FrequencySketch::CountSketch(CountSketch::from_asapv1(asapv1).ok()?)
+                }
+                FrequencyKind::CmsHeap => {
+                    FrequencySketch::CmsHeap(CountMinSketchWithHeap::from_asapv1(asapv1).ok()?)
+                }
+                FrequencyKind::CountSketchHeap => {
+                    FrequencySketch::CountSketchHeap(CountSketchWithHeap::from_asapv1(asapv1).ok()?)
+                }
+            };
+            Arc::new(WeightedFrequency::restore_from_disk(sketch).ok()?)
+        }
+        SketchKernel::UnivMon {
+            max_key_bytes,
+            inserted_key_bytes,
+        } => Arc::new(
+            UnivMonAccumulator::restore_from_disk(
+                UnivMon::from_asapv1(asapv1).ok()?,
+                max_key_bytes,
+                inserted_key_bytes,
+            )
+            .ok()?,
+        ),
     })
 }
 
 /// `state` as ASAPv1 bytes with its kernel, if it is one of the sketch
-/// kernels persisted.
+/// kernels persisted (Hydra-Count-Min groups aside, stored by grid).
 pub fn encode_sketch(state: &dyn AggregateCore) -> Option<(SketchKernel, Vec<u8>)> {
-    match encode_state(state)? {
+    match encode_state(state, &mut Grids::default())? {
         StoredValue::Sketch { kernel, asapv1 } => Some((kernel, asapv1)),
         _ => None,
     }
@@ -448,6 +641,7 @@ struct Texts<'a> {
     dictionary: &'a Dictionary,
     new: Vec<Arc<str>>,
     new_index: std::collections::HashMap<Arc<str>, u32>,
+    grids: Grids,
 }
 
 impl Texts<'_> {
@@ -482,7 +676,7 @@ fn encode_rows(batches: &[Batch], texts: &mut Texts) -> Option<Vec<Vec<StoredVal
         .map(|row| {
             row.into_iter()
                 .map(|value| match value {
-                    Value::Summary { state, .. } => encode_state(state.as_ref()),
+                    Value::Summary { state, .. } => encode_state(state.as_ref(), &mut texts.grids),
                     Value::Utf8(text) => Some(StoredValue::Text(texts.index(&text))),
                     plain => Some(StoredValue::Plain(plain)),
                 })
@@ -496,6 +690,7 @@ fn decode_rows(
     schema: &SchemaRef,
     rows: Vec<Vec<StoredValue>>,
     texts: &[Arc<str>],
+    grids: &[Option<Arc<HydraCms>>],
 ) -> Option<Batch> {
     let rows = rows
         .into_iter()
@@ -511,6 +706,10 @@ fn decode_rows(
                         StoredValue::Exact(state) => Arc::new(state),
                         StoredValue::Increase(state) => Arc::new(state),
                         StoredValue::Sketch { kernel, asapv1 } => decode_sketch(kernel, &asapv1)?,
+                        StoredValue::HydraCmsGroup { grid, group } => Arc::new(HydraCmsGroup {
+                            grid: grids.get(grid as usize)?.clone()?,
+                            group,
+                        }),
                     };
                     Some(Value::Summary {
                         family: field.dtype.clone(),
@@ -527,6 +726,7 @@ fn decode_rows(
 mod tests {
     use super::*;
     use asap_executor::planner::summary_type::SketchStatistic;
+    use asap_executor::values::Value;
 
     /// Two states of each persisted sketch kernel, built from different
     /// samples.
@@ -534,10 +734,8 @@ mod tests {
 
     fn states() -> Vec<StatePair> {
         let mut out: Vec<StatePair> = Vec::new();
-        let (mut a, mut b) = (
-            DDSketchAccumulator::new(0.01),
-            DDSketchAccumulator::new(0.01),
-        );
+        let empty_dd = DDSketchAccumulator::new(0.01).sketch().clone();
+        let (mut a, mut b) = (empty_dd.clone(), empty_dd);
         let (mut c, mut d) = (
             DatasketchesKLLAccumulator::new(200),
             DatasketchesKLLAccumulator::new(200),
@@ -551,28 +749,80 @@ mod tests {
             HydraKllSketchAccumulator::new(2, 8, 50),
             HydraKllSketchAccumulator::new(2, 8, 50),
         );
+        let (mut k, mut l) = (
+            HllSketchAccumulator::new(12).unwrap(),
+            HllSketchAccumulator::new(12).unwrap(),
+        );
+        use asap_executor::summary_kernels::weighted_frequency::FrequencyAlgorithm;
+        let frequency = |algorithm, capacity| {
+            (
+                WeightedFrequency::new(algorithm, 64, 3, capacity).unwrap(),
+                WeightedFrequency::new(algorithm, 64, 3, capacity).unwrap(),
+            )
+        };
+        let mut frequencies = [
+            (FrequencyKind::Cms, frequency(FrequencyAlgorithm::Cms, 0)),
+            (
+                FrequencyKind::CountSketch,
+                frequency(FrequencyAlgorithm::CountSketch, 0),
+            ),
+            (
+                FrequencyKind::CmsHeap,
+                frequency(FrequencyAlgorithm::Cms, 4),
+            ),
+            (
+                FrequencyKind::CountSketchHeap,
+                frequency(FrequencyAlgorithm::CountSketch, 4),
+            ),
+        ];
+        let (mut m, mut o) = (
+            UnivMonAccumulator::new(8, 3, 64, 4).unwrap(),
+            UnivMonAccumulator::new(8, 3, 64, 4).unwrap(),
+        );
         for n in 0..500 {
             let v = (n * 37 % 1000) as f64 + 0.5;
             let (first, key) = (n % 2 == 0, [format!("k{}", n % 5)]);
+            let text = [Value::Utf8(key[0].as_str().into())];
             if first {
-                a.inner.add(&v);
+                a.add(&v);
                 c.update(v);
                 e.update(&key[0], 1.0 + v);
                 g.insert_sample(v);
                 i.update(&key, v);
+                k.update(&v.to_le_bytes());
+                m.insert_sample(v % 50.0).unwrap();
             } else {
-                b.inner.add(&v);
+                b.add(&v);
                 d.update(v);
                 f.update(&key[0], 1.0 + v);
                 h.insert_sample(v);
                 j.update(&key, v);
+                l.update(&v.to_le_bytes());
+                o.insert_sample(v % 50.0).unwrap();
+            }
+            for (_, (x, y)) in &mut frequencies {
+                if first { x } else { y }.update(&text, 1.0 + v).unwrap();
             }
         }
-        out.push((SketchKernel::DDSketch, Box::new(a), Box::new(b)));
+        let dd = |sketch| Box::new(DDSketchAccumulator::restore_from_disk(sketch).unwrap());
+        out.push((SketchKernel::DDSketch, dd(a), dd(b)));
         out.push((SketchKernel::Kll, Box::new(c), Box::new(d)));
         out.push((SketchKernel::CountMin, Box::new(e), Box::new(f)));
         out.push((SketchKernel::Kmv, Box::new(g), Box::new(h)));
         out.push((SketchKernel::HydraKll, Box::new(i), Box::new(j)));
+        out.push((SketchKernel::Hll(12), Box::new(k), Box::new(l)));
+        for (kind, (x, y)) in frequencies {
+            out.push((
+                SketchKernel::WeightedFrequency(kind),
+                Box::new(x),
+                Box::new(y),
+            ));
+        }
+        let univmon = SketchKernel::UnivMon {
+            max_key_bytes: m.max_key_bytes(),
+            inserted_key_bytes: m.inserted_key_bytes(),
+        };
+        out.push((univmon, Box::new(m), Box::new(o)));
         out
     }
 
@@ -595,6 +845,38 @@ mod tests {
                     .map(|k| hydra.query_key(&[format!("k{k}")], 0.5))
                     .collect()
             }
+            SketchKernel::Hll(_) => {
+                let hll = any.downcast_ref::<HllSketchAccumulator>().unwrap();
+                hll.registers().iter().map(|&r| f64::from(r)).collect()
+            }
+            SketchKernel::WeightedFrequency(_) => {
+                let frequency = any.downcast_ref::<WeightedFrequency>().unwrap();
+                let mut out = frequency.counters().to_vec();
+                out.extend(frequency.rows(4).iter().flatten().filter_map(|v| match v {
+                    Value::Float64(x) => Some(*x),
+                    _ => None,
+                }));
+                out
+            }
+            SketchKernel::UnivMon { .. } => [
+                SketchStatistic::FrequencyL2,
+                SketchStatistic::FrequencyEntropy,
+            ]
+            .iter()
+            .map(|statistic| state.estimate(statistic).unwrap())
+            .collect(),
+        }
+    }
+
+    /// Readouts equal. A merged UnivMon is compared on its L2 estimate
+    /// only: its merge breaks heap ties in a nondeterministic order
+    /// (asap_sketchlib #266), so the heavy hitters, and the entropy read
+    /// from them, differ between two merges of the same states.
+    fn assert_same_readout(kernel: SketchKernel, a: Vec<f64>, b: Vec<f64>, what: &str) {
+        if matches!(kernel, SketchKernel::UnivMon { .. }) && what.ends_with("merge") {
+            assert_eq!(a[0], b[0], "{what}: {a:?} vs {b:?}");
+        } else {
+            assert_eq!(a, b, "{what}");
         }
     }
 
@@ -609,23 +891,66 @@ mod tests {
             let a2 = decode_sketch(kernel, &bytes_a).unwrap();
             let b2 = decode_sketch(kernel, &bytes_b).unwrap();
             assert_eq!(encode_sketch(a2.as_ref()).unwrap().1, bytes_a, "{kernel:?}");
-            assert_eq!(
+            assert_same_readout(
+                kernel,
                 readout(kernel, a.as_ref()),
                 readout(kernel, a2.as_ref()),
-                "{kernel:?}"
+                &format!("{kernel:?}"),
             );
             let merged = a.merge_with(b.as_ref()).unwrap();
             let merged2 = a2.merge_with(b2.as_ref()).unwrap();
-            assert_eq!(
+            assert_same_readout(
+                kernel,
                 readout(kernel, merged.as_ref()),
                 readout(kernel, merged2.as_ref()),
-                "{kernel:?} merge"
+                &format!("{kernel:?} merge"),
             );
-            assert_eq!(
-                encode_sketch(merged.as_ref()).unwrap().1,
-                encode_sketch(merged2.as_ref()).unwrap().1,
-                "{kernel:?} merge bytes"
-            );
+            if !matches!(kernel, SketchKernel::UnivMon { .. }) {
+                assert_eq!(
+                    encode_sketch(merged.as_ref()).unwrap().1,
+                    encode_sketch(merged2.as_ref()).unwrap().1,
+                    "{kernel:?} merge bytes"
+                );
+            }
+        }
+    }
+
+    /// A Hydra-Count-Min grid shared by several groups is stored once per
+    /// record, and its rebuilt grid answers every group's point counts as
+    /// before.
+    #[test]
+    fn hydra_cms_grids_are_stored_once_and_rebuilt() {
+        let mut grid = HydraCms::new(2, 16, 32, 3).unwrap();
+        for (group, item) in [("g1", "a"), ("g1", "b"), ("g2", "a"), ("g2", "a")] {
+            grid.count(group, item, 1).unwrap();
+        }
+        let grid = Arc::new(grid);
+        let groups: Vec<HydraCmsGroup> = ["g1", "g2"]
+            .iter()
+            .map(|group| HydraCmsGroup {
+                grid: grid.clone(),
+                group: group.to_string(),
+            })
+            .collect();
+        let mut grids = Grids::default();
+        let stored: Vec<StoredValue> = groups
+            .iter()
+            .map(|group| encode_state(group, &mut grids).unwrap())
+            .collect();
+        assert_eq!(grids.bytes.len(), 1);
+        let rebuilt = Arc::new(
+            HydraCms::restore_from_disk(Hydra::from_asapv1(&grids.bytes[0]).unwrap()).unwrap(),
+        );
+        for value in stored {
+            let StoredValue::HydraCmsGroup { grid: 0, group } = value else {
+                panic!("not a Hydra-Count-Min group");
+            };
+            for item in ["a", "b", "c"] {
+                assert_eq!(
+                    rebuilt.point(&group, item).unwrap(),
+                    grid.point(&group, item).unwrap()
+                );
+            }
         }
     }
 

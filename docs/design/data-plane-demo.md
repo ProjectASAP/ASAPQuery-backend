@@ -463,13 +463,17 @@ makes the first window complete.
 Plain values and exact states (sum, count, min, max, rate, increase, which
 the executor serializes) are stored by their serde form. Sketch states are
 stored as `asap_sketchlib`'s ASAPv1 bytes with the kernel they rebuild,
-read and rebuilt through the executor kernels' public sketch fields:
-DDSketch, KLL, Count-Min, KMV and Hydra-KLL. HyperLogLog, UnivMon,
-Count-Min with heap (weighted frequency) and Hydra-Count-Min kernels expose
-no public way to rebuild their state; a view holding one is not persisted,
-and `asap_view_windows_not_persisted_total` counts its (view, window)
-pairs. Persisting them needs a constructor from the sketch in the
-executor's kernels. Files are not compacted while running; records past
+read and rebuilt through every executor sketch kernel's one interface,
+`sketch()` and `restore_from_disk(...)`: DDSketch, KLL, Count-Min, KMV,
+HyperLogLog (with its precision), weighted frequency (Count-Min or Count
+Sketch, with or without a heap), UnivMon (with its key-byte counters),
+Hydra-KLL and Hydra-Count-Min, whose grid is shared by every group of a
+build and so is stored once per record and rebuilt once, shared again by
+the rows. A UnivMon whose heaps mix key types has no ASAPv1 encoding
+(`asap_sketchlib` #265); its (view, window) pairs are counted in
+`asap_view_windows_not_persisted_total` and the refresh is unaffected.
+UnivMon merges break heap ties in a nondeterministic order (#266), so a
+merge after reload may differ slightly from one before. Files are not compacted while running; records past
 retention are skipped at load.
 
 ### Measurements
@@ -681,7 +685,10 @@ this known limit and also runs workloads with more samples per window.
 - Query-time `Scan`s that read the open pane read every chunk published so
   far; an open pane holds one chunk per Remote Write request until the
   watermark passes it, so many small requests mean many small batches.
-- Views holding sketch states are not persisted yet.
+- A UnivMon view whose heaps mix key types is not persisted.
+- Follow-ups in the Planner executor (a few percent of query CPU in the
+  profile): DDSketch merge clones then merges (`summary::execute_merge`);
+  group tables are not pre-sized.
 - Sketch answers are within the plan's error target, not exact; only planned
   queries are answered.
 - Open: sharded ingestion and its cost-model terms; batch sketch updates.

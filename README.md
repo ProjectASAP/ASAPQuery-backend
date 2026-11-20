@@ -137,9 +137,12 @@ view already stores is not refreshed for it again. Raw samples and open
 windows are not persisted, so after a restart the windows whose samples
 arrived before it stay missing (`--stream-start-ms` no longer makes the
 first window complete). Sketch states are stored as `asap_sketchlib`'s
-ASAPv1 bytes for DDSketch, KLL, Count-Min, KMV and Hydra-KLL; views holding
-HyperLogLog, UnivMon, Count-Min-with-heap or Hydra-Count-Min states are not
-persisted (`asap_view_windows_not_persisted_total`).
+ASAPv1 bytes, read and rebuilt through each executor kernel's `sketch()`
+and `restore_from_disk`: DDSketch, KLL, Count-Min, KMV, HyperLogLog,
+weighted frequency (Count-Min or Count Sketch, with or without a heap),
+UnivMon, Hydra-KLL and Hydra-Count-Min (one grid per window, shared by its
+groups). A UnivMon whose heaps mix key types has no ASAPv1 encoding; its
+windows are counted in `asap_view_windows_not_persisted_total`.
 
 Not supported yet: views refreshed on first read (so the backend declares
 `query_time_results_retained: false`), SQL.
@@ -191,5 +194,5 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-The Planner revision is pinned in `Cargo.toml` (ASAPPlanner `1b18ad92`); see
+The Planner revision is pinned in `Cargo.toml` (ASAPPlanner `056da657`); see
 [scripts/ci/README.md](scripts/ci/README.md).
