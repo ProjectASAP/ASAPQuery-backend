@@ -173,7 +173,16 @@ HTTP queries ─► query workers: one query run per worker thread over
   holds the watermark back; the coordinator also wakes every 100 ms. The
   allowed lateness is unchanged. (Taking the minimum over the shards with
   samples queued, without a flush, raced with requests spread over
-  several shards and lost samples in the parity test.) It closes each
+  several shards and lost samples in the parity test.) Two rules make the
+  flush exact. A request is sent to its shards whole between two flushes,
+  never split by one (a read-write lock: requests share it, a flush takes
+  it alone). And a shard that has answered the flush may already run later
+  requests while slower shards still run earlier ones; the reports it
+  sends after its answer are held for the next pass, so its newer samples
+  move neither this pass's watermark nor the raw data its windows read.
+  (Applying them at once let the watermark pass samples the slower shards
+  had yet to append: windows closed without them, and sums and top-k came
+  out low.) It closes each
   refresh window the watermark passes and hands it, with every shard's raw
   data as it was then (shared `Arc` chunk lists, no copy), to the
   precompute thread,

@@ -37,9 +37,14 @@ fn plan_json() -> String {
 }
 
 fn data_plane(ingest_threads: usize) -> (Router, Arc<DataPlane>) {
+    data_plane_with(ingest_threads, 0)
+}
+
+fn data_plane_with(ingest_threads: usize, shard_delay_ms: u64) -> (Router, Arc<DataPlane>) {
     let options = EngineOptions {
         no_forward: true,
         ingest_threads,
+        shard_delay_ms,
         ingestion: IngestionOptions {
             allowed_lateness_ms: 0,
             stream_start_ms: Some(0),
@@ -92,6 +97,13 @@ async fn write(app: &Router, series: usize) {
 }
 
 async fn answer(app: &Router, time_s: i64) -> Value {
+    let (status, body) = status_and_answer(app, time_s).await;
+    assert_eq!(status, StatusCode::OK);
+    body
+}
+
+/// The status of `QUERY` at `time_s` and its body, results sorted by job.
+async fn status_and_answer(app: &Router, time_s: i64) -> (StatusCode, Value) {
     let uri = format!(
         "/api/v1/query?query={}&time={time_s}",
         form_urlencoded::byte_serialize(QUERY.as_bytes()).collect::<String>()
@@ -101,14 +113,13 @@ async fn answer(app: &Router, time_s: i64) -> Value {
         .oneshot(Request::get(uri).body(Body::empty()).unwrap())
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let mut body: Value =
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    body["data"]["result"]
-        .as_array_mut()
-        .unwrap()
-        .sort_by_key(|s| s["metric"]["job"].as_str().unwrap().to_string());
-    body
+    if let Some(result) = body["data"]["result"].as_array_mut() {
+        result.sort_by_key(|s| s["metric"]["job"].as_str().unwrap().to_string());
+    }
+    (status, body)
 }
 
 async fn barrier(app: &Router, time_ms: i64) {
@@ -141,6 +152,32 @@ async fn views_over_several_shards_equal_views_over_one() {
             "at {time_s}"
         );
     }
+}
+
+/// One shard runs ahead of seven slow ones: having answered a flush, it
+/// runs the next minute's batch while the others still run this one. Its
+/// newer samples must not move the watermark until every shard has run
+/// the batches before them, or windows close without the slow shards'
+/// samples. Every window answers as over one shard.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shard_running_ahead_does_not_close_windows_early() {
+    let (one, _one_state) = data_plane(1);
+    let (eight, _eight_state) = data_plane_with(8, 20);
+    for app in [&one, &eight] {
+        write(app, 64).await;
+        barrier(app, 600_000).await;
+    }
+    let mut answered = 0;
+    for time_s in (30..=600).step_by(10) {
+        let expected = status_and_answer(&one, time_s).await;
+        answered += usize::from(expected.0 == StatusCode::OK);
+        assert_eq!(
+            status_and_answer(&eight, time_s).await,
+            expected,
+            "at {time_s}"
+        );
+    }
+    assert!(answered >= 5, "{answered} times answered");
 }
 
 /// With one series, three of four shards never get a sample; the windows

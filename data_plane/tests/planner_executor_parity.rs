@@ -188,6 +188,12 @@ async fn data_plane(
     let options = EngineOptions {
         no_forward: true,
         result_cache,
+        // `PARITY_INGEST_THREADS=n` runs the data plane over `n` ingest
+        // shards.
+        ingest_threads: std::env::var("PARITY_INGEST_THREADS")
+            .map_or(EngineOptions::default().ingest_threads, |n| {
+                n.parse().unwrap()
+            }),
         ingestion: IngestionOptions {
             allowed_lateness_ms: 0,
             max_future_ms: 0,

@@ -54,6 +54,10 @@ pub struct EngineOptions {
     /// Ingest shard threads: each routes and appends the samples of the
     /// series hashed to it, into its own raw data.
     pub ingest_threads: usize,
+    /// For tests: how long every ingest shard but the first waits before
+    /// running each batch, so the first runs ahead of the others.
+    #[doc(hidden)]
+    pub shard_delay_ms: u64,
     /// Persist threads, each writing the view files of every
     /// `persist_threads`-th refresh group.
     pub persist_threads: usize,
@@ -109,6 +113,7 @@ impl Default for EngineOptions {
             max_precompute_backlog: 256,
             ingest_threads: std::thread::available_parallelism()
                 .map_or(1, |cores| (usize::from(cores) / 4).max(1)),
+            shard_delay_ms: 0,
             persist_threads: std::thread::available_parallelism()
                 .map_or(1, |cores| (usize::from(cores) / 4).clamp(1, 4)),
             max_persist_backlog_bytes: 256 << 20,
@@ -135,7 +140,9 @@ enum Command {
     /// A shard routed and appended a batch, or sealed and evicted.
     Report(ShardReport),
     /// A shard has run every message sent to it before a flush.
-    Flushed,
+    /// The shard numbered here has run every message sent to it before a
+    /// flush.
+    Flushed(usize),
     AdvanceWatermark {
         barrier_ms: i64,
         reply: oneshot::Sender<i64>,
@@ -213,6 +220,9 @@ struct Shared {
     shard_queued: Vec<AtomicU64>,
     /// What the shards route samples by, as the coordinator last published.
     routing: RwLock<Arc<Routing>>,
+    /// Held (shared) while a request is sent to its shards, and
+    /// exclusively while a flush is sent, so no flush splits a request.
+    admission: RwLock<()>,
     /// Windows closed and not yet refreshed.
     precompute_backlog: AtomicU64,
     /// Refreshed windows not yet written to the view files.
@@ -280,6 +290,7 @@ impl EngineHandle {
             queued_samples: AtomicU64::new(0),
             shard_queued: (0..shard_count).map(|_| AtomicU64::new(0)).collect(),
             routing: RwLock::new(Arc::new(ingestion.routing())),
+            admission: RwLock::new(()),
             precompute_backlog: AtomicU64::new(0),
             persist_backlog: AtomicU64::new(0),
             persist_queue: Mutex::new(0),
@@ -300,11 +311,16 @@ impl EngineHandle {
             let (coordinator, raw_data) = (commands.clone(), raw_data.clone());
             let shard_shared = shared.clone();
             let guard = RunningGuard(running.clone());
+            let delay = std::time::Duration::from_millis(if index == 0 {
+                0
+            } else {
+                options.shard_delay_ms
+            });
             std::thread::Builder::new()
                 .name(format!("ingest-{index}"))
                 .spawn(move || {
                     let _guard = guard;
-                    serve_shard(index, raw_data, messages, coordinator, &shard_shared);
+                    serve_shard(index, raw_data, messages, coordinator, &shard_shared, delay);
                 })?;
             shards.push(shard);
         }
@@ -396,6 +412,13 @@ impl EngineHandle {
             }
         }
         let counts: Vec<u64> = by_shard.iter().map(|s| s.len() as u64).collect();
+        // A request reaches its shards whole between two flushes, never
+        // split by one: a flush covers all of it or none.
+        let _sending = self
+            .shared
+            .admission
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         admit_shards(&self.shared.shard_queued, &counts, self.max_queued_samples)?;
         let shared = &self.shared;
         for (shard, samples) in by_shard.into_iter().enumerate() {
@@ -755,6 +778,15 @@ fn install(
     Ok((ingestion, precompute, query, plan.query_texts.clone()))
 }
 
+/// Sends every shard a flush, with no request half sent: each request
+/// already admitted is wholly before it in its shards' queues.
+fn flush(shards: &[Sender<ShardMessage>], shared: &Shared) {
+    let _admission = shared.admission.write().unwrap_or_else(|e| e.into_inner());
+    for shard in shards {
+        let _ = shard.send(ShardMessage::Flush);
+    }
+}
+
 /// An ingest shard: routes and appends the samples of its series to its
 /// own raw data, seals and evicts it when told, and reports its state to
 /// the coordinator after each message.
@@ -764,11 +796,15 @@ fn serve_shard(
     messages: Receiver<ShardMessage>,
     coordinator: Sender<Command>,
     shared: &Shared,
+    delay: std::time::Duration,
 ) {
     let mut newest_ms: Option<i64> = None;
     for message in messages {
         let (count, first_seen) = match message {
             ShardMessage::Samples(samples) => {
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
                 let timer = Timer::start();
                 let count = samples.len() as u64;
                 let routing = shared
@@ -797,7 +833,7 @@ fn serve_shard(
                 (0, Vec::new())
             }
             ShardMessage::Flush => {
-                if coordinator.send(Command::Flushed).is_err() {
+                if coordinator.send(Command::Flushed(index)).is_err() {
                     break;
                 }
                 continue;
@@ -852,8 +888,17 @@ fn serve_ingest(
     // A barrier met while draining reports waits for the next pass, which
     // runs it behind a flush.
     let mut deferred: Option<Command> = None;
+    // Reports a shard sent after answering a flush, of samples admitted
+    // after it: held for the next pass, so they move neither this pass's
+    // watermark nor its raw data. Without this, a shard that ran ahead
+    // would move the watermark past samples other shards have yet to
+    // append, and windows would close without them.
+    let mut held: Vec<ShardReport> = Vec::new();
     'serve: loop {
         let mut barriers = Vec::new();
+        for report in held.drain(..) {
+            apply(report, &mut ingestion, &mut raw_shards, &mut newest);
+        }
         let next = match deferred.take() {
             Some(command) => Ok(command),
             None => commands.recv_timeout(TICK),
@@ -862,21 +907,25 @@ fn serve_ingest(
             Ok(Command::Report(report)) => {
                 apply(report, &mut ingestion, &mut raw_shards, &mut newest)
             }
-            Ok(Command::Flushed) => {}
+            Ok(Command::Flushed(_)) => {}
             Ok(Command::AdvanceWatermark { barrier_ms, reply }) => {
                 // Behind every write acknowledged before: each shard runs
                 // the samples queued to it first.
                 barriers.push((barrier_ms, reply));
-                for shard in &shards {
-                    let _ = shard.send(ShardMessage::Flush);
-                }
-                let mut flushed = 0;
-                while flushed < shards.len() {
+                flush(&shards, shared);
+                let mut flushed = vec![false; shards.len()];
+                while !flushed.iter().all(|&f| f) {
                     match commands.recv() {
+                        Ok(Command::Report(report))
+                            if flushed[report.shard]
+                                || held.iter().any(|r| r.shard == report.shard) =>
+                        {
+                            held.push(report)
+                        }
                         Ok(Command::Report(report)) => {
                             apply(report, &mut ingestion, &mut raw_shards, &mut newest)
                         }
-                        Ok(Command::Flushed) => flushed += 1,
+                        Ok(Command::Flushed(shard)) => flushed[shard] = true,
                         Ok(Command::AdvanceWatermark { barrier_ms, reply }) => {
                             barriers.push((barrier_ms, reply))
                         }
@@ -889,12 +938,15 @@ fn serve_ingest(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
         // Drain the reports already sent, so one pass takes them all.
-        while let Ok(command) = commands.try_recv() {
+        while held.is_empty() {
+            let Ok(command) = commands.try_recv() else {
+                break;
+            };
             match command {
                 Command::Report(report) => {
                     apply(report, &mut ingestion, &mut raw_shards, &mut newest)
                 }
-                Command::Flushed => {}
+                Command::Flushed(_) => {}
                 command @ Command::AdvanceWatermark { .. } => {
                     deferred = Some(command);
                     break;
@@ -907,16 +959,20 @@ fn serve_ingest(
         // and the raw data they read is every shard's as of then.
         let newest_ms = newest.iter().flatten().copied().max();
         if newest_ms > ingestion.newest_sample_ms() {
-            for shard in &shards {
-                let _ = shard.send(ShardMessage::Flush);
-            }
-            let mut flushed = 0;
-            while flushed < shards.len() {
+            flush(&shards, shared);
+            let mut flushed = vec![false; shards.len()];
+            while !flushed.iter().all(|&f| f) {
                 match commands.recv() {
+                    Ok(Command::Report(report))
+                        if flushed[report.shard]
+                            || held.iter().any(|r| r.shard == report.shard) =>
+                    {
+                        held.push(report)
+                    }
                     Ok(Command::Report(report)) => {
                         apply(report, &mut ingestion, &mut raw_shards, &mut newest)
                     }
-                    Ok(Command::Flushed) => flushed += 1,
+                    Ok(Command::Flushed(shard)) => flushed[shard] = true,
                     Ok(command @ Command::AdvanceWatermark { .. }) => deferred = Some(command),
                     Ok(Command::Stop) | Err(_) => break 'serve,
                 }
