@@ -16,7 +16,7 @@
 //! `SERIES` series of every metric it names; `PACED=1` sends one scrape per
 //! second of wall time, as a live producer does, and reports the largest
 //! precompute and persist backlogs seen; `PERSIST_THREADS=n` sets the
-//! persist threads.
+//! persist threads; `INGEST_THREADS=n` the ingest shards.
 //!
 //! `cargo run --release -p data_plane --example ingest_bench -- SERIES SECONDS [PLAN] [REQUESTS] [PERSIST]`
 
@@ -98,9 +98,16 @@ async fn main() {
             ..IngestionOptions::default()
         },
         view_dir: view_dir.clone(),
+        ingest_threads: std::env::var("INGEST_THREADS")
+            .ok()
+            .map_or(EngineOptions::default().ingest_threads, |n| {
+                n.parse().unwrap()
+            }),
         persist_threads: std::env::var("PERSIST_THREADS")
             .ok()
-            .map_or(EngineOptions::default().persist_threads, |n| n.parse().unwrap()),
+            .map_or(EngineOptions::default().persist_threads, |n| {
+                n.parse().unwrap()
+            }),
         ..EngineOptions::default()
     };
     println!(

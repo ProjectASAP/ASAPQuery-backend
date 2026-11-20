@@ -40,8 +40,10 @@ through its `DataStore` interface:
   that refreshed them with the `(start, end]` they cover, and kept for the
   view's `retention_ms`.
 
-**Threads.** An `ingest` thread stores samples and closes windows, a
-`precompute` thread refreshes the closed windows' views, and `query-N`
+**Threads.** `--ingest-threads` `ingest-N` shards (default a quarter of the
+cores) each store the samples of their series, an `ingest` coordinator
+keeps the watermark over them and closes windows, a `precompute` thread
+refreshes the closed windows' views, and `query-N`
 worker threads (`--query-threads`, default one per core) answer queries,
 each over the newest published snapshot of the store. See
 [docs/design/data-plane-demo.md](docs/design/data-plane-demo.md).
@@ -65,10 +67,10 @@ query up to that far behind the newest refreshed window is still answered.
 
 Samples more than `--max-future-ms` (default 5 min) ahead of the wall clock
 are dropped. Remote Write gets 503 when admitting it would leave more than
-`--max-queued-samples` (default 2,000,000) samples waiting for the ingest
-thread (a request into an empty queue is always admitted), and 500 if the
-engine has stopped, which also makes `/-/ready` fail. The ingest thread
-waits while `--max-precompute-backlog` (default 256) closed windows await
+`--max-queued-samples` (default 2,000,000) samples waiting for an ingest
+shard it reaches (a request into an empty queue is always admitted), and
+500 if the engine has stopped, which also makes `/-/ready` fail. The
+ingest coordinator waits while `--max-precompute-backlog` (default 256) closed windows await
 their refresh, so a precompute that cannot keep up pushes back on Remote
 Write. `/api/v1/status/asap` reports the engine's `ingestion` counters
 (samples accepted, late, future, unrouted; windows refreshed, failed,

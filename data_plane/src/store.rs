@@ -374,11 +374,15 @@ fn column_kinds(metric: &str, request: &RawDataRequest) -> Result<Vec<ColumnKind
         .collect()
 }
 
+/// The raw data of every ingest shard: each shard holds the samples of
+/// its series; a read takes the union.
+pub type RawShards = Arc<Vec<Arc<RawData>>>;
+
 /// What one run reads: the store as it was when the run started. It
 /// records the first view read that found no rows, which says the query
 /// cannot be answered from what is stored (rather than that it failed).
 pub struct RunStore {
-    raw_data: Arc<RawData>,
+    raw_data: RawShards,
     views: Arc<ViewStore>,
     /// The query-time results the run reads, by node: each computed for
     /// the run's evaluation time before the run starts and held by the run.
@@ -387,13 +391,13 @@ pub struct RunStore {
 }
 
 impl RunStore {
-    pub fn new(raw_data: Arc<RawData>, views: Arc<ViewStore>) -> Self {
+    pub fn new(raw_data: RawShards, views: Arc<ViewStore>) -> Self {
         Self::with_query_time_results(raw_data, views, HashMap::new())
     }
 
     /// A run reading `query_time_results` besides the views and raw data.
     pub fn with_query_time_results(
-        raw_data: Arc<RawData>,
+        raw_data: RawShards,
         views: Arc<ViewStore>,
         query_time_results: HashMap<PhysicalASAPNodeId, Arc<Vec<Batch>>>,
     ) -> Self {
@@ -426,7 +430,10 @@ impl DataStore for RunStore {
                 "the data plane stores time series only, not {source:?}"
             )));
         };
-        let batches = self.raw_data.read(metric, request)?;
+        let mut batches = Vec::new();
+        for shard in self.raw_data.iter() {
+            batches.extend(shard.read(metric, request)?);
+        }
         Ok(stream::iter(batches)
             .map(move |batch| {
                 if context.is_cancelled() {
@@ -574,14 +581,14 @@ impl ViewStore {
 
 /// The newest published snapshot of the store, which every query run reads.
 pub struct PublishedStore {
-    snapshot: RwLock<(Arc<RawData>, Arc<ViewStore>)>,
+    snapshot: RwLock<(RawShards, Arc<ViewStore>)>,
     /// The watermark as of the raw data published, `i64::MIN` before the
     /// first: no sample at or before it is expected any more.
     watermark_ms: std::sync::atomic::AtomicI64,
 }
 
 impl PublishedStore {
-    pub fn new(raw_data: Arc<RawData>) -> Self {
+    pub fn new(raw_data: RawShards) -> Self {
         Self {
             snapshot: RwLock::new((raw_data, Arc::default())),
             watermark_ms: std::sync::atomic::AtomicI64::new(i64::MIN),
@@ -590,7 +597,7 @@ impl PublishedStore {
 
     /// Makes `raw_data`, complete through `watermark_ms`, what new runs
     /// read.
-    pub fn publish_raw_data(&self, raw_data: Arc<RawData>, watermark_ms: Option<i64>) {
+    pub fn publish_raw_data(&self, raw_data: RawShards, watermark_ms: Option<i64>) {
         self.snapshot.write().unwrap_or_else(|e| e.into_inner()).0 = raw_data;
         if let Some(watermark_ms) = watermark_ms {
             self.watermark_ms.fetch_max(watermark_ms, Ordering::SeqCst);
@@ -609,7 +616,7 @@ impl PublishedStore {
     }
 
     /// The newest published raw data and views.
-    pub fn snapshot(&self) -> (Arc<RawData>, Arc<ViewStore>) {
+    pub fn snapshot(&self) -> (RawShards, Arc<ViewStore>) {
         self.snapshot
             .read()
             .unwrap_or_else(|e| e.into_inner())

@@ -40,7 +40,7 @@ use asap_executor::runtime::{Limits, RunContext, Scope};
 use asap_executor::values::{Batch, SchemaRef};
 use futures::executor::block_on;
 
-use crate::store::{RawData, RawSample, RunStore, ViewStore};
+use crate::store::{RawData, RawSample, RawShards, RunStore, ViewStore};
 
 /// How ingestion treats sample times.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,7 +158,7 @@ impl RefreshGroup {
 pub struct Ingestion {
     groups: Vec<RefreshGroup>,
     /// Every metric a `Scan` reads; samples of others are not stored.
-    scanned_metrics: BTreeSet<String>,
+    scanned_metrics: Arc<BTreeSet<String>>,
     /// Raw-data pane width: the gcd of every group's window width and
     /// phase (and of `MAX_PANE_WIDTH_MS`), so panes tile every window.
     pane_width_ms: i64,
@@ -280,7 +280,7 @@ impl Ingestion {
         }
         let ingestion = Self {
             groups: clocks,
-            scanned_metrics: crate::store::scanned_metrics(&dag.nodes),
+            scanned_metrics: Arc::new(crate::store::scanned_metrics(&dag.nodes)),
             pane_width_ms,
             query_time_lookback_ms,
             options,
@@ -302,7 +302,7 @@ impl Ingestion {
     /// An empty raw store for the metrics the plan scans, in this
     /// ingestion's panes.
     pub fn raw_data(&self) -> RawData {
-        RawData::for_metrics(&self.scanned_metrics, self.pane_width_ms)
+        RawData::for_metrics(self.scanned_metrics.iter(), self.pane_width_ms)
     }
 
     /// The raw-data pane width.
@@ -323,95 +323,62 @@ impl Ingestion {
         from_samples.max(self.barrier_ms)
     }
 
-    /// [`Self::ingest_at`] the current wall-clock time.
-    pub fn ingest(&mut self, raw_data: &mut RawData, samples: Vec<RawSample>) -> Vec<ClosedWindow> {
-        self.ingest_at(raw_data, samples, wall_clock_ms())
+    /// What the ingest shards need to route samples now: the metrics a
+    /// `Scan` reads, each one's eviction cutoff, and whether a group still
+    /// waits for its first sample.
+    pub fn routing(&self) -> Routing {
+        Routing {
+            scanned_metrics: self.scanned_metrics.clone(),
+            max_future_ms: millis(self.options.max_future_ms),
+            cutoffs: self
+                .scanned_metrics
+                .iter()
+                .map(|metric| (metric.clone(), self.oldest_kept_ms(metric)))
+                .collect(),
+            groups_waiting: self.groups.iter().any(|g| g.refreshed_through.is_none()),
+        }
     }
 
-    /// Stores `samples`, then closes and returns every window the
-    /// watermark has passed, oldest first within each group, groups in
-    /// plan order (a group may read the views of an earlier one). `now_ms`
-    /// bounds sample times from above. Call [`Self::evict`] once the
-    /// windows' runs hold the raw data they read.
-    pub fn ingest_at(
-        &mut self,
-        raw_data: &mut RawData,
-        samples: Vec<RawSample>,
-        now_ms: i64,
-    ) -> Vec<ClosedWindow> {
+    /// Takes in what a shard routed at `now_ms`: each metric's first
+    /// sample starts the groups scanning it.
+    pub fn observe(&mut self, first_seen: &[(Arc<str>, i64)], now_ms: i64) {
         self.newest_clock_ms = self.newest_clock_ms.max(Some(now_ms));
-        let latest_allowed_ms = now_ms.saturating_add(millis(self.options.max_future_ms));
-        // Per metric of this request: whether a `Scan` reads it, and the
-        // eviction cutoff as of its first routed sample (`None` before). Samples of one
-        // metric usually come together, so the last metric is checked by
-        // pointer first.
-        let mut metrics: Vec<(std::sync::Arc<str>, bool, Option<Option<i64>>)> = Vec::new();
-        let mut last: Option<usize> = None;
-        let mut groups_waiting = self.groups.iter().any(|g| g.refreshed_through.is_none());
-        let mut accepted = Vec::with_capacity(samples.len());
-        for sample in samples {
-            let metric = &sample.labels.metric;
-            let known = last
-                .filter(|&i| std::sync::Arc::ptr_eq(&metrics[i].0, metric))
-                .or_else(|| metrics.iter().position(|(m, _, _)| m == metric));
-            let index = match known {
-                Some(index) => index,
-                None => {
-                    let routed = self.scanned_metrics.contains(&**metric);
-                    metrics.push((metric.clone(), routed, None));
-                    metrics.len() - 1
-                }
-            };
-            last = Some(index);
-            if !metrics[index].1 {
-                self.stats.samples_unrouted += 1;
-                continue;
-            }
-            if sample.timestamp_ms > latest_allowed_ms {
-                self.stats.samples_dropped_future += 1;
-                continue;
-            }
-            if groups_waiting {
-                self.start_groups(metric, sample.timestamp_ms);
-                groups_waiting = self.groups.iter().any(|g| g.refreshed_through.is_none());
-            }
-            let cutoff = match metrics[index].2 {
-                Some(cutoff) => cutoff,
-                None => {
-                    let cutoff = self.oldest_kept_ms(metric);
-                    metrics[index].2 = Some(cutoff);
-                    cutoff
-                }
-            };
-            if cutoff.is_some_and(|cutoff| sample.timestamp_ms <= cutoff) {
-                self.stats.samples_dropped_late += 1;
-                continue;
-            }
-            self.newest_sample_ms = self.newest_sample_ms.max(Some(sample.timestamp_ms));
-            accepted.push(sample);
-            self.stats.samples_accepted += 1;
+        for (metric, timestamp_ms) in first_seen {
+            self.start_groups(metric, *timestamp_ms);
         }
-        raw_data.append(&accepted);
-        self.close_windows(raw_data)
+    }
+
+    /// The newest sample time the watermark follows.
+    pub fn newest_sample_ms(&self) -> Option<i64> {
+        self.newest_sample_ms
+    }
+
+    /// Sets the newest sample time the watermark follows (it never goes
+    /// back): across shards, the oldest newest sample of the shards with
+    /// samples still queued, or the newest of all when none has.
+    pub fn advance_newest_sample(&mut self, newest_ms: Option<i64>) {
+        self.newest_sample_ms = self.newest_sample_ms.max(newest_ms);
+    }
+
+    /// Closes and returns every window the watermark has passed, oldest
+    /// first within each group, groups in plan order (a group may read the
+    /// views of an earlier one).
+    pub fn close(&mut self) -> Vec<ClosedWindow> {
+        self.close_windows()
     }
 
     /// [`Self::advance_watermark_at`] the current wall-clock time.
-    pub fn advance_watermark(
-        &mut self,
-        raw_data: &mut RawData,
-        barrier_ms: i64,
-    ) -> (i64, Vec<ClosedWindow>) {
-        self.advance_watermark_at(raw_data, barrier_ms, wall_clock_ms())
+    pub fn advance_watermark(&mut self, barrier_ms: i64) -> (i64, Vec<ClosedWindow>) {
+        self.advance_watermark_at(barrier_ms, wall_clock_ms())
     }
 
     /// An event-time barrier: the producer states that every sample at or
     /// before `barrier_ms` has been written, so every window ending at or
     /// before it closes without a later sample. Capped at `now_ms`; a
     /// repeated or lower barrier does nothing. Returns the barrier in force
-    /// and the windows it closed, as [`Self::ingest_at`] does.
+    /// and the windows it closed, as [`Self::close`] does.
     pub fn advance_watermark_at(
         &mut self,
-        raw_data: &mut RawData,
         barrier_ms: i64,
         now_ms: i64,
     ) -> (i64, Vec<ClosedWindow>) {
@@ -421,7 +388,7 @@ impl Ingestion {
             return (current, Vec::new());
         }
         self.barrier_ms = Some(barrier_ms);
-        (barrier_ms, self.close_windows(raw_data))
+        (barrier_ms, self.close_windows())
     }
 
     /// Starts each group scanning `metric` at its first sample: its first
@@ -478,7 +445,7 @@ impl Ingestion {
 
     /// Closes every window the watermark has passed and compacts the
     /// panes it has passed.
-    fn close_windows(&mut self, raw_data: &mut RawData) -> Vec<ClosedWindow> {
+    fn close_windows(&mut self) -> Vec<ClosedWindow> {
         let Some(watermark) = self.watermark_ms() else {
             return Vec::new();
         };
@@ -507,22 +474,101 @@ impl Ingestion {
             }
             group.refreshed_through = Some(through);
         }
-        raw_data.seal_through(watermark);
         closed
     }
+}
 
-    /// Drops the raw panes nothing reads any more: older than every window
-    /// still to be closed and than what a query-time `Scan` reads back.
-    pub fn evict(&self, raw_data: &mut RawData) {
-        let metrics: BTreeSet<&String> = self
-            .groups
-            .iter()
-            .flat_map(|g| g.metrics.iter())
-            .chain(self.query_time_lookback_ms.keys())
-            .collect();
-        for metric in metrics {
-            if let Some(cutoff) = self.oldest_kept_ms(metric) {
-                raw_data.evict_through(metric, cutoff);
+/// What an ingest shard routes samples by: a snapshot of the ingestion's
+/// state, published after every change.
+#[derive(Debug, Clone, Default)]
+pub struct Routing {
+    scanned_metrics: Arc<BTreeSet<String>>,
+    max_future_ms: i64,
+    /// Each scanned metric's eviction cutoff: samples at or before it are
+    /// late (`None`: all are kept).
+    cutoffs: HashMap<String, Option<i64>>,
+    /// Some group has not seen its first sample: report each metric's
+    /// first sample.
+    groups_waiting: bool,
+}
+
+/// One batch of samples routed by a shard.
+#[derive(Debug, Default)]
+pub struct Routed {
+    pub accepted: Vec<RawSample>,
+    /// The sample counters of the batch.
+    pub stats: IngestionStats,
+    /// The newest accepted sample.
+    pub newest_ms: Option<i64>,
+    /// Each metric's first routed sample, while a group waits for one.
+    pub first_seen: Vec<(Arc<str>, i64)>,
+}
+
+impl Routing {
+    /// Routes `samples` at `now_ms`: drops samples of metrics no `Scan`
+    /// reads, samples more than `max_future_ms` ahead of `now_ms`, and
+    /// samples at or before their metric's eviction cutoff.
+    pub fn route(&self, samples: Vec<RawSample>, now_ms: i64) -> Routed {
+        let latest_allowed_ms = now_ms.saturating_add(self.max_future_ms);
+        let mut routed = Routed {
+            accepted: Vec::with_capacity(samples.len()),
+            ..Routed::default()
+        };
+        // Samples of one metric usually come together: the last metric is
+        // checked by pointer first.
+        let mut metrics: Vec<(Arc<str>, bool, Option<i64>, bool)> = Vec::new();
+        let mut last: Option<usize> = None;
+        for sample in samples {
+            let metric = &sample.labels.metric;
+            let known = last
+                .filter(|&i| Arc::ptr_eq(&metrics[i].0, metric))
+                .or_else(|| metrics.iter().position(|(m, ..)| m == metric));
+            let index = match known {
+                Some(index) => index,
+                None => {
+                    let routed = self.scanned_metrics.contains(&**metric);
+                    let cutoff = self.cutoffs.get(&**metric).copied().flatten();
+                    metrics.push((metric.clone(), routed, cutoff, false));
+                    metrics.len() - 1
+                }
+            };
+            last = Some(index);
+            let (_, is_routed, cutoff, seen) = &mut metrics[index];
+            if !*is_routed {
+                routed.stats.samples_unrouted += 1;
+                continue;
+            }
+            if sample.timestamp_ms > latest_allowed_ms {
+                routed.stats.samples_dropped_future += 1;
+                continue;
+            }
+            if self.groups_waiting && !*seen {
+                *seen = true;
+                routed
+                    .first_seen
+                    .push((metric.clone(), sample.timestamp_ms));
+            }
+            if cutoff.is_some_and(|cutoff| sample.timestamp_ms <= cutoff) {
+                routed.stats.samples_dropped_late += 1;
+                continue;
+            }
+            routed.newest_ms = routed.newest_ms.max(Some(sample.timestamp_ms));
+            routed.accepted.push(sample);
+            routed.stats.samples_accepted += 1;
+        }
+        routed
+    }
+
+    /// Seals and evicts `raw_data` as the ingestion stands: compacts the
+    /// panes the watermark has passed and drops the panes at or before
+    /// each metric's cutoff.
+    pub fn maintain(&self, raw_data: &mut RawData, watermark_ms: Option<i64>) {
+        if let Some(watermark_ms) = watermark_ms {
+            raw_data.seal_through(watermark_ms);
+        }
+        for (metric, cutoff) in &self.cutoffs {
+            if let Some(cutoff) = cutoff {
+                raw_data.evict_through(metric, *cutoff);
             }
         }
     }
@@ -554,7 +600,7 @@ impl Precompute {
     pub fn refresh(
         &self,
         window: ClosedWindow,
-        raw_data: Arc<RawData>,
+        raw_data: RawShards,
         views: &mut Arc<ViewStore>,
     ) -> Result<Refreshed, asap_executor::Error> {
         let group = &self.runs[window.group];

@@ -34,7 +34,7 @@ use asap_planner::InstallablePlan;
 use futures::executor::block_on;
 use futures::StreamExt;
 
-use crate::store::{PublishedStore, QueryTimeResults, RawData, RunStore, ViewStore};
+use crate::store::{PublishedStore, QueryTimeResults, RawShards, RunStore, ViewStore};
 
 /// One series of an instant-query result.
 #[derive(Debug, Clone, PartialEq)]
@@ -242,7 +242,7 @@ impl QueryEngine {
 /// What one evaluation reads: the raw data and views published when it
 /// started, and the watermark then.
 struct Snapshot {
-    raw_data: Arc<RawData>,
+    raw_data: RawShards,
     views: Arc<ViewStore>,
     watermark_ms: Option<i64>,
 }

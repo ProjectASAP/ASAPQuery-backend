@@ -50,6 +50,10 @@ struct Args {
     /// waits (and Remote Write then gets 503).
     #[arg(long, default_value_t = EngineOptions::default().max_precompute_backlog)]
     max_precompute_backlog: usize,
+    /// Ingest shard threads: each routes and appends the samples of the
+    /// series hashed to it. Default: a quarter of the cores, at least 1.
+    #[arg(long, default_value_t = EngineOptions::default().ingest_threads)]
+    ingest_threads: usize,
     /// Threads that write the view files (each the files of every n-th
     /// refresh group). Default: a quarter of the cores, from 1 to 4.
     #[arg(long, default_value_t = EngineOptions::default().persist_threads)]
@@ -115,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
                 },
                 max_queued_samples: args.max_queued_samples,
                 max_precompute_backlog: args.max_precompute_backlog,
+                ingest_threads: args.ingest_threads,
                 persist_threads: args.persist_threads,
                 max_persist_backlog_bytes: args.max_persist_backlog_bytes,
                 persist_delay_ms: 0,

@@ -20,7 +20,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 
 use asap_executor::runtime::Limits;
 use asap_planner::InstallablePlan;
@@ -28,12 +28,14 @@ use asap_planner::InstallablePlan;
 use tokio::sync::oneshot;
 
 use crate::ingestion::{
-    ClosedWindow, Ingestion, IngestionOptions, IngestionStats, Precompute, Refreshed,
+    ClosedWindow, Ingestion, IngestionOptions, IngestionStats, Precompute, Refreshed, Routing,
 };
 use crate::metrics::{Gauges, Metrics, Timer};
 use crate::persist::{plan_hash, ViewFiles};
 use crate::query::{QueryEngine, ResultSample, Unanswered};
-use crate::store::{PublishedStore, QueryTimeResults, RawData, RawSample, RunStore, ViewStore};
+use crate::store::{
+    PublishedStore, QueryTimeResults, RawData, RawSample, RawShards, RunStore, ViewStore,
+};
 use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
 use asap_executor::values::Batch;
 
@@ -48,6 +50,9 @@ pub struct EngineOptions {
     /// Refresh windows closed and not yet refreshed beyond which the
     /// ingest thread waits for the precompute thread.
     pub max_precompute_backlog: usize,
+    /// Ingest shard threads: each routes and appends the samples of the
+    /// series hashed to it, into its own raw data.
+    pub ingest_threads: usize,
     /// Persist threads, each writing the view files of every
     /// `persist_threads`-th refresh group.
     pub persist_threads: usize,
@@ -94,6 +99,8 @@ impl Default for EngineOptions {
             // Two Remote Write requests of the default sample limit.
             max_queued_samples: 2_000_000,
             max_precompute_backlog: 256,
+            ingest_threads: std::thread::available_parallelism()
+                .map_or(1, |cores| (usize::from(cores) / 4).max(1)),
             persist_threads: std::thread::available_parallelism()
                 .map_or(1, |cores| (usize::from(cores) / 4).clamp(1, 4)),
             max_persist_backlog_bytes: 256 << 20,
@@ -113,9 +120,12 @@ impl Default for EngineOptions {
 
 type Reply<T> = oneshot::Sender<Result<T, Unanswered>>;
 
-/// What the ingest thread does next.
+/// What the ingest coordinator does next.
 enum Command {
-    Ingest(Vec<RawSample>),
+    /// A shard routed and appended a batch, or sealed and evicted.
+    Report(ShardReport),
+    /// A shard has run every message sent to it before a flush.
+    Flushed,
     AdvanceWatermark {
         barrier_ms: i64,
         reply: oneshot::Sender<i64>,
@@ -123,11 +133,35 @@ enum Command {
     Stop,
 }
 
+/// A shard's state after its last message.
+struct ShardReport {
+    shard: usize,
+    raw_data: Arc<RawData>,
+    /// The newest sample the shard holds.
+    newest_ms: Option<i64>,
+    /// Each metric's first sample, while a group waits for one.
+    first_seen: Vec<(Arc<str>, i64)>,
+    now_ms: i64,
+}
+
+/// What an ingest shard does next.
+enum ShardMessage {
+    Samples(Vec<RawSample>),
+    /// Seal the panes through the watermark and evict by the routing's
+    /// cutoffs.
+    Maintain {
+        routing: Arc<Routing>,
+        watermark_ms: Option<i64>,
+    },
+    /// Report `Flushed` once every message before is run.
+    Flush,
+}
+
 /// What the precompute thread does next.
 enum PrecomputeJob {
     Refresh {
         window: ClosedWindow,
-        raw_data: Arc<RawData>,
+        raw_data: RawShards,
     },
     /// Answers `barrier_ms` once every window queued before is refreshed.
     Barrier {
@@ -151,6 +185,8 @@ pub enum IngestError {
 #[derive(Clone)]
 pub struct EngineHandle {
     commands: Sender<Command>,
+    /// Each ingest shard's queue; a sample goes to the shard of its series.
+    shards: Vec<Sender<ShardMessage>>,
     /// Queries for the worker threads.
     queries: Sender<QueryJob>,
     query: Arc<QueryEngine>,
@@ -161,8 +197,12 @@ pub struct EngineHandle {
 
 /// What the engine's threads publish to the HTTP side and to each other.
 struct Shared {
-    /// Samples sent to the ingest thread and not yet ingested.
+    /// Samples sent to the ingest shards and not yet ingested.
     queued_samples: AtomicU64,
+    /// The same, per shard.
+    shard_queued: Vec<AtomicU64>,
+    /// What the shards route samples by, as the coordinator last published.
+    routing: RwLock<Arc<Routing>>,
     /// Windows closed and not yet refreshed.
     precompute_backlog: AtomicU64,
     /// Refreshed windows not yet written to the view files.
@@ -215,7 +255,10 @@ impl EngineHandle {
             }
             None => None,
         };
-        let raw_data = Arc::new(ingestion.raw_data());
+        let shard_count = options.ingest_threads.max(1);
+        let raw_shards: Vec<Arc<RawData>> = (0..shard_count)
+            .map(|_| Arc::new(ingestion.raw_data()))
+            .collect();
         let groups: Vec<(i64, Vec<String>)> = precompute
             .groups()
             .into_iter()
@@ -225,13 +268,15 @@ impl EngineHandle {
         let running = Arc::new(AtomicBool::new(true));
         let shared = Arc::new(Shared {
             queued_samples: AtomicU64::new(0),
+            shard_queued: (0..shard_count).map(|_| AtomicU64::new(0)).collect(),
+            routing: RwLock::new(Arc::new(ingestion.routing())),
             precompute_backlog: AtomicU64::new(0),
             persist_backlog: AtomicU64::new(0),
             persist_queue: Mutex::new(0),
             persist_room: Condvar::new(),
             running: running.clone(),
             stats: Mutex::new(IngestionStats::default()),
-            published: PublishedStore::new(raw_data.clone()),
+            published: PublishedStore::new(Arc::new(raw_shards.clone())),
             precompute_gate: Mutex::new(()),
             metrics,
         });
@@ -239,13 +284,35 @@ impl EngineHandle {
         let (jobs, job_receiver) = sync_channel(options.max_precompute_backlog.max(1));
         let (queries, query_receiver) = channel::<QueryJob>();
 
+        let mut shards = Vec::new();
+        for (index, raw_data) in raw_shards.iter().enumerate() {
+            let (shard, messages) = channel();
+            let (coordinator, raw_data) = (commands.clone(), raw_data.clone());
+            let shard_shared = shared.clone();
+            let guard = RunningGuard(running.clone());
+            std::thread::Builder::new()
+                .name(format!("ingest-{index}"))
+                .spawn(move || {
+                    let _guard = guard;
+                    serve_shard(index, raw_data, messages, coordinator, &shard_shared);
+                })?;
+            shards.push(shard);
+        }
         let ingest_guard = RunningGuard(running.clone());
         let ingest_shared = shared.clone();
+        let coordinator_shards = shards.clone();
         std::thread::Builder::new()
             .name("ingest".into())
             .spawn(move || {
                 let _guard = ingest_guard;
-                serve_ingest(ingestion, raw_data, command_receiver, jobs, &ingest_shared);
+                serve_ingest(
+                    ingestion,
+                    raw_shards,
+                    coordinator_shards,
+                    command_receiver,
+                    jobs,
+                    &ingest_shared,
+                );
             })?;
         let views = Arc::new(views);
         shared.published.publish_views(views.clone());
@@ -293,6 +360,7 @@ impl EngineHandle {
         )?;
         let handle = Self {
             commands,
+            shards,
             queries,
             query,
             query_threads: options.query_threads.max(1),
@@ -308,21 +376,34 @@ impl EngineHandle {
         if !self.is_running() {
             return Err(IngestError::Stopped);
         }
-        let queued_samples = &self.shared.queued_samples;
-        let count = samples.len() as u64;
-        let mut queued = queued_samples.load(Ordering::SeqCst);
-        loop {
-            let total = admit(queued, count, self.max_queued_samples)?;
-            match queued_samples.compare_exchange(queued, total, Ordering::SeqCst, Ordering::SeqCst)
-            {
-                Ok(_) => break,
-                Err(current) => queued = current,
+        // Each series' samples go to one shard, in order.
+        let mut by_shard: Vec<Vec<RawSample>> = vec![Vec::new(); self.shards.len()];
+        if self.shards.len() == 1 {
+            by_shard[0] = samples;
+        } else {
+            for sample in samples {
+                by_shard[sample.labels.id as usize % self.shards.len()].push(sample);
             }
         }
-        self.commands.send(Command::Ingest(samples)).map_err(|_| {
-            queued_samples.fetch_sub(count, Ordering::SeqCst);
-            IngestError::Stopped
-        })
+        let counts: Vec<u64> = by_shard.iter().map(|s| s.len() as u64).collect();
+        admit_shards(&self.shared.shard_queued, &counts, self.max_queued_samples)?;
+        let shared = &self.shared;
+        for (shard, samples) in by_shard.into_iter().enumerate() {
+            let count = samples.len() as u64;
+            if count == 0 {
+                continue;
+            }
+            shared.queued_samples.fetch_add(count, Ordering::SeqCst);
+            if self.shards[shard]
+                .send(ShardMessage::Samples(samples))
+                .is_err()
+            {
+                shared.queued_samples.fetch_sub(count, Ordering::SeqCst);
+                shared.shard_queued[shard].fetch_sub(count, Ordering::SeqCst);
+                return Err(IngestError::Stopped);
+            }
+        }
+        Ok(())
     }
 
     /// Answers the planned `query` at `time_ms` on a query worker, from
@@ -473,6 +554,39 @@ impl EngineHandle {
     }
 }
 
+/// Admits `counts[i]` samples to shard `i`'s queue `queued[i]` for every
+/// shard, or none: `Busy` if any shard's queue would pass `max_queued`
+/// ([`admit`]), and then no queue changes, so a request is taken whole or
+/// not at all.
+fn admit_shards(queued: &[AtomicU64], counts: &[u64], max_queued: u64) -> Result<(), IngestError> {
+    let mut admitted: Vec<usize> = Vec::new();
+    for (shard, &count) in counts.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let queue = &queued[shard];
+        let mut current = queue.load(Ordering::SeqCst);
+        let result = loop {
+            let total = match admit(current, count, max_queued) {
+                Ok(total) => total,
+                Err(error) => break Err(error),
+            };
+            match queue.compare_exchange(current, total, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break Ok(()),
+                Err(now) => current = now,
+            }
+        };
+        if let Err(error) = result {
+            for shard in admitted {
+                queued[shard].fetch_sub(counts[shard], Ordering::SeqCst);
+            }
+            return Err(error);
+        }
+        admitted.push(shard);
+    }
+    Ok(())
+}
+
 /// The queue length after admitting `count` samples to a queue of
 /// `queued`: admitted while the total stays within `max_queued`, and always
 /// into an empty queue, so a bound smaller than one request cannot refuse
@@ -611,74 +725,226 @@ fn install(
     Ok((ingestion, precompute, query, plan.query_texts.clone()))
 }
 
-/// The ingest thread: runs `commands` in order over its copy of the raw
-/// data, publishing it after each, and queues the windows each closes.
+/// An ingest shard: routes and appends the samples of its series to its
+/// own raw data, seals and evicts it when told, and reports its state to
+/// the coordinator after each message.
+fn serve_shard(
+    index: usize,
+    mut raw_data: Arc<RawData>,
+    messages: Receiver<ShardMessage>,
+    coordinator: Sender<Command>,
+    shared: &Shared,
+) {
+    let mut newest_ms: Option<i64> = None;
+    for message in messages {
+        let (count, first_seen) = match message {
+            ShardMessage::Samples(samples) => {
+                let timer = Timer::start();
+                let count = samples.len() as u64;
+                let routing = shared
+                    .routing
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let routed = routing.route(samples, crate::ingestion::wall_clock_ms());
+                Arc::make_mut(&mut raw_data).append(&routed.accepted);
+                newest_ms = newest_ms.max(routed.newest_ms);
+                {
+                    let mut stats = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
+                    stats.samples_accepted += routed.stats.samples_accepted;
+                    stats.samples_dropped_late += routed.stats.samples_dropped_late;
+                    stats.samples_dropped_future += routed.stats.samples_dropped_future;
+                    stats.samples_unrouted += routed.stats.samples_unrouted;
+                }
+                shared.metrics.append.record(timer);
+                (count, routed.first_seen)
+            }
+            ShardMessage::Maintain {
+                routing,
+                watermark_ms,
+            } => {
+                routing.maintain(Arc::make_mut(&mut raw_data), watermark_ms);
+                (0, Vec::new())
+            }
+            ShardMessage::Flush => {
+                if coordinator.send(Command::Flushed).is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
+        let report = ShardReport {
+            shard: index,
+            raw_data: raw_data.clone(),
+            newest_ms,
+            first_seen,
+            now_ms: crate::ingestion::wall_clock_ms(),
+        };
+        let sent = coordinator.send(Command::Report(report));
+        // Counted out after the report, so the coordinator never takes the
+        // shard for caught up before it knows the samples' times.
+        shared.shard_queued[index].fetch_sub(count, Ordering::SeqCst);
+        shared.queued_samples.fetch_sub(count, Ordering::SeqCst);
+        if sent.is_err() {
+            break;
+        }
+    }
+}
+
+/// The ingest coordinator: keeps the watermark over the shards, closes the
+/// windows it passes and queues their refreshes over every shard's raw data
+/// as it was then, publishes the raw data and the routing, and has the
+/// shards seal and evict as the watermark moves. The watermark follows the
+/// newest sample of any shard; before it moves, every shard runs the
+/// samples queued to it (a flush), so a window closes over every sample
+/// admitted before. Shards with nothing queued answer the flush at once,
+/// so idle shards never hold the watermark; the coordinator also wakes
+/// every tick.
 fn serve_ingest(
     mut ingestion: Ingestion,
-    mut raw_data: Arc<RawData>,
+    mut raw_shards: Vec<Arc<RawData>>,
+    shards: Vec<Sender<ShardMessage>>,
     commands: Receiver<Command>,
     jobs: SyncSender<PrecomputeJob>,
     shared: &Shared,
 ) {
-    for command in commands {
-        let timer = Timer::start();
-        let (count, barrier) = match command {
-            Command::Ingest(samples) => {
-                let count = samples.len() as u64;
-                let closed = ingestion.ingest(Arc::make_mut(&mut raw_data), samples);
-                if !queue_refreshes(&closed, &raw_data, &jobs, shared) {
-                    break;
-                }
-                (count, None)
-            }
-            Command::AdvanceWatermark { barrier_ms, reply } => {
-                let (barrier_ms, closed) =
-                    ingestion.advance_watermark(Arc::make_mut(&mut raw_data), barrier_ms);
-                if !queue_refreshes(&closed, &raw_data, &jobs, shared) {
-                    break;
-                }
-                (0, Some((barrier_ms, reply)))
-            }
-            Command::Stop => break,
+    const TICK: std::time::Duration = std::time::Duration::from_millis(100);
+    let mut newest: Vec<Option<i64>> = vec![None; shards.len()];
+    let mut sealed_through: Option<i64> = None;
+    let apply = |report: ShardReport,
+                 ingestion: &mut Ingestion,
+                 raw_shards: &mut Vec<Arc<RawData>>,
+                 newest: &mut Vec<Option<i64>>| {
+        ingestion.observe(&report.first_seen, report.now_ms);
+        raw_shards[report.shard] = report.raw_data;
+        newest[report.shard] = report.newest_ms;
+    };
+    // A barrier met while draining reports waits for the next pass, which
+    // runs it behind a flush.
+    let mut deferred: Option<Command> = None;
+    'serve: loop {
+        let mut barriers = Vec::new();
+        let next = match deferred.take() {
+            Some(command) => Ok(command),
+            None => commands.recv_timeout(TICK),
         };
-        // The refreshes queued hold the raw data as it was when their
-        // windows closed; eviction changes a copy.
-        ingestion.evict(Arc::make_mut(&mut raw_data));
+        match next {
+            Ok(Command::Report(report)) => {
+                apply(report, &mut ingestion, &mut raw_shards, &mut newest)
+            }
+            Ok(Command::Flushed) => {}
+            Ok(Command::AdvanceWatermark { barrier_ms, reply }) => {
+                // Behind every write acknowledged before: each shard runs
+                // the samples queued to it first.
+                barriers.push((barrier_ms, reply));
+                for shard in &shards {
+                    let _ = shard.send(ShardMessage::Flush);
+                }
+                let mut flushed = 0;
+                while flushed < shards.len() {
+                    match commands.recv() {
+                        Ok(Command::Report(report)) => {
+                            apply(report, &mut ingestion, &mut raw_shards, &mut newest)
+                        }
+                        Ok(Command::Flushed) => flushed += 1,
+                        Ok(Command::AdvanceWatermark { barrier_ms, reply }) => {
+                            barriers.push((barrier_ms, reply))
+                        }
+                        Ok(Command::Stop) | Err(_) => break 'serve,
+                    }
+                }
+            }
+            Ok(Command::Stop) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        // Drain the reports already sent, so one pass takes them all.
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                Command::Report(report) => {
+                    apply(report, &mut ingestion, &mut raw_shards, &mut newest)
+                }
+                Command::Flushed => {}
+                command @ Command::AdvanceWatermark { .. } => {
+                    deferred = Some(command);
+                    break;
+                }
+                Command::Stop => break 'serve,
+            }
+        }
+        // Before the watermark moves, every shard runs the samples queued to
+        // it, so the windows it closes hold every sample admitted so far
+        // and the raw data they read is every shard's as of then.
+        let newest_ms = newest.iter().flatten().copied().max();
+        if newest_ms > ingestion.newest_sample_ms() {
+            for shard in &shards {
+                let _ = shard.send(ShardMessage::Flush);
+            }
+            let mut flushed = 0;
+            while flushed < shards.len() {
+                match commands.recv() {
+                    Ok(Command::Report(report)) => {
+                        apply(report, &mut ingestion, &mut raw_shards, &mut newest)
+                    }
+                    Ok(Command::Flushed) => flushed += 1,
+                    Ok(command @ Command::AdvanceWatermark { .. }) => deferred = Some(command),
+                    Ok(Command::Stop) | Err(_) => break 'serve,
+                }
+            }
+        }
+        let newest_ms = newest.iter().flatten().copied().max();
+        ingestion.advance_newest_sample(newest_ms);
+        let mut closed = ingestion.close();
+        let mut answered = Vec::new();
+        for (barrier_ms, reply) in barriers {
+            let (barrier_ms, more) = ingestion.advance_watermark(barrier_ms);
+            closed.extend(more);
+            answered.push((barrier_ms, reply));
+        }
+        let snapshot: RawShards = Arc::new(raw_shards.clone());
+        if !queue_refreshes(&closed, &snapshot, &jobs, shared) {
+            break;
+        }
+        let routing = Arc::new(ingestion.routing());
+        *shared.routing.write().unwrap_or_else(|e| e.into_inner()) = routing.clone();
+        let watermark_ms = ingestion.watermark_ms();
+        if watermark_ms != sealed_through || !closed.is_empty() {
+            sealed_through = watermark_ms;
+            for shard in &shards {
+                let _ = shard.send(ShardMessage::Maintain {
+                    routing: routing.clone(),
+                    watermark_ms,
+                });
+            }
+        }
         shared
             .published
-            .publish_raw_data(raw_data.clone(), ingestion.watermark_ms());
+            .publish_raw_data(snapshot.clone(), watermark_ms);
         let metrics = &shared.metrics;
-        if let Some(watermark_ms) = ingestion.watermark_ms() {
+        if let Some(watermark_ms) = watermark_ms {
             metrics.watermark_ms.store(watermark_ms, Ordering::Relaxed);
         }
+        let sum = |f: fn(&RawData) -> usize| snapshot.iter().map(|r| f(r) as u64).sum::<u64>();
         metrics
             .raw_data_bytes
-            .store(raw_data.bytes() as u64, Ordering::Relaxed);
+            .store(sum(RawData::bytes), Ordering::Relaxed);
         metrics
             .raw_data_samples
-            .store(raw_data.len() as u64, Ordering::Relaxed);
+            .store(sum(RawData::len), Ordering::Relaxed);
         metrics
             .raw_data_panes
-            .store(raw_data.panes() as u64, Ordering::Relaxed);
-        // The wait for room in the precompute backlog is not counted.
-        if count > 0 {
-            metrics.append.record(timer);
-        }
+            .store(sum(RawData::panes), Ordering::Relaxed);
         {
             let mut stats = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
-            *stats = IngestionStats {
-                // The precompute thread counts these.
-                windows_refreshed: stats.windows_refreshed,
-                windows_failed: stats.windows_failed,
-                windows_already_stored: stats.windows_already_stored,
-                ..ingestion.stats
-            };
+            stats.windows_skipped_first = ingestion.stats.windows_skipped_first;
+            stats.windows_skipped_expired = ingestion.stats.windows_skipped_expired;
         }
-        shared.queued_samples.fetch_sub(count, Ordering::SeqCst);
-        if let Some((barrier_ms, reply)) = barrier {
-            let job = PrecomputeJob::Barrier { barrier_ms, reply };
-            if jobs.send(job).is_err() {
-                break;
+        for (barrier_ms, reply) in answered {
+            if jobs
+                .send(PrecomputeJob::Barrier { barrier_ms, reply })
+                .is_err()
+            {
+                break 'serve;
             }
         }
     }
@@ -689,7 +955,7 @@ fn serve_ingest(
 /// backlog is full; `false` once the precompute thread has exited.
 fn queue_refreshes(
     closed: &[ClosedWindow],
-    raw_data: &Arc<RawData>,
+    raw_data: &RawShards,
     jobs: &SyncSender<PrecomputeJob>,
     shared: &Shared,
 ) -> bool {
@@ -980,6 +1246,19 @@ mod tests {
         assert_eq!(admit(1, 1, 2), Ok(2));
         assert_eq!(admit(1, 2, 2), Err(IngestError::Busy));
         assert_eq!(admit(u64::MAX, 1, u64::MAX), Err(IngestError::Busy));
+    }
+
+    /// A request reaching a full shard is refused whole: no other shard's
+    /// queue takes its samples.
+    #[test]
+    fn a_full_shard_refuses_the_whole_request() {
+        let queued: Vec<AtomicU64> = [0, 5, 0].into_iter().map(AtomicU64::new).collect();
+        assert_eq!(admit_shards(&queued, &[2, 3, 1], 6), Err(IngestError::Busy));
+        let now: Vec<u64> = queued.iter().map(|q| q.load(Ordering::SeqCst)).collect();
+        assert_eq!(now, [0, 5, 0]);
+        assert_eq!(admit_shards(&queued, &[2, 1, 1], 6), Ok(()));
+        let now: Vec<u64> = queued.iter().map(|q| q.load(Ordering::SeqCst)).collect();
+        assert_eq!(now, [2, 6, 1]);
     }
 
     /// The running flag clears when an engine thread panics.

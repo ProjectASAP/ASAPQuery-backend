@@ -114,9 +114,13 @@ Non-goals (v1):
 ```
 Remote Write ─► HTTP threads: decode, intern series
                      ▼
-                ingest thread: append each request's samples of a pane as
-                one immutable columnar chunk (time, value, series code)
+                ingest shards (ingest-N, by series hash): append each
+                request's samples of a pane as one immutable columnar chunk
+                (time, value, series code), into the shard's own raw data
                      │ watermark passes the pane ⇒ chunks compacted into one
+                     ▼
+                ingest coordinator: watermark over the shards, closes
+                windows over the union of the shards' raw data
                      ▼
                 precompute thread: one ingestion run per closed refresh
                 window over the panes it covers; publishes a new snapshot of
@@ -136,8 +140,14 @@ HTTP queries ─► query workers: one query run per worker thread over
 
 ### Ingestion
 
-- Remote Write is decoded and its series interned on the HTTP threads; the
-  ingest thread only routes and appends. A series' identity and label text
+- Remote Write is decoded and its series interned on the HTTP threads,
+  which send each series' samples to one of `--ingest-threads` ingest
+  shards (`ingest-N`, by series id; default a quarter of the cores, at
+  least 1), as VictoriaMetrics spreads ingestion over its cores. Each shard
+  owns its raw data: it routes and appends its samples with no lock shared
+  on the hot path. Each shard's queue is bounded (`--max-queued-samples`);
+  a request is admitted whole or, if any shard it reaches is full, refused
+  with 503. A series' identity and label text
   are computed once, when the series is interned; rows hold an index into
   their chunk's series.
 - Raw samples are held per pane, whose width is the gcd of the refresh
@@ -151,19 +161,32 @@ HTTP queries ─► query workers: one query run per worker thread over
   cutoff falls in answers as the row store did.
 - A read returns one batch per chunk of the panes overlapping its range;
   only a chunk straddling the range is filtered. A query-time `Scan` that
-  reads the open pane reads the chunks published so far, the same way: the
-  ingest thread publishes the raw data after every request (copy on write:
-  the per-pane chunk lists are copied, never the chunks).
-- The ingest thread closes each refresh window the watermark passes and
-  hands it, with the raw data as it was then, to the precompute thread,
+  reads the open pane reads the chunks published so far, the same way:
+  every shard reports its raw data after every request (copy on write: the
+  per-pane chunk lists are copied, never the chunks), and a read takes the
+  union over the shards.
+- An `ingest` coordinator thread keeps the watermark over the shards: it
+  follows the newest sample any shard holds, and before it moves the
+  coordinator flushes every shard (each runs the samples queued to it and
+  reports), so a window closes over every sample admitted before it, from
+  whichever shard. An idle shard answers the flush at once, so it never
+  holds the watermark back; the coordinator also wakes every 100 ms. The
+  allowed lateness is unchanged. (Taking the minimum over the shards with
+  samples queued, without a flush, raced with requests spread over
+  several shards and lost samples in the parity test.) It closes each
+  refresh window the watermark passes and hands it, with every shard's raw
+  data as it was then (shared `Arc` chunk lists, no copy), to the
+  precompute thread,
   which runs `execute_ingestion` and publishes the views' rows as a new
   immutable snapshot. A refresh therefore reads exactly the samples the
   serial engine read. Inside a run, a node feeding several views runs once
   and each batch reaches every view (one producer, many consumers).
+- One precompute thread refreshes the windows in this design; computing
+  windows in parallel is the next step (a separate, stacked change).
 - At most `--max-precompute-backlog` (default 256) windows wait for their
-  refresh; when the backlog is full the ingest thread waits, its queue
-  fills up to `--max-queued-samples`, and Remote Write gets 503 so senders
-  retry. The backlog is exported: a growing backlog means the data plane
+  refresh; when the backlog is full the coordinator waits, the shards'
+  queues fill up to `--max-queued-samples`, and Remote Write gets 503 so
+  senders retry. The backlog is exported: a growing backlog means the data plane
   cannot keep up with the input rate.
 
 ### Queries
@@ -490,7 +513,8 @@ retention are skipped at load.
 
 ### Measurements
 
-- Threads are named by role: `ingest`, `precompute`, `persist-N`,
+- Threads are named by role: `ingest-N` (shards), `ingest` (coordinator),
+  `precompute`, `persist-N`,
   `query-N`; Remote Write is decoded on the HTTP runtime's threads.
 - `GET /metrics` exports, in the Prometheus text format:
   - `asap_phase_cpu_seconds_total`, `asap_phase_wall_seconds_total` and
