@@ -310,16 +310,23 @@ impl Ingestion {
         self.pane_width_ms
     }
 
-    /// The watermark: no sample older than this is expected any more. The
-    /// newest routed sample, capped at the wall clock, minus the allowed
-    /// lateness, or the newest barrier if that is later.
+    /// The watermark: no sample at or before this is expected any more, so
+    /// a window ending at or before it closes. From samples, one
+    /// millisecond before the newest routed sample (capped at the wall
+    /// clock) less the allowed lateness: other series' samples at that very
+    /// time may still come in a later request, as a scraper sends one
+    /// timestamp over several requests, and a window ending there waits
+    /// for them. A barrier states every sample at or before it was written,
+    /// so it counts whole when later. (Closing a window only once event
+    /// time is past its end follows the ASAPQuery precompute engine's
+    /// window manager, `closed_windows`.)
     pub fn watermark_ms(&self) -> Option<i64> {
         let newest = match self.newest_clock_ms {
             Some(clock) => self.newest_sample_ms.map(|newest| newest.min(clock)),
             None => self.newest_sample_ms,
         };
         let lateness = millis(self.options.allowed_lateness_ms);
-        let from_samples = newest.map(|newest| newest.saturating_sub(lateness));
+        let from_samples = newest.map(|newest| newest.saturating_sub(lateness).saturating_sub(1));
         from_samples.max(self.barrier_ms)
     }
 

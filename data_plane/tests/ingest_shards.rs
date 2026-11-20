@@ -98,7 +98,7 @@ async fn write(app: &Router, series: usize) {
 
 async fn answer(app: &Router, time_s: i64) -> Value {
     let (status, body) = status_and_answer(app, time_s).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{body}");
     body
 }
 
@@ -180,8 +180,172 @@ async fn a_shard_running_ahead_does_not_close_windows_early() {
     assert!(answered >= 5, "{answered} times answered");
 }
 
+/// Sends one Remote Write request: for each series `i` in `series`, one
+/// sample per second at `seconds`, valued as [`value`].
+async fn write_seconds(
+    app: &Router,
+    series: std::ops::Range<usize>,
+    seconds: std::ops::RangeInclusive<i64>,
+) {
+    let timeseries = series
+        .map(|i| TimeSeries {
+            labels: [
+                ("__name__", "data".to_string()),
+                ("instance", format!("i{i}")),
+                ("job", format!("job{}", i % 4)),
+            ]
+            .into_iter()
+            .map(|(name, value)| Label {
+                name: name.into(),
+                value,
+            })
+            .collect(),
+            samples: seconds
+                .clone()
+                .map(|second| Sample {
+                    timestamp: second * 1000,
+                    value: value(i, second),
+                })
+                .collect(),
+        })
+        .collect();
+    let written = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/write")
+                .body(Body::from(encode(&WriteRequest { timeseries })))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(written.status(), StatusCode::NO_CONTENT);
+}
+
+/// The value of series `i` at `second`, as [`write`] writes it.
+fn value(i: usize, second: i64) -> f64 {
+    (second * (i as i64 + 1) % 17) as f64
+}
+
+/// `QUERY`'s answer per job at `time_s`, from the samples of series
+/// `0..64` in `(time_s - 30, time_s]`.
+fn expected(time_s: i64) -> Vec<(String, f64)> {
+    (0..4)
+        .map(|job| {
+            let sum = (0..64)
+                .filter(|i| i % 4 == job)
+                .flat_map(|i| ((time_s - 29).max(1)..=time_s).map(move |t| value(i, t)))
+                .sum();
+            (format!("job{job}"), sum)
+        })
+        .collect()
+}
+
+fn per_job(body: &Value) -> Vec<(String, f64)> {
+    body["data"]["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["metric"]["job"].as_str().unwrap().to_string(),
+                s["value"][1].as_str().unwrap().parse().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// A scraper sends one timestamp over several requests. Half the series'
+/// samples at 30 s, the end of the window `(20, 30]`, come in a later
+/// request than the rest, after other samples at 30 s were routed; they
+/// still join that window, over one shard or eight. The window closes only
+/// once event time is past its end, as in the ASAPQuery precompute
+/// engine's window manager (`closed_windows`, and its test
+/// `test_open_closed_pane_ownership_at_grid_boundaries`).
+#[tokio::test(flavor = "multi_thread")]
+async fn samples_at_a_window_end_in_a_later_request_join_the_window() {
+    for shards in [1, 8] {
+        let (app, state) = data_plane(shards);
+        write_seconds(&app, 0..64, 1..=29).await;
+        write_seconds(&app, 0..32, 30..=30).await;
+        write_seconds(&app, 32..64, 30..=30).await;
+        write_seconds(&app, 0..64, 31..=40).await;
+        barrier(&app, 40_000).await;
+        assert_eq!(
+            state.engine.stats().samples_dropped_late,
+            0,
+            "{shards} shards"
+        );
+        assert_eq!(
+            per_job(&answer(&app, 30).await),
+            expected(30),
+            "{shards} shards"
+        );
+        assert_eq!(
+            per_job(&answer(&app, 40).await),
+            expected(40),
+            "{shards} shards"
+        );
+    }
+}
+
+/// A sample older than a window already closed is dropped and counted,
+/// and the window keeps its answer, over one shard or eight. Ported from
+/// the ASAPQuery precompute worker's `test_late_data_drop`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_sample_is_dropped_on_any_shard_count() {
+    for shards in [1, 8] {
+        let (app, state) = data_plane(shards);
+        write_seconds(&app, 0..64, 1..=40).await;
+        barrier(&app, 40_000).await;
+        // Series 5 at 25 s again, with another value: the window (20, 30] is
+        // closed.
+        let timeseries = vec![TimeSeries {
+            labels: [("__name__", "data"), ("instance", "i5"), ("job", "job1")]
+                .into_iter()
+                .map(|(name, value)| Label {
+                    name: name.into(),
+                    value: value.into(),
+                })
+                .collect(),
+            samples: vec![Sample {
+                timestamp: 25_000,
+                value: 1000.0,
+            }],
+        }];
+        let written = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/write")
+                    .body(Body::from(encode(&WriteRequest { timeseries })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(written.status(), StatusCode::NO_CONTENT);
+        barrier(&app, 40_000).await;
+        let started = std::time::Instant::now();
+        while state.engine.stats().samples_dropped_late < 1 {
+            assert!(started.elapsed().as_secs() < 10, "{shards} shards");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            state.engine.stats().samples_dropped_late,
+            1,
+            "{shards} shards"
+        );
+        assert_eq!(
+            per_job(&answer(&app, 30).await),
+            expected(30),
+            "{shards} shards"
+        );
+    }
+}
+
 /// With one series, three of four shards never get a sample; the windows
 /// still close as the busy shard's samples pass them, without a barrier.
+/// A shard with no samples does not hold the watermark, as the ASAPQuery
+/// precompute engine leaves workers not yet started out of its
+/// cross-worker minimum (`test_compute_global_watermark_ignores_unstarted`).
 #[tokio::test(flavor = "multi_thread")]
 async fn idle_shards_do_not_hold_the_watermark() {
     let (app, state) = data_plane(4);

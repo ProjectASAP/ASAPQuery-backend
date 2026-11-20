@@ -290,8 +290,9 @@ async fn a_slow_disk_does_not_hold_refreshes_and_stopping_writes_everything() {
     let dir = view_dir("slow-disk");
     let plan = plan_json(SUM);
     let (app, state) = data_plane_with(&plan, &dir, 1, 400);
-    // Samples through 60 s close the windows through 60 s; no barrier,
-    // which would wait for the writes.
+    // Samples through 61 s close the windows through 60 s (a window closes
+    // once event time is past its end); no barrier, which would wait for
+    // the writes.
     let timeseries = vec![TimeSeries {
         labels: vec![
             Label {
@@ -303,7 +304,7 @@ async fn a_slow_disk_does_not_hold_refreshes_and_stopping_writes_everything() {
                 value: "a".into(),
             },
         ],
-        samples: (1..=60)
+        samples: (1..=61)
             .map(|s| Sample {
                 timestamp: s * 1000,
                 value: s as f64,

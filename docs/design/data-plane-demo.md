@@ -182,7 +182,11 @@ HTTP queries ─► query workers: one query run per worker thread over
   move neither this pass's watermark nor the raw data its windows read.
   (Applying them at once let the watermark pass samples the slower shards
   had yet to append: windows closed without them, and sums and top-k came
-  out low.) It closes each
+  out low.) A window `(s, e]` closes only once event time is past `e`:
+  the watermark from samples is one millisecond before the newest sample
+  less the allowed lateness, since a scraper sends one timestamp over
+  several requests and samples at `e` may still come (a barrier counts
+  whole). It closes each
   refresh window the watermark passes and hands it, with every shard's raw
   data as it was then (shared `Arc` chunk lists, no copy), to the
   precompute thread,
@@ -190,6 +194,21 @@ HTTP queries ─► query workers: one query run per worker thread over
   immutable snapshot. A refresh therefore reads exactly the samples the
   serial engine read. Inside a run, a node feeding several views runs once
   and each batch reaches every view (one producer, many consumers).
+- Borrowed from the ASAPQuery precompute engine
+  (`asap-query-engine/src/precompute_engine/`): routing by series hash to
+  one worker per shard; a watermark that is the newest applied sample less
+  the allowed lateness, combined across workers so that time moves only
+  as far as every worker with samples has applied, and workers with no
+  samples do not hold it back; a periodic tick so windows close while
+  input is idle; closing `(s, e]` only once event time is past `e`
+  (`window_manager.rs`); dropping and counting late samples. Its tests for
+  the cross-worker watermark, workers not yet started, window-end
+  boundaries and late data are ported, at the engine level over one and
+  eight shards, to `data_plane/tests/ingest_shards.rs`. ASAPQuery closes
+  each worker's own partial windows from the shared minimum; here one
+  coordinator closes a window over every shard's raw data, so the
+  minimum is reached by a flush: every shard runs what was admitted
+  before it, and an idle shard answers at once.
 - One precompute thread refreshes the windows in this design; computing
   windows in parallel is the next step (a separate, stacked change).
 - At most `--max-precompute-backlog` (default 256) windows wait for their
