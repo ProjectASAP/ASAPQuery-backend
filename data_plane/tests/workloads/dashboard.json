@@ -1,0 +1,121 @@
+{
+ "query_workload": {
+  "language": "promql",
+  "query_batch": null,
+  "repeating_queries": [
+   {
+    "query": "quantile_over_time(0.99, lat[1h])",
+    "demand": {
+     "fixed_interval_at": {
+      "interval": 15000,
+      "evaluation_phase": 0
+     }
+    },
+    "requirements": {
+     "accuracy": {
+      "max_error": 0.05,
+      "failure_probability": 0.01,
+      "accuracy_scope": "whole_result"
+     },
+     "max_latency_ms": null
+    },
+    "predictability": {
+     "predictable": {
+      "known_at": null
+     }
+    }
+   },
+   {
+    "query": "max_over_time(lat[30m])",
+    "demand": {
+     "fixed_interval_at": {
+      "interval": 15000,
+      "evaluation_phase": 0
+     }
+    },
+    "requirements": {
+     "accuracy": {
+      "max_error": 0.05,
+      "failure_probability": 0.01,
+      "accuracy_scope": "whole_result"
+     },
+     "max_latency_ms": null
+    },
+    "predictability": {
+     "predictable": {
+      "known_at": null
+     }
+    }
+   },
+   {
+    "query": "topk(10, sum by (job) (rate(reqs[1h])))",
+    "demand": {
+     "fixed_interval_at": {
+      "interval": 15000,
+      "evaluation_phase": 0
+     }
+    },
+    "requirements": {
+     "accuracy": {
+      "max_error": 0.05,
+      "failure_probability": 0.01,
+      "accuracy_scope": "whole_result"
+     },
+     "max_latency_ms": null
+    },
+    "predictability": {
+     "predictable": {
+      "known_at": null
+     }
+    }
+   },
+   {
+    "query": "sum by (job) (increase(reqs[1h]))",
+    "demand": {
+     "fixed_interval_at": {
+      "interval": 15000,
+      "evaluation_phase": 0
+     }
+    },
+    "requirements": {
+     "accuracy": {
+      "max_error": 0.05,
+      "failure_probability": 0.01,
+      "accuracy_scope": "whole_result"
+     },
+     "max_latency_ms": null
+    },
+    "predictability": {
+     "predictable": {
+      "known_at": null
+     }
+    }
+   }
+  ]
+ },
+ "data_workload": {
+  "arrival": {
+   "ingesting": {
+    "rows_per_second": 20000.0
+   }
+  },
+  "sources": {
+   "lat": {
+    "series_count": 10000,
+    "metric_type": "gauge",
+    "column_signs": {
+     "value": "non_negative"
+    },
+    "sample_interval": 1000
+   },
+   "reqs": {
+    "series_count": 10000,
+    "metric_type": "counter",
+    "column_signs": {
+     "value": "non_negative"
+    },
+    "sample_interval": 1000
+   }
+  }
+ }
+}

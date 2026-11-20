@@ -2,8 +2,11 @@
 //! the same installed plan and the same raw samples, on public PromQL
 //! workloads: the #509 examples (`examples/`) and ASAPPlanner's mixed and
 //! sketch-plan workloads (`tests/workloads/`, copied unchanged from
-//! ASAPPlanner's `tools/dag-viewer/workloads/random-mixed-seed-862/` and
-//! `crates/devtools/tests/sketch_plan_snapshots/workloads/`).
+//! ASAPPlanner's `tools/dag-viewer/workloads/random-mixed-seed-862/`,
+//! `crates/devtools/tests/sketch_plan_snapshots/workloads/` (as
+//! `sketch-plan-*.json`) and `tools/dag-viewer/memo-examples/promql/`
+//! (`rangeheavy-t5-q05-q09-1h.json`)), plus the demo's dashboard workload
+//! (`dashboard.json`).
 //!
 //! Each workload is planned by the control plane twice, for a deployment
 //! that keeps raw samples and for one that does not. The data plane
@@ -12,7 +15,8 @@
 //! query over HTTP. The reference runs the same plan in process as the
 //! Planner's runtime tests do: every raw sample in an `InMemoryDataStore`,
 //! each refresh group refreshed in one ingestion run per window, then one
-//! query run.
+//! query run. Answers must be equal, except that a plan with a KLL
+//! sketch answers within 5% (KLL seeds its compaction coin at random).
 //!
 //! Range queries: the mixed workloads again, each query requested as a
 //! range over its last three evaluations (`range_evaluation`); the data
@@ -582,14 +586,31 @@ fn answers(schema: &Schema, batches: &[Batch]) -> Vec<Answer> {
     answers
 }
 
-fn same(a: &[Answer], b: &[Answer]) -> bool {
+/// Whether two answers are equal: the same series with the same values,
+/// within `relative` of each other.
+fn same_within(a: &[Answer], b: &[Answer], relative: f64) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(x, y)| {
             x.0 == y.0
                 && (x.1 == y.1
                     || (x.1.is_nan() && y.1.is_nan())
-                    || (x.1 - y.1).abs() <= 1e-9 * y.1.abs().max(1.0))
+                    || (x.1 - y.1).abs() <= relative * y.1.abs().max(1.0))
         })
+}
+
+/// How far apart two runs of `plan` may answer. A KLL sketch seeds its
+/// compaction coin at random, so two builds of the same window over enough
+/// samples differ, within the sketch's error; every other state is
+/// deterministic.
+fn tolerance(plan: &InstallablePlan) -> f64 {
+    let randomized = serde_json::to_string(&plan.dag)
+        .unwrap()
+        .contains("\"Kll\"");
+    if randomized {
+        0.05
+    } else {
+        1e-9
+    }
 }
 
 /// Every public workload, planned with and without raw samples kept: each
@@ -621,10 +642,11 @@ async fn the_data_plane_answers_what_the_planner_executor_answers() {
             let app = data_plane(&plan, &points, start_ms).await;
             let mut answered = 0;
             let mut non_empty = 0;
+            let tolerance = tolerance(&plan);
             for (query, expected) in plan.query_texts.iter().zip(&expected) {
                 let served = served_answer(&app, query).await;
                 match (expected, &served) {
-                    (Ok(expected), Ok(served)) if same(served, expected) => {
+                    (Ok(expected), Ok(served)) if same_within(served, expected, tolerance) => {
                         answered += 1;
                         non_empty += usize::from(!served.is_empty());
                     }
@@ -734,7 +756,7 @@ async fn range_queries_answer_what_the_planner_executor_answers_at_each_step() {
                         for (time_ms, expected) in times.iter().zip(expected) {
                             let served = &served[time_ms];
                             match expected {
-                                Ok(expected) if same(served, expected) => {
+                                Ok(expected) if same_within(served, expected, tolerance(&plan)) => {
                                     equal += 1;
                                     non_empty_steps += usize::from(!served.is_empty());
                                 }
