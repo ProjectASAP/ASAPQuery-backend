@@ -14,6 +14,9 @@
 //! Windows closed and not yet refreshed (the precompute backlog) are
 //! bounded by `max_precompute_backlog`: when it is full, the ingest thread
 //! waits, its queue fills and Remote Write gets 503.
+//!
+//! Each thread records the thread CPU and wall time of its phases in
+//! [`Metrics`], exported on `/metrics`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
@@ -25,6 +28,7 @@ use asap_planner::InstallablePlan;
 use tokio::sync::oneshot;
 
 use crate::ingestion::{ClosedWindow, Ingestion, IngestionOptions, IngestionStats, Precompute};
+use crate::metrics::{Gauges, Metrics, Timer};
 use crate::query::{QueryEngine, ResultSample, Unanswered};
 use crate::store::{PublishedStore, RawData, RawSample, RunStore, ViewStore};
 
@@ -129,6 +133,7 @@ struct Shared {
     /// Held by the precompute thread during each refresh; tests hold it to
     /// keep a refresh from finishing.
     precompute_gate: Mutex<()>,
+    metrics: Metrics,
 }
 
 /// Marks the engine stopped when its thread exits, panics included.
@@ -147,6 +152,12 @@ impl EngineHandle {
     pub fn spawn(plan_json: String, options: EngineOptions) -> anyhow::Result<(Self, Vec<String>)> {
         let (ingestion, precompute, query, query_texts) = install(&plan_json, options)?;
         let raw_data = Arc::new(ingestion.raw_data());
+        let groups: Vec<(i64, Vec<String>)> = precompute
+            .groups()
+            .into_iter()
+            .map(|(width_ms, views)| (width_ms, views.iter().map(ToString::to_string).collect()))
+            .collect();
+        let metrics = Metrics::new(&groups, &query_texts);
         let running = Arc::new(AtomicBool::new(true));
         let shared = Arc::new(Shared {
             queued_samples: AtomicU64::new(0),
@@ -155,6 +166,7 @@ impl EngineHandle {
             stats: Mutex::new(IngestionStats::default()),
             published: PublishedStore::new(raw_data.clone()),
             precompute_gate: Mutex::new(()),
+            metrics,
         });
         let (commands, command_receiver) = channel();
         let (jobs, job_receiver) = sync_channel(options.max_precompute_backlog.max(1));
@@ -226,6 +238,8 @@ impl EngineHandle {
         time_ms: i64,
     ) -> Result<Vec<ResultSample>, Unanswered> {
         let stopped = || Unanswered::Execution("the query workers have stopped".into());
+        let started = std::time::Instant::now();
+        let metrics = self.shared.metrics.query(&query);
         let (reply, answer) = oneshot::channel();
         self.queries
             .send(QueryJob {
@@ -234,7 +248,30 @@ impl EngineHandle {
                 reply,
             })
             .map_err(|_| stopped())?;
-        answer.await.map_err(|_| stopped())?
+        let answer = answer.await.map_err(|_| stopped())?;
+        if let Some(metrics) = metrics {
+            metrics.latency.observe(started.elapsed().as_secs_f64());
+        }
+        answer
+    }
+
+    /// The engine's measurements.
+    pub fn metrics(&self) -> &Metrics {
+        &self.shared.metrics
+    }
+
+    /// The engine's measurements and counters in the Prometheus text
+    /// format.
+    pub fn render_metrics(&self) -> String {
+        crate::metrics::render(
+            &self.shared.metrics,
+            &Gauges {
+                stats: self.stats(),
+                samples_queued: self.queued_samples(),
+                precompute_backlog: self.precompute_backlog(),
+                now_ms: crate::ingestion::wall_clock_ms(),
+            },
+        )
     }
 
     /// Whether the ingest and precompute threads are still running.
@@ -347,7 +384,11 @@ fn spawn_query_workers(
                     Ok(job) => job,
                     Err(_) => break,
                 };
+                let timer = Timer::start();
                 let answer = query.evaluate(&job.query, job.time_ms, &shared.published);
+                if let Some(metrics) = shared.metrics.query(&job.query) {
+                    metrics.run.record(timer);
+                }
                 let _ = job.reply.send(answer);
             })?;
     }
@@ -400,6 +441,7 @@ fn serve_ingest(
     shared: &Shared,
 ) {
     for command in commands {
+        let timer = Timer::start();
         let (count, barrier) = match command {
             Command::Ingest(samples) => {
                 let count = samples.len() as u64;
@@ -423,6 +465,23 @@ fn serve_ingest(
         // windows closed; eviction changes a copy.
         ingestion.evict(Arc::make_mut(&mut raw_data));
         shared.published.publish_raw_data(raw_data.clone());
+        let metrics = &shared.metrics;
+        if let Some(watermark_ms) = ingestion.watermark_ms() {
+            metrics.watermark_ms.store(watermark_ms, Ordering::Relaxed);
+        }
+        metrics
+            .raw_data_bytes
+            .store(raw_data.bytes() as u64, Ordering::Relaxed);
+        metrics
+            .raw_data_samples
+            .store(raw_data.len() as u64, Ordering::Relaxed);
+        metrics
+            .raw_data_panes
+            .store(raw_data.panes() as u64, Ordering::Relaxed);
+        // The wait for room in the precompute backlog is not counted.
+        if count > 0 {
+            metrics.append.record(timer);
+        }
         {
             let mut stats = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
             *stats = IngestionStats {
@@ -475,15 +534,22 @@ fn serve_precompute(precompute: Precompute, jobs: Receiver<PrecomputeJob>, share
                         .precompute_gate
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    precompute.refresh(window, raw_data, &mut views)
+                    let timer = Timer::start();
+                    let result = precompute.refresh(window, raw_data, &mut views);
+                    shared.metrics.precompute[window.group].1.record(timer);
+                    result
                 };
                 shared.published.publish_views(views.clone());
+                shared
+                    .metrics
+                    .view_bytes
+                    .store(views.bytes() as u64, Ordering::Relaxed);
                 {
                     let mut stats = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
                     match result {
                         Ok(()) => stats.windows_refreshed += 1,
                         Err(error) => {
-                            tracing::error!(views = ?precompute.view_ids(window), end = window.end_ms, %error, "ingestion run failed");
+                            tracing::error!(group = window.group, end = window.end_ms, %error, "ingestion run failed");
                             stats.windows_failed += 1;
                         }
                     }

@@ -33,11 +33,18 @@ through its `DataStore` interface:
 
 - **Raw data:** every Remote Write sample of a metric some `Scan` of the
   plan reads, as a time series table `(ts, value, $promql_series_identity,
-  labels...)`. The DAG's own `TimeRange`s keep each window, an instant
+  labels...)`, held columnar in panes whose width divides every refresh
+  window. The DAG's own `TimeRange`s keep each window, an instant
   selector's latest sample per series, and drop stale markers.
 - **Materialized views:** each view's rows, appended by the ingestion run
   that refreshed them with the `(start, end]` they cover, and kept for the
   view's `retention_ms`.
+
+**Threads.** An `ingest` thread stores samples and closes windows, a
+`precompute` thread refreshes the closed windows' views, and `query-N`
+worker threads (`--query-threads`, default one per core) answer queries,
+each over the newest published snapshot of the store. See
+[docs/design/data-plane-runtime.md](docs/design/data-plane-runtime.md).
 
 **Ingestion.** The plan lists its views refreshed at ingestion by refresh
 group (`InstallablePlan::ingestion_refresh_groups`): views with one window
@@ -58,17 +65,20 @@ query up to that far behind the newest refreshed window is still answered.
 
 Samples more than `--max-future-ms` (default 5 min) ahead of the wall clock
 are dropped. Remote Write gets 503 when admitting it would leave more than
-`--max-queued-samples` (default 2,000,000) samples waiting for the engine (a
-request into an empty queue is always admitted), and 500 if the engine has
-stopped, which also makes `/-/ready` fail. `/api/v1/status/asap` reports the
-engine's `ingestion` counters (samples accepted, late, future, unrouted;
-windows refreshed, failed, skipped) as JSON.
+`--max-queued-samples` (default 2,000,000) samples waiting for the ingest
+thread (a request into an empty queue is always admitted), and 500 if the
+engine has stopped, which also makes `/-/ready` fail. The ingest thread
+waits while `--max-precompute-backlog` (default 256) closed windows await
+their refresh, so a precompute that cannot keep up pushes back on Remote
+Write. `/api/v1/status/asap` reports the engine's `ingestion` counters
+(samples accepted, late, future, unrouted; windows refreshed, failed,
+skipped) and the precompute backlog as JSON.
 
 A producer can close windows without waiting for later samples:
 `POST /api/v1/precompute/watermark?time_ms=T` states that every sample at or
-before `T` has been written. After the writes acknowledged before it have
-been ingested, every window ending at or before `T` (capped at the wall
-clock) is refreshed. A repeated or lower `T` does nothing. The response is
+before `T` has been written. It answers once the writes acknowledged before it
+have been ingested and every window ending at or before `T` (capped at the
+wall clock) is refreshed. A repeated or lower `T` does nothing. The response is
 `{"barrier_ms": B}`, the barrier in force. With several producers, send the
 barrier only after all of them have written through `T`.
 
@@ -81,8 +91,20 @@ or the query is not answered. Each run is limited to
 `--run-memory-limit-bytes` (default 4 GiB). Anything else is forwarded to
 Prometheus with its end-to-end headers, such as `Authorization` and
 `X-Scope-OrgID` (`x-asap-execution: forwarded`); a planned query that could
-not be answered also says why in `x-asap-forward-reason`. Runs execute one
-at a time on the engine thread, after every write acknowledged before.
+not be answered also says why in `x-asap-forward-reason`. A query reads the
+newest published snapshot when its run starts; it does not wait for writes
+still queued (a barrier does). Queries may hold up to `--query-threads`
+times the run memory limit.
+
+**Measurements.** `GET /metrics` exports, in the Prometheus text format,
+the thread CPU and wall time of each phase
+(`asap_phase_cpu_seconds_total{phase=...}`: `remote_write_decode`,
+`append`, `precompute` per refresh group, `query` per query text), query
+latency, sample and window counters, the backlogs, the watermark lag, the
+bytes held by raw panes and views, RSS, and each thread's CPU time by
+name. `scripts/profile.sh` records a flamegraph of a running data plane;
+`cargo run --release -p data_plane --example ingest_bench -- 10000 300`
+measures ingest throughput in process.
 
 Not supported yet: views refreshed on first read (so the backend declares
 `query_time_results_retained: false`), range queries, SQL.

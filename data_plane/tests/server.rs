@@ -381,3 +381,33 @@ async fn reports_sample_counters() {
     .sum();
     assert_eq!(total, 3, "{body}");
 }
+
+/// `/metrics` reports, in the Prometheus text format, the Remote Write
+/// decode and append phases a write ran, the samples it stored, and the
+/// engine's threads by name.
+#[tokio::test]
+async fn exports_phase_metrics() {
+    let state = data_plane("http://unused".into());
+    let app = router(state.clone());
+    assert_eq!(write(&app, 3).await, StatusCode::NO_CONTENT);
+    for _ in 0..200 {
+        if state.engine.queued_samples() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (status, _, body) = send(&app, Request::get("/metrics").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    for line in [
+        "asap_phase_runs_total{phase=\"remote_write_decode\"} 1",
+        "asap_phase_runs_total{phase=\"append\"} 1",
+        "asap_samples_total{outcome=\"accepted\"} 3",
+        "asap_raw_data_samples 3",
+        "asap_precompute_backlog_windows 0",
+        "asap_thread_cpu_seconds_total{thread=\"ingest\"}",
+        "asap_thread_cpu_seconds_total{thread=\"precompute\"}",
+        "asap_thread_cpu_seconds_total{thread=\"query-\"}",
+    ] {
+        assert!(body.contains(line), "{line} missing from\n{body}");
+    }
+}

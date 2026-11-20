@@ -541,18 +541,12 @@ impl Precompute {
         Ok(())
     }
 
-    /// The views of `window`'s group, for logging.
-    pub fn view_ids(&self, window: ClosedWindow) -> Vec<PhysicalASAPNodeId> {
-        self.runs[window.group]
-            .views
+    /// Each refresh group's window width and views, in plan order.
+    pub fn groups(&self) -> Vec<(i64, Vec<PhysicalASAPNodeId>)> {
+        self.runs
             .iter()
-            .map(|v| v.node_id)
+            .map(|run| (run.width_ms, run.views.iter().map(|v| v.node_id).collect()))
             .collect()
-    }
-
-    /// How many refresh groups there are.
-    pub fn groups(&self) -> usize {
-        self.runs.len()
     }
 }
 

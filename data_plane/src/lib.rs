@@ -11,6 +11,7 @@
 
 pub mod engine;
 pub mod ingestion;
+pub mod metrics;
 pub mod prometheus;
 pub mod query;
 pub mod remote_write;
@@ -113,12 +114,14 @@ pub fn router(state: Arc<DataPlane>) -> Router {
         .route("/api/v1/query", get(query).post(query))
         .route("/api/v1/query_range", get(query_range).post(query_range))
         .route("/api/v1/status/asap", get(status))
+        .route("/metrics", get(metrics))
         .route("/api/v1/precompute/watermark", post(watermark))
         .route("/-/ready", get(ready))
         .with_state(state)
 }
 
 async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
+    let timer = metrics::Timer::start();
     match remote_write::decode(&body, &state.limits) {
         Ok(request) => {
             let mut samples = Vec::new();
@@ -138,6 +141,7 @@ async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
                 }));
             }
             let count = samples.len() as u64;
+            state.engine.metrics().remote_write_decode.record(timer);
             if count == 0 {
                 return StatusCode::NO_CONTENT.into_response();
             }
@@ -237,6 +241,17 @@ async fn status(State(state): State<Arc<DataPlane>>) -> Response {
     (
         [(header::CONTENT_TYPE, "application/json")],
         body.to_string(),
+    )
+        .into_response()
+}
+
+/// The data plane's measurements in the Prometheus text format: per-phase
+/// thread CPU and wall time, query latency, counters, backlogs, watermark
+/// lag, bytes held and each thread's CPU time ([`metrics`]).
+async fn metrics(State(state): State<Arc<DataPlane>>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        state.engine.render_metrics(),
     )
         .into_response()
 }

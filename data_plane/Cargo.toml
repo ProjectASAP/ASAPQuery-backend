@@ -7,6 +7,7 @@ edition.workspace = true
 asap-planner.workspace = true
 asap-executor.workspace = true
 ahash = "0.8"
+libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
