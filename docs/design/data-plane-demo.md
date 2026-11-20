@@ -457,6 +457,80 @@ evaluation at its time, so `OneEvaluation` sharing applies per step. The
 workload's `range_evaluation` (`step_ms`, `span_ms`) tells the Planner the
 requests' shape, so the plan delivers every step time.
 
+### Result cache
+
+A Grafana range panel refreshed every 15 s asks for the same range shifted
+by one step; without a cache every step is computed again. VictoriaMetrics
+keeps a rollup result cache for this; the data plane keeps one too
+(`data_plane/src/result_cache.rs`).
+
+- Key and value: (planned query root, evaluation time T) → the answer
+  vector (`Arc`). An instant query at T and a range step at T share the
+  entry. Not aligned start/end are still correct, with fewer hits.
+- Only final answers are kept (`QueryEngine::evaluate`): the run succeeded,
+  so every view window it read was stored (a window is appended once, when
+  the watermark closes it, and never changes; a missing one fails the run);
+  and, when the root reaches a `Scan` without passing a view (it reads raw
+  data at query time), T ≤ W, where W is the watermark the run's snapshot
+  was published with: max(min(newest sample, wall clock) − allowed
+  lateness, newest barrier). An answer at T > W is computed and returned,
+  not kept, so the next request computes it again. W is read before the
+  snapshot (raw data is published before the watermark that covers it), so
+  the snapshot holds every sample at or before W; this also fixes the same
+  race for the shared query-time results. A sample later than the allowed
+  lateness may still be appended to raw data and is not reflected in a kept
+  answer, as it is not in a closed view window. This rule replaces
+  VictoriaMetrics' fixed 5-minute `-search.cacheTimestampOffset` with what
+  the data plane knows.
+- A range request looks up every step and sends only the missing ones
+  through the bounded worker fan-out (and `OneEvaluation` single flight).
+- Eviction: an answer whose T is more than the plan's longest retention
+  (the largest `retention_ms` of any view or `Scan`, which counts back from
+  the newest evaluation time) plus `--view-retention-margin-ms` behind the
+  watermark is dropped (no planned evaluation reaches it; none when a `Scan`
+  is unbounded); beyond `--result-cache-bytes` (default 256 MiB, estimated
+  from labels and samples) the least recently used go. `--no-result-cache`
+  turns it off.
+- Metrics: `asap_result_cache_{hits,misses,evictions}_total`,
+  `asap_result_cache_{entries,bytes}`, and per query
+  `asap_range_query_steps_total` and `asap_range_query_steps_cached_total`.
+- The Planner's cost model does not know about the cache: it charges every
+  evaluation of a range. Follow-up: charge a refreshed range only its new
+  steps.
+
+Every step of one range request also reads the same snapshot (raw shards,
+views, watermark), taken when the request starts. A raw chunk a step reads
+whole is converted to a batch once per request and shared by the other
+steps (`RawReads`, sharded by chunk); a view read finds the windows tiling
+its range by binary search. View windows were already `Arc`ed batches read
+without copying, so this saves little: the cold cost is the per-step merge
+of window states, which incremental cross-step aggregation would address
+(not done).
+
+Evidence (`examples/range_bench`, dashboard workload, 1,000 series per
+metric, a sample every 15 s, four panels each a 1 h range at 15 s steps,
+964 steps; 56-core x86 server, three runs each):
+
+| Request | Result cache on | off |
+| --- | --- | --- |
+| first (cold), views plan | 5.0–5.1 s wall, 176–187 s CPU | 5.1 s, 177–180 s CPU |
+| 15 s later, views plan | 1.2–1.6 s wall, 1.2–1.6 s CPU (960/964 steps cached) | 4.8–5.1 s, 172–175 s CPU |
+| first (cold), raw plan | 4.7–4.9 s wall, 163–176 s CPU | 4.9–5.1 s, 165–180 s CPU |
+| 15 s later, raw plan | 1.1–1.3 s wall, 1.1–1.3 s CPU (960/964 steps cached) | 4.5–4.9 s, 152–172 s CPU |
+
+- Of the refresh, the four new steps of `quantile_over_time(0.99,
+  lat[1h])` take about 0.3 s; most of the rest is encoding the two
+  1,000-series matrices as JSON (a fully cached request still takes
+  0.8–1.1 s, 0.4–0.5 s per 1,000-series panel, 8–10 ms per small panel).
+  Follow-up: encode the matrix without building `serde_json::Value`s.
+- Cold profile (views plan): `DdSketch::merge_store` 20 %, `memmove` 18 %,
+  the executor's summary merge 5.5 %; the store's reads are not among the
+  top symbols. Reading one snapshot per request: cold CPU 186–195 s →
+  174–195 s (views plan) and 170–181 s → 162–176 s (raw plan), four runs
+  each, within run-to-run noise on wall time. A first version guarding the
+  converted chunks with one mutex took 7.0 s and 230–262 s CPU (39 % in
+  the kernel's spin lock), so they are sharded.
+
 ### Persisting views
 
 Each refresh group has one append-only file in `--view-dir` (default
@@ -533,6 +607,11 @@ retention are skipped at load.
   - Query-time results: `asap_query_time_results`,
     `asap_query_time_result_computes_total` (misses),
     `asap_query_time_result_hits_total`.
+  - Result cache ([Result cache](#result-cache)):
+    `asap_result_cache_{hits,misses,evictions}_total`,
+    `asap_result_cache_{entries,bytes}`, and per query
+    `asap_range_query_steps_total` and
+    `asap_range_query_steps_cached_total`.
   - Persistence: `asap_view_persisted_bytes_total`,
     `asap_view_sync_seconds_total`, and (view, window) pairs not persisted
     (`asap_view_windows_not_persisted_total`) or loaded at startup
