@@ -93,7 +93,14 @@ Prometheus with its end-to-end headers, such as `Authorization` and
 `X-Scope-OrgID` (`x-asap-execution: forwarded`); a planned query that could
 not be answered also says why in `x-asap-forward-reason`. A query reads the
 newest published snapshot when its run starts; it does not wait for writes
-still queued (a barrier does). Queries may hold up to `--query-threads`
+still queued (a barrier does). What runs once is the plan's decision: a
+query-time `OneEvaluation` node that several queries read is computed once
+per evaluation time, by the first query that needs it while the others
+wait, and kept in the view store's query-time partition for
+`--query-time-results-retention-ms` (default 60 s) behind the newest
+evaluation time (`--no-shared-results` computes it in every query's run,
+for comparison). A plan that would compute any other node in several
+queries' runs is refused. Queries may hold up to `--query-threads`
 times the run memory limit.
 
 **Measurements.** `GET /metrics` exports, in the Prometheus text format,

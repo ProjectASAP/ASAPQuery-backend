@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::ingestion::IngestionStats;
+use crate::store::QueryTimeResults;
 
 /// CPU time this thread has used, in nanoseconds.
 pub fn thread_cpu_ns() -> u64 {
@@ -195,11 +196,12 @@ impl Metrics {
 }
 
 /// What `/metrics` reports beside [`Metrics`].
-pub struct Gauges {
+pub struct Gauges<'a> {
     pub stats: IngestionStats,
     pub samples_queued: u64,
     pub precompute_backlog: u64,
     pub now_ms: i64,
+    pub query_time_results: &'a QueryTimeResults,
 }
 
 /// `metrics` and `gauges` in the Prometheus text format.
@@ -332,6 +334,37 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
         "Bytes of materialized view rows held.",
         load(&metrics.view_bytes),
     );
+    let results = gauges.query_time_results;
+    gauge(
+        &mut out,
+        "asap_query_time_result_bytes",
+        "Bytes of query-time OneEvaluation results held.",
+        results.bytes() as f64,
+    );
+    gauge(
+        &mut out,
+        "asap_query_time_results",
+        "Query-time OneEvaluation results held, computed or being computed.",
+        results.len() as f64,
+    );
+    family(
+        &mut out,
+        "asap_query_time_result_computes_total",
+        "counter",
+        "Query-time OneEvaluation results computed (misses).",
+    );
+    let _ = writeln!(
+        out,
+        "asap_query_time_result_computes_total {}",
+        results.computes()
+    );
+    family(
+        &mut out,
+        "asap_query_time_result_hits_total",
+        "counter",
+        "Reads of a query-time OneEvaluation result already computed.",
+    );
+    let _ = writeln!(out, "asap_query_time_result_hits_total {}", results.hits());
     if let Some(rss) = resident_bytes() {
         gauge(
             &mut out,
@@ -433,6 +466,7 @@ mod tests {
                 samples_queued: 0,
                 precompute_backlog: 2,
                 now_ms: 0,
+                query_time_results: &QueryTimeResults::new(0, 0),
             },
         );
         assert!(

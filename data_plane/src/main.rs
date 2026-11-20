@@ -57,6 +57,17 @@ struct Args {
     /// core). Queries may hold up to this many times the run memory limit.
     #[arg(long, default_value_t = EngineOptions::default().query_threads)]
     query_threads: usize,
+    /// Compute a query-time OneEvaluation node in every query's run instead
+    /// of once per evaluation time (for comparison).
+    #[arg(long)]
+    no_shared_results: bool,
+    /// How long a query-time result is kept behind the newest evaluation
+    /// time computed.
+    #[arg(long, default_value_t = EngineOptions::default().query_time_results_retention_ms)]
+    query_time_results_retention_ms: u64,
+    /// The most bytes of query-time results kept.
+    #[arg(long, default_value_t = EngineOptions::default().query_time_results_max_bytes)]
+    query_time_results_max_bytes: usize,
 }
 
 #[tokio::main]
@@ -82,6 +93,9 @@ async fn main() -> anyhow::Result<()> {
                 no_forward: args.no_forward,
                 run_memory_limit_bytes: args.run_memory_limit_bytes,
                 query_threads: args.query_threads,
+                share_one_evaluation_results: !args.no_shared_results,
+                query_time_results_retention_ms: args.query_time_results_retention_ms,
+                query_time_results_max_bytes: args.query_time_results_max_bytes,
             },
         )?
         .with_forward_timeout(Duration::from_secs(args.forward_timeout_seconds)),

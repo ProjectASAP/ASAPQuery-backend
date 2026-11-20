@@ -1,26 +1,40 @@
-//! Query engine: answers a planned query at evaluation time `T` with one
-//! query run of its root of the plan's DAG, over the store.
+//! Query engine: answers a planned query at evaluation time `T` with
+//! query runs of its root of the plan's DAG, over the store.
 //!
-//! Each root is compiled once, with the materialized views it reaches
-//! (without passing another view) as view slots and each `Scan` it reaches
-//! outside them as a raw data slot. A run reads the views' rows tiling the
-//! windows its `TimeRange`s select, and the raw samples its query-time
-//! `Scan`s read. A query the engine cannot answer returns [`Unanswered`];
-//! the caller then forwards it to Prometheus (or refuses it).
+//! What runs once and what is shared is the plan's decision, by each
+//! query-time node's `Lifetime`: a `None` node runs in each run that reads
+//! it; a `OneEvaluation` node runs once per evaluation time and its
+//! consumers share it; an `AcrossEvaluations` node is a materialized view.
+//! A `OneEvaluation` node reached from more than one query's run is
+//! compiled on its own, and its output at `T` is stored in the view
+//! store's query-time partition ([`QueryTimeResults`]): every run at `T`
+//! that reads it binds it as a materialized view slot. Any other node
+//! reached from more than one query's run means the plan and the data
+//! plane disagree, and the plan is refused.
+//!
+//! Each run is compiled once, with the materialized views it reaches
+//! (without passing another view) and the shared nodes below it as view
+//! slots, and each `Scan` it reaches outside them as a raw data slot. A
+//! query the engine cannot answer returns [`Unanswered`]; the caller then
+//! forwards it to Prometheus (or refuses it).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use asap_executor::physical_planner::{compile, CompiledPhysicalDAG};
+use asap_executor::planner::ir::properties::ExecutionTiming;
 use asap_executor::planner::ir::schema::{Schema, PROMQL_SERIES_IDENTITY};
+use asap_executor::planner::ir::{NonASAPOp, Operator};
 use asap_executor::planner::plan::materialized_view::MaterializedView;
 use asap_executor::planner::plan::physical_asap_dag::{PhysicalASAPDAG, PhysicalASAPNodeId};
+use asap_executor::planner::stages::Lifetime;
 use asap_executor::runtime::{Limits, RunContext, Scope};
 use asap_executor::values::{Batch, Value};
 use asap_planner::InstallablePlan;
 use futures::executor::block_on;
 use futures::StreamExt;
 
-use crate::store::PublishedStore;
+use crate::store::{PublishedStore, QueryTimeResults, RawData, RunStore, ViewStore};
 
 /// One series of an instant-query result.
 #[derive(Debug, Clone, PartialEq)]
@@ -44,26 +58,91 @@ pub enum Unanswered {
     Execution(String),
 }
 
+/// One compiled query run: of a query's root, or of a shared node.
+struct Run {
+    compiled: CompiledPhysicalDAG,
+    /// The shared nodes it binds as view slots.
+    reads: Vec<PhysicalASAPNodeId>,
+}
+
 pub struct QueryEngine {
-    /// Each query, with its compiled root or why it cannot run.
-    roots: Vec<(String, Result<CompiledPhysicalDAG, String>)>,
+    /// Each query and its root, or why it cannot run.
+    roots: Vec<(String, Result<PhysicalASAPNodeId, String>)>,
+    /// The run of each query root and shared node.
+    runs: BTreeMap<PhysicalASAPNodeId, Run>,
+    /// The shared nodes: their outputs live in `results`.
+    shared: BTreeSet<PhysicalASAPNodeId>,
+    results: QueryTimeResults,
     limits: Limits,
 }
 
 impl QueryEngine {
-    /// Compiles each query's root of `plan`, whose views are `views`.
-    pub fn new(plan: &InstallablePlan, views: &[MaterializedView], limits: Limits) -> Self {
+    /// Compiles each query's root of `plan`, whose views are `views`, and
+    /// each query-time `OneEvaluation` node shared by several queries'
+    /// runs, whose outputs `results` keeps. With `share_one_evaluation`
+    /// false, every run computes every node it reads, as one run per query
+    /// did before. Fails when a node other than a query-time
+    /// `OneEvaluation` one would be computed in several queries' runs.
+    pub fn new(
+        plan: &InstallablePlan,
+        views: &[MaterializedView],
+        limits: Limits,
+        results: QueryTimeResults,
+        share_one_evaluation: bool,
+    ) -> anyhow::Result<Self> {
+        let dag = &plan.dag;
+        let view_ids: HashSet<PhysicalASAPNodeId> = views.iter().map(|v| v.node_id).collect();
+        let shared = if share_one_evaluation {
+            shared_nodes(dag, &view_ids)?
+        } else {
+            BTreeSet::new()
+        };
+        let mut slots: Vec<MaterializedView> = views.to_vec();
+        for &node in &shared {
+            slots.push(query_time_slot(node)?);
+        }
+        let mut compiled: BTreeMap<PhysicalASAPNodeId, Result<Run, String>> = BTreeMap::new();
+        for &node in shared.iter().chain(&dag.roots) {
+            if compiled.contains_key(&node) {
+                continue;
+            }
+            // A shared node's own run computes it, rather than reading it.
+            let own_slots: Vec<MaterializedView> = slots
+                .iter()
+                .filter(|v| !(shared.contains(&node) && v.node_id == node))
+                .cloned()
+                .collect();
+            let read = slots_read(dag, &own_slots, node);
+            let reads = read
+                .iter()
+                .map(|v| v.node_id)
+                .filter(|id| shared.contains(id))
+                .collect();
+            let run = compile(dag, &read, &[node as u64])
+                .map(|compiled| Run { compiled, reads })
+                .map_err(|e| e.to_string());
+            compiled.insert(node, run);
+        }
         let roots = plan
             .query_texts
             .iter()
-            .zip(&plan.dag.roots)
+            .zip(&dag.roots)
             .map(|(query, &root)| {
-                let read = views_read(&plan.dag, views, root);
-                let compiled = compile(&plan.dag, &read, &[root as u64]).map_err(|e| e.to_string());
-                (query.trim().to_string(), compiled)
+                let runnable = runnable(root, &compiled).map(|()| root);
+                (query.trim().to_string(), runnable)
             })
             .collect();
-        Self { roots, limits }
+        let runs = compiled
+            .into_iter()
+            .filter_map(|(node, run)| Some((node, run.ok()?)))
+            .collect();
+        Ok(Self {
+            roots,
+            runs,
+            shared,
+            results,
+            limits,
+        })
     }
 
     /// The planned queries the engine cannot run, with why.
@@ -74,6 +153,16 @@ impl QueryEngine {
             .collect()
     }
 
+    /// The query-time partition of the view store.
+    pub fn query_time_results(&self) -> &QueryTimeResults {
+        &self.results
+    }
+
+    /// The query-time `OneEvaluation` nodes several queries' runs share.
+    pub fn shared_nodes(&self) -> &BTreeSet<PhysicalASAPNodeId> {
+        &self.shared
+    }
+
     /// Answers `query` at `time_ms` from the newest snapshot of `store`.
     pub fn evaluate(
         &self,
@@ -82,7 +171,7 @@ impl QueryEngine {
         store: &PublishedStore,
     ) -> Result<Vec<ResultSample>, Unanswered> {
         let query = query.trim();
-        let compiled = self
+        let root = *self
             .roots
             .iter()
             .find(|(planned, _)| planned == query)
@@ -90,22 +179,153 @@ impl QueryEngine {
             .1
             .as_ref()
             .map_err(|reason| Unanswered::Unsupported(reason.clone()))?;
-        let run_store = store.run_store();
-        let batches = run(compiled, run_store.clone(), time_ms, &self.limits);
-        let batches = batches.map_err(|error| match run_store.missing_view_rows() {
-            Some(missing) => Unanswered::MissingViewRows(missing),
-            None => Unanswered::Execution(error.to_string()),
-        })?;
-        let root = compiled.roots()[0];
+        let (raw_data, views) = store.snapshot();
+        let batches = self.output(root, time_ms, &raw_data, &views)?;
+        let compiled = &self.runs[&root].compiled;
         let schema = compiled
-            .output_schema(root)
+            .output_schema(root as u64)
             .map_err(|e| Unanswered::Execution(e.to_string()))?;
         result_samples(&schema, &batches)
     }
+
+    /// `node`'s output at `time_ms`: from the query-time partition when it
+    /// is shared (computed there by the first run that needs it), else
+    /// from its own run.
+    fn output(
+        &self,
+        node: PhysicalASAPNodeId,
+        time_ms: i64,
+        raw_data: &Arc<RawData>,
+        views: &Arc<ViewStore>,
+    ) -> Result<Arc<Vec<Batch>>, Unanswered> {
+        if self.shared.contains(&node) {
+            self.results
+                .get_or_compute(node, time_ms, || self.run(node, time_ms, raw_data, views))
+        } else {
+            self.run(node, time_ms, raw_data, views).map(Arc::new)
+        }
+    }
+
+    /// The batches of `node`'s run at `time_ms`, after the shared nodes it
+    /// reads.
+    fn run(
+        &self,
+        node: PhysicalASAPNodeId,
+        time_ms: i64,
+        raw_data: &Arc<RawData>,
+        views: &Arc<ViewStore>,
+    ) -> Result<Vec<Batch>, Unanswered> {
+        let run = &self.runs[&node];
+        let mut shared = HashMap::new();
+        for &read in &run.reads {
+            shared.insert(read, self.output(read, time_ms, raw_data, views)?);
+        }
+        let run_store = Arc::new(RunStore::with_query_time_results(
+            raw_data.clone(),
+            views.clone(),
+            shared,
+        ));
+        run_compiled(&run.compiled, run_store.clone(), time_ms, &self.limits).map_err(|error| {
+            match run_store.missing_view_rows() {
+                Some(missing) => Unanswered::MissingViewRows(missing),
+                None => Unanswered::Execution(error.to_string()),
+            }
+        })
+    }
+}
+
+/// Whether `node`'s run, and every shared node's run it reads, compiled.
+fn runnable(
+    node: PhysicalASAPNodeId,
+    compiled: &BTreeMap<PhysicalASAPNodeId, Result<Run, String>>,
+) -> Result<(), String> {
+    let run = compiled[&node].as_ref().map_err(Clone::clone)?;
+    run.reads
+        .iter()
+        .try_for_each(|&read| runnable(read, compiled))
+}
+
+/// The query-time `OneEvaluation` nodes that more than one query's run
+/// reaches: each is cut out of the runs above it into a run of its own,
+/// the topmost first, until no node is computed in two runs. A node other
+/// than a query-time `OneEvaluation` one that two runs would compute is an
+/// error: the plan does not share it. A `Scan` is a read, not a
+/// computation, and is never cut.
+fn shared_nodes(
+    dag: &PhysicalASAPDAG,
+    views: &HashSet<PhysicalASAPNodeId>,
+) -> anyhow::Result<BTreeSet<PhysicalASAPNodeId>> {
+    let nodes: HashMap<PhysicalASAPNodeId, _> = dag.nodes.iter().map(|n| (n.id, n)).collect();
+    let mut inputs: HashMap<PhysicalASAPNodeId, Vec<PhysicalASAPNodeId>> = HashMap::new();
+    for edge in &dag.edges {
+        inputs.entry(edge.consumer).or_default().push(edge.producer);
+    }
+    let is_scan = |id: PhysicalASAPNodeId| {
+        matches!(
+            nodes[&id].payload,
+            Operator::NonASAP(NonASAPOp::Scan { .. })
+        )
+    };
+    let mut cut: BTreeSet<PhysicalASAPNodeId> = BTreeSet::new();
+    loop {
+        // How many runs compute each node.
+        let run_roots: BTreeSet<PhysicalASAPNodeId> =
+            dag.roots.iter().chain(&cut).copied().collect();
+        let mut runs_of: HashMap<PhysicalASAPNodeId, usize> = HashMap::new();
+        for &run_root in &run_roots {
+            let mut seen = HashSet::new();
+            let mut pending = vec![run_root];
+            while let Some(id) = pending.pop() {
+                let slot = id != run_root && (views.contains(&id) || cut.contains(&id));
+                if slot || views.contains(&id) || !seen.insert(id) {
+                    continue;
+                }
+                *runs_of.entry(id).or_default() += 1;
+                pending.extend(inputs.get(&id).into_iter().flatten().copied());
+            }
+        }
+        let several: HashSet<PhysicalASAPNodeId> = runs_of
+            .into_iter()
+            .filter(|&(id, runs)| runs > 1 && !is_scan(id))
+            .map(|(id, _)| id)
+            .collect();
+        if several.is_empty() {
+            return Ok(cut);
+        }
+        // The topmost: no input path from another of them reaches them.
+        let below: HashSet<PhysicalASAPNodeId> = several
+            .iter()
+            .flat_map(|id| inputs.get(id).into_iter().flatten().copied())
+            .collect();
+        for &id in several.iter().filter(|id| !below.contains(id)) {
+            let node = nodes[&id];
+            let one_evaluation = matches!(node.lifetime, Lifetime::OneEvaluation(_));
+            if !(one_evaluation && node.output_state.timing == ExecutionTiming::QueryTime) {
+                anyhow::bail!(
+                    "node {id} ({:?}, {:?}) would be computed in several queries' runs, but the plan shares only query-time OneEvaluation nodes",
+                    node.output_state.timing,
+                    node.lifetime
+                );
+            }
+            cut.insert(id);
+        }
+    }
+}
+
+/// The view slot a shared node is bound as: its whole output at the run's
+/// evaluation time, refreshed on first read and kept for that evaluation.
+fn query_time_slot(node: PhysicalASAPNodeId) -> anyhow::Result<MaterializedView> {
+    Ok(serde_json::from_value(serde_json::json!({
+        "node_id": node,
+        "refresh": "on_first_read",
+        "coverage": {"definition_id": format!("query-time-result-{node}"), "selection": []},
+        "inputs": {"materialized_views": []},
+        "retention_ms": 0,
+    }))?)
 }
 
 /// The batches of `compiled`'s one root in a query run at `time_ms`.
-fn run(
+fn run_compiled(
     compiled: &CompiledPhysicalDAG,
     store: std::sync::Arc<crate::store::RunStore>,
     time_ms: i64,
@@ -131,14 +351,14 @@ fn run(
     })
 }
 
-/// The views `root` reaches without passing another view (itself
+/// The slots `root` reaches without passing another slot (itself
 /// included, when it is one): the view slots of its query run.
-fn views_read(
+fn slots_read(
     dag: &PhysicalASAPDAG,
-    views: &[MaterializedView],
+    slots: &[MaterializedView],
     root: PhysicalASAPNodeId,
 ) -> Vec<MaterializedView> {
-    let view_ids: HashSet<PhysicalASAPNodeId> = views.iter().map(|v| v.node_id).collect();
+    let slot_ids: HashSet<PhysicalASAPNodeId> = slots.iter().map(|v| v.node_id).collect();
     let mut read = HashSet::new();
     let mut seen = HashSet::new();
     let mut pending = vec![root];
@@ -146,7 +366,7 @@ fn views_read(
         if !seen.insert(id) {
             continue;
         }
-        if view_ids.contains(&id) {
+        if slot_ids.contains(&id) {
             read.insert(id);
             continue;
         }
@@ -157,7 +377,7 @@ fn views_read(
                 .map(|e| e.producer),
         );
     }
-    views
+    slots
         .iter()
         .filter(|v| read.contains(&v.node_id))
         .cloned()

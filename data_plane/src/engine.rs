@@ -30,7 +30,7 @@ use tokio::sync::oneshot;
 use crate::ingestion::{ClosedWindow, Ingestion, IngestionOptions, IngestionStats, Precompute};
 use crate::metrics::{Gauges, Metrics, Timer};
 use crate::query::{QueryEngine, ResultSample, Unanswered};
-use crate::store::{PublishedStore, RawData, RawSample, RunStore, ViewStore};
+use crate::store::{PublishedStore, QueryTimeResults, RawData, RawSample, RunStore, ViewStore};
 
 /// How the engine ingests samples and runs queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +54,16 @@ pub struct EngineOptions {
     /// hold `run_memory_limit_bytes`, so queries may hold up to this many
     /// times that.
     pub query_threads: usize,
+    /// Compute each query-time `OneEvaluation` node several queries read
+    /// once per evaluation time, as the plan says; `false` computes it in
+    /// every query's run (for comparison).
+    pub share_one_evaluation_results: bool,
+    /// How long a query-time result is kept after its evaluation time,
+    /// counted back from the newest evaluation time computed.
+    pub query_time_results_retention_ms: u64,
+    /// The most bytes of query-time results kept; the oldest are dropped
+    /// first.
+    pub query_time_results_max_bytes: usize,
 }
 
 impl Default for EngineOptions {
@@ -66,6 +76,9 @@ impl Default for EngineOptions {
             no_forward: false,
             run_memory_limit_bytes: 4 << 30,
             query_threads: std::thread::available_parallelism().map_or(1, usize::from),
+            share_one_evaluation_results: true,
+            query_time_results_retention_ms: 60_000,
+            query_time_results_max_bytes: 1 << 30,
         }
     }
 }
@@ -112,6 +125,7 @@ pub struct EngineHandle {
     commands: Sender<Command>,
     /// Queries for the worker threads.
     queries: Sender<QueryJob>,
+    query: Arc<QueryEngine>,
     shared: Arc<Shared>,
     max_queued_samples: u64,
 }
@@ -188,8 +202,9 @@ impl EngineHandle {
                 let _guard = precompute_guard;
                 serve_precompute(precompute, job_receiver, &precompute_shared);
             })?;
+        let query = Arc::new(query);
         spawn_query_workers(
-            Arc::new(query),
+            query.clone(),
             shared.clone(),
             query_receiver,
             options.query_threads.max(1),
@@ -197,6 +212,7 @@ impl EngineHandle {
         let handle = Self {
             commands,
             queries,
+            query,
             shared,
             max_queued_samples: options.max_queued_samples,
         };
@@ -255,6 +271,16 @@ impl EngineHandle {
         answer
     }
 
+    /// How many query-time `OneEvaluation` nodes several queries share.
+    pub fn shared_nodes(&self) -> usize {
+        self.query.shared_nodes().len()
+    }
+
+    /// The query-time partition of the view store.
+    pub fn query_time_results(&self) -> &QueryTimeResults {
+        self.query.query_time_results()
+    }
+
     /// The engine's measurements.
     pub fn metrics(&self) -> &Metrics {
         &self.shared.metrics
@@ -270,6 +296,7 @@ impl EngineHandle {
                 samples_queued: self.queued_samples(),
                 precompute_backlog: self.precompute_backlog(),
                 now_ms: crate::ingestion::wall_clock_ms(),
+                query_time_results: self.query.query_time_results(),
             },
         )
     }
@@ -413,7 +440,21 @@ fn install(
         refresh_groups = groups.len(),
         "materialized views"
     );
-    let query = QueryEngine::new(&plan, &views, limits.clone());
+    let results = QueryTimeResults::new(
+        i64::try_from(options.query_time_results_retention_ms).unwrap_or(i64::MAX),
+        options.query_time_results_max_bytes,
+    );
+    let query = QueryEngine::new(
+        &plan,
+        &views,
+        limits.clone(),
+        results,
+        options.share_one_evaluation_results,
+    )?;
+    tracing::info!(
+        shared = ?query.shared_nodes(),
+        "query-time OneEvaluation nodes shared across queries"
+    );
     let unexecutable = query.unexecutable();
     if options.no_forward && !unexecutable.is_empty() {
         let reasons: Vec<String> = unexecutable

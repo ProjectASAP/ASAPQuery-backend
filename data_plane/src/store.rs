@@ -17,6 +17,10 @@
 //! whole panes. A series' identity text is computed once, when it is
 //! interned, and each row holds an index into its chunk's series.
 //!
+//! The views have a second, query-time partition ([`QueryTimeResults`]):
+//! each query-time `OneEvaluation` node's output at one evaluation time,
+//! computed once and shared by the queries at that time.
+//!
 //! A run reads a [`RunStore`]: an immutable snapshot sharing both parts.
 //! Each part has one writer (raw data: the ingest thread; views: the
 //! precompute thread), which changes its own copy (copy on write: clones
@@ -25,6 +29,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use asap_executor::arrow::array::{
@@ -365,14 +370,27 @@ fn column_kinds(metric: &str, request: &RawDataRequest) -> Result<Vec<ColumnKind
 pub struct RunStore {
     raw_data: Arc<RawData>,
     views: Arc<ViewStore>,
+    /// The query-time results the run reads, by node: each computed for
+    /// the run's evaluation time before the run starts and held by the run.
+    query_time_results: HashMap<PhysicalASAPNodeId, Arc<Vec<Batch>>>,
     missing_view_rows: Mutex<Option<String>>,
 }
 
 impl RunStore {
     pub fn new(raw_data: Arc<RawData>, views: Arc<ViewStore>) -> Self {
+        Self::with_query_time_results(raw_data, views, HashMap::new())
+    }
+
+    /// A run reading `query_time_results` besides the views and raw data.
+    pub fn with_query_time_results(
+        raw_data: Arc<RawData>,
+        views: Arc<ViewStore>,
+        query_time_results: HashMap<PhysicalASAPNodeId, Arc<Vec<Batch>>>,
+    ) -> Self {
         Self {
             raw_data,
             views,
+            query_time_results,
             missing_view_rows: Mutex::new(None),
         }
     }
@@ -416,6 +434,18 @@ impl DataStore for RunStore {
         request: &MaterializedViewRequest,
         context: RunContext,
     ) -> Result<OutputStream<'_, Batch>, Error> {
+        // A query-time result is the node's whole output at the run's
+        // evaluation time, whatever range the request names.
+        if let Some(batches) = self.query_time_results.get(&view.node_id) {
+            return Ok(stream::iter(batches.iter().cloned())
+                .map(move |batch| {
+                    if context.is_cancelled() {
+                        return Err(Error::Cancelled);
+                    }
+                    Ok(batch)
+                })
+                .boxed_local());
+        }
         self.views
             .read(view, request, context)
             .inspect_err(|error| {
@@ -549,6 +579,14 @@ impl PublishedStore {
         self.snapshot.write().unwrap_or_else(|e| e.into_inner()).1 = views;
     }
 
+    /// The newest published raw data and views.
+    pub fn snapshot(&self) -> (Arc<RawData>, Arc<ViewStore>) {
+        self.snapshot
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// The snapshot one run reads: the newest published.
     pub fn run_store(&self) -> Arc<RunStore> {
         let (raw_data, views) = self
@@ -557,6 +595,129 @@ impl PublishedStore {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         Arc::new(RunStore::new(raw_data, views))
+    }
+}
+
+/// One query-time result: empty while it is being computed or after its
+/// computation failed; the rows and their bytes once computed.
+type QueryTimeEntry = Arc<Mutex<Option<(Arc<Vec<Batch>>, usize)>>>;
+
+/// The materialized view store's query-time partition: the output of each
+/// query-time `OneEvaluation` node at one evaluation time `T`, shared by
+/// every query run at `T` that reads it, keyed by `(T, node)`. Query
+/// workers write it during their runs, so unlike the ingestion-time views
+/// it is not a published snapshot. A missing result is computed by the
+/// first run that needs it, while the others wait for it (single flight).
+/// A result is kept while `T` is within `retention_ms` of the newest
+/// evaluation time computed, and the oldest are dropped while more than
+/// `max_bytes` are held.
+pub struct QueryTimeResults {
+    entries: Mutex<BTreeMap<(i64, PhysicalASAPNodeId), QueryTimeEntry>>,
+    retention_ms: i64,
+    max_bytes: usize,
+    bytes: AtomicU64,
+    computes: AtomicU64,
+    hits: AtomicU64,
+}
+
+impl QueryTimeResults {
+    pub fn new(retention_ms: i64, max_bytes: usize) -> Self {
+        Self {
+            entries: Mutex::default(),
+            retention_ms,
+            max_bytes,
+            bytes: AtomicU64::new(0),
+            computes: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+        }
+    }
+
+    /// `node`'s output at `time_ms`: stored, or computed now by `compute`
+    /// (once, however many runs ask at once). A failed computation is not
+    /// stored, so the next run asking computes again.
+    pub fn get_or_compute<E>(
+        &self,
+        node: PhysicalASAPNodeId,
+        time_ms: i64,
+        compute: impl FnOnce() -> Result<Vec<Batch>, E>,
+    ) -> Result<Arc<Vec<Batch>>, E> {
+        let entry = {
+            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = entries.entry((time_ms, node)).or_default().clone();
+            self.drop_old(&mut entries, time_ms);
+            entry
+        };
+        let mut result = entry.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((batches, _)) = &*result {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(batches.clone());
+        }
+        self.computes.fetch_add(1, Ordering::Relaxed);
+        let batches = Arc::new(compute()?);
+        let bytes = batches.iter().map(Batch::memory_bytes).sum::<usize>();
+        *result = Some((batches.clone(), bytes));
+        drop(result);
+        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        self.drop_old(&mut entries, time_ms);
+        Ok(batches)
+    }
+
+    /// Drops the results older than the retention before the newest
+    /// evaluation time, then the oldest while more than `max_bytes` are
+    /// held; never one being computed, nor `(keep_ms, _)`.
+    fn drop_old(
+        &self,
+        entries: &mut BTreeMap<(i64, PhysicalASAPNodeId), QueryTimeEntry>,
+        keep_ms: i64,
+    ) {
+        let Some(&(newest_ms, _)) = entries.keys().next_back() else {
+            return;
+        };
+        let oldest_kept_ms = newest_ms.saturating_sub(self.retention_ms);
+        let keys: Vec<(i64, PhysicalASAPNodeId)> = entries.keys().copied().collect();
+        for key in keys {
+            let expired = key.0 < oldest_kept_ms;
+            let over = self.bytes.load(Ordering::Relaxed) as usize > self.max_bytes;
+            if !expired && !over {
+                break;
+            }
+            if key.0 == keep_ms {
+                continue;
+            }
+            // An entry being computed is kept: its computer adds its bytes.
+            let Ok(result) = entries[&key].try_lock() else {
+                continue;
+            };
+            let bytes = result.as_ref().map_or(0, |(_, bytes)| *bytes);
+            drop(result);
+            entries.remove(&key);
+            self.bytes.fetch_sub(bytes as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Bytes of the results held.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Results held, computed or being computed.
+    pub fn len(&self) -> usize {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Results computed so far.
+    pub fn computes(&self) -> u64 {
+        self.computes.load(Ordering::Relaxed)
+    }
+
+    /// Reads served by a result already computed.
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
     }
 }
 
@@ -763,5 +924,27 @@ mod tests {
                 sorted(row_read(&kept, &schema, range)),
             );
         }
+    }
+
+    /// A query-time result is computed once and then read; a failed
+    /// computation is not kept; results older than the retention before
+    /// the newest evaluation time are dropped.
+    #[test]
+    fn query_time_results_are_computed_once_and_expire() {
+        let results = QueryTimeResults::new(10_000, usize::MAX);
+        let ok = || Ok::<_, ()>(Vec::new());
+        results.get_or_compute(7, 1_000, ok).unwrap();
+        results.get_or_compute(7, 1_000, ok).unwrap();
+        assert_eq!((results.computes(), results.hits()), (1, 1));
+        assert!(results
+            .get_or_compute(8, 1_000, || Err::<Vec<Batch>, _>(()))
+            .is_err());
+        results.get_or_compute(8, 1_000, ok).unwrap();
+        assert_eq!(results.computes(), 3);
+        results.get_or_compute(7, 11_000, ok).unwrap();
+        assert_eq!(results.len(), 3);
+        results.get_or_compute(7, 11_001, ok).unwrap();
+        // (1_000, 7) and (1_000, 8) are more than 10 s older than 11_001.
+        assert_eq!(results.len(), 2);
     }
 }
