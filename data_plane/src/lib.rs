@@ -29,7 +29,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use engine::{EngineHandle, EngineOptions, IngestError};
-use prometheus::InstantQuery;
+use prometheus::{InstantQuery, RangeQuery};
 use query::Unanswered;
 use store::RawSample;
 
@@ -320,6 +320,8 @@ async fn answer(state: &DataPlane, query: InstantQuery) -> Result<serde_json::Va
     Ok(prometheus::vector_response(time_ms, &samples))
 }
 
+/// Answers a planned range query from the plan, one evaluation per step;
+/// forwards anything else.
 async fn query_range(
     state: State<Arc<DataPlane>>,
     method: Method,
@@ -327,10 +329,57 @@ async fn query_range(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if state.no_forward {
-        return not_answered("the data plane does not answer range queries yet");
+    let range = match RangeQuery::parse(query.0.as_deref(), &body) {
+        Ok(Some(range)) => range,
+        Ok(None) if state.no_forward => {
+            return not_answered(
+                "the request lacks query, start, end or step, or names a time that is not in Unix seconds",
+            );
+        }
+        Ok(None) => return forward(state, "query_range", method, query, headers, body).await,
+        Err(bad) => {
+            let body = axum::Json(prometheus::bad_data(&bad.to_string()));
+            return (StatusCode::BAD_REQUEST, body).into_response();
+        }
+    };
+    let reason = match answer_range(&state, range).await {
+        Ok(response) => {
+            let mut response = axum::Json(response).into_response();
+            response
+                .headers_mut()
+                .insert(EXECUTION_HEADER, HeaderValue::from_static("plan"));
+            return response;
+        }
+        Err(reason) if state.no_forward => return not_answered(&reason.to_string()),
+        Err(Unanswered::NotPlanned(_)) => None,
+        Err(reason) => {
+            tracing::debug!(%reason, "forwarding a planned range query");
+            Some(header_value(&reason.to_string()))
+        }
+    };
+    let mut response = forward(state, "query_range", method, query, headers, body).await;
+    if let Some(reason) = reason {
+        response.headers_mut().insert(FORWARD_REASON_HEADER, reason);
     }
-    forward(state, "query_range", method, query, headers, body).await
+    response
+}
+
+/// Runs a planned query at every step of `range`, the steps in parallel on
+/// the query workers; unanswered if any step is.
+async fn answer_range(
+    state: &DataPlane,
+    range: RangeQuery,
+) -> Result<serde_json::Value, Unanswered> {
+    let query = &range.query;
+    let steps = range.times_ms().map(|time_ms| async move {
+        let samples = state.engine.evaluate(query.clone(), time_ms).await?;
+        Ok::<_, Unanswered>((time_ms, samples))
+    });
+    let steps = futures::future::join_all(steps)
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(prometheus::matrix_response(&steps))
 }
 
 /// With `--no-forward`, the answer to a query the plan does not answer: a

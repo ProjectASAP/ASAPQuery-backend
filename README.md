@@ -113,8 +113,15 @@ name. `scripts/profile.sh` records a flamegraph of a running data plane;
 `cargo run --release -p data_plane --example ingest_bench -- 10000 300`
 measures ingest throughput in process.
 
+A range query (`/api/v1/query_range`) whose text is one of the plan's
+queries is answered with one evaluation per step, the steps in parallel on
+the query workers, as a Prometheus matrix; it is not answered if any step
+is not. Plan a dashboard's range requests with the workload's
+`range_evaluation` (`{"step_ms": 60000, "span_ms": 3600000}`), so the plan
+delivers every step time.
+
 Not supported yet: views refreshed on first read (so the backend declares
-`query_time_results_retained: false`), range queries, SQL.
+`query_time_results_retained: false`), SQL.
 
 ## Running
 
@@ -151,7 +158,7 @@ Prometheus's default query timeout); a query that runs longer gets 502.
 `--no-forward` makes every answer ASAP's: the data plane never sends a query
 to Prometheus. It refuses to start with a plan that has a query it cannot
 run, and answers any query the plan does not answer (not planned, a window
-not stored, a range query) with a Prometheus `execution` error (422,
+not stored) with a Prometheus `execution` error (422,
 `x-asap-execution: refused`) whose `error` is the reason a forwarded query's
 `x-asap-forward-reason` would give.
 

@@ -13,6 +13,10 @@
 //! Planner's runtime tests do: every raw sample in an `InMemoryDataStore`,
 //! each refresh group refreshed in one ingestion run per window, then one
 //! query run.
+//!
+//! Range queries: the mixed workloads again, each query requested as a
+//! range over its last three evaluations (`range_evaluation`); the data
+//! plane's matrix equals the reference's query run at each step.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -283,6 +287,64 @@ async fn served_answer(app: &Router, query: &str) -> Result<Vec<Answer>, String>
     Ok(answers)
 }
 
+fn sample_value(value: &Json) -> f64 {
+    match value.as_str().unwrap() {
+        "NaN" => f64::NAN,
+        "+Inf" => f64::INFINITY,
+        "-Inf" => f64::NEG_INFINITY,
+        v => v.parse().unwrap(),
+    }
+}
+
+/// The data plane's answer to `query` as a range from `start_ms` to
+/// `end_ms` at `step_ms`: each step's answer rows, or its error.
+async fn served_range(
+    app: &Router,
+    query: &str,
+    (start_ms, end_ms, step_ms): (i64, i64, i64),
+) -> Result<BTreeMap<i64, Vec<Answer>>, String> {
+    let uri = format!(
+        "/api/v1/query_range?{}",
+        form_urlencoded::Serializer::new(String::new())
+            .append_pair("query", query)
+            .append_pair("start", &format!("{}", start_ms as f64 / 1000.0))
+            .append_pair("end", &format!("{}", end_ms as f64 / 1000.0))
+            .append_pair("step", &format!("{}", step_ms as f64 / 1000.0))
+            .finish()
+    );
+    let response = app
+        .clone()
+        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: Json =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    if status != StatusCode::OK {
+        return Err(body["error"].as_str().unwrap_or_default().to_string());
+    }
+    assert_eq!(body["data"]["resultType"], "matrix");
+    let mut steps: BTreeMap<i64, Vec<Answer>> = (0..)
+        .map(|i| start_ms + i * step_ms)
+        .take_while(|t| *t <= end_ms)
+        .map(|t| (t, Vec::new()))
+        .collect();
+    for series in body["data"]["result"].as_array().unwrap() {
+        let labels: Labels = serde_json::from_value(series["metric"].clone()).unwrap();
+        for value in series["values"].as_array().unwrap() {
+            let time_ms = (value[0].as_f64().unwrap() * 1000.0).round() as i64;
+            steps
+                .get_mut(&time_ms)
+                .unwrap()
+                .push((labels.clone(), sample_value(&value[1])));
+        }
+    }
+    for answers in steps.values_mut() {
+        answers.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+    Ok(steps)
+}
+
 // ── The reference: the Planner's executor in process ───────────────────
 
 fn raw_tables(plan: &InstallablePlan, points: &[Point]) -> InMemoryDataStore {
@@ -336,6 +398,21 @@ fn reference_answers(
     points: &[Point],
     start_ms: i64,
 ) -> Vec<Result<Vec<Answer>, String>> {
+    let times = vec![vec![EVALUATION_MS]; plan.dag.roots.len()];
+    reference_answers_at(plan, points, start_ms, &times)
+        .into_iter()
+        .map(|mut answers| answers.remove(0))
+        .collect()
+}
+
+/// As [`reference_answers`], with one query run of root `i` at each of
+/// `times[i]`.
+fn reference_answers_at(
+    plan: &InstallablePlan,
+    points: &[Point],
+    start_ms: i64,
+    times: &[Vec<i64>],
+) -> Vec<Vec<Result<Vec<Answer>, String>>> {
     let dag = &plan.dag;
     let views = plan.materialized_views().unwrap();
     let limits = Limits { max_bytes: 4 << 30 };
@@ -394,38 +471,54 @@ fn reference_answers(
     }
     dag.roots
         .iter()
-        .map(|&root| {
-            let read: Vec<_> = views
+        .zip(times)
+        .map(|(&root, times)| {
+            times
                 .iter()
-                .filter(|v| reaches_without_passing_a_view(plan, root, v.node_id, &views))
-                .cloned()
-                .collect();
-            let compiled = compile(dag, &read, &[root as u64]).map_err(|e| e.to_string())?;
-            let instance = compiled
-                .instantiate(store.clone())
-                .map_err(|e| e.to_string())?;
-            let context = RunContext::new(
-                Scope::Query {
-                    evaluation_time_ms: EVALUATION_MS,
-                },
-                limits.clone(),
-            )
-            .unwrap();
-            let schema = compiled.output_schema(root as u64).unwrap();
-            let batches = block_on(async {
-                let mut output = instance
-                    .execute(compiled.roots(), context)
-                    .map_err(|e| e.to_string())?
-                    .remove(0);
-                let mut batches = Vec::new();
-                while let Some(batch) = output.next().await {
-                    batches.push((*batch.map_err(|e| e.to_string())?).clone());
-                }
-                Ok::<_, String>(batches)
-            })?;
-            Ok(answers(&schema, &batches))
+                .map(|&time_ms| reference_run(plan, &store, &views, root, time_ms))
+                .collect()
         })
         .collect()
+}
+
+/// `root`'s answer from one query run at `time_ms` over `store`.
+fn reference_run(
+    plan: &InstallablePlan,
+    store: &Arc<InMemoryDataStore>,
+    views: &[asap_planner::MaterializedView],
+    root: usize,
+    time_ms: i64,
+) -> Result<Vec<Answer>, String> {
+    let limits = Limits { max_bytes: 4 << 30 };
+    let read: Vec<_> = views
+        .iter()
+        .filter(|v| reaches_without_passing_a_view(plan, root, v.node_id, views))
+        .cloned()
+        .collect();
+    let compiled = compile(&plan.dag, &read, &[root as u64]).map_err(|e| e.to_string())?;
+    let instance = compiled
+        .instantiate(store.clone())
+        .map_err(|e| e.to_string())?;
+    let context = RunContext::new(
+        Scope::Query {
+            evaluation_time_ms: time_ms,
+        },
+        limits,
+    )
+    .unwrap();
+    let schema = compiled.output_schema(root as u64).unwrap();
+    let batches = block_on(async {
+        let mut output = instance
+            .execute(compiled.roots(), context)
+            .map_err(|e| e.to_string())?
+            .remove(0);
+        let mut batches = Vec::new();
+        while let Some(batch) = output.next().await {
+            batches.push((*batch.map_err(|e| e.to_string())?).clone());
+        }
+        Ok::<_, String>(batches)
+    })?;
+    Ok(answers(&schema, &batches))
 }
 
 /// Whether `view` is a view slot of `root`'s query run: reached from it
@@ -566,5 +659,114 @@ async fn the_data_plane_answers_what_the_planner_executor_answers() {
     assert!(
         compared_plans >= 10,
         "only {compared_plans} plans compared ({compared_queries} queries)"
+    );
+}
+
+/// Steps per range request in the range comparison.
+const RANGE_STEPS: u64 = 3;
+
+/// `workload` with each repeating query requested as a range over its last
+/// `RANGE_STEPS` evaluations, at its interval; and each query's step.
+fn with_range_evaluation(workload: &PlanningWorkload) -> (PlanningWorkload, Vec<i64>) {
+    let mut json = serde_json::to_value(workload).unwrap();
+    let mut steps = Vec::new();
+    for entry in json["query_workload"]["repeating_queries"]
+        .as_array_mut()
+        .unwrap()
+    {
+        let step_ms = entry["demand"]["fixed_interval_at"]["interval"]
+            .as_u64()
+            .unwrap();
+        entry["range_evaluation"] =
+            serde_json::json!({"step_ms": step_ms, "span_ms": step_ms * (RANGE_STEPS - 1)});
+        steps.push(step_ms as i64);
+    }
+    (serde_json::from_value(json).unwrap(), steps)
+}
+
+/// The mixed workloads with every query requested as a range: at each
+/// step, the data plane's matrix holds what the reference's query run at
+/// that time answers, or neither answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn range_queries_answer_what_the_planner_executor_answers_at_each_step() {
+    let mut compared_steps = 0;
+    let mut non_empty_steps = 0;
+    let mut report = Vec::new();
+    let mut mismatches = Vec::new();
+    for (name, workload) in workloads().into_iter().filter(|(name, _)| {
+        name.starts_with("random-mixed-seed-862-0") && name.as_str() <= "random-mixed-seed-862-03"
+    }) {
+        let (workload, steps) = with_range_evaluation(&workload);
+        for raw_data_retained in [true, false] {
+            let label = format!("{name} as ranges (raw data retained: {raw_data_retained})");
+            let mut inputs = DeploymentInputs::default();
+            inputs.deployment_capabilities.raw_data_retained = raw_data_retained;
+            let plan = match plan_workload(&workload, &inputs) {
+                Ok((plan, _)) => plan,
+                Err(error) => {
+                    report.push(format!("{label}: not planned: {error}"));
+                    continue;
+                }
+            };
+            let start_ms = EVALUATION_MS - reach_back_ms(&plan);
+            let points = points(&plan, start_ms);
+            let times: Vec<Vec<i64>> = steps
+                .iter()
+                .map(|step| {
+                    (0..RANGE_STEPS as i64)
+                        .rev()
+                        .map(|i| EVALUATION_MS - i * step)
+                        .collect()
+                })
+                .collect();
+            let expected = reference_answers_at(&plan, &points, start_ms, &times);
+            let app = data_plane(&plan, &points, start_ms).await;
+            let mut equal = 0;
+            for ((query, expected), (step, times)) in plan
+                .query_texts
+                .iter()
+                .zip(&expected)
+                .zip(steps.iter().zip(&times))
+            {
+                let range = (times[0], EVALUATION_MS, *step);
+                match served_range(&app, query, range).await {
+                    Ok(served) => {
+                        for (time_ms, expected) in times.iter().zip(expected) {
+                            let served = &served[time_ms];
+                            match expected {
+                                Ok(expected) if same(served, expected) => {
+                                    equal += 1;
+                                    non_empty_steps += usize::from(!served.is_empty());
+                                }
+                                _ => mismatches.push(format!(
+                                    "{label}: {query} at {time_ms}:\n  data plane {served:?}\n  reference  {expected:?}"
+                                )),
+                            }
+                        }
+                    }
+                    Err(error) if expected.iter().any(Result::is_err) => report.push(format!(
+                        "{label}: {query}: neither answers every step: {error}"
+                    )),
+                    Err(error) => mismatches.push(format!(
+                        "{label}: {query}: data plane {error}, reference {expected:?}"
+                    )),
+                }
+            }
+            compared_steps += equal;
+            report.push(format!(
+                "{label}: {equal}/{} steps equal",
+                plan.query_texts.len() * RANGE_STEPS as usize
+            ));
+        }
+    }
+    println!("{}", report.join("\n"));
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    assert!(
+        compared_steps >= 100,
+        "only {compared_steps} steps compared"
+    );
+    assert!(
+        non_empty_steps * 10 >= compared_steps * 9,
+        "only {non_empty_steps} of {compared_steps} equal steps have rows"
     );
 }
