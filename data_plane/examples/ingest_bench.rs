@@ -12,6 +12,12 @@
 //! temporary directory, as the data plane does by default, unless
 //! `PERSIST` is `memory`.
 //!
+//! Environment: `WORKLOAD=path.json` plans that workload instead and feeds
+//! `SERIES` series of every metric it names; `PACED=1` sends one scrape per
+//! second of wall time, as a live producer does, and reports the largest
+//! precompute and persist backlogs seen; `PERSIST_THREADS=n` sets the
+//! persist threads.
+//!
 //! `cargo run --release -p data_plane --example ingest_bench -- SERIES SECONDS [PLAN] [REQUESTS] [PERSIST]`
 
 /// The data plane's allocator, as `main.rs` sets it.
@@ -44,10 +50,13 @@ async fn main() {
         dir
     });
 
-    let path = concat!(
+    let default_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/workloads/random-mixed-seed-862-01.json"
     );
+    let custom = std::env::var("WORKLOAD").ok();
+    let path = custom.clone().unwrap_or_else(|| default_path.to_string());
+    let paced = std::env::var("PACED").is_ok_and(|v| v == "1");
     let mut workload: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     for source in workload["data_workload"]["sources"]
@@ -58,6 +67,16 @@ async fn main() {
         source["series_count"] = series.into();
         source["sample_interval"] = 1000.into();
     }
+    // The metrics fed: the custom workload's every source, else `data`.
+    let metrics: Vec<String> = match custom {
+        Some(_) => workload["data_workload"]["sources"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect(),
+        None => vec!["data".to_string()],
+    };
     workload["data_workload"]["arrival"]["ingesting"]["rows_per_second"] = (series as f64).into();
     let workload = serde_json::from_value(workload).unwrap();
     let mut inputs = DeploymentInputs::default();
@@ -79,6 +98,9 @@ async fn main() {
             ..IngestionOptions::default()
         },
         view_dir: view_dir.clone(),
+        persist_threads: std::env::var("PERSIST_THREADS")
+            .ok()
+            .map_or(EngineOptions::default().persist_threads, |n| n.parse().unwrap()),
         ..EngineOptions::default()
     };
     println!(
@@ -99,10 +121,12 @@ async fn main() {
     );
     let app = router(state.clone());
 
-    let labels: Vec<Vec<Label>> = (0..series)
-        .map(|i| {
+    let labels: Vec<Vec<Label>> = metrics
+        .iter()
+        .flat_map(|metric| (0..series).map(move |i| (metric, i)))
+        .map(|(metric, i)| {
             [
-                ("__name__", "data".to_string()),
+                ("__name__", metric.clone()),
                 ("instance", format!("i{i}")),
                 ("job", format!("job{}", i % 16)),
                 ("region", format!("r{}", i % 4)),
@@ -116,7 +140,8 @@ async fn main() {
             .collect()
         })
         .collect();
-    let slice = series.div_ceil(requests_per_scrape.max(1));
+    let slice = labels.len().div_ceil(requests_per_scrape.max(1));
+    let requests_per_second = labels.len().div_ceil(slice);
     let bodies: Vec<Vec<u8>> = (1..=seconds)
         .flat_map(|second| {
             let timestamp = start_ms + second * 1000;
@@ -144,7 +169,23 @@ async fn main() {
     let cpu_before = thread_cpu_seconds();
     let started = Instant::now();
     let mut retries = 0u64;
-    for body in bodies {
+    let (mut max_precompute_backlog, mut max_persist_backlog) = (0u64, 0f64);
+    for (index, body) in bodies.into_iter().enumerate() {
+        if paced && index % requests_per_second == 0 {
+            let due = std::time::Duration::from_secs((index / requests_per_second) as u64);
+            if let Some(wait) = due.checked_sub(started.elapsed()) {
+                tokio::time::sleep(wait).await;
+            }
+            max_precompute_backlog = max_precompute_backlog.max(state.engine.precompute_backlog());
+            let persist = state
+                .engine
+                .render_metrics()
+                .lines()
+                .find_map(|l| l.strip_prefix("asap_persist_backlog_bytes "))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0);
+            max_persist_backlog = f64::max(max_persist_backlog, persist);
+        }
         loop {
             let response = app
                 .clone()
@@ -182,7 +223,7 @@ async fn main() {
     let wall = started.elapsed().as_secs_f64();
     let cpu_after = thread_cpu_seconds();
 
-    let samples = series as f64 * seconds as f64;
+    let samples = (series * metrics.len()) as f64 * seconds as f64;
     println!(
         "series {series}, seconds {seconds}, samples {samples}: every write acknowledged after {acknowledged:.2} s \
          ({:.0} samples/s), every window refreshed after {wall:.2} s ({:.0} samples/s), 503 retries {retries}",
@@ -190,6 +231,12 @@ async fn main() {
         samples / wall
     );
     println!("ingestion counters: {:?}", state.engine.stats());
+    if paced {
+        println!(
+            "  paced: largest precompute backlog {max_precompute_backlog} windows, largest persist queue {:.0} bytes",
+            max_persist_backlog
+        );
+    }
     let mut total = 0.0;
     for (name, after) in &cpu_after {
         let cpu = after - cpu_before.get(name).copied().unwrap_or(0.0);
