@@ -342,11 +342,29 @@ impl Ingestion {
     ) -> Vec<ClosedWindow> {
         self.newest_clock_ms = self.newest_clock_ms.max(Some(now_ms));
         let latest_allowed_ms = now_ms.saturating_add(millis(self.options.max_future_ms));
-        let mut oldest_kept: HashMap<std::sync::Arc<str>, Option<i64>> = HashMap::new();
+        // Per metric of this request: whether a `Scan` reads it, and the
+        // eviction cutoff as of its first routed sample (`None` before). Samples of one
+        // metric usually come together, so the last metric is checked by
+        // pointer first.
+        let mut metrics: Vec<(std::sync::Arc<str>, bool, Option<Option<i64>>)> = Vec::new();
+        let mut last: Option<usize> = None;
+        let mut groups_waiting = self.groups.iter().any(|g| g.refreshed_through.is_none());
         let mut accepted = Vec::with_capacity(samples.len());
         for sample in samples {
-            let metric = sample.labels.metric.clone();
-            if !self.scanned_metrics.contains(&*metric) {
+            let metric = &sample.labels.metric;
+            let known = last
+                .filter(|&i| std::sync::Arc::ptr_eq(&metrics[i].0, metric))
+                .or_else(|| metrics.iter().position(|(m, _, _)| m == metric));
+            let index = match known {
+                Some(index) => index,
+                None => {
+                    let routed = self.scanned_metrics.contains(&**metric);
+                    metrics.push((metric.clone(), routed, None));
+                    metrics.len() - 1
+                }
+            };
+            last = Some(index);
+            if !metrics[index].1 {
                 self.stats.samples_unrouted += 1;
                 continue;
             }
@@ -354,10 +372,18 @@ impl Ingestion {
                 self.stats.samples_dropped_future += 1;
                 continue;
             }
-            self.start_groups(&metric, sample.timestamp_ms);
-            let cutoff = *oldest_kept
-                .entry(metric.clone())
-                .or_insert_with(|| self.oldest_kept_ms(&metric));
+            if groups_waiting {
+                self.start_groups(metric, sample.timestamp_ms);
+                groups_waiting = self.groups.iter().any(|g| g.refreshed_through.is_none());
+            }
+            let cutoff = match metrics[index].2 {
+                Some(cutoff) => cutoff,
+                None => {
+                    let cutoff = self.oldest_kept_ms(metric);
+                    metrics[index].2 = Some(cutoff);
+                    cutoff
+                }
+            };
             if cutoff.is_some_and(|cutoff| sample.timestamp_ms <= cutoff) {
                 self.stats.samples_dropped_late += 1;
                 continue;
