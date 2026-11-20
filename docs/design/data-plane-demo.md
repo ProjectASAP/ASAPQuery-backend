@@ -82,7 +82,11 @@ Non-goals (v1):
   it replaces the executor's whole operator layer and changes edge-case
   semantics, so it is separate, multi-week work.
 - Persisting raw samples or open windows, checkpointing, and changing the
-  shard count at run time. Late samples are dropped, as before.
+  shard count at run time. Late samples are handled as before: a sample
+  older than every window still to be closed and than what a query-time
+  `Scan` reads back is dropped (`asap_samples_total{outcome="dropped_late"}`);
+  a later sample for a window already refreshed is kept for query-time
+  `Scan`s but does not change the stored window.
 
 ## Framing questions
 
@@ -119,10 +123,11 @@ Remote Write ─► HTTP threads: decode, intern series
                 the ingestion-time views (Arc swap)
                      ▼
         materialized view store
-          ├─ ingestion-time views: immutable snapshots, retention from the plan,
-          │  each window appended to its view's file and synced
+          ├─ ingestion-time views: immutable snapshots, kept for each view's
+          │  retention; each window appended to its group's file and synced
           └─ query-time results: (OneEvaluation node, T) → rows, written by
-             query workers, single flight, dropped once T is past
+             query workers, single flight, kept while T is within a margin
+             of the watermark
                      ▲
 HTTP queries ─► query workers: one query run per worker thread over
                 (view snapshot + query-time results); a range query is one
@@ -170,7 +175,13 @@ HTTP queries ─► query workers: one query run per worker thread over
   snapshots, output batches, sketch states) is `Send + Sync`, checked at
   compile time.
 - Concurrency is bounded by the worker count; further requests queue. Each
-  run has its own memory limit, so peak query memory ≤ workers × run limit.
+  run has its own memory limit, so runs in progress hold at most workers ×
+  run limit. On top of that come the queued requests (unbounded), the
+  query-time results (up to `--query-time-results-max-bytes`), and a range
+  query's step answers until its matrix is sent; peak query memory is the
+  sum, not the run limit alone.
+- A panic in a run answers that query with an error and the worker keeps
+  serving; it is logged.
 - Each query takes the latest view snapshot when it starts, so two queries at
   the same evaluation time may read different snapshots.
 
@@ -192,11 +203,15 @@ own, and each query reading it binds it as a view slot (an on-first-read
 `MaterializedView` descriptor, so the executor is unchanged) read through
 `read_materialized_view`. The first query needing (node, T) computes it;
 queries needing it meanwhile wait for that result (single flight); later
-ones read it. A run holds the results it reads, so dropping one cannot
-fail a run. A failed computation is not kept. Results are dropped once T
-is more than `--query-time-results-retention-ms` (default 60 s) behind the
-newest evaluation time computed, or, oldest first, while more than
-`--query-time-results-max-bytes` (default 1 GiB) are held. Install fails if
+ones read it. A failed computation reaches the queries that waited for it
+and is not kept. A run holds the results it reads, so dropping one cannot
+fail a run. A result is kept only for a time T the watermark has passed,
+whose inputs are complete; at a later T (for example a client's
+far-future `time=`) each run computes the node itself. Results are dropped
+once T is more than `--query-time-results-retention-ms` (default 60 s)
+behind the watermark, or, oldest first, while more than
+`--query-time-results-max-bytes` (default 1 GiB) are held; an entry being
+computed is never dropped. Install fails if
 the plan and the runtime disagree: any other node (for example a computed
 `None` node) that several queries' runs would compute. `--no-shared-results`
 computes the node in every query's run instead, for comparison. Stage 3
@@ -206,33 +221,247 @@ runtime match it.
 The query-time results partition is also where views refreshed on first read
 will live, with a longer retention, when they are supported.
 
+### Examples: executing PromQL plans of any shape
+
+The engines never match plan shapes. They execute whatever DAG the plan
+contains, by these rules:
+
+| Plan element | Precompute engine | Query engine |
+| --- | --- | --- |
+| Ingestion-time view (`AcrossEvaluations` at ingestion) | grouped by the plan with the views of the same window width W and phase p (a refresh group, `ingestion_refresh_groups`); one `execute_ingestion` run per closed window `(e − W, e]`; when one watermark advance closes windows of several groups, they run in plan order, so a group runs after the groups whose views it reads | a slot: its stored windows that tile the run's `TimeRange` |
+| Ingestion-time `None` node (e.g. the `Scan` under a view) | computed inside each refresh group's run that reaches it (a `Scan` under two groups is read by each group's run); within one run, once for all its consumers | — |
+| Query-time `OneEvaluation` node read by several queries' runs | — | cut out like a view: computed once per evaluation time T, single flight, then a slot of each run that reads it |
+| Query-time `OneEvaluation` node with several consumers inside one run | — | computed once inside that run, held until its consumers finish (the executor's rule) |
+| Query-time `None` node | — | computed inside the run that reads it (one consumer) |
+| Query-time `Scan` (raw data retained) | keeps the raw panes back to the scan's retention | a raw-data slot over the panes |
+
+Each query root is compiled once at install, with views and shared nodes as
+slots. An instant query at T runs its compiled root once; a range query runs
+it once per step, at most one step per query worker at a time. The plans
+below come from `asap_planner --run-until stage3` at ASAPPlanner `1b18ad92`
+(workload files are ASAPPlanner's sketch plan snapshot workloads, ids in
+parentheses). Each listing shows plan node
+`n<k>`, its timing and lifetime, the operator, and the nodes it reads.
+
+#### 1. One query, a diamond inside it (`ratio-of-quantiles-1h-mvp`)
+
+`quantile_over_time(0.9, data[1h]) / quantile_over_time(0.5, data[1h])`,
+every 60 s, raw data not retained.
+
+```
+n0  Ingestion None                Scan
+n1  Ingestion AcrossEvaluations   SummaryTumblingWindowChain DDSketch W=60s α=0.02  <- n0
+n2  Query     None                TimeRange 1h                                       <- n1
+n3  Query     OneEvaluation       SummaryMerge                                       <- n2
+n4  Query     None                SummaryEstimate q=0.5                              <- n3
+n5  Query     None                Project                                            <- n4
+n6  Query     None                SummaryEstimate q=0.9                              <- n3
+n7  Query     None                Project                                            <- n6
+n8  Query     None                BinaryOp                                           <- n7, n5   (root)
+```
+
+- Precompute: one refresh group {n1} (W = 60 s). Each closed minute runs
+  n0 → n1 once and appends one window of DDSketches per series.
+- Query: one compiled root (n8) with n1 as a view slot. In each run, n3
+  merges the 60 windows once and both estimates read it (two consumers in one
+  run), then the division joins the two sides.
+
+#### 2. Two queries share a query-time node (`shared-quantiles-1h-mvp`)
+
+`quantile_over_time(0.5, data[1h])` and `quantile_over_time(0.9, data[1h])`,
+both every 60 s.
+
+```
+n0  Ingestion None                Scan
+n1  Ingestion AcrossEvaluations   SummaryTumblingWindowChain DDSketch W=60s α=0.05  <- n0
+n2  Query     None                TimeRange 1h                                       <- n1
+n3  Query     OneEvaluation       SummaryMerge                                       <- n2
+n4  Query     None                SummaryEstimate q=0.9                              <- n3
+n5  Query     None                Project                                            <- n4   (root, q2)
+n6  Query     None                SummaryEstimate q=0.5                              <- n3
+n7  Query     None                Project                                            <- n6   (root, q1)
+```
+
+- Precompute: as in example 1, one view feeds both queries.
+- Query: n3 is `OneEvaluation` and is read by two queries' runs, so it is cut
+  out. At T, whichever query arrives first runs n2 → n3 and stores the merged
+  sketches under (n3, T); the other waits for that result or reads it. Then
+  q1 runs slot(n3) → n6 → n7 and q2 runs slot(n3) → n4 → n5, on two worker
+  threads. The 60-window merge happens once per T, as Stage 3 charged it.
+
+#### 3. Different window widths and intervals (`chains-10m-5m-3m-10s-mvp`)
+
+`quantile_over_time(0.5, data[10m])` and `quantile_over_time(0.9, data[5m])`
+every 5 min; `quantile_over_time(0.99, data[3m])` every 10 s.
+
+```
+n0   Ingestion None               Scan
+n1   Ingestion AcrossEvaluations  SummaryTumblingWindowChain KLL W=300s k=1404  <- n0
+n2   Query     None               TimeRange 5m                                   <- n1
+n3   Query     OneEvaluation      SummaryMerge                                   <- n2
+n4   Query     None               SummaryEstimate q=0.9                          <- n3
+n5   Query     None               Project                                        <- n4   (root)
+n6   Query     None               TimeRange 10m                                  <- n1
+n7   Query     OneEvaluation      SummaryMerge                                   <- n6
+n8   Query     None               SummaryEstimate q=0.5                          <- n7
+n9   Query     None               Project                                        <- n8   (root)
+n10  Ingestion AcrossEvaluations  SummaryTumblingWindowChain KLL W=10s k=1404   <- n0
+n11  Query     None               TimeRange 3m                                   <- n10
+n12  Query     OneEvaluation      SummaryMerge                                   <- n11
+n13  Query     None               SummaryEstimate q=0.99                         <- n12
+n14  Query     None               Project                                        <- n13  (root)
+```
+
+- Precompute: two refresh groups, {n1} with W = 300 s and {n10} with
+  W = 10 s. Each runs on its own windows; the `Scan` n0 under both runs in
+  each group's run, so the raw rows of a 10 s window are read again by the
+  300 s window that contains it. (Stage 3 charges n0 once; the second read
+  is a known cost-model mismatch, small because a scan is cheap.)
+- Query: view n1 is read by two roots with different ranges (5 m reads one
+  window, 10 m reads two); n3 and n7 each have one reader, so they are not
+  cut. The 10 s query reads 18 windows of n10.
+
+#### 4. Four dashboard queries over two metrics (dashboard workload)
+
+`quantile_over_time(0.99, lat[1h])`, `max_over_time(lat[30m])`,
+`topk(10, sum by (job) (rate(reqs[1h])))`,
+`sum by (job) (increase(reqs[1h]))`, every 15 s; 10k series per metric,
+1 sample/s; raw data not retained.
+
+```
+n0   Ingestion None               Scan lat
+n1   Ingestion AcrossEvaluations  SummaryTumblingWindowChain KLL W=15s  <- n0
+n2   Query     None               TimeRange 1h                    <- n1
+n3   Query     OneEvaluation      SummaryMerge                    <- n2
+n4   Query     None               SummaryEstimate q=0.99          <- n3
+n5   Query     None               Project                         <- n4   (root)
+n6   Ingestion AcrossEvaluations  SummaryTumblingWindowChain Max W=15s       <- n0
+n7   Query     None               TimeRange 30m                   <- n6
+n8   Query     OneEvaluation      SummaryMerge                    <- n7
+n9   Query     None               FinalizeExactAccumulator        <- n8   (root)
+n10  Ingestion None               Scan reqs
+n11  Ingestion AcrossEvaluations  SummaryTumblingWindowChain Rate W=15s      <- n10
+n12  Query     None               TimeRange 1h                    <- n11
+n13  Query     OneEvaluation      SummaryMerge                    <- n12
+n14  Query     None               FinalizeExactAccumulator        <- n13
+n15  Query     OneEvaluation      Aggregate sum by (job)          <- n14
+n16  Query     OneEvaluation      Aggregate topk(10)              <- n15  (root)
+n17  Ingestion AcrossEvaluations  SummaryTumblingWindowChain Increase W=15s  <- n10
+n18  Query     None               TimeRange 1h                    <- n17
+n19  Query     OneEvaluation      SummaryMerge                    <- n18
+n20  Query     None               FinalizeExactAccumulator        <- n19
+n21  Query     OneEvaluation      Aggregate sum by (job)          <- n20  (root)
+```
+
+- Precompute: all four views have W = 15 s and phase 0, so they form one
+  refresh group. Each closed 15 s window runs one `execute_ingestion`: n0
+  feeds both the DDSketch and the Max chain, n10 feeds both the Rate and the
+  Increase chain (one producer, several consumers, each scan read once).
+- Query: four roots, each over its own view; no node is read by two
+  queries, so nothing is cut. (At ASAPPlanner `1b18ad92` with default cost
+  inputs the plan's quantile chain is a KLL sketch; KLL seeds its
+  compaction coin at random, so the parity test compares this plan's
+  answers within 5%.) The quantile root merges 240 windows per
+  series per evaluation (see "Hierarchical rollups").
+
+#### 5. Query-time only, raw data retained (`topk-by-job-and-global-raw-retained`)
+
+`topk by (job) (5, data)` and `topk(10, data)`, every 60 s.
+
+```
+n0  Query None           Scan
+n1  Query None           TimeRange 15s  <- n0
+n2  Query None           Sort           <- n1
+n3  Query None           Limit          <- n2   (root)
+n4  Query None           Scan
+n5  Query None           TimeRange 15s  <- n4
+n6  Query OneEvaluation  Sort           <- n5
+n7  Query None           Limit          <- n6   (root)
+```
+
+- Precompute: no views. The ingest thread only keeps the raw panes that the
+  query-time scans read (their retention).
+- Query: each root reads raw data through its own `Scan` slot, sorts and
+  limits; the plan gives each query its own scan, so each run reads the
+  panes itself.
+
+#### 6. Two label granularities, raw data retained (`rollup-quantile-nested-labels-raw-retained`)
+
+`quantile by (job) (0.9, data)` and `quantile by (job, host) (0.9, data)`,
+every 60 s.
+
+```
+n0  Query None           Scan
+n1  Query None           TimeRange 15s               <- n0
+n2  Query OneEvaluation  Aggregate quantile(q=0.9)   <- n1   (root)
+n3  Query None           Scan
+n4  Query None           TimeRange 15s               <- n3
+n5  Query OneEvaluation  Aggregate quantile(q=0.9)   <- n4   (root)
+```
+
+- Precompute: no views; raw panes kept for the scans.
+- Query: two independent runs, each an exact grouped quantile over the last
+  15 s of raw samples (Stage 3 chose exact over a shared sketch here).
+
+#### Range queries in these examples
+
+A planned range query with `range_evaluation {step, span}` runs its compiled
+root once per step time T in `[start, end]` (`start`, `start + step`, … up
+to `end`), on the worker threads; at each T, the cut-out `OneEvaluation`
+nodes of example 2 are shared with every other run at the same T (once the
+watermark has passed T; before that each run computes them).
+
+Every example is executed by the parity test against the Planner executor on
+the same plan and samples, with raw data kept and not kept
+(`data_plane/tests/workloads/`: `sketch-plan-ratio-of-quantiles-1h.json`,
+`rangeheavy-t5-q05-q09-1h.json`, `sketch-plan-chains-10m-5m-3m-10s.json`,
+`dashboard.json`, `sketch-plan-topk-by-job-and-global.json`,
+`sketch-plan-rollup-quantile-nested-labels.json`).
+
 ### Range queries
 
 A range request for a planned query (`start`, `end`, `step` as Prometheus
-takes them, at most 11,000 steps) is evaluated at every step time, the
-steps in parallel on the query workers, and answered as a Prometheus
-matrix; if any step is not answered, the query is not (forwarded with the
-reason, or refused under `--no-forward`). Each step is an ordinary
+takes them; refused, as Prometheus does, when `(end − start) / step`
+exceeds 11,000) is evaluated at every step time, at most one step per
+query worker in flight, so a long range neither floods the queue nor
+starves instant queries, and answered as a Prometheus matrix. The first
+step that is not answered, or the client going away, drops the remaining
+steps unrun; the query is then not answered (forwarded with the reason, or
+refused under `--no-forward`). Steps are measured as
+`phase="query_range_step"` and the request as
+`asap_range_query_latency_seconds`, apart from instant queries. Each step is an ordinary
 evaluation at its time, so `OneEvaluation` sharing applies per step. The
 workload's `range_evaluation` (`step_ms`, `span_ms`) tells the Planner the
 requests' shape, so the plan delivers every step time.
 
 ### Persisting views
 
-Each view has one append-only file in `--view-dir` (default `asap-views`;
-`--no-view-persistence` keeps views in memory only): one record per
-refreshed window, a length and a MessagePack payload holding `(start, end]`
-and the rows, synced (`fdatasync`) before the next window is refreshed. At
-startup the records within each view's retention of its newest one are
-loaded back, oldest first, and a window every view of a group already
-stores is not refreshed again. A partial record at a file's end (a crash
-while writing) is ignored. Plain values and exact states (sum, count, min,
-max, rate, increase, which the executor serializes) are stored; sketch
-states have no byte encoding yet, so their windows are counted in
-`asap_view_windows_not_persisted_total` and not written. Persisting them
-needs byte encodings in `asap_sketchlib` and an encode hook in the
-executor. Files are not compacted while running; records past retention
-are skipped at load.
+Each refresh group has one append-only file in `--view-dir` (default
+`asap-views`; `--no-view-persistence` keeps views in memory only): a header
+naming the plan (a hash of the plan file) and the group, then one record
+per refreshed window, a length and a MessagePack payload holding
+`(start, end]` and the rows of each view appended, synced with one
+`fdatasync` before the next window is refreshed. A file of another plan or
+group is renamed `*.stale` and never loaded. At startup the records within
+each view's retention of its newest one are loaded back, oldest first; a
+torn or oversized record at a file's end (a crash while writing) is cut
+off, so later records stay aligned. A view that already stores a window is
+not appended to again, while the group's other views are. Raw samples are
+not persisted, so after a restart that loaded views, windows whose samples
+arrived before the restart stay missing: a declared stream start no longer
+makes the first window complete.
+
+Plain values and exact states (sum, count, min, max, rate, increase, which
+the executor serializes) are stored by their serde form. Sketch states are
+stored as `asap_sketchlib`'s ASAPv1 bytes with the kernel they rebuild,
+read and rebuilt through the executor kernels' public sketch fields:
+DDSketch, KLL, Count-Min, KMV and Hydra-KLL. HyperLogLog, UnivMon,
+Count-Min with heap (weighted frequency) and Hydra-Count-Min kernels expose
+no public way to rebuild their state; a view holding one is not persisted,
+and `asap_view_windows_not_persisted_total` counts its (view, window)
+pairs. Persisting them needs a constructor from the sketch in the
+executor's kernels. Files are not compacted while running; records past
+retention are skipped at load.
 
 ### Measurements
 
@@ -256,8 +485,9 @@ are skipped at load.
     `asap_query_time_result_computes_total` (misses),
     `asap_query_time_result_hits_total`.
   - Persistence: `asap_view_persisted_bytes_total`,
-    `asap_view_sync_seconds_total`, `asap_view_windows_not_persisted_total`,
-    `asap_view_windows_loaded_total`.
+    `asap_view_sync_seconds_total`, and (view, window) pairs not persisted
+    (`asap_view_windows_not_persisted_total`) or loaded at startup
+    (`asap_view_windows_loaded_total`).
   - `asap_thread_cpu_seconds_total` by thread name (trailing digits
     removed), from `/proc`, for the threads the phases do not cover.
 - `scripts/profile.sh` records a CPU profile (`perf record`) of a running
@@ -328,7 +558,9 @@ answers table. No percentile panels and no CPU-over-time lines.
 
 ## Minimal complexity
 
-- Two threads and a worker pool replace one thread; no new public interface.
+- Two threads and a worker pool replace one thread. The new public
+  surface is what the demo needs: `/metrics`, planned `query_range`, the
+  view files, and the flags that bound queues, workers and caches.
 - Panes are the smallest unit every refresh window tiles, so one buffer
   serves all refresh groups.
 - Query-time results reuse the materialized view store and its read path
@@ -346,7 +578,7 @@ answers table. No percentile panels and no CPU-over-time lines.
 | Who decides sharing | the plan (`Lifetime`) | the data plane discovering nodes reached from several queries |
 | Raw sample layout | columnar per pane | rows converted to columns on every read |
 | Open pane for query-time `Scan`s | each request's samples are an immutable chunk, published after every request; reads take the chunks so far | one mutable Arrow builder per pane copied into a batch on every read |
-| View persistence | append-only file per view, synced per window, loaded within retention | a checkpoint of the whole store; persisting raw samples |
+| View persistence | append-only file per refresh group, one record and one sync per window, tied to the plan, loaded within retention | a file per view (one sync per view and window); a checkpoint of the whole store; persisting raw samples |
 | When views are computed | when their window closes | query time; background |
 | Operators | the Planner executor's | DataFusion's now (ASAPPlanner#1421) |
 | Should a view be bounded or unbounded? | stored views are bounded: one immutable instance per (definition, window). How a window is computed (one batch run when it closes, or incremental streaming updates) is a separate choice, and freshness for a query at "now" is a third one (reading the open window's partial state, flagged as partial), not in the demo | one unbounded, continuously updated view per definition |
@@ -444,3 +676,8 @@ this known limit and also runs workloads with more samples per window.
 - Sketch answers are within the plan's error target, not exact; only planned
   queries are answered.
 - Open: sharded ingestion and its cost-model terms; batch sketch updates.
+- Follow-ups: the backend builds `MaterializedView` values through their
+  serde JSON form (the retention margin, and the on-first-read slot of a
+  shared query-time node); both belong in executor APIs. The ingest thread's
+  per-request bookkeeping (publishing the raw data, compaction, eviction)
+  is linear in the panes retained; it changes only if profiling shows it.
