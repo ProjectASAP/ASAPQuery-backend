@@ -124,7 +124,12 @@ delivers every step time.
 
 **Persistence.** Each refresh group's views are appended to one file in
 `--view-dir` (default `asap-views`; `--no-view-persistence` keeps views in
-memory only), one record per refreshed window, synced once per window. A
+memory only), one record per refreshed window. Files are synced every
+`--view-sync-interval-ms` (default 5,000, VictoriaMetrics' default
+`-inmemoryDataFlushInterval` as of v1.155.0), so a refreshed window is
+durable within that interval, the same guarantee VictoriaMetrics gives its
+in-memory data; 0 syncs after every window. Label values and series
+identities are stored once per file, in a text dictionary. A
 file names the plan it was written for; another plan's file is set aside
 (`*.stale`), never loaded. At startup the records within each view's
 retention are loaded back, a torn last record is cut off, and a window a

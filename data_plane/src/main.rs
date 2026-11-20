@@ -80,6 +80,11 @@ struct Args {
     /// Keep the materialized views in memory only.
     #[arg(long)]
     no_view_persistence: bool,
+    /// How often the view files are synced to disk: a refreshed window is
+    /// durable within this long (0: after every window). The default is
+    /// VictoriaMetrics' default -inmemoryDataFlushInterval.
+    #[arg(long, default_value_t = EngineOptions::default().view_sync_interval_ms)]
+    view_sync_interval_ms: u64,
 }
 
 #[tokio::main]
@@ -109,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
                 query_time_results_retention_ms: args.query_time_results_retention_ms,
                 query_time_results_max_bytes: args.query_time_results_max_bytes,
                 view_dir: (!args.no_view_persistence).then_some(args.view_dir),
+                view_sync_interval_ms: args.view_sync_interval_ms,
             },
         )?
         .with_forward_timeout(Duration::from_secs(args.forward_timeout_seconds)),

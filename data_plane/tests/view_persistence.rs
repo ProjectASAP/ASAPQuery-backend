@@ -241,7 +241,15 @@ async fn windows_before_a_restart_are_not_stored_empty() {
         body["error"].as_str().unwrap().contains("no rows tiling"),
         "{body}"
     );
+    let (status, after_restart) = query(&app, SUM, 180).await;
+    assert_eq!(status, StatusCode::OK, "{after_restart}");
+    drop(app);
+
+    // The windows written after the first restart extend the files' text
+    // dictionary; a second restart reads them back alike.
+    let (app, _state) = data_plane(&plan, &dir);
     let (status, body) = query(&app, SUM, 180).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, after_restart);
     std::fs::remove_dir_all(&dir).unwrap();
 }

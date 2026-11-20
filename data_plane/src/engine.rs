@@ -70,6 +70,9 @@ pub struct EngineOptions {
     /// Where the materialized views are persisted and loaded from at
     /// startup ([`crate::persist`]); `None`: kept in memory only.
     pub view_dir: Option<std::path::PathBuf>,
+    /// How often the view files are synced to disk: a refreshed window is
+    /// durable within this long. 0 syncs after every window.
+    pub view_sync_interval_ms: u64,
 }
 
 impl Default for EngineOptions {
@@ -86,6 +89,8 @@ impl Default for EngineOptions {
             query_time_results_retention_ms: 60_000,
             query_time_results_max_bytes: 1 << 30,
             view_dir: None,
+            // VictoriaMetrics' default -inmemoryDataFlushInterval (v1.155.0).
+            view_sync_interval_ms: 5_000,
         }
     }
 }
@@ -176,7 +181,9 @@ impl EngineHandle {
         let mut views = ViewStore::default();
         let files = match &options.view_dir {
             Some(dir) => {
-                let files = ViewFiles::open(dir, plan_hash(plan_json.as_bytes()))?;
+                let sync_interval = std::time::Duration::from_millis(options.view_sync_interval_ms);
+                let mut files =
+                    ViewFiles::open(dir, plan_hash(plan_json.as_bytes()), sync_interval)?;
                 let loaded = files.load(&precompute.views(), &mut views)?;
                 tracing::info!(dir = %dir.display(), windows = loaded, "loaded persisted views");
                 if loaded > 0 {
@@ -661,7 +668,20 @@ fn serve_precompute(
     jobs: Receiver<PrecomputeJob>,
     shared: &Shared,
 ) {
-    for job in jobs {
+    let sync_interval = files
+        .as_ref()
+        .map_or(std::time::Duration::MAX, |f| f.sync_interval());
+    loop {
+        // Waits at most one sync interval, so view files written are synced
+        // within it even when no window closes.
+        let job = match jobs.recv_timeout(sync_interval.min(std::time::Duration::from_secs(3600))) {
+            Ok(job) => job,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                sync_view_files(&mut files, shared, false);
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         match job {
             PrecomputeJob::Refresh { window, raw_data } => {
                 let result = {
@@ -711,7 +731,25 @@ fn serve_precompute(
             }
         }
     }
+    sync_view_files(&mut files, shared, true);
     tracing::warn!("precompute stopped");
+}
+
+/// Syncs the view files written since the last sync: when the sync
+/// interval has passed, or now with `force`.
+fn sync_view_files(files: &mut Option<ViewFiles>, shared: &Shared, force: bool) {
+    let Some(files) = files else { return };
+    let synced = if force {
+        files.sync()
+    } else {
+        files.sync_if_due()
+    };
+    match synced {
+        Ok(ns) => {
+            shared.metrics.view_sync_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+        Err(error) => tracing::error!(%error, "syncing the view files failed"),
+    }
 }
 
 #[cfg(test)]

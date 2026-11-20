@@ -440,8 +440,17 @@ Each refresh group has one append-only file in `--view-dir` (default
 `asap-views`; `--no-view-persistence` keeps views in memory only): a header
 naming the plan (a hash of the plan file) and the group, then one record
 per refreshed window, a length and a MessagePack payload holding
-`(start, end]` and the rows of each view appended, synced with one
-`fdatasync` before the next window is refreshed. A file of another plan or
+`(start, end]` and the rows of each view appended. A text (a label value or
+a series identity) is stored once per file: a record carries the texts it
+adds to the file's dictionary, and rows hold indices. Files are synced
+(`fdatasync`) every `--view-sync-interval-ms`, also when no window closes;
+the default, 5 s, is VictoriaMetrics' own default
+`-inmemoryDataFlushInterval` (v1.155.0: "The interval for guaranteed saving
+of in-memory data to disk ... (default 5s)"). A refreshed window is
+therefore durable within that interval, the same class of guarantee
+VictoriaMetrics gives: after a crash, the windows of the last interval may
+be lost and are left missing (their raw samples are not persisted). 0
+syncs after every window. A file of another plan or
 group is renamed `*.stale` and never loaded. At startup the records within
 each view's retention of its newest one are loaded back, oldest first; a
 torn or oversized record at a file's end (a crash while writing) is cut
@@ -578,7 +587,7 @@ answers table. No percentile panels and no CPU-over-time lines.
 | Who decides sharing | the plan (`Lifetime`) | the data plane discovering nodes reached from several queries |
 | Raw sample layout | columnar per pane | rows converted to columns on every read |
 | Open pane for query-time `Scan`s | each request's samples are an immutable chunk, published after every request; reads take the chunks so far | one mutable Arrow builder per pane copied into a batch on every read |
-| View persistence | append-only file per refresh group, one record and one sync per window, tied to the plan, loaded within retention | a file per view (one sync per view and window); a checkpoint of the whole store; persisting raw samples |
+| View persistence | append-only file per refresh group, one record per window, texts in a per-file dictionary, synced on an interval (5 s, as VictoriaMetrics), tied to the plan, loaded within retention | a sync per window (on the test host, 0.2–0.5 s per sync capped refreshes at a few windows per second); a file per view; label text per row; a checkpoint of the whole store; persisting raw samples |
 | When views are computed | when their window closes | query time; background |
 | Operators | the Planner executor's | DataFusion's now (ASAPPlanner#1421) |
 | Should a view be bounded or unbounded? | stored views are bounded: one immutable instance per (definition, window). How a window is computed (one batch run when it closes, or incremental streaming updates) is a separate choice, and freshness for a query at "now" is a third one (reading the open window's partial state, flagged as partial), not in the demo | one unbounded, continuously updated view per definition |

@@ -25,7 +25,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use asap_executor::planner::plan::materialized_view::MaterializedView;
 use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
@@ -67,6 +67,8 @@ pub enum SketchKernel {
 #[derive(Serialize, Deserialize)]
 enum StoredValue {
     Plain(Value),
+    /// A text value, by its index in the file's dictionary.
+    Text(u32),
     Exact(ExactAccumulator),
     Increase(IncreaseAccumulator),
     Sketch {
@@ -81,6 +83,10 @@ enum StoredValue {
 struct Record {
     start_ms: i64,
     end_ms: i64,
+    /// Texts this record adds to the file's dictionary, in index order:
+    /// label values and series identities are written once per file.
+    #[serde(default)]
+    new_texts: Vec<String>,
     views: Vec<(PhysicalASAPNodeId, Vec<Vec<StoredValue>>)>,
 }
 
@@ -96,11 +102,26 @@ pub struct Written {
     pub not_persisted: u64,
 }
 
+/// A group file's text dictionary: each text's index, in the order the
+/// records added them.
+#[derive(Default)]
+struct Dictionary {
+    index: std::collections::HashMap<Arc<str>, u32>,
+    len: u32,
+}
+
 /// The group files in one directory, for one plan.
 pub struct ViewFiles {
     dir: PathBuf,
     plan_hash: u64,
     files: BTreeMap<usize, File>,
+    dictionaries: BTreeMap<usize, Dictionary>,
+    /// Files are synced at most this often; a window's record is durable
+    /// within this long after it is written.
+    sync_interval: Duration,
+    last_sync: Instant,
+    /// Groups written since the last sync.
+    unsynced: std::collections::BTreeSet<usize>,
 }
 
 /// A stable 64-bit FNV-1a hash of `bytes`.
@@ -113,13 +134,44 @@ pub fn plan_hash(bytes: &[u8]) -> u64 {
 impl ViewFiles {
     /// The group files in `dir` (created if missing) of the plan whose
     /// file hashes to `plan_hash`.
-    pub fn open(dir: &Path, plan_hash: u64) -> std::io::Result<Self> {
+    pub fn open(dir: &Path, plan_hash: u64, sync_interval: Duration) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             plan_hash,
             files: BTreeMap::new(),
+            dictionaries: BTreeMap::new(),
+            sync_interval,
+            last_sync: Instant::now(),
+            unsynced: Default::default(),
         })
+    }
+
+    /// How often the files are synced.
+    pub fn sync_interval(&self) -> Duration {
+        self.sync_interval
+    }
+
+    /// Syncs every file written since the last sync when the sync interval
+    /// has passed; returns the nanoseconds spent syncing.
+    pub fn sync_if_due(&mut self) -> std::io::Result<u64> {
+        if self.last_sync.elapsed() < self.sync_interval {
+            return Ok(0);
+        }
+        self.sync()
+    }
+
+    /// Syncs every file written since the last sync; returns the
+    /// nanoseconds spent.
+    pub fn sync(&mut self) -> std::io::Result<u64> {
+        let started = Instant::now();
+        for group in std::mem::take(&mut self.unsynced) {
+            if let Some(file) = self.files.get(&group) {
+                file.sync_data()?;
+            }
+        }
+        self.last_sync = Instant::now();
+        Ok(started.elapsed().as_nanos() as u64)
     }
 
     fn path(&self, group: usize) -> PathBuf {
@@ -127,8 +179,9 @@ impl ViewFiles {
     }
 
     /// Appends the rows each of `views` got for `(start, end]` as one record
-    /// of `group`'s file and syncs it once. A view holding a state with no
-    /// byte encoding is left out of the record and counted.
+    /// of `group`'s file, synced with the other files once the sync
+    /// interval has passed. A view holding a state with no byte encoding is
+    /// left out of the record and counted.
     pub fn append(
         &mut self,
         group: usize,
@@ -137,18 +190,31 @@ impl ViewFiles {
     ) -> std::io::Result<Written> {
         let mut written = Written::default();
         let mut stored = Vec::new();
+        let dictionary = self.dictionaries.entry(group).or_default();
+        // Texts new to the file; added to its dictionary once written.
+        let mut texts = Texts {
+            dictionary,
+            new: Vec::new(),
+            new_index: std::collections::HashMap::new(),
+        };
         for (view, batches) in views {
-            match encode_rows(batches) {
+            let mark = texts.new.len();
+            match encode_rows(batches, &mut texts) {
                 Some(rows) => stored.push((*view, rows)),
-                None => written.not_persisted += 1,
+                None => {
+                    texts.forget_after(mark);
+                    written.not_persisted += 1;
+                }
             }
         }
         if stored.is_empty() {
             return Ok(written);
         }
+        let new_texts: Vec<Arc<str>> = texts.new;
         let record = Record {
             start_ms,
             end_ms,
+            new_texts: new_texts.iter().map(|t| t.to_string()).collect(),
             views: stored,
         };
         let file = match self.files.entry(group) {
@@ -168,10 +234,14 @@ impl ViewFiles {
         };
         let bytes = framed(&record)?;
         file.write_all(&bytes)?;
-        let synced = Instant::now();
-        file.sync_data()?;
+        let dictionary = self.dictionaries.entry(group).or_default();
+        for text in new_texts {
+            dictionary.index.insert(text, dictionary.len);
+            dictionary.len += 1;
+        }
+        self.unsynced.insert(group);
         written.bytes = bytes.len() as u64;
-        written.sync_ns = synced.elapsed().as_nanos() as u64;
+        written.sync_ns = self.sync_if_due()?;
         Ok(written)
     }
 
@@ -182,7 +252,7 @@ impl ViewFiles {
     /// record at a file's end is cut off; a record that does not decode, or
     /// is not after the rows already loaded, is skipped.
     pub fn load(
-        &self,
+        &mut self,
         groups: &[Vec<(MaterializedView, SchemaRef)>],
         views: &mut ViewStore,
     ) -> std::io::Result<u64> {
@@ -192,14 +262,23 @@ impl ViewFiles {
             let Some(records) = self.read_group(&path, group)? else {
                 continue;
             };
+            // The file's dictionary, replayed in record order; appends
+            // after the restart continue it.
+            let mut texts: Vec<Arc<str>> = Vec::new();
             let mut by_view: BTreeMap<PhysicalASAPNodeId, Vec<StoredWindow>> = BTreeMap::new();
             for record in records {
+                texts.extend(record.new_texts.iter().map(|t| Arc::from(t.as_str())));
                 for (view, rows) in record.views {
                     by_view
                         .entry(view)
                         .or_default()
                         .push((record.start_ms, record.end_ms, rows));
                 }
+            }
+            let dictionary = self.dictionaries.entry(group).or_default();
+            for text in &texts {
+                dictionary.index.insert(text.clone(), dictionary.len);
+                dictionary.len += 1;
             }
             for (view, schema) in group_views {
                 let Some(own) = by_view.remove(&view.node_id) else {
@@ -214,7 +293,7 @@ impl ViewFiles {
                     if end <= oldest_kept_end && end != newest_end {
                         continue;
                     }
-                    let Some(batch) = decode_rows(schema, rows) else {
+                    let Some(batch) = decode_rows(schema, rows, &texts) else {
                         tracing::warn!(
                             view = view.node_id,
                             start,
@@ -363,9 +442,40 @@ pub fn encode_sketch(state: &dyn AggregateCore) -> Option<(SketchKernel, Vec<u8>
     }
 }
 
-/// The rows of `batches`, or `None` when one holds a state with no byte
-/// encoding.
-fn encode_rows(batches: &[Batch]) -> Option<Vec<Vec<StoredValue>>> {
+/// Texts being encoded into one record: the file's dictionary, and the
+/// texts this record adds to it.
+struct Texts<'a> {
+    dictionary: &'a Dictionary,
+    new: Vec<Arc<str>>,
+    new_index: std::collections::HashMap<Arc<str>, u32>,
+}
+
+impl Texts<'_> {
+    /// `text`'s index, added to the record's new texts if the file has none.
+    fn index(&mut self, text: &Arc<str>) -> u32 {
+        if let Some(&index) = self.dictionary.index.get(text) {
+            return index;
+        }
+        if let Some(&index) = self.new_index.get(text) {
+            return index;
+        }
+        let index = self.dictionary.len + self.new.len() as u32;
+        self.new.push(text.clone());
+        self.new_index.insert(text.clone(), index);
+        index
+    }
+
+    /// Drops the new texts after the first `mark` (a view left out).
+    fn forget_after(&mut self, mark: usize) {
+        for text in self.new.drain(mark..) {
+            self.new_index.remove(&text);
+        }
+    }
+}
+
+/// The rows of `batches`, texts as dictionary indices; `None` when one
+/// holds a state with no byte encoding.
+fn encode_rows(batches: &[Batch], texts: &mut Texts) -> Option<Vec<Vec<StoredValue>>> {
     batches
         .iter()
         .flat_map(Batch::to_rows)
@@ -373,6 +483,7 @@ fn encode_rows(batches: &[Batch]) -> Option<Vec<Vec<StoredValue>>> {
             row.into_iter()
                 .map(|value| match value {
                     Value::Summary { state, .. } => encode_state(state.as_ref()),
+                    Value::Utf8(text) => Some(StoredValue::Text(texts.index(&text))),
                     plain => Some(StoredValue::Plain(plain)),
                 })
                 .collect()
@@ -381,7 +492,11 @@ fn encode_rows(batches: &[Batch]) -> Option<Vec<Vec<StoredValue>>> {
 }
 
 /// `rows` as one batch of `schema`, each state of its field's family.
-fn decode_rows(schema: &SchemaRef, rows: Vec<Vec<StoredValue>>) -> Option<Batch> {
+fn decode_rows(
+    schema: &SchemaRef,
+    rows: Vec<Vec<StoredValue>>,
+    texts: &[Arc<str>],
+) -> Option<Batch> {
     let rows = rows
         .into_iter()
         .map(|row| {
@@ -390,6 +505,9 @@ fn decode_rows(schema: &SchemaRef, rows: Vec<Vec<StoredValue>>) -> Option<Batch>
                 .map(|(value, field)| {
                     let state: Arc<dyn AggregateCore> = match value {
                         StoredValue::Plain(value) => return Some(value),
+                        StoredValue::Text(index) => {
+                            return texts.get(index as usize).cloned().map(Value::Utf8)
+                        }
                         StoredValue::Exact(state) => Arc::new(state),
                         StoredValue::Increase(state) => Arc::new(state),
                         StoredValue::Sketch { kernel, asapv1 } => decode_sketch(kernel, &asapv1)?,
@@ -517,7 +635,7 @@ mod tests {
     fn torn_tails_are_cut_and_other_plans_are_not_loaded() {
         let dir = std::env::temp_dir().join(format!("asap-persist-unit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut files = ViewFiles::open(&dir, 7).unwrap();
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
         let empty: &[Batch] = &[];
         files.append(0, (0, 10), &[(1, empty)]).unwrap();
         drop(files);
@@ -526,9 +644,9 @@ mod tests {
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all(&[100, 0, 0, 0, 1, 2, 3]).unwrap();
         drop(file);
-        let files = ViewFiles::open(&dir, 7).unwrap();
+        let files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
         assert_eq!(files.read_group(&path, 0).unwrap().unwrap().len(), 1);
-        let mut files = ViewFiles::open(&dir, 7).unwrap();
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
         files.append(0, (10, 20), &[(1, empty)]).unwrap();
         let records = files.read_group(&path, 0).unwrap().unwrap();
         assert_eq!(
@@ -544,7 +662,7 @@ mod tests {
         drop(file);
         assert_eq!(files.read_group(&path, 0).unwrap().unwrap().len(), 2);
         // Another plan's file is set aside.
-        let other = ViewFiles::open(&dir, 8).unwrap();
+        let other = ViewFiles::open(&dir, 8, Duration::ZERO).unwrap();
         assert!(other.read_group(&path, 0).unwrap().is_none());
         assert!(dir.join("group-0.log.stale").exists());
         std::fs::remove_dir_all(&dir).unwrap();
