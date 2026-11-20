@@ -186,6 +186,31 @@ impl ViewFiles {
         })
     }
 
+    /// Splits the files into `shards` sets, refresh group `g` going to set
+    /// `g % shards`, each with the dictionaries loaded for its groups: one
+    /// writer per file, so records stay in window order.
+    pub fn split(self, shards: usize) -> Vec<ViewFiles> {
+        let shards = shards.max(1);
+        let mut out: Vec<ViewFiles> = (0..shards)
+            .map(|_| ViewFiles {
+                dir: self.dir.clone(),
+                plan_hash: self.plan_hash,
+                files: BTreeMap::new(),
+                dictionaries: BTreeMap::new(),
+                sync_interval: self.sync_interval,
+                last_sync: Instant::now(),
+                unsynced: Default::default(),
+            })
+            .collect();
+        for (group, file) in self.files {
+            out[group % shards].files.insert(group, file);
+        }
+        for (group, dictionary) in self.dictionaries {
+            out[group % shards].dictionaries.insert(group, dictionary);
+        }
+        out
+    }
+
     /// How often the files are synced.
     pub fn sync_interval(&self) -> Duration {
         self.sync_interval

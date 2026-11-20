@@ -50,6 +50,14 @@ struct Args {
     /// waits (and Remote Write then gets 503).
     #[arg(long, default_value_t = EngineOptions::default().max_precompute_backlog)]
     max_precompute_backlog: usize,
+    /// Threads that write the view files (each the files of every n-th
+    /// refresh group). Default: a quarter of the cores, from 1 to 4.
+    #[arg(long, default_value_t = EngineOptions::default().persist_threads)]
+    persist_threads: usize,
+    /// Bytes of refreshed windows queued for the persist threads beyond
+    /// which refreshes wait.
+    #[arg(long, default_value_t = EngineOptions::default().max_persist_backlog_bytes)]
+    max_persist_backlog_bytes: u64,
     /// Never forward a query to Prometheus: refuse a plan with a query the
     /// data plane cannot run, and answer any query the plan does not answer
     /// with an error giving the reason.
@@ -107,6 +115,9 @@ async fn main() -> anyhow::Result<()> {
                 },
                 max_queued_samples: args.max_queued_samples,
                 max_precompute_backlog: args.max_precompute_backlog,
+                persist_threads: args.persist_threads,
+                max_persist_backlog_bytes: args.max_persist_backlog_bytes,
+                persist_delay_ms: 0,
                 no_forward: args.no_forward,
                 run_memory_limit_bytes: args.run_memory_limit_bytes,
                 query_threads: args.query_threads,

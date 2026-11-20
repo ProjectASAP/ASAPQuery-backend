@@ -148,6 +148,8 @@ async fn answers_alike_after_a_restart(test: &str, query_text: &str, plan: &str)
     assert_eq!(status, StatusCode::OK, "{before}");
     assert!(!before["data"]["result"].as_array().unwrap().is_empty());
     assert_eq!(metric(&state, "asap_view_windows_not_persisted_total"), 0.0);
+    // The barrier answered once the windows were written.
+    assert_eq!(metric(&state, "asap_persist_backlog_windows"), 0.0);
     assert!(metric(&state, "asap_view_persisted_bytes_total") > 0.0);
     drop((app, state));
 
@@ -251,5 +253,135 @@ async fn windows_before_a_restart_are_not_stored_empty() {
     let (status, body) = query(&app, SUM, 180).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body, after_restart);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A data plane over `dir` with explicit persist options.
+fn data_plane_with(
+    plan: &str,
+    dir: &Path,
+    persist_threads: usize,
+    persist_delay_ms: u64,
+) -> (Router, Arc<DataPlane>) {
+    let options = EngineOptions {
+        no_forward: true,
+        view_dir: Some(dir.to_path_buf()),
+        persist_threads,
+        persist_delay_ms,
+        ingestion: IngestionOptions {
+            allowed_lateness_ms: 0,
+            stream_start_ms: Some(0),
+            ..IngestionOptions::default()
+        },
+        ..EngineOptions::default()
+    };
+    let state = Arc::new(
+        DataPlane::with_options(plan.into(), "http://127.0.0.1:1".into(), options).unwrap(),
+    );
+    (router(state.clone()), state)
+}
+
+/// A slow disk does not slow refreshes: with every window's write delayed,
+/// the windows are refreshed and answer at once while their writes wait in
+/// the persist queue; stopping the engine still writes every queued window,
+/// and a restart answers alike from them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_disk_does_not_hold_refreshes_and_stopping_writes_everything() {
+    let dir = view_dir("slow-disk");
+    let plan = plan_json(SUM);
+    let (app, state) = data_plane_with(&plan, &dir, 1, 400);
+    // Samples through 60 s close the windows through 60 s; no barrier,
+    // which would wait for the writes.
+    let timeseries = vec![TimeSeries {
+        labels: vec![
+            Label {
+                name: "__name__".into(),
+                value: "data".into(),
+            },
+            Label {
+                name: "job".into(),
+                value: "a".into(),
+            },
+        ],
+        samples: (1..=60)
+            .map(|s| Sample {
+                timestamp: s * 1000,
+                value: s as f64,
+            })
+            .collect(),
+    }];
+    let written = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/write")
+                .body(Body::from(encode(&WriteRequest { timeseries })))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(written.status(), StatusCode::NO_CONTENT);
+    let started = std::time::Instant::now();
+    while state.engine.stats().windows_refreshed < 6 {
+        assert!(
+            started.elapsed().as_secs() < 5,
+            "refreshes waited for the disk"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // Six windows' writes take 2.4 s; the refreshes did not wait for them.
+    assert!(
+        started.elapsed().as_millis() < 2_000,
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(metric(&state, "asap_persist_backlog_windows") > 0.0);
+    let (status, before) = query(&app, SUM, 60).await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+
+    state.engine.stop();
+    let started = std::time::Instant::now();
+    while metric(&state, "asap_persist_backlog_windows") > 0.0 {
+        assert!(
+            started.elapsed().as_secs() < 20,
+            "queued windows were not written"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    drop((app, state));
+    let (app, _state) = data_plane_with(&plan, &dir, 1, 0);
+    let (status, after) = query(&app, SUM, 60).await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert_eq!(after, before);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// With several persist threads, each refresh group's file has one writer,
+/// so its records stay in window order: every query of a plan with several
+/// refresh groups answers alike after a restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn several_persist_threads_keep_each_files_window_order() {
+    let dir = view_dir("persist-threads");
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/workloads/random-mixed-seed-862-01.json");
+    let workload = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let plan = plan_workload(&workload, &common::inputs(false)).unwrap().0;
+    assert!(plan.ingestion_refresh_groups().unwrap().len() > 1);
+    let queries = plan.query_texts.clone();
+    let plan = serde_json::to_string(&plan).unwrap();
+
+    let (app, state) = data_plane_with(&plan, &dir, 3, 0);
+    write(&app, "data", 0, 1200).await;
+    let mut before = Vec::new();
+    for query_text in &queries {
+        before.push(query(&app, query_text, 1200).await);
+    }
+    assert!(before.iter().any(|(status, _)| *status == StatusCode::OK));
+    assert!(metric(&state, "asap_view_persisted_bytes_total") > 0.0);
+    drop((app, state));
+
+    let (app, _state) = data_plane_with(&plan, &dir, 3, 0);
+    for (query_text, before) in queries.iter().zip(&before) {
+        assert_eq!(&query(&app, query_text, 1200).await, before, "{query_text}");
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }

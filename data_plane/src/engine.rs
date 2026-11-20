@@ -20,7 +20,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use asap_executor::runtime::Limits;
 use asap_planner::InstallablePlan;
@@ -34,6 +34,8 @@ use crate::metrics::{Gauges, Metrics, Timer};
 use crate::persist::{plan_hash, ViewFiles};
 use crate::query::{QueryEngine, ResultSample, Unanswered};
 use crate::store::{PublishedStore, QueryTimeResults, RawData, RawSample, RunStore, ViewStore};
+use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
+use asap_executor::values::Batch;
 
 /// How the engine ingests samples and runs queries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +48,16 @@ pub struct EngineOptions {
     /// Refresh windows closed and not yet refreshed beyond which the
     /// ingest thread waits for the precompute thread.
     pub max_precompute_backlog: usize,
+    /// Persist threads, each writing the view files of every
+    /// `persist_threads`-th refresh group.
+    pub persist_threads: usize,
+    /// Bytes of refreshed windows queued for the persist threads beyond
+    /// which the precompute thread waits (the wait is exported).
+    pub max_persist_backlog_bytes: u64,
+    /// For tests: how long a persist thread waits before writing each
+    /// window, as a slow disk would.
+    #[doc(hidden)]
+    pub persist_delay_ms: u64,
     /// Every answer must be computed from the plan: a plan with a query the
     /// query engine cannot run is refused at install, and the data plane
     /// never forwards a query to Prometheus (`--no-forward`).
@@ -82,6 +94,10 @@ impl Default for EngineOptions {
             // Two Remote Write requests of the default sample limit.
             max_queued_samples: 2_000_000,
             max_precompute_backlog: 256,
+            persist_threads: std::thread::available_parallelism()
+                .map_or(1, |cores| (usize::from(cores) / 4).clamp(1, 4)),
+            max_persist_backlog_bytes: 256 << 20,
+            persist_delay_ms: 0,
             no_forward: false,
             run_memory_limit_bytes: 4 << 30,
             query_threads: std::thread::available_parallelism().map_or(1, usize::from),
@@ -149,6 +165,12 @@ struct Shared {
     queued_samples: AtomicU64,
     /// Windows closed and not yet refreshed.
     precompute_backlog: AtomicU64,
+    /// Refreshed windows not yet written to the view files.
+    persist_backlog: AtomicU64,
+    /// Bytes of the refreshed windows queued for the persist threads.
+    persist_queue: Mutex<u64>,
+    /// Signalled when the persist threads release queued bytes.
+    persist_room: Condvar,
     /// False once the ingest or precompute thread has exited, for any
     /// reason.
     running: Arc<AtomicBool>,
@@ -204,6 +226,9 @@ impl EngineHandle {
         let shared = Arc::new(Shared {
             queued_samples: AtomicU64::new(0),
             precompute_backlog: AtomicU64::new(0),
+            persist_backlog: AtomicU64::new(0),
+            persist_queue: Mutex::new(0),
+            persist_room: Condvar::new(),
             running: running.clone(),
             stats: Mutex::new(IngestionStats::default()),
             published: PublishedStore::new(raw_data.clone()),
@@ -228,20 +253,36 @@ impl EngineHandle {
             .metrics
             .view_bytes
             .store(views.bytes() as u64, Ordering::Relaxed);
-        let files = files.map(|(files, loaded)| {
-            shared
-                .metrics
-                .view_windows_loaded
-                .store(loaded, Ordering::Relaxed);
-            files
-        });
+        let persist = match files {
+            Some((files, loaded)) => {
+                shared
+                    .metrics
+                    .view_windows_loaded
+                    .store(loaded, Ordering::Relaxed);
+                let mut shards = Vec::new();
+                for (index, files) in files.split(options.persist_threads).into_iter().enumerate() {
+                    let (shard, jobs) = channel();
+                    let persist_shared = shared.clone();
+                    let delay = std::time::Duration::from_millis(options.persist_delay_ms);
+                    std::thread::Builder::new()
+                        .name(format!("persist-{index}"))
+                        .spawn(move || serve_persist(files, jobs, &persist_shared, delay))?;
+                    shards.push(shard);
+                }
+                Some(PersistPool {
+                    shards,
+                    max_bytes: options.max_persist_backlog_bytes,
+                })
+            }
+            None => None,
+        };
         let precompute_guard = RunningGuard(running);
         let precompute_shared = shared.clone();
         std::thread::Builder::new()
             .name("precompute".into())
             .spawn(move || {
                 let _guard = precompute_guard;
-                serve_precompute(precompute, views, files, job_receiver, &precompute_shared);
+                serve_precompute(precompute, views, persist, job_receiver, &precompute_shared);
             })?;
         let query = Arc::new(query);
         spawn_query_workers(
@@ -364,6 +405,12 @@ impl EngineHandle {
                 stats: self.stats(),
                 samples_queued: self.queued_samples(),
                 precompute_backlog: self.precompute_backlog(),
+                persist_backlog: self.shared.persist_backlog.load(Ordering::SeqCst),
+                persist_backlog_bytes: *self
+                    .shared
+                    .persist_queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
                 now_ms: crate::ingestion::wall_clock_ms(),
                 query_time_results: self.query.query_time_results(),
             },
@@ -664,24 +711,11 @@ fn queue_refreshes(
 fn serve_precompute(
     precompute: Precompute,
     mut views: Arc<ViewStore>,
-    mut files: Option<ViewFiles>,
+    persist: Option<PersistPool>,
     jobs: Receiver<PrecomputeJob>,
     shared: &Shared,
 ) {
-    let sync_interval = files
-        .as_ref()
-        .map_or(std::time::Duration::MAX, |f| f.sync_interval());
-    loop {
-        // Waits at most one sync interval, so view files written are synced
-        // within it even when no window closes.
-        let job = match jobs.recv_timeout(sync_interval.min(std::time::Duration::from_secs(3600))) {
-            Ok(job) => job,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                sync_view_files(&mut files, shared, false);
-                continue;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        };
+    for job in jobs {
         match job {
             PrecomputeJob::Refresh { window, raw_data } => {
                 let result = {
@@ -690,8 +724,8 @@ fn serve_precompute(
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
                     let timer = Timer::start();
-                    let result = precompute.refresh(window, raw_data, &mut views, files.as_mut());
-                    if result != Ok(Refreshed::AlreadyStored) {
+                    let result = precompute.refresh(window, raw_data, &mut views);
+                    if !matches!(result, Ok(Refreshed::AlreadyStored)) {
                         shared.metrics.precompute[window.group].1.record(timer);
                     }
                     result
@@ -704,18 +738,18 @@ fn serve_precompute(
                 {
                     let mut stats = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
                     match result {
-                        Ok(Refreshed::Ran(written)) => {
+                        Ok(Refreshed::Ran(appended)) => {
                             stats.windows_refreshed += 1;
-                            let metrics = &shared.metrics;
-                            metrics
-                                .view_persisted_bytes
-                                .fetch_add(written.bytes, Ordering::Relaxed);
-                            metrics
-                                .view_sync_ns
-                                .fetch_add(written.sync_ns, Ordering::Relaxed);
-                            metrics
-                                .view_windows_not_persisted
-                                .fetch_add(written.not_persisted, Ordering::Relaxed);
+                            drop(stats);
+                            if let Some(persist) = &persist {
+                                let start_ms = window.end_ms - precompute.width_ms(window.group);
+                                persist.queue(
+                                    window.group,
+                                    (start_ms, window.end_ms),
+                                    appended,
+                                    shared,
+                                );
+                            }
                         }
                         Ok(Refreshed::AlreadyStored) => stats.windows_already_stored += 1,
                         Err(error) => {
@@ -726,30 +760,212 @@ fn serve_precompute(
                 }
                 shared.precompute_backlog.fetch_sub(1, Ordering::SeqCst);
             }
-            PrecomputeJob::Barrier { barrier_ms, reply } => {
-                let _ = reply.send(barrier_ms);
-            }
+            PrecomputeJob::Barrier { barrier_ms, reply } => match &persist {
+                // The barrier answers once the windows before it are also
+                // written (not necessarily synced), without the precompute
+                // thread waiting for that.
+                Some(persist) => persist.barrier(barrier_ms, reply),
+                None => {
+                    let _ = reply.send(barrier_ms);
+                }
+            },
         }
     }
-    sync_view_files(&mut files, shared, true);
     tracing::warn!("precompute stopped");
 }
 
-/// Syncs the view files written since the last sync: when the sync
-/// interval has passed, or now with `force`.
-fn sync_view_files(files: &mut Option<ViewFiles>, shared: &Shared, force: bool) {
-    let Some(files) = files else { return };
-    let synced = if force {
-        files.sync()
-    } else {
-        files.sync_if_due()
-    };
-    match synced {
+/// What a persist thread does next.
+enum PersistJob {
+    /// Write the rows each view got for its group's window `range_ms`;
+    /// `bytes` of the queue it releases once written.
+    Window {
+        group: usize,
+        range_ms: (i64, i64),
+        views: Vec<(PhysicalASAPNodeId, Vec<Batch>)>,
+        bytes: u64,
+    },
+    /// Done once every window queued to this thread before is written.
+    Barrier(Arc<PersistBarrier>),
+}
+
+/// An event-time barrier waiting for every persist thread.
+struct PersistBarrier {
+    barrier_ms: i64,
+    remaining: AtomicU64,
+    reply: Mutex<Option<oneshot::Sender<i64>>>,
+}
+
+impl PersistBarrier {
+    /// One persist thread reached it; the last one answers.
+    fn reached(&self) {
+        if self.remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
+            if let Some(reply) = self.reply.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let _ = reply.send(self.barrier_ms);
+            }
+        }
+    }
+}
+
+/// The persist threads, as the precompute thread sees them: refresh group
+/// `g`'s windows go to thread `g % threads`, so each file has one writer
+/// and its records stay in window order. The queue between precompute and
+/// the threads is bounded by bytes.
+struct PersistPool {
+    shards: Vec<Sender<PersistJob>>,
+    max_bytes: u64,
+}
+
+impl PersistPool {
+    /// Queues a refreshed window for its group's persist thread, waiting
+    /// while the queue holds more than `max_bytes` (the wait is exported;
+    /// a window larger than the bound is still queued into an empty queue).
+    fn queue(
+        &self,
+        group: usize,
+        range_ms: (i64, i64),
+        views: Vec<(PhysicalASAPNodeId, Vec<Batch>)>,
+        shared: &Shared,
+    ) {
+        let bytes: u64 = views
+            .iter()
+            .flat_map(|(_, batches)| batches)
+            .map(|batch| batch.memory_bytes() as u64)
+            .sum();
+        {
+            let mut queued = shared
+                .persist_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if *queued > 0 && *queued + bytes > self.max_bytes {
+                let waited = std::time::Instant::now();
+                while *queued > 0 && *queued + bytes > self.max_bytes {
+                    queued = shared
+                        .persist_room
+                        .wait(queued)
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+                shared
+                    .metrics
+                    .view_persist_wait_ns
+                    .fetch_add(waited.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            *queued += bytes;
+        }
+        shared.persist_backlog.fetch_add(1, Ordering::SeqCst);
+        let job = PersistJob::Window {
+            group,
+            range_ms,
+            views,
+            bytes,
+        };
+        if self.shards[group % self.shards.len()].send(job).is_err() {
+            tracing::error!(group, "the persist thread has stopped");
+            release_persist_queue(shared, bytes);
+        }
+    }
+
+    /// Answers `reply` once every persist thread has written the windows
+    /// queued before.
+    fn barrier(&self, barrier_ms: i64, reply: oneshot::Sender<i64>) {
+        let barrier = Arc::new(PersistBarrier {
+            barrier_ms,
+            remaining: AtomicU64::new(self.shards.len() as u64),
+            reply: Mutex::new(Some(reply)),
+        });
+        for shard in &self.shards {
+            if shard.send(PersistJob::Barrier(barrier.clone())).is_err() {
+                barrier.reached();
+            }
+        }
+    }
+}
+
+/// Releases `bytes` of the persist queue for a window written (or lost).
+fn release_persist_queue(shared: &Shared, bytes: u64) {
+    let mut queued = shared
+        .persist_queue
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *queued = queued.saturating_sub(bytes);
+    shared.persist_backlog.fetch_sub(1, Ordering::SeqCst);
+    shared.persist_room.notify_all();
+}
+
+/// The persist thread: writes each refreshed window's records to the view
+/// files, in order, and syncs them every sync interval, also when no window
+/// arrives; syncs everything when the precompute thread stops.
+fn serve_persist(
+    mut files: ViewFiles,
+    jobs: Receiver<PersistJob>,
+    shared: &Shared,
+    delay: std::time::Duration,
+) {
+    let metrics = &shared.metrics;
+    let wait = files.sync_interval().clamp(
+        std::time::Duration::from_millis(1),
+        std::time::Duration::from_secs(3600),
+    );
+    loop {
+        let job = match jobs.recv_timeout(wait) {
+            Ok(job) => job,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                match files.sync_if_due() {
+                    Ok(ns) => metrics.view_sync_ns.fetch_add(ns, Ordering::Relaxed),
+                    Err(error) => {
+                        tracing::error!(%error, "syncing the view files failed");
+                        0
+                    }
+                };
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        match job {
+            PersistJob::Window {
+                group,
+                range_ms,
+                views,
+                bytes,
+            } => {
+                // A slow disk, for tests.
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+                let records: Vec<(PhysicalASAPNodeId, &[Batch])> = views
+                    .iter()
+                    .map(|(view, batches)| (*view, batches.as_slice()))
+                    .collect();
+                match files.append(group, range_ms, &records) {
+                    Ok(written) => {
+                        metrics
+                            .view_persisted_bytes
+                            .fetch_add(written.bytes, Ordering::Relaxed);
+                        metrics
+                            .view_sync_ns
+                            .fetch_add(written.sync_ns, Ordering::Relaxed);
+                        metrics
+                            .view_windows_not_persisted
+                            .fetch_add(written.not_persisted, Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        tracing::error!(group, ?range_ms, %error, "persisting a window failed");
+                        metrics
+                            .view_windows_not_persisted
+                            .fetch_add(records.len() as u64, Ordering::Relaxed);
+                    }
+                }
+                release_persist_queue(shared, bytes);
+            }
+            PersistJob::Barrier(barrier) => barrier.reached(),
+        }
+    }
+    match files.sync() {
         Ok(ns) => {
-            shared.metrics.view_sync_ns.fetch_add(ns, Ordering::Relaxed);
+            metrics.view_sync_ns.fetch_add(ns, Ordering::Relaxed);
         }
         Err(error) => tracing::error!(%error, "syncing the view files failed"),
     }
+    tracing::info!("persist stopped");
 }
 
 #[cfg(test)]

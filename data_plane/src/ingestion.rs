@@ -40,7 +40,6 @@ use asap_executor::runtime::{Limits, RunContext, Scope};
 use asap_executor::values::{Batch, SchemaRef};
 use futures::executor::block_on;
 
-use crate::persist::{ViewFiles, Written};
 use crate::store::{RawData, RawSample, RunStore, ViewStore};
 
 /// How ingestion treats sample times.
@@ -530,10 +529,11 @@ impl Ingestion {
 }
 
 /// What a refresh did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Refreshed {
-    /// Ran the window and stored its rows; what it wrote to the view files.
-    Ran(Written),
+    /// Ran the window and stored its rows: each view appended to, with its
+    /// rows, for the view files.
+    Ran(Vec<(PhysicalASAPNodeId, Vec<Batch>)>),
     /// Every view of the group already stores the window.
     AlreadyStored,
 }
@@ -547,15 +547,15 @@ pub struct Precompute {
 impl Precompute {
     /// Runs `window`'s group's views in one ingestion run over
     /// `(end - W, end]`, reading `raw_data` (as it was when the window
-    /// closed) and `views`, appends each view's rows to `views` and, with
-    /// `files`, to its file. A window every view of the group already
-    /// stores (loaded from files at startup) is not run again.
+    /// closed) and `views`, and appends each view's rows to `views`. A view
+    /// that already stores the window (loaded from files at startup) is not
+    /// appended to again; a window every view of the group stores is not
+    /// run.
     pub fn refresh(
         &self,
         window: ClosedWindow,
         raw_data: Arc<RawData>,
         views: &mut Arc<ViewStore>,
-        files: Option<&mut ViewFiles>,
     ) -> Result<Refreshed, asap_executor::Error> {
         let group = &self.runs[window.group];
         let end = window.end_ms;
@@ -604,24 +604,10 @@ impl Precompute {
                 (view.node_id, batches)
             })
             .collect();
-        let mut written = Written::default();
-        if let Some(files) = files {
-            let records: Vec<(PhysicalASAPNodeId, &[Batch])> = appended
-                .iter()
-                .map(|(view, batches)| (*view, batches.as_slice()))
-                .collect();
-            match files.append(window.group, (start, end), &records) {
-                Ok(group_written) => written = group_written,
-                Err(error) => {
-                    tracing::error!(group = window.group, end, %error, "persisting a window failed");
-                    written.not_persisted = records.len() as u64;
-                }
-            }
+        for (view, (_, batches)) in missing.iter().zip(&appended) {
+            views.append(view, (start, end), batches.clone())?;
         }
-        for (view, (_, batches)) in missing.iter().zip(appended) {
-            views.append(view, (start, end), batches)?;
-        }
-        Ok(Refreshed::Ran(written))
+        Ok(Refreshed::Ran(appended))
     }
 
     /// Each refresh group's views (with their retention margin) and their
@@ -639,6 +625,11 @@ impl Precompute {
                     .collect()
             })
             .collect()
+    }
+
+    /// Refresh group `group`'s window width.
+    pub fn width_ms(&self, group: usize) -> i64 {
+        self.runs[group].width_ms
     }
 
     /// Each refresh group's window width and views, in plan order.

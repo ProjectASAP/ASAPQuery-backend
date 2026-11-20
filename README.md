@@ -124,7 +124,15 @@ delivers every step time.
 
 **Persistence.** Each refresh group's views are appended to one file in
 `--view-dir` (default `asap-views`; `--no-view-persistence` keeps views in
-memory only), one record per refreshed window. Files are synced every
+memory only), one record per refreshed window. Encoding, writing and
+syncing run on `--persist-threads` `persist-N` threads (default a quarter
+of the cores, 1 to 4; refresh group `g` goes to thread `g % n`, so each
+file has one writer and keeps window order) after the window is published,
+so disk I/O does not slow refreshes. Up to `--max-persist-backlog-bytes`
+(default 256 MiB) of refreshed windows wait for them; beyond that
+refreshes wait (`asap_view_persist_wait_seconds_total`,
+`asap_persist_backlog_bytes`).
+Files are synced every
 `--view-sync-interval-ms` (default 5,000, VictoriaMetrics' default
 `-inmemoryDataFlushInterval` as of v1.155.0), so a refreshed window is
 durable within that interval, the same guarantee VictoriaMetrics gives its

@@ -442,8 +442,20 @@ naming the plan (a hash of the plan file) and the group, then one record
 per refreshed window, a length and a MessagePack payload holding
 `(start, end]` and the rows of each view appended. A text (a label value or
 a series identity) is stored once per file: a record carries the texts it
-adds to the file's dictionary, and rows hold indices. Files are synced
-(`fdatasync`) every `--view-sync-interval-ms`, also when no window closes;
+adds to the file's dictionary, and rows hold indices. Persisting runs in
+the background: the precompute thread publishes a refreshed window first
+and then queues its rows for a pool of `--persist-threads` threads
+(`persist-N`; default a quarter of the cores, 1 to 4), which encode, write
+and sync. Refresh group `g` goes to thread `g % n`, so each file has
+exactly one writer and its records stay in window order. The queue is
+bounded by bytes (`--max-persist-backlog-bytes`, default 256 MiB;
+`asap_persist_backlog_bytes`, `asap_persist_backlog_windows`); only when
+it is full does the precompute thread wait, and the wait is exported
+(`asap_view_persist_wait_seconds_total`). An event-time barrier answers
+once the windows before it are written, without the precompute thread
+waiting. Each persist thread syncs its files (`fdatasync`) every
+`--view-sync-interval-ms` on its own timer, also when no window arrives,
+and writes and syncs everything queued when the engine stops;
 the default, 5 s, is VictoriaMetrics' own default
 `-inmemoryDataFlushInterval` (v1.155.0: "The interval for guaranteed saving
 of in-memory data to disk ... (default 5s)"). A refreshed window is
@@ -478,8 +490,8 @@ retention are skipped at load.
 
 ### Measurements
 
-- Threads are named by role: `ingest`, `precompute`, `query-N`; Remote
-  Write is decoded on the HTTP runtime's threads.
+- Threads are named by role: `ingest`, `precompute`, `persist-N`,
+  `query-N`; Remote Write is decoded on the HTTP runtime's threads.
 - `GET /metrics` exports, in the Prometheus text format:
   - `asap_phase_cpu_seconds_total`, `asap_phase_wall_seconds_total` and
     `asap_phase_runs_total` by `phase`: `remote_write_decode`, `append`,

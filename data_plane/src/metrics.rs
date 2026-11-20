@@ -163,6 +163,8 @@ pub struct Metrics {
     pub view_windows_not_persisted: AtomicU64,
     /// View windows loaded from the files at startup.
     pub view_windows_loaded: AtomicU64,
+    /// Time the precompute thread waited for room in the persist backlog.
+    pub view_persist_wait_ns: AtomicU64,
 }
 
 impl Metrics {
@@ -196,6 +198,7 @@ impl Metrics {
             view_sync_ns: AtomicU64::new(0),
             view_windows_not_persisted: AtomicU64::new(0),
             view_windows_loaded: AtomicU64::new(0),
+            view_persist_wait_ns: AtomicU64::new(0),
         }
     }
 
@@ -210,6 +213,8 @@ pub struct Gauges<'a> {
     pub stats: IngestionStats,
     pub samples_queued: u64,
     pub precompute_backlog: u64,
+    pub persist_backlog: u64,
+    pub persist_backlog_bytes: u64,
     pub now_ms: i64,
     pub query_time_results: &'a QueryTimeResults,
 }
@@ -327,6 +332,18 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
         "Refresh windows closed and not yet refreshed.",
         gauges.precompute_backlog as f64,
     );
+    gauge(
+        &mut out,
+        "asap_persist_backlog_windows",
+        "Refreshed windows not yet written to the view files.",
+        gauges.persist_backlog as f64,
+    );
+    gauge(
+        &mut out,
+        "asap_persist_backlog_bytes",
+        "Bytes of refreshed windows queued for the persist threads.",
+        gauges.persist_backlog_bytes as f64,
+    );
     let watermark_ms = metrics.watermark_ms.load(Ordering::Relaxed);
     if watermark_ms != i64::MIN {
         gauge(
@@ -376,6 +393,11 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
             "asap_view_windows_not_persisted_total",
             "View windows not written to the view files (a sketch state, or an error).",
             load(&metrics.view_windows_not_persisted),
+        ),
+        (
+            "asap_view_persist_wait_seconds_total",
+            "Time the precompute thread waited for room in the persist queue.",
+            load(&metrics.view_persist_wait_ns) / 1e9,
         ),
         (
             "asap_view_windows_loaded_total",
@@ -517,6 +539,8 @@ mod tests {
                 stats: IngestionStats::default(),
                 samples_queued: 0,
                 precompute_backlog: 2,
+                persist_backlog: 0,
+                persist_backlog_bytes: 0,
                 now_ms: 0,
                 query_time_results: &QueryTimeResults::new(0, 0),
             },
