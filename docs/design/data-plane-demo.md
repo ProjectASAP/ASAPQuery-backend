@@ -186,7 +186,14 @@ HTTP queries ─► query workers: one query run per worker thread over
   the watermark from samples is one millisecond before the newest sample
   less the allowed lateness, since a scraper sends one timestamp over
   several requests and samples at `e` may still come (a barrier counts
-  whole). It closes each
+  whole). Every pass that took a report or a barrier flushes before the
+  watermark moves, and the wall clock the watermark is capped at (samples
+  may be stamped ahead of it) is the time that flush was sent, not a
+  shard's report time: a shard working through a backlog reports the
+  current time while it still runs old requests, and taking that time let
+  the watermark pass samples of requests admitted after the flush. A
+  barrier that comes while a flush is waited for takes the next pass (a
+  queue), behind its own flush. It closes each
   refresh window the watermark passes and hands it, with every shard's raw
   data as it was then (shared `Arc` chunk lists, no copy), to the
   precompute thread,

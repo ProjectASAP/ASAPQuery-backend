@@ -18,6 +18,7 @@
 //! Each thread records the thread CPU and wall time of its phases in
 //! [`Metrics`], exported on `/metrics`.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
@@ -158,7 +159,6 @@ struct ShardReport {
     newest_ms: Option<i64>,
     /// Each metric's first sample, while a group waits for one.
     first_seen: Vec<(Arc<str>, i64)>,
-    now_ms: i64,
 }
 
 /// What an ingest shard does next.
@@ -779,12 +779,16 @@ fn install(
 }
 
 /// Sends every shard a flush, with no request half sent: each request
-/// already admitted is wholly before it in its shards' queues.
-fn flush(shards: &[Sender<ShardMessage>], shared: &Shared) {
+/// already admitted is wholly before it in its shards' queues. Returns
+/// the wall-clock time it was sent: every request admitted later holds
+/// samples stamped later (a sender stamps before it sends).
+fn flush(shards: &[Sender<ShardMessage>], shared: &Shared) -> i64 {
     let _admission = shared.admission.write().unwrap_or_else(|e| e.into_inner());
+    let sent_ms = crate::ingestion::wall_clock_ms();
     for shard in shards {
         let _ = shard.send(ShardMessage::Flush);
     }
+    sent_ms
 }
 
 /// An ingest shard: routes and appends the samples of its series to its
@@ -844,7 +848,6 @@ fn serve_shard(
             raw_data: raw_data.clone(),
             newest_ms,
             first_seen,
-            now_ms: crate::ingestion::wall_clock_ms(),
         };
         let sent = coordinator.send(Command::Report(report));
         // Counted out after the report, so the coordinator never takes the
@@ -861,11 +864,14 @@ fn serve_shard(
 /// windows it passes and queues their refreshes over every shard's raw data
 /// as it was then, publishes the raw data and the routing, and has the
 /// shards seal and evict as the watermark moves. The watermark follows the
-/// newest sample of any shard; before it moves, every shard runs the
-/// samples queued to it (a flush), so a window closes over every sample
-/// admitted before. Shards with nothing queued answer the flush at once,
-/// so idle shards never hold the watermark; the coordinator also wakes
-/// every tick.
+/// newest sample of any shard, capped at the wall clock; it moves only
+/// behind a flush, which every pass that took a report or a barrier
+/// sends: every shard runs the samples queued to it, so a window closes
+/// over every sample admitted before. The clock cap is the time that flush
+/// was sent (a request admitted later holds samples stamped later), never
+/// a report's time. Barriers that come during a flush take the next pass.
+/// Shards with nothing queued answer the flush at once, so idle shards
+/// never hold the watermark; the coordinator also wakes every tick.
 fn serve_ingest(
     mut ingestion: Ingestion,
     mut raw_shards: Vec<Arc<RawData>>,
@@ -881,13 +887,13 @@ fn serve_ingest(
                  ingestion: &mut Ingestion,
                  raw_shards: &mut Vec<Arc<RawData>>,
                  newest: &mut Vec<Option<i64>>| {
-        ingestion.observe(&report.first_seen, report.now_ms);
+        ingestion.observe(&report.first_seen);
         raw_shards[report.shard] = report.raw_data;
         newest[report.shard] = report.newest_ms;
     };
-    // A barrier met while draining reports waits for the next pass, which
-    // runs it behind a flush.
-    let mut deferred: Option<Command> = None;
+    // Barriers that came while a flush was waited for: written after it,
+    // so they take the next pass, behind its own flush.
+    let mut deferred: VecDeque<(i64, oneshot::Sender<i64>)> = VecDeque::new();
     // Reports a shard sent after answering a flush, of samples admitted
     // after it: held for the next pass, so they move neither this pass's
     // watermark nor its raw data. Without this, a shard that ran ahead
@@ -895,61 +901,43 @@ fn serve_ingest(
     // append, and windows would close without them.
     let mut held: Vec<ShardReport> = Vec::new();
     'serve: loop {
-        let mut barriers = Vec::new();
+        let mut barriers: Vec<_> = deferred.drain(..).collect();
+        // Whether anything this pass may move the watermark: a newer
+        // sample, the wall clock a report carries (the watermark is capped
+        // at it), a metric's first sample, or a barrier.
+        let mut moved = !barriers.is_empty() || !held.is_empty();
         for report in held.drain(..) {
             apply(report, &mut ingestion, &mut raw_shards, &mut newest);
         }
-        let next = match deferred.take() {
-            Some(command) => Ok(command),
-            None => commands.recv_timeout(TICK),
-        };
-        match next {
-            Ok(Command::Report(report)) => {
-                apply(report, &mut ingestion, &mut raw_shards, &mut newest)
-            }
-            Ok(Command::Flushed(_)) => {}
-            Ok(Command::AdvanceWatermark { barrier_ms, reply }) => {
-                // Behind every write acknowledged before: each shard runs
-                // the samples queued to it first.
-                barriers.push((barrier_ms, reply));
-                flush(&shards, shared);
-                let mut flushed = vec![false; shards.len()];
-                while !flushed.iter().all(|&f| f) {
-                    match commands.recv() {
-                        Ok(Command::Report(report))
-                            if flushed[report.shard]
-                                || held.iter().any(|r| r.shard == report.shard) =>
-                        {
-                            held.push(report)
-                        }
-                        Ok(Command::Report(report)) => {
-                            apply(report, &mut ingestion, &mut raw_shards, &mut newest)
-                        }
-                        Ok(Command::Flushed(shard)) => flushed[shard] = true,
-                        Ok(Command::AdvanceWatermark { barrier_ms, reply }) => {
-                            barriers.push((barrier_ms, reply))
-                        }
-                        Ok(Command::Stop) | Err(_) => break 'serve,
-                    }
+        if !moved {
+            match commands.recv_timeout(TICK) {
+                Ok(Command::Report(report)) => {
+                    apply(report, &mut ingestion, &mut raw_shards, &mut newest);
+                    moved = true;
                 }
+                Ok(Command::Flushed(_)) => {}
+                Ok(Command::AdvanceWatermark { barrier_ms, reply }) => {
+                    barriers.push((barrier_ms, reply));
+                    moved = true;
+                }
+                Ok(Command::Stop) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            Ok(Command::Stop) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        // Drain the reports already sent, so one pass takes them all.
-        while held.is_empty() {
-            let Ok(command) = commands.try_recv() else {
-                break;
-            };
+        // Drain what was already sent, so one pass takes it all. A barrier
+        // taken here is behind every write acknowledged before it, as the
+        // flush below is sent after it.
+        while let Ok(command) = commands.try_recv() {
             match command {
                 Command::Report(report) => {
-                    apply(report, &mut ingestion, &mut raw_shards, &mut newest)
+                    apply(report, &mut ingestion, &mut raw_shards, &mut newest);
+                    moved = true;
                 }
                 Command::Flushed(_) => {}
-                command @ Command::AdvanceWatermark { .. } => {
-                    deferred = Some(command);
-                    break;
+                Command::AdvanceWatermark { barrier_ms, reply } => {
+                    barriers.push((barrier_ms, reply));
+                    moved = true;
                 }
                 Command::Stop => break 'serve,
             }
@@ -957,12 +945,11 @@ fn serve_ingest(
         // Before the watermark moves, every shard runs the samples queued to
         // it, so the windows it closes hold every sample admitted so far
         // and the raw data they read is every shard's as of then.
-        let newest_ms = newest.iter().flatten().copied().max();
-        if newest_ms > ingestion.newest_sample_ms() {
-            flush(&shards, shared);
+        if moved {
+            let flushed_ms = flush(&shards, shared);
             let mut flushed = vec![false; shards.len()];
             while !flushed.iter().all(|&f| f) {
-                match commands.recv() {
+                match commands.recv_timeout(TICK) {
                     Ok(Command::Report(report))
                         if flushed[report.shard]
                             || held.iter().any(|r| r.shard == report.shard) =>
@@ -973,10 +960,21 @@ fn serve_ingest(
                         apply(report, &mut ingestion, &mut raw_shards, &mut newest)
                     }
                     Ok(Command::Flushed(shard)) => flushed[shard] = true,
-                    Ok(command @ Command::AdvanceWatermark { .. }) => deferred = Some(command),
-                    Ok(Command::Stop) | Err(_) => break 'serve,
+                    Ok(Command::AdvanceWatermark { barrier_ms, reply }) => {
+                        deferred.push_back((barrier_ms, reply))
+                    }
+                    Ok(Command::Stop) => break 'serve,
+                    // A shard that died never answers: stop, failing the
+                    // barriers waiting.
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if !shared.running.load(Ordering::SeqCst) {
+                            break 'serve;
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'serve,
                 }
             }
+            ingestion.advance_clock(flushed_ms);
         }
         let newest_ms = newest.iter().flatten().copied().max();
         ingestion.advance_newest_sample(newest_ms);

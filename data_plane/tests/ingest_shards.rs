@@ -360,3 +360,149 @@ async fn idle_shards_do_not_hold_the_watermark() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
+
+const CLOCK_QUERY: &str = "sum by (job) (count_over_time(data[2s]))";
+
+/// The data plane of `CLOCK_QUERY`, evaluated every second, over
+/// `ingest_threads` shards, every shard but the first slowed by
+/// `shard_delay_ms`; samples may be up to 5 s ahead of the wall clock.
+fn clock_data_plane(
+    ingest_threads: usize,
+    shard_delay_ms: u64,
+    stream_start_ms: i64,
+) -> (Router, Arc<DataPlane>) {
+    let workload = serde_json::from_value(json!({
+        "query_workload": {"language": "promql", "repeating_queries": [{
+            "query": CLOCK_QUERY,
+            "demand": {"fixed_interval_at": {"interval": 1000, "evaluation_phase": 0}},
+            "requirements": {},
+            "predictability": {"predictable": {"known_at": null}},
+        }]},
+        "data_workload": {"arrival": {"ingesting": {"rows_per_second": 640.0}},
+          "sources": {"data": {"series_count": 64, "sample_interval": 100,
+            "metric_type": "gauge", "column_signs": {"value": "non_negative"}}}},
+    }))
+    .unwrap();
+    let plan = serde_json::to_string(&plan_workload(&workload, &common::inputs(false)).unwrap().0)
+        .unwrap();
+    let options = EngineOptions {
+        no_forward: true,
+        ingest_threads,
+        shard_delay_ms,
+        ingestion: IngestionOptions {
+            allowed_lateness_ms: 0,
+            max_future_ms: 5_000,
+            stream_start_ms: Some(stream_start_ms),
+            ..IngestionOptions::default()
+        },
+        ..EngineOptions::default()
+    };
+    let state =
+        Arc::new(DataPlane::with_options(plan, "http://127.0.0.1:1".into(), options).unwrap());
+    (router(state.clone()), state)
+}
+
+fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// A feeder stamps samples up to a second ahead of the wall clock, each
+/// series at its own offset, as the demo's feeder does; the watermark then
+/// follows the wall clock, which moves with every shard's report even when
+/// no newer sample came. Over four shards, three slow, every window must
+/// still hold every sample: the watermark moves only behind a flush.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watermark_capped_at_the_clock_moves_only_behind_a_flush() {
+    let start_ms = (wall_clock_ms() / 1000 + 1) * 1000;
+    let (app, state) = clock_data_plane(4, 250, start_ms);
+    while wall_clock_ms() < start_ms {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // Every 100 ms for 3 s: each series one sample, series i stamped
+    // (i + 1) / 64 s after the send time.
+    let mut sent: Vec<(usize, i64)> = Vec::new();
+    for _ in 0..30 {
+        let now_ms = wall_clock_ms();
+        let timeseries = (0..64usize)
+            .map(|i| {
+                let timestamp = now_ms + (i as i64 + 1) * 1000 / 64;
+                sent.push((i, timestamp));
+                TimeSeries {
+                    labels: [
+                        ("__name__", "data".to_string()),
+                        ("instance", format!("i{i}")),
+                        ("job", format!("job{}", i % 4)),
+                    ]
+                    .into_iter()
+                    .map(|(name, value)| Label {
+                        name: name.into(),
+                        value,
+                    })
+                    .collect(),
+                    samples: vec![Sample {
+                        timestamp,
+                        value: 1.0,
+                    }],
+                }
+            })
+            .collect();
+        let written = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/write")
+                    .body(Body::from(encode(&WriteRequest { timeseries })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(written.status(), StatusCode::NO_CONTENT);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let last_ms = sent.iter().map(|(_, t)| *t).max().unwrap();
+    while wall_clock_ms() <= last_ms {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    barrier(&app, last_ms).await;
+    assert_eq!(state.engine.stats().samples_dropped_late, 0);
+    let mut times = 0;
+    for time_ms in (start_ms + 2000..=last_ms).step_by(1000) {
+        let expected: Vec<(String, f64)> = (0..4)
+            .map(|job| {
+                let count = sent
+                    .iter()
+                    .filter(|(i, t)| i % 4 == job && *t > time_ms - 2000 && *t <= time_ms)
+                    .count();
+                (format!("job{job}"), count as f64)
+            })
+            .collect();
+        let (status, body) = status_and_answer_of(&app, CLOCK_QUERY, time_ms).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(per_job(&body), expected, "at {time_ms}");
+        times += 1;
+    }
+    assert!(times >= 1);
+}
+
+/// `query` at `time_ms`: its status and body, results sorted by job.
+async fn status_and_answer_of(app: &Router, query: &str, time_ms: i64) -> (StatusCode, Value) {
+    let uri = format!(
+        "/api/v1/query?query={}&time={}",
+        form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>(),
+        time_ms as f64 / 1000.0
+    );
+    let response = app
+        .clone()
+        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let mut body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    if let Some(result) = body["data"]["result"].as_array_mut() {
+        result.sort_by_key(|s| s["metric"]["job"].as_str().unwrap().to_string());
+    }
+    (status, body)
+}

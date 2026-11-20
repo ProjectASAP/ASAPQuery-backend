@@ -346,13 +346,20 @@ impl Ingestion {
         }
     }
 
-    /// Takes in what a shard routed at `now_ms`: each metric's first
-    /// sample starts the groups scanning it.
-    pub fn observe(&mut self, first_seen: &[(Arc<str>, i64)], now_ms: i64) {
-        self.newest_clock_ms = self.newest_clock_ms.max(Some(now_ms));
+    /// Takes in what a shard routed: each metric's first sample starts
+    /// the groups scanning it.
+    pub fn observe(&mut self, first_seen: &[(Arc<str>, i64)]) {
         for (metric, timestamp_ms) in first_seen {
             self.start_groups(metric, *timestamp_ms);
         }
+    }
+
+    /// Sets the wall clock the watermark is capped at (it never goes
+    /// back): the time every shard was last flushed. A request admitted
+    /// after that time holds samples stamped after it, and a request
+    /// admitted before it was run by every shard.
+    pub fn advance_clock(&mut self, now_ms: i64) {
+        self.newest_clock_ms = self.newest_clock_ms.max(Some(now_ms));
     }
 
     /// The newest sample time the watermark follows.
@@ -361,8 +368,7 @@ impl Ingestion {
     }
 
     /// Sets the newest sample time the watermark follows (it never goes
-    /// back): across shards, the oldest newest sample of the shards with
-    /// samples still queued, or the newest of all when none has.
+    /// back): the newest sample any shard ran by the last flush.
     pub fn advance_newest_sample(&mut self, newest_ms: Option<i64>) {
         self.newest_sample_ms = self.newest_sample_ms.max(newest_ms);
     }
@@ -389,7 +395,8 @@ impl Ingestion {
         barrier_ms: i64,
         now_ms: i64,
     ) -> (i64, Vec<ClosedWindow>) {
-        self.newest_clock_ms = self.newest_clock_ms.max(Some(now_ms));
+        // The barrier is capped at the wall clock, but does not move the
+        // clock the samples' watermark is capped at: only a flush does.
         let barrier_ms = barrier_ms.min(now_ms);
         if let Some(current) = self.barrier_ms.filter(|current| *current >= barrier_ms) {
             return (current, Vec::new());
