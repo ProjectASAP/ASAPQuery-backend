@@ -2,11 +2,12 @@
 //! the Prometheus query API for an installed plan.
 //!
 //! The installed plan is ASAPPlanner's `InstallablePlan`: one selected
-//! physical ASAP DAG. The engine thread stores the raw samples its `Scan`s
-//! read, refreshes its materialized views in ingestion runs, and answers
-//! the plan's instant queries with query runs, all through the Planner's
-//! executor; every other query, and any planned query it cannot answer, is
-//! forwarded to Prometheus (or refused with `--no-forward`).
+//! physical ASAP DAG. The engine's ingest thread stores the raw samples its
+//! `Scan`s read, its precompute thread refreshes the materialized views in
+//! ingestion runs, and query worker threads answer the plan's instant
+//! queries with query runs, all through the Planner's executor
+//! ([`engine`]); every other query, and any planned query it cannot
+//! answer, is forwarded to Prometheus (or refused with `--no-forward`).
 
 pub mod engine;
 pub mod ingestion;
@@ -213,8 +214,8 @@ async fn watermark(State(state): State<Arc<DataPlane>>, RawQuery(query): RawQuer
     }
 }
 
-/// Ready while the engine thread runs; a stopped engine never ingests
-/// again, so the data plane must be restarted.
+/// Ready while the engine's ingest and precompute threads run; a stopped
+/// engine never ingests again, so the data plane must be restarted.
 async fn ready(State(state): State<Arc<DataPlane>>) -> StatusCode {
     if state.engine.is_running() {
         StatusCode::OK
@@ -224,11 +225,13 @@ async fn ready(State(state): State<Arc<DataPlane>>) -> StatusCode {
 }
 
 /// The data plane's counters, as JSON: ingestion's sample and window
-/// counters, the samples queued for it, and whether it runs.
+/// counters, the samples queued for it, the windows closed and not yet
+/// refreshed, and whether it runs.
 async fn status(State(state): State<Arc<DataPlane>>) -> Response {
     let body = serde_json::json!({
         "engine_running": state.engine.is_running(),
         "samples_queued": state.engine.queued_samples(),
+        "precompute_backlog": state.engine.precompute_backlog(),
         "ingestion": state.engine.stats(),
     });
     (

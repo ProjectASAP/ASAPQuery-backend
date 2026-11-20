@@ -23,6 +23,9 @@ pub struct Series {
     pub id: u32,
     /// The `__name__` label (empty without one).
     pub metric: Arc<str>,
+    /// The canonical JSON of every label, `__name__` included: the series
+    /// identity column of a raw-data read, computed once when interned.
+    pub identity: Arc<str>,
     labels: BTreeMap<String, String>,
 }
 
@@ -137,6 +140,9 @@ pub fn intern_pairs<N: AsRef<str>, V: AsRef<str>>(pairs: &[(N, V)]) -> Arc<Serie
     let series = Arc::new(Series {
         id,
         metric: labels.get("__name__").map_or("", String::as_str).into(),
+        identity: serde_json::to_string(&labels)
+            .expect("labels serialize")
+            .into(),
         labels,
     });
     interner.series.push(series.clone());

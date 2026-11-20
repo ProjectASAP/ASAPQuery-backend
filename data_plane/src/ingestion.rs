@@ -18,10 +18,16 @@
 //! When the watermark jumps past a view's retention, the windows that would
 //! already be dropped are skipped.
 //!
-//! Raw samples are kept while a window still to be refreshed or a
-//! query-time `Scan` (back to its `retention_ms`) reads them.
+//! Raw samples are kept while a window still to be closed or a query-time
+//! `Scan` (back to its `retention_ms`) reads them.
+//!
+//! [`Ingestion`] (the ingest thread) stores samples, keeps the watermark
+//! and closes windows; each closed window is refreshed by [`Precompute`]
+//! (the precompute thread) over the raw data as it was when the window
+//! closed, so the samples it reads are those the serial engine read.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use asap_executor::physical_planner::{compile, CompiledPhysicalDAG};
 use asap_executor::planner::ir::operator::Source;
@@ -33,7 +39,7 @@ use asap_executor::planner::plan::physical_asap_dag::{PhysicalASAPDAG, PhysicalA
 use asap_executor::runtime::{Limits, RunContext, Scope};
 use futures::executor::block_on;
 
-use crate::store::{RawSample, TimeIndexedStore};
+use crate::store::{RawData, RawSample, RunStore, ViewStore};
 
 /// How ingestion treats sample times.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,24 +110,41 @@ pub enum IngestionError {
     },
 }
 
-/// One refresh group, compiled once.
+/// Raw-data panes are never wider than this, so eviction frees memory at
+/// least this often.
+const MAX_PANE_WIDTH_MS: i64 = 60_000;
+
+/// A refresh group's window `(end_ms - W, end_ms]` that the watermark has
+/// passed, to refresh; `group` indexes the plan's ingestion refresh groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClosedWindow {
+    pub group: usize,
+    pub end_ms: i64,
+}
+
+/// One refresh group, compiled once: what its ingestion runs execute.
 struct RefreshGroupRun {
-    width_ms: i64,
-    phase_ms: i64,
     /// The group's views, with `retention_ms` extended by
     /// `view_retention_margin_ms`: how long the store keeps their rows.
     views: Vec<MaterializedView>,
     compiled: CompiledPhysicalDAG,
+    width_ms: i64,
+}
+
+/// One refresh group's windows.
+struct RefreshGroup {
+    width_ms: i64,
+    phase_ms: i64,
     /// The metrics its runs scan.
     metrics: BTreeSet<String>,
     /// The longest retention of its views.
     retention_ms: i64,
-    /// End of the newest window refreshed or skipped; `None` before the
+    /// End of the newest window closed or skipped; `None` before the
     /// first sample of a metric it scans.
     refreshed_through: Option<i64>,
 }
 
-impl RefreshGroupRun {
+impl RefreshGroup {
     /// The end of the group's window holding `timestamp_ms`.
     fn window_end(&self, timestamp_ms: i64) -> i64 {
         window_end(timestamp_ms - self.phase_ms, self.width_ms) + self.phase_ms
@@ -129,12 +152,16 @@ impl RefreshGroupRun {
 }
 
 pub struct Ingestion {
-    groups: Vec<RefreshGroupRun>,
+    groups: Vec<RefreshGroup>,
+    /// Every metric a `Scan` reads; samples of others are not stored.
+    scanned_metrics: BTreeSet<String>,
+    /// Raw-data pane width: the gcd of every group's window width and
+    /// phase (and of `MAX_PANE_WIDTH_MS`), so panes tile every window.
+    pane_width_ms: i64,
     /// For each metric a query-time `Scan` reads, how far back it reads
     /// (`None`: every sample).
     query_time_lookback_ms: HashMap<String, Option<i64>>,
     options: IngestionOptions,
-    limits: Limits,
     newest_sample_ms: Option<i64>,
     /// The newest wall-clock time an ingest ran at: the watermark never
     /// passes it, so a series stamped ahead of the others cannot close
@@ -146,16 +173,17 @@ pub struct Ingestion {
 }
 
 impl Ingestion {
-    /// Compiles one ingestion run per refresh group of `dag`'s `views`.
-    /// Refuses views refreshed on first read, which the data plane does not
-    /// refresh yet, and groups without a bounded window.
+    /// Compiles one ingestion run per refresh group of `dag`'s `views`,
+    /// for the [`Precompute`] returned with the ingestion. Refuses views
+    /// refreshed on first read, which the data plane does not refresh yet,
+    /// and groups without a bounded window.
     pub fn new(
         dag: &PhysicalASAPDAG,
         views: &[MaterializedView],
         groups: Vec<IngestionRefreshGroup>,
         options: IngestionOptions,
         limits: Limits,
-    ) -> Result<Self, IngestionError> {
+    ) -> Result<(Self, Precompute), IngestionError> {
         if let Some(view) = views
             .iter()
             .find(|v| v.refresh() == MaterializedViewRefresh::OnFirstRead)
@@ -167,6 +195,7 @@ impl Ingestion {
         }
         let index = DagIndex::new(dag);
         let mut runs = Vec::new();
+        let mut clocks = Vec::new();
         for group in groups {
             let ids: Vec<PhysicalASAPNodeId> = group.views.iter().map(|v| v.node_id).collect();
             let Some(window) = group.refresh_window else {
@@ -206,15 +235,22 @@ impl Ingestion {
                 .max()
                 .unwrap_or(0);
             runs.push(RefreshGroupRun {
-                width_ms: millis(window.width_ms),
-                phase_ms: millis(window.phase_ms),
                 views,
                 compiled,
+                width_ms: millis(window.width_ms),
+            });
+            clocks.push(RefreshGroup {
+                width_ms: millis(window.width_ms),
+                phase_ms: millis(window.phase_ms),
                 metrics,
                 retention_ms,
                 refreshed_through: None,
             });
         }
+        let pane_width_ms = clocks
+            .iter()
+            .flat_map(|g| [g.width_ms, g.phase_ms])
+            .fold(MAX_PANE_WIDTH_MS, gcd);
         // The `Scan`s the query run reads: below the roots, outside views.
         let view_ids: HashSet<PhysicalASAPNodeId> = views.iter().map(|v| v.node_id).collect();
         let mut query_time_lookback_ms: HashMap<String, Option<i64>> = HashMap::new();
@@ -238,16 +274,29 @@ impl Ingestion {
                 };
             }
         }
-        Ok(Self {
-            groups: runs,
+        let ingestion = Self {
+            groups: clocks,
+            scanned_metrics: crate::store::scanned_metrics(&dag.nodes),
+            pane_width_ms,
             query_time_lookback_ms,
             options,
-            limits,
             newest_sample_ms: None,
             newest_clock_ms: None,
             barrier_ms: None,
             stats: IngestionStats::default(),
-        })
+        };
+        Ok((ingestion, Precompute { runs, limits }))
+    }
+
+    /// An empty raw store for the metrics the plan scans, in this
+    /// ingestion's panes.
+    pub fn raw_data(&self) -> RawData {
+        RawData::for_metrics(&self.scanned_metrics, self.pane_width_ms)
+    }
+
+    /// The raw-data pane width.
+    pub fn pane_width_ms(&self) -> i64 {
+        self.pane_width_ms
     }
 
     /// The watermark: no sample older than this is expected any more. The
@@ -264,24 +313,28 @@ impl Ingestion {
     }
 
     /// [`Self::ingest_at`] the current wall-clock time.
-    pub fn ingest(&mut self, store: &mut TimeIndexedStore, samples: Vec<RawSample>) {
-        self.ingest_at(store, samples, wall_clock_ms());
+    pub fn ingest(&mut self, raw_data: &mut RawData, samples: Vec<RawSample>) -> Vec<ClosedWindow> {
+        self.ingest_at(raw_data, samples, wall_clock_ms())
     }
 
-    /// Stores `samples`, then refreshes every window the watermark has
-    /// passed. `now_ms` bounds sample times from above.
+    /// Stores `samples`, then closes and returns every window the
+    /// watermark has passed, oldest first within each group, groups in
+    /// plan order (a group may read the views of an earlier one). `now_ms`
+    /// bounds sample times from above. Call [`Self::evict`] once the
+    /// windows' runs hold the raw data they read.
     pub fn ingest_at(
         &mut self,
-        store: &mut TimeIndexedStore,
+        raw_data: &mut RawData,
         samples: Vec<RawSample>,
         now_ms: i64,
-    ) {
+    ) -> Vec<ClosedWindow> {
         self.newest_clock_ms = self.newest_clock_ms.max(Some(now_ms));
         let latest_allowed_ms = now_ms.saturating_add(millis(self.options.max_future_ms));
         let mut oldest_kept: HashMap<String, Option<i64>> = HashMap::new();
+        let mut accepted = Vec::with_capacity(samples.len());
         for sample in samples {
             let metric = sample.labels.metric.clone();
-            if !store.raw_data().reads(&metric) {
+            if !self.scanned_metrics.contains(&*metric) {
                 self.stats.samples_unrouted += 1;
                 continue;
             }
@@ -298,35 +351,40 @@ impl Ingestion {
                 continue;
             }
             self.newest_sample_ms = self.newest_sample_ms.max(Some(sample.timestamp_ms));
-            store.raw_data_mut().push(sample);
+            accepted.push(sample);
             self.stats.samples_accepted += 1;
         }
-        self.refresh_closed_windows(store);
+        raw_data.append(&accepted);
+        self.close_windows(raw_data)
     }
 
     /// [`Self::advance_watermark_at`] the current wall-clock time.
-    pub fn advance_watermark(&mut self, store: &mut TimeIndexedStore, barrier_ms: i64) -> i64 {
-        self.advance_watermark_at(store, barrier_ms, wall_clock_ms())
+    pub fn advance_watermark(
+        &mut self,
+        raw_data: &mut RawData,
+        barrier_ms: i64,
+    ) -> (i64, Vec<ClosedWindow>) {
+        self.advance_watermark_at(raw_data, barrier_ms, wall_clock_ms())
     }
 
     /// An event-time barrier: the producer states that every sample at or
     /// before `barrier_ms` has been written, so every window ending at or
     /// before it closes without a later sample. Capped at `now_ms`; a
-    /// repeated or lower barrier does nothing. Returns the barrier in force.
+    /// repeated or lower barrier does nothing. Returns the barrier in force
+    /// and the windows it closed, as [`Self::ingest_at`] does.
     pub fn advance_watermark_at(
         &mut self,
-        store: &mut TimeIndexedStore,
+        raw_data: &mut RawData,
         barrier_ms: i64,
         now_ms: i64,
-    ) -> i64 {
+    ) -> (i64, Vec<ClosedWindow>) {
         self.newest_clock_ms = self.newest_clock_ms.max(Some(now_ms));
         let barrier_ms = barrier_ms.min(now_ms);
         if let Some(current) = self.barrier_ms.filter(|current| *current >= barrier_ms) {
-            return current;
+            return (current, Vec::new());
         }
         self.barrier_ms = Some(barrier_ms);
-        self.refresh_closed_windows(store);
-        barrier_ms
+        (barrier_ms, self.close_windows(raw_data))
     }
 
     /// Starts each group scanning `metric` at its first sample: its first
@@ -381,11 +439,14 @@ impl Ingestion {
         cutoff
     }
 
-    fn refresh_closed_windows(&mut self, store: &mut TimeIndexedStore) {
+    /// Closes every window the watermark has passed and compacts the
+    /// panes it has passed.
+    fn close_windows(&mut self, raw_data: &mut RawData) -> Vec<ClosedWindow> {
         let Some(watermark) = self.watermark_ms() else {
-            return;
+            return Vec::new();
         };
-        for group in &mut self.groups {
+        let mut closed = Vec::new();
+        for (index, group) in self.groups.iter_mut().enumerate() {
             let Some(mut through) = group.refreshed_through else {
                 continue;
             };
@@ -401,69 +462,98 @@ impl Ingestion {
                 .checked_add(group.width_ms)
                 .filter(|e| *e <= watermark)
             {
-                match refresh(group, end, store, &self.limits) {
-                    Ok(()) => self.stats.windows_refreshed += 1,
-                    Err(error) => {
-                        tracing::error!(views = ?group.views.iter().map(|v| v.node_id).collect::<Vec<_>>(), end, %error, "ingestion run failed");
-                        self.stats.windows_failed += 1;
-                    }
-                }
+                closed.push(ClosedWindow {
+                    group: index,
+                    end_ms: end,
+                });
                 through = end;
             }
             group.refreshed_through = Some(through);
         }
-        let metrics: Vec<String> = self
+        raw_data.seal_through(watermark);
+        closed
+    }
+
+    /// Drops the raw panes nothing reads any more: older than every window
+    /// still to be closed and than what a query-time `Scan` reads back.
+    pub fn evict(&self, raw_data: &mut RawData) {
+        let metrics: BTreeSet<&String> = self
             .groups
             .iter()
-            .flat_map(|g| g.metrics.iter().cloned())
-            .chain(self.query_time_lookback_ms.keys().cloned())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
+            .flat_map(|g| g.metrics.iter())
+            .chain(self.query_time_lookback_ms.keys())
             .collect();
         for metric in metrics {
-            if let Some(cutoff) = self.oldest_kept_ms(&metric) {
-                store.raw_data_mut().evict_through(&metric, cutoff);
+            if let Some(cutoff) = self.oldest_kept_ms(metric) {
+                raw_data.evict_through(metric, cutoff);
             }
         }
     }
 }
 
-/// Runs `group`'s views in one ingestion run over `(end - W, end]` and
-/// appends each view's rows to `store`.
-fn refresh(
-    group: &RefreshGroupRun,
-    end: i64,
-    store: &mut TimeIndexedStore,
-    limits: &Limits,
-) -> Result<(), asap_executor::Error> {
-    let start = end - group.width_ms;
-    let outputs = {
-        let instance = group.compiled.instantiate(store.run_store())?;
-        let context = RunContext::new(
-            Scope::Ingestion {
-                window_start_ms: start,
-                window_end_ms: end,
-            },
-            limits.clone(),
-        )?;
-        let outputs = block_on(instance.execute_ingestion(group.compiled.roots(), context)?)?;
-        outputs
-    };
-    let by_root: BTreeMap<u64, Vec<_>> = group
-        .compiled
-        .roots()
-        .iter()
-        .copied()
-        .zip(outputs)
-        .collect();
-    for view in &group.views {
-        let batches = by_root
-            .get(&(view.node_id as u64))
-            .map(|batches| batches.iter().map(|batch| (**batch).clone()).collect())
-            .unwrap_or_default();
-        store.append_view_rows(view, (start, end), batches)?;
+/// The ingestion runs of the plan's refresh groups.
+pub struct Precompute {
+    runs: Vec<RefreshGroupRun>,
+    limits: Limits,
+}
+
+impl Precompute {
+    /// Runs `window`'s group's views in one ingestion run over
+    /// `(end - W, end]`, reading `raw_data` (as it was when the window
+    /// closed) and `views`, and appends each view's rows to `views`.
+    pub fn refresh(
+        &self,
+        window: ClosedWindow,
+        raw_data: Arc<RawData>,
+        views: &mut Arc<ViewStore>,
+    ) -> Result<(), asap_executor::Error> {
+        let group = &self.runs[window.group];
+        let end = window.end_ms;
+        let start = end - group.width_ms;
+        let outputs = {
+            let store = Arc::new(RunStore::new(raw_data, views.clone()));
+            let instance = group.compiled.instantiate(store)?;
+            let context = RunContext::new(
+                Scope::Ingestion {
+                    window_start_ms: start,
+                    window_end_ms: end,
+                },
+                self.limits.clone(),
+            )?;
+            let outputs = block_on(instance.execute_ingestion(group.compiled.roots(), context)?)?;
+            outputs
+        };
+        let by_root: BTreeMap<u64, Vec<_>> = group
+            .compiled
+            .roots()
+            .iter()
+            .copied()
+            .zip(outputs)
+            .collect();
+        let views = Arc::make_mut(views);
+        for view in &group.views {
+            let batches = by_root
+                .get(&(view.node_id as u64))
+                .map(|batches| batches.iter().map(|batch| (**batch).clone()).collect())
+                .unwrap_or_default();
+            views.append(view, (start, end), batches)?;
+        }
+        Ok(())
     }
-    Ok(())
+
+    /// The views of `window`'s group, for logging.
+    pub fn view_ids(&self, window: ClosedWindow) -> Vec<PhysicalASAPNodeId> {
+        self.runs[window.group]
+            .views
+            .iter()
+            .map(|v| v.node_id)
+            .collect()
+    }
+
+    /// How many refresh groups there are.
+    pub fn groups(&self) -> usize {
+        self.runs.len()
+    }
 }
 
 /// The DAG's nodes by id and each node's inputs.
@@ -530,6 +620,14 @@ fn with_retention_margin(
     let mut value = serde_json::to_value(view).map_err(error)?;
     value["retention_ms"] = (view.retention_ms().saturating_add(margin_ms)).into();
     serde_json::from_value(value).map_err(error)
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        a.abs()
+    } else {
+        gcd(b, a.rem_euclid(b))
+    }
 }
 
 fn millis(value: u64) -> i64 {

@@ -1,32 +1,44 @@
 //! The engine: the installed plan, compiled once when it is installed,
-//! and the threads that execute it. The engine thread ingests samples and
-//! refreshes views, changing its working copy of the store and publishing
-//! a snapshot after each command; `query-N` worker threads answer queries,
-//! each run entirely on one worker over the newest published snapshot, so
-//! a query never waits for ingestion. A run's output stream is not `Send`,
-//! so a run never moves between threads.
+//! and the threads that execute it:
+//!
+//! - `ingest` decodes nothing (Remote Write is decoded on the HTTP side):
+//!   it appends samples to its copy of the raw data, advances the
+//!   watermark, publishes the raw data and hands each closed refresh
+//!   window, with the raw data as it was when the window closed, to
+//! - `precompute`, which runs the window's ingestion run, appends the
+//!   views' rows to its copy of the views and publishes them;
+//! - `query-N` workers each run one query to completion over the newest
+//!   published snapshot, so a query never waits for ingestion. A run's
+//!   output stream is not `Send`, so a run never moves between threads.
+//!
+//! Windows closed and not yet refreshed (the precompute backlog) are
+//! bounded by `max_precompute_backlog`: when it is full, the ingest thread
+//! waits, its queue fills and Remote Write gets 503.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use asap_executor::runtime::Limits;
 use asap_planner::InstallablePlan;
 
 use tokio::sync::oneshot;
 
-use crate::ingestion::{Ingestion, IngestionOptions, IngestionStats};
+use crate::ingestion::{ClosedWindow, Ingestion, IngestionOptions, IngestionStats, Precompute};
 use crate::query::{QueryEngine, ResultSample, Unanswered};
-use crate::store::{scanned_metrics, PublishedStore, RawSample, RunStore, TimeIndexedStore};
+use crate::store::{PublishedStore, RawData, RawSample, RunStore, ViewStore};
 
-/// How the engine thread ingests samples and runs queries.
+/// How the engine ingests samples and runs queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineOptions {
     /// Lateness, future bound and first-window checks of ingestion.
     pub ingestion: IngestionOptions,
-    /// Samples queued for the engine, not yet ingested, beyond which Remote
-    /// Write is refused with 503 so senders retry.
+    /// Samples queued for the ingest thread, not yet ingested, beyond which
+    /// Remote Write is refused with 503 so senders retry.
     pub max_queued_samples: u64,
+    /// Refresh windows closed and not yet refreshed beyond which the
+    /// ingest thread waits for the precompute thread.
+    pub max_precompute_backlog: usize,
     /// Every answer must be computed from the plan: a plan with a query the
     /// query engine cannot run is refused at install, and the data plane
     /// never forwards a query to Prometheus (`--no-forward`).
@@ -46,6 +58,7 @@ impl Default for EngineOptions {
             ingestion: IngestionOptions::default(),
             // Two Remote Write requests of the default sample limit.
             max_queued_samples: 2_000_000,
+            max_precompute_backlog: 256,
             no_forward: false,
             run_memory_limit_bytes: 4 << 30,
             query_threads: std::thread::available_parallelism().map_or(1, usize::from),
@@ -55,13 +68,27 @@ impl Default for EngineOptions {
 
 type Reply<T> = oneshot::Sender<Result<T, Unanswered>>;
 
+/// What the ingest thread does next.
 enum Command {
     Ingest(Vec<RawSample>),
     AdvanceWatermark {
         barrier_ms: i64,
-        reply: tokio::sync::oneshot::Sender<i64>,
+        reply: oneshot::Sender<i64>,
     },
     Stop,
+}
+
+/// What the precompute thread does next.
+enum PrecomputeJob {
+    Refresh {
+        window: ClosedWindow,
+        raw_data: Arc<RawData>,
+    },
+    /// Answers `barrier_ms` once every window queued before is refreshed.
+    Barrier {
+        barrier_ms: i64,
+        reply: oneshot::Sender<i64>,
+    },
 }
 
 /// Why the engine did not take samples.
@@ -70,24 +97,38 @@ pub enum IngestError {
     /// More samples are queued than `max_queued_samples`; retry later.
     #[error("the engine is busy: too many samples queued")]
     Busy,
-    /// The engine thread has stopped; no sample will be ingested again.
+    /// The ingest thread has stopped; no sample will be ingested again.
     #[error("the engine has stopped")]
     Stopped,
 }
 
-/// The HTTP side of the engine thread.
+/// The HTTP side of the engine.
 #[derive(Clone)]
 pub struct EngineHandle {
     commands: Sender<Command>,
     /// Queries for the worker threads.
     queries: Sender<QueryJob>,
-    /// Samples sent and not yet ingested.
-    queued_samples: Arc<AtomicU64>,
+    shared: Arc<Shared>,
     max_queued_samples: u64,
-    /// False once the engine thread has exited, for any reason.
+}
+
+/// What the engine's threads publish to the HTTP side and to each other.
+struct Shared {
+    /// Samples sent to the ingest thread and not yet ingested.
+    queued_samples: AtomicU64,
+    /// Windows closed and not yet refreshed.
+    precompute_backlog: AtomicU64,
+    /// False once the ingest or precompute thread has exited, for any
+    /// reason.
     running: Arc<AtomicBool>,
-    /// The ingestion counters as of the last command the engine ran.
-    stats: Arc<Mutex<IngestionStats>>,
+    /// The ingestion counters: samples and skipped windows as of the last
+    /// command the ingest thread ran, refreshed and failed windows as the
+    /// precompute thread counts them.
+    stats: Mutex<IngestionStats>,
+    published: PublishedStore,
+    /// Held by the precompute thread during each refresh; tests hold it to
+    /// keep a refresh from finishing.
+    precompute_gate: Mutex<()>,
 }
 
 /// Marks the engine stopped when its thread exits, panics included.
@@ -101,53 +142,51 @@ impl Drop for RunningGuard {
 
 impl EngineHandle {
     /// Starts the engine for the plan file `plan_json`, read, checked and
-    /// compiled once on the engine thread, and returns the plan's queries.
-    /// Fails if the plan is invalid or the data plane cannot execute it.
+    /// compiled once, and returns the plan's queries. Fails if the plan is
+    /// invalid or the data plane cannot execute it.
     pub fn spawn(plan_json: String, options: EngineOptions) -> anyhow::Result<(Self, Vec<String>)> {
-        let (commands, receiver) = channel();
-        let (installed, installation) = channel();
-        let (queries, query_jobs) = channel::<QueryJob>();
-        let published = Arc::new(PublishedStore::default());
-        let engine_published = published.clone();
+        let (ingestion, precompute, query, query_texts) = install(&plan_json, options)?;
+        let raw_data = Arc::new(ingestion.raw_data());
         let running = Arc::new(AtomicBool::new(true));
-        let queued_samples = Arc::new(AtomicU64::new(0));
-        let stats = Arc::new(Mutex::new(IngestionStats::default()));
-        let shared = Shared {
-            queued_samples: queued_samples.clone(),
-            stats: stats.clone(),
-            published: engine_published,
-        };
-        let guard = RunningGuard(running.clone());
+        let shared = Arc::new(Shared {
+            queued_samples: AtomicU64::new(0),
+            precompute_backlog: AtomicU64::new(0),
+            running: running.clone(),
+            stats: Mutex::new(IngestionStats::default()),
+            published: PublishedStore::new(raw_data.clone()),
+            precompute_gate: Mutex::new(()),
+        });
+        let (commands, command_receiver) = channel();
+        let (jobs, job_receiver) = sync_channel(options.max_precompute_backlog.max(1));
+        let (queries, query_receiver) = channel::<QueryJob>();
+
+        let ingest_guard = RunningGuard(running.clone());
+        let ingest_shared = shared.clone();
         std::thread::Builder::new()
-            .name("engine".into())
+            .name("ingest".into())
             .spawn(move || {
-                let _guard = guard;
-                match Engine::new(&plan_json, options) {
-                    Ok((engine, query, queries)) => {
-                        let _ = installed.send(Ok((query, queries)));
-                        engine.serve(receiver, shared);
-                    }
-                    Err(error) => {
-                        let _ = installed.send(Err(error));
-                    }
-                }
+                let _guard = ingest_guard;
+                serve_ingest(ingestion, raw_data, command_receiver, jobs, &ingest_shared);
             })?;
-        let (query, query_texts) = installation
-            .recv()
-            .map_err(|_| anyhow::anyhow!("the engine thread exited while installing"))??;
+        let precompute_guard = RunningGuard(running);
+        let precompute_shared = shared.clone();
+        std::thread::Builder::new()
+            .name("precompute".into())
+            .spawn(move || {
+                let _guard = precompute_guard;
+                serve_precompute(precompute, job_receiver, &precompute_shared);
+            })?;
         spawn_query_workers(
             Arc::new(query),
-            published,
-            query_jobs,
+            shared.clone(),
+            query_receiver,
             options.query_threads.max(1),
         )?;
         let handle = Self {
             commands,
             queries,
-            queued_samples,
+            shared,
             max_queued_samples: options.max_queued_samples,
-            running,
-            stats,
         };
         Ok((handle, query_texts))
     }
@@ -158,22 +197,19 @@ impl EngineHandle {
         if !self.is_running() {
             return Err(IngestError::Stopped);
         }
+        let queued_samples = &self.shared.queued_samples;
         let count = samples.len() as u64;
-        let mut queued = self.queued_samples.load(Ordering::SeqCst);
+        let mut queued = queued_samples.load(Ordering::SeqCst);
         loop {
             let total = admit(queued, count, self.max_queued_samples)?;
-            match self.queued_samples.compare_exchange(
-                queued,
-                total,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
+            match queued_samples.compare_exchange(queued, total, Ordering::SeqCst, Ordering::SeqCst)
+            {
                 Ok(_) => break,
                 Err(current) => queued = current,
             }
         }
         self.commands.send(Command::Ingest(samples)).map_err(|_| {
-            self.queued_samples.fetch_sub(count, Ordering::SeqCst);
+            queued_samples.fetch_sub(count, Ordering::SeqCst);
             IngestError::Stopped
         })
     }
@@ -201,43 +237,59 @@ impl EngineHandle {
         answer.await.map_err(|_| stopped())?
     }
 
-    /// Whether the engine thread is still running.
+    /// Whether the ingest and precompute threads are still running.
     pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
+        self.shared.running.load(Ordering::SeqCst)
     }
 
     /// Samples queued and not yet ingested.
     pub fn queued_samples(&self) -> u64 {
-        self.queued_samples.load(Ordering::SeqCst)
+        self.shared.queued_samples.load(Ordering::SeqCst)
     }
 
-    /// The ingestion counters as of the last command the engine ran.
+    /// Refresh windows closed and not yet refreshed.
+    pub fn precompute_backlog(&self) -> u64 {
+        self.shared.precompute_backlog.load(Ordering::SeqCst)
+    }
+
+    /// The ingestion counters.
     pub fn stats(&self) -> IngestionStats {
-        *self.stats.lock().unwrap_or_else(|e| e.into_inner())
+        *self.shared.stats.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Queues an event-time barrier behind every write already acknowledged
-    /// and waits until it has run: every window ending at or before
-    /// `barrier_ms` (capped at the wall clock) is then refreshed. Returns
-    /// the barrier in force; see [`Ingestion::advance_watermark_at`].
+    /// and waits until it has run and every window it closed is refreshed:
+    /// every window ending at or before `barrier_ms` (capped at the wall
+    /// clock) is then answered from. Returns the barrier in force; see
+    /// [`Ingestion::advance_watermark_at`].
     pub async fn advance_watermark(&self, barrier_ms: i64) -> Result<i64, IngestError> {
         if !self.is_running() {
             return Err(IngestError::Stopped);
         }
-        let (reply, done) = tokio::sync::oneshot::channel();
+        let (reply, done) = oneshot::channel();
         self.commands
             .send(Command::AdvanceWatermark { barrier_ms, reply })
             .map_err(|_| IngestError::Stopped)?;
         done.await.map_err(|_| IngestError::Stopped)
     }
 
-    /// For tests: stops the engine thread after the commands queued before.
-    /// Samples queued between this call and the stop are acknowledged and
-    /// then lost; ingestion after the stop fails with
+    /// For tests: stops the ingest thread after the commands queued before,
+    /// and the precompute thread once it has refreshed the windows queued
+    /// before. Samples queued between this call and the stop are
+    /// acknowledged and then lost; ingestion after the stop fails with
     /// [`IngestError::Stopped`].
     #[doc(hidden)]
     pub fn stop(&self) {
         let _ = self.commands.send(Command::Stop);
+    }
+
+    /// For tests: no refresh finishes while the guard is held.
+    #[doc(hidden)]
+    pub fn hold_precompute(&self) -> MutexGuard<'_, ()> {
+        self.shared
+            .precompute_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -254,13 +306,6 @@ fn admit(queued: u64, count: u64, max_queued: u64) -> Result<u64, IngestError> {
     }
 }
 
-/// What the engine thread publishes to the HTTP side and the query workers.
-struct Shared {
-    queued_samples: Arc<AtomicU64>,
-    stats: Arc<Mutex<IngestionStats>>,
-    published: Arc<PublishedStore>,
-}
-
 /// One query for a worker thread.
 struct QueryJob {
     query: String,
@@ -268,27 +313,33 @@ struct QueryJob {
     reply: Reply<Vec<ResultSample>>,
 }
 
-/// What crosses threads: the compiled queries, shared by every worker, and
-/// the store snapshots runs read.
+/// What crosses threads: the compiled queries and refresh runs, the store
+/// snapshots runs read, and what the threads share.
 #[allow(dead_code)]
 fn assert_send_sync<T: Send + Sync>() {}
+#[allow(dead_code)]
+fn assert_send<T: Send>() {}
 const _: fn() = || {
     assert_send_sync::<QueryEngine>();
-    assert_send_sync::<PublishedStore>();
+    assert_send_sync::<Shared>();
     assert_send_sync::<RunStore>();
+    assert_send_sync::<RawData>();
+    assert_send_sync::<ViewStore>();
+    assert_send::<Precompute>();
+    assert_send::<Ingestion>();
 };
 
 /// Starts `threads` workers `query-0`, `query-1`, …, each running one query
-/// at a time to completion from `jobs`.
+/// at a time to completion from `jobs`; more queries wait in `jobs`.
 fn spawn_query_workers(
     query: Arc<QueryEngine>,
-    published: Arc<PublishedStore>,
+    shared: Arc<Shared>,
     jobs: Receiver<QueryJob>,
     threads: usize,
 ) -> std::io::Result<()> {
     let jobs = Arc::new(Mutex::new(jobs));
     for index in 0..threads {
-        let (query, published, jobs) = (query.clone(), published.clone(), jobs.clone());
+        let (query, shared, jobs) = (query.clone(), shared.clone(), jobs.clone());
         std::thread::Builder::new()
             .name(format!("query-{index}"))
             .spawn(move || loop {
@@ -296,77 +347,155 @@ fn spawn_query_workers(
                     Ok(job) => job,
                     Err(_) => break,
                 };
-                let answer = query.evaluate(&job.query, job.time_ms, &published);
+                let answer = query.evaluate(&job.query, job.time_ms, &shared.published);
                 let _ = job.reply.send(answer);
             })?;
     }
     Ok(())
 }
 
-struct Engine {
-    store: TimeIndexedStore,
-    ingestion: Ingestion,
+/// Reads, checks and compiles the plan file `plan_json`: its ingestion,
+/// refresh runs, queries and query texts.
+fn install(
+    plan_json: &str,
+    options: EngineOptions,
+) -> anyhow::Result<(Ingestion, Precompute, QueryEngine, Vec<String>)> {
+    let plan = InstallablePlan::from_json(plan_json)?;
+    plan.validate()?;
+    let views = plan.materialized_views()?;
+    let groups = plan.ingestion_refresh_groups()?;
+    let limits = Limits {
+        max_bytes: options.run_memory_limit_bytes,
+    };
+    tracing::info!(
+        views = views.len(),
+        refresh_groups = groups.len(),
+        "materialized views"
+    );
+    let query = QueryEngine::new(&plan, &views, limits.clone());
+    let unexecutable = query.unexecutable();
+    if options.no_forward && !unexecutable.is_empty() {
+        let reasons: Vec<String> = unexecutable
+            .iter()
+            .map(|(query, reason)| format!("{query:?}: {reason}"))
+            .collect();
+        anyhow::bail!(
+            "--no-forward refuses a plan with queries the data plane cannot run: {}",
+            reasons.join("; ")
+        );
+    }
+    let (ingestion, precompute) =
+        Ingestion::new(&plan.dag, &views, groups, options.ingestion, limits)?;
+    tracing::info!(pane_width_ms = ingestion.pane_width_ms(), "raw data panes");
+    Ok((ingestion, precompute, query, plan.query_texts.clone()))
 }
 
-impl Engine {
-    /// The engine, the compiled queries and their texts.
-    fn new(
-        plan_json: &str,
-        options: EngineOptions,
-    ) -> anyhow::Result<(Self, QueryEngine, Vec<String>)> {
-        let plan = InstallablePlan::from_json(plan_json)?;
-        plan.validate()?;
-        let views = plan.materialized_views()?;
-        let groups = plan.ingestion_refresh_groups()?;
-        let limits = Limits {
-            max_bytes: options.run_memory_limit_bytes,
+/// The ingest thread: runs `commands` in order over its copy of the raw
+/// data, publishing it after each, and queues the windows each closes.
+fn serve_ingest(
+    mut ingestion: Ingestion,
+    mut raw_data: Arc<RawData>,
+    commands: Receiver<Command>,
+    jobs: SyncSender<PrecomputeJob>,
+    shared: &Shared,
+) {
+    for command in commands {
+        let (count, barrier) = match command {
+            Command::Ingest(samples) => {
+                let count = samples.len() as u64;
+                let closed = ingestion.ingest(Arc::make_mut(&mut raw_data), samples);
+                if !queue_refreshes(&closed, &raw_data, &jobs, shared) {
+                    break;
+                }
+                (count, None)
+            }
+            Command::AdvanceWatermark { barrier_ms, reply } => {
+                let (barrier_ms, closed) =
+                    ingestion.advance_watermark(Arc::make_mut(&mut raw_data), barrier_ms);
+                if !queue_refreshes(&closed, &raw_data, &jobs, shared) {
+                    break;
+                }
+                (0, Some((barrier_ms, reply)))
+            }
+            Command::Stop => break,
         };
-        tracing::info!(
-            views = views.len(),
-            refresh_groups = groups.len(),
-            "materialized views"
-        );
-        let query = QueryEngine::new(&plan, &views, limits.clone());
-        let unexecutable = query.unexecutable();
-        if options.no_forward && !unexecutable.is_empty() {
-            let reasons: Vec<String> = unexecutable
-                .iter()
-                .map(|(query, reason)| format!("{query:?}: {reason}"))
-                .collect();
-            anyhow::bail!(
-                "--no-forward refuses a plan with queries the data plane cannot run: {}",
-                reasons.join("; ")
-            );
+        // The refreshes queued hold the raw data as it was when their
+        // windows closed; eviction changes a copy.
+        ingestion.evict(Arc::make_mut(&mut raw_data));
+        shared.published.publish_raw_data(raw_data.clone());
+        {
+            let mut stats = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
+            *stats = IngestionStats {
+                windows_refreshed: stats.windows_refreshed,
+                windows_failed: stats.windows_failed,
+                ..ingestion.stats
+            };
         }
-        let ingestion = Ingestion::new(&plan.dag, &views, groups, options.ingestion, limits)?;
-        let store = TimeIndexedStore::for_metrics(&scanned_metrics(&plan.dag.nodes));
-        let queries = plan.query_texts.clone();
-        Ok((Self { store, ingestion }, query, queries))
-    }
-
-    fn serve(mut self, commands: Receiver<Command>, shared: Shared) {
-        for command in commands {
-            match command {
-                Command::Ingest(samples) => {
-                    let count = samples.len() as u64;
-                    self.ingestion.ingest(&mut self.store, samples);
-                    shared.published.publish(&self.store);
-                    *shared.stats.lock().unwrap_or_else(|e| e.into_inner()) = self.ingestion.stats;
-                    shared.queued_samples.fetch_sub(count, Ordering::SeqCst);
-                }
-                Command::AdvanceWatermark { barrier_ms, reply } => {
-                    let barrier_ms = self
-                        .ingestion
-                        .advance_watermark(&mut self.store, barrier_ms);
-                    shared.published.publish(&self.store);
-                    *shared.stats.lock().unwrap_or_else(|e| e.into_inner()) = self.ingestion.stats;
-                    let _ = reply.send(barrier_ms);
-                }
-                Command::Stop => break,
+        shared.queued_samples.fetch_sub(count, Ordering::SeqCst);
+        if let Some((barrier_ms, reply)) = barrier {
+            let job = PrecomputeJob::Barrier { barrier_ms, reply };
+            if jobs.send(job).is_err() {
+                break;
             }
         }
-        tracing::warn!("engine stopped");
     }
+    tracing::warn!("ingest stopped");
+}
+
+/// Queues a refresh of each of `closed` over `raw_data`, waiting while the
+/// backlog is full; `false` once the precompute thread has exited.
+fn queue_refreshes(
+    closed: &[ClosedWindow],
+    raw_data: &Arc<RawData>,
+    jobs: &SyncSender<PrecomputeJob>,
+    shared: &Shared,
+) -> bool {
+    for &window in closed {
+        shared.precompute_backlog.fetch_add(1, Ordering::SeqCst);
+        let job = PrecomputeJob::Refresh {
+            window,
+            raw_data: raw_data.clone(),
+        };
+        if jobs.send(job).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// The precompute thread: refreshes each queued window in order over its
+/// copy of the views, publishing them after each.
+fn serve_precompute(precompute: Precompute, jobs: Receiver<PrecomputeJob>, shared: &Shared) {
+    let mut views: Arc<ViewStore> = Arc::default();
+    for job in jobs {
+        match job {
+            PrecomputeJob::Refresh { window, raw_data } => {
+                let result = {
+                    let _gate = shared
+                        .precompute_gate
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    precompute.refresh(window, raw_data, &mut views)
+                };
+                shared.published.publish_views(views.clone());
+                {
+                    let mut stats = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
+                    match result {
+                        Ok(()) => stats.windows_refreshed += 1,
+                        Err(error) => {
+                            tracing::error!(views = ?precompute.view_ids(window), end = window.end_ms, %error, "ingestion run failed");
+                            stats.windows_failed += 1;
+                        }
+                    }
+                }
+                shared.precompute_backlog.fetch_sub(1, Ordering::SeqCst);
+            }
+            PrecomputeJob::Barrier { barrier_ms, reply } => {
+                let _ = reply.send(barrier_ms);
+            }
+        }
+    }
+    tracing::warn!("precompute stopped");
 }
 
 #[cfg(test)]
@@ -383,7 +512,7 @@ mod tests {
         assert_eq!(admit(u64::MAX, 1, u64::MAX), Err(IngestError::Busy));
     }
 
-    /// The running flag clears when the engine thread panics.
+    /// The running flag clears when an engine thread panics.
     #[test]
     fn running_guard_clears_on_panic() {
         let running = Arc::new(AtomicBool::new(true));

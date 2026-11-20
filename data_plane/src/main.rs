@@ -41,6 +41,10 @@ struct Args {
     /// Samples queued for the engine beyond which Remote Write gets 503.
     #[arg(long, default_value_t = EngineOptions::default().max_queued_samples)]
     max_queued_samples: u64,
+    /// Refresh windows closed and not yet refreshed beyond which ingestion
+    /// waits (and Remote Write then gets 503).
+    #[arg(long, default_value_t = EngineOptions::default().max_precompute_backlog)]
+    max_precompute_backlog: usize,
     /// Never forward a query to Prometheus: refuse a plan with a query the
     /// data plane cannot run, and answer any query the plan does not answer
     /// with an error giving the reason.
@@ -74,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
                     view_retention_margin_ms: args.view_retention_margin_ms,
                 },
                 max_queued_samples: args.max_queued_samples,
+                max_precompute_backlog: args.max_precompute_backlog,
                 no_forward: args.no_forward,
                 run_memory_limit_bytes: args.run_memory_limit_bytes,
                 query_threads: args.query_threads,
