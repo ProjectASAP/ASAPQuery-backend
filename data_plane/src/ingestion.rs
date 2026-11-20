@@ -37,7 +37,7 @@ use asap_executor::planner::plan::materialized_view::{
 };
 use asap_executor::planner::plan::physical_asap_dag::{PhysicalASAPDAG, PhysicalASAPNodeId};
 use asap_executor::runtime::{Limits, RunContext, Scope};
-use asap_executor::values::SchemaRef;
+use asap_executor::values::{Batch, SchemaRef};
 use futures::executor::block_on;
 
 use crate::persist::{ViewFiles, Written};
@@ -293,6 +293,13 @@ impl Ingestion {
         Ok((ingestion, Precompute { runs, limits }))
     }
 
+    /// After a restart that loaded views from files: the raw samples before
+    /// the restart are gone, so a declared stream start no longer makes a
+    /// group's first window complete; it is skipped, as without one.
+    pub fn restarted(&mut self) {
+        self.options.stream_start_ms = None;
+    }
+
     /// An empty raw store for the metrics the plan scans, in this
     /// ingestion's panes.
     pub fn raw_data(&self) -> RawData {
@@ -527,11 +534,17 @@ impl Precompute {
         let group = &self.runs[window.group];
         let end = window.end_ms;
         let start = end - group.width_ms;
-        if group.views.iter().all(|view| {
-            views
-                .stored_through(view.node_id)
-                .is_some_and(|stored| stored >= end)
-        }) {
+        // Views loaded from files may already store the window.
+        let missing: Vec<&MaterializedView> = group
+            .views
+            .iter()
+            .filter(|view| {
+                views
+                    .stored_through(view.node_id)
+                    .is_none_or(|stored| stored < end)
+            })
+            .collect();
+        if missing.is_empty() {
             return Ok(Refreshed::AlreadyStored);
         }
         let outputs = {
@@ -555,41 +568,49 @@ impl Precompute {
             .zip(outputs)
             .collect();
         let views = Arc::make_mut(views);
+        let appended: Vec<(PhysicalASAPNodeId, Vec<Batch>)> = missing
+            .iter()
+            .map(|view| {
+                let batches = by_root
+                    .get(&(view.node_id as u64))
+                    .map(|batches| batches.iter().map(|batch| (**batch).clone()).collect())
+                    .unwrap_or_default();
+                (view.node_id, batches)
+            })
+            .collect();
         let mut written = Written::default();
-        let mut files = files;
-        for view in &group.views {
-            let batches: Vec<_> = by_root
-                .get(&(view.node_id as u64))
-                .map(|batches| batches.iter().map(|batch| (**batch).clone()).collect())
-                .unwrap_or_default();
-            if let Some(files) = files.as_deref_mut() {
-                match files.append(view.node_id, (start, end), &batches) {
-                    Ok(view_written) => {
-                        written.bytes += view_written.bytes;
-                        written.sync_ns += view_written.sync_ns;
-                        written.not_persisted += view_written.not_persisted;
-                    }
-                    Err(error) => {
-                        tracing::error!(view = view.node_id, end, %error, "persisting a view window failed");
-                        written.not_persisted += 1;
-                    }
+        if let Some(files) = files {
+            let records: Vec<(PhysicalASAPNodeId, &[Batch])> = appended
+                .iter()
+                .map(|(view, batches)| (*view, batches.as_slice()))
+                .collect();
+            match files.append(window.group, (start, end), &records) {
+                Ok(group_written) => written = group_written,
+                Err(error) => {
+                    tracing::error!(group = window.group, end, %error, "persisting a window failed");
+                    written.not_persisted = records.len() as u64;
                 }
             }
+        }
+        for (view, (_, batches)) in missing.iter().zip(appended) {
             views.append(view, (start, end), batches)?;
         }
         Ok(Refreshed::Ran(written))
     }
 
-    /// Each view the refreshes append to (with its retention margin) and
-    /// its output schema, to load them from files.
-    pub fn views(&self) -> Vec<(MaterializedView, SchemaRef)> {
+    /// Each refresh group's views (with their retention margin) and their
+    /// output schemas, in plan order, to load them from files.
+    pub fn views(&self) -> Vec<Vec<(MaterializedView, SchemaRef)>> {
         self.runs
             .iter()
-            .flat_map(|run| {
-                run.views.iter().filter_map(|view| {
-                    let schema = run.compiled.output_schema(view.node_id as u64).ok()?;
-                    Some((view.clone(), schema))
-                })
+            .map(|run| {
+                run.views
+                    .iter()
+                    .filter_map(|view| {
+                        let schema = run.compiled.output_schema(view.node_id as u64).ok()?;
+                        Some((view.clone(), schema))
+                    })
+                    .collect()
             })
             .collect()
     }

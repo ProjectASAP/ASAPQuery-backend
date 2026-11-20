@@ -120,14 +120,19 @@ is not. Plan a dashboard's range requests with the workload's
 `range_evaluation` (`{"step_ms": 60000, "span_ms": 3600000}`), so the plan
 delivers every step time.
 
-**Persistence.** Each materialized view is appended to its own file in
+**Persistence.** Each refresh group's views are appended to one file in
 `--view-dir` (default `asap-views`; `--no-view-persistence` keeps views in
-memory only), one record per refreshed window, synced before the next
-window is refreshed. At startup the records within each view's retention
-are loaded back, and a window already loaded is not refreshed again. Raw
-samples and open windows are not persisted. Views holding sketch states
-are not persisted yet (no byte encoding for them);
-`asap_view_windows_not_persisted_total` counts those windows.
+memory only), one record per refreshed window, synced once per window. A
+file names the plan it was written for; another plan's file is set aside
+(`*.stale`), never loaded. At startup the records within each view's
+retention are loaded back, a torn last record is cut off, and a window a
+view already stores is not refreshed for it again. Raw samples and open
+windows are not persisted, so after a restart the windows whose samples
+arrived before it stay missing (`--stream-start-ms` no longer makes the
+first window complete). Sketch states are stored as `asap_sketchlib`'s
+ASAPv1 bytes for DDSketch, KLL, Count-Min, KMV and Hydra-KLL; views holding
+HyperLogLog, UnivMon, Count-Min-with-heap or Hydra-Count-Min states are not
+persisted (`asap_view_windows_not_persisted_total`).
 
 Not supported yet: views refreshed on first read (so the backend declares
 `query_time_results_retained: false`), SQL.

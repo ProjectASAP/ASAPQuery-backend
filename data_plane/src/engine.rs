@@ -31,7 +31,7 @@ use crate::ingestion::{
     ClosedWindow, Ingestion, IngestionOptions, IngestionStats, Precompute, Refreshed,
 };
 use crate::metrics::{Gauges, Metrics, Timer};
-use crate::persist::ViewFiles;
+use crate::persist::{plan_hash, ViewFiles};
 use crate::query::{QueryEngine, ResultSample, Unanswered};
 use crate::store::{PublishedStore, QueryTimeResults, RawData, RawSample, RunStore, ViewStore};
 
@@ -171,13 +171,16 @@ impl EngineHandle {
     /// compiled once, and returns the plan's queries. Fails if the plan is
     /// invalid or the data plane cannot execute it.
     pub fn spawn(plan_json: String, options: EngineOptions) -> anyhow::Result<(Self, Vec<String>)> {
-        let (ingestion, precompute, query, query_texts) = install(&plan_json, &options)?;
+        let (mut ingestion, precompute, query, query_texts) = install(&plan_json, &options)?;
         let mut views = ViewStore::default();
         let files = match &options.view_dir {
             Some(dir) => {
-                let files = ViewFiles::open(dir)?;
+                let files = ViewFiles::open(dir, plan_hash(plan_json.as_bytes()))?;
                 let loaded = files.load(&precompute.views(), &mut views)?;
                 tracing::info!(dir = %dir.display(), windows = loaded, "loaded persisted views");
+                if loaded > 0 {
+                    ingestion.restarted();
+                }
                 Some((files, loaded))
             }
             None => None,
@@ -556,8 +559,10 @@ fn serve_ingest(
         {
             let mut stats = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
             *stats = IngestionStats {
+                // The precompute thread counts these.
                 windows_refreshed: stats.windows_refreshed,
                 windows_failed: stats.windows_failed,
+                windows_already_stored: stats.windows_already_stored,
                 ..ingestion.stats
             };
         }

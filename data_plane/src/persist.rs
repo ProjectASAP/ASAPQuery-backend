@@ -1,19 +1,28 @@
-//! Materialized views on disk: one append-only file per view,
-//! `view-<node id>.log`, one record per refreshed window holding its
-//! `(start, end]` and rows, synced to disk before the next window is
-//! refreshed. At startup the records still within each view's retention
-//! are loaded back into the view store; open windows and raw samples are
-//! not persisted.
+//! Materialized views on disk: one append-only file per refresh group,
+//! `group-<index>.log`, one record per refreshed window holding its
+//! `(start, end]` and the rows of each view the window was appended to,
+//! synced to disk (one `fdatasync`) before the next window is refreshed.
+//! At startup the records still within each view's retention are loaded
+//! back into the view store; open windows and raw samples are not
+//! persisted.
 //!
-//! A record is a little-endian `u32` length and a MessagePack payload. A
-//! row's plain values are stored as the executor's `Value`s and an exact
-//! summary state (sum, count, min, max, rate, increase) by its serde form.
-//! Sketch states have no byte encoding yet, so a window of a view holding
-//! one is not persisted (counted in `asap_view_windows_not_persisted_total`).
+//! A file starts with a header naming the plan (a hash of the plan file)
+//! and the group; a file written for another plan or group is renamed to
+//! `*.stale` and never loaded. A record is a little-endian `u32` length
+//! and a MessagePack payload; a torn or oversized record at the end (a
+//! crash while writing) is cut off at load, so later records stay aligned.
+//!
+//! A row's plain values are stored as the executor's `Value`s, an exact
+//! state (sum, count, min, max, rate, increase) by its serde form, and a
+//! sketch state by `asap_sketchlib`'s ASAPv1 bytes with the kernel it
+//! rebuilds: DDSketch, KLL, Count-Min, KMV and Hydra-KLL. A HyperLogLog,
+//! UnivMon, weighted-frequency (Count-Min with heap) or Hydra-Count-Min
+//! state has no public way to rebuild its kernel, so a view holding one is
+//! not persisted (counted in `asap_view_windows_not_persisted_total`).
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -21,11 +30,38 @@ use std::time::Instant;
 use asap_executor::planner::plan::materialized_view::MaterializedView;
 use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
 use asap_executor::summary_kernels::exact::ExactAccumulator;
-use asap_executor::summary_kernels::IncreaseAccumulator;
+use asap_executor::summary_kernels::{
+    CountMinSketchAccumulator, DDSketchAccumulator, DatasketchesKLLAccumulator,
+    HydraKllSketchAccumulator, IncreaseAccumulator, KmvAccumulator,
+};
 use asap_executor::values::{Batch, SchemaRef, Value};
+use asap_executor::AggregateCore;
+use asap_sketchlib::{CountMinF64, DdSketch, Hydra, Kll, Kmv};
 use serde::{Deserialize, Serialize};
 
 use crate::store::ViewStore;
+
+/// A record longer than this is taken as torn: no window's rows are this
+/// large, and a garbage length must not size an allocation.
+const MAX_RECORD_BYTES: usize = 1 << 30;
+
+/// The first record of a group file.
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
+struct Header {
+    /// A hash of the plan file the views were computed for.
+    plan_hash: u64,
+    group: usize,
+}
+
+/// The kernels whose sketch state is stored as ASAPv1 bytes.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SketchKernel {
+    DDSketch,
+    Kll,
+    CountMin,
+    Kmv,
+    HydraKll,
+}
 
 /// One stored value of a view row.
 #[derive(Serialize, Deserialize)]
@@ -33,152 +69,298 @@ enum StoredValue {
     Plain(Value),
     Exact(ExactAccumulator),
     Increase(IncreaseAccumulator),
+    Sketch {
+        kernel: SketchKernel,
+        #[serde(with = "serde_bytes")]
+        asapv1: Vec<u8>,
+    },
 }
 
-/// One refreshed window of a view.
+/// One refreshed window of a group: the rows of each view appended.
 #[derive(Serialize, Deserialize)]
 struct Record {
     start_ms: i64,
     end_ms: i64,
-    rows: Vec<Vec<StoredValue>>,
+    views: Vec<(PhysicalASAPNodeId, Vec<Vec<StoredValue>>)>,
 }
+
+/// One view's stored rows of one window: `(start, end, rows)`.
+type StoredWindow = (i64, i64, Vec<Vec<StoredValue>>);
 
 /// What persisting one window wrote.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Written {
     pub bytes: u64,
     pub sync_ns: u64,
-    /// Views whose window could not be encoded (a sketch state).
+    /// Views whose window could not be encoded.
     pub not_persisted: u64,
 }
 
-/// The view files in one directory.
+/// The group files in one directory, for one plan.
 pub struct ViewFiles {
     dir: PathBuf,
-    files: BTreeMap<PhysicalASAPNodeId, File>,
+    plan_hash: u64,
+    files: BTreeMap<usize, File>,
+}
+
+/// A stable 64-bit FNV-1a hash of `bytes`.
+pub fn plan_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 impl ViewFiles {
-    /// The view files in `dir`, created if missing.
-    pub fn open(dir: &Path) -> std::io::Result<Self> {
+    /// The group files in `dir` (created if missing) of the plan whose
+    /// file hashes to `plan_hash`.
+    pub fn open(dir: &Path, plan_hash: u64) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         Ok(Self {
             dir: dir.to_path_buf(),
+            plan_hash,
             files: BTreeMap::new(),
         })
     }
 
-    fn path(&self, view: PhysicalASAPNodeId) -> PathBuf {
-        self.dir.join(format!("view-{view}.log"))
+    fn path(&self, group: usize) -> PathBuf {
+        self.dir.join(format!("group-{group}.log"))
     }
 
-    /// Appends `batches` as `view`'s rows of `(start, end]` and syncs the
-    /// file; a window with a sketch state is not written.
+    /// Appends the rows each of `views` got for `(start, end]` as one record
+    /// of `group`'s file and syncs it once. A view holding a state with no
+    /// byte encoding is left out of the record and counted.
     pub fn append(
         &mut self,
-        view: PhysicalASAPNodeId,
+        group: usize,
         (start_ms, end_ms): (i64, i64),
-        batches: &[Batch],
+        views: &[(PhysicalASAPNodeId, &[Batch])],
     ) -> std::io::Result<Written> {
-        let Some(rows) = encode_rows(batches) else {
-            return Ok(Written {
-                not_persisted: 1,
-                ..Written::default()
-            });
-        };
-        let payload = rmp_serde::to_vec(&Record {
+        let mut written = Written::default();
+        let mut stored = Vec::new();
+        for (view, batches) in views {
+            match encode_rows(batches) {
+                Some(rows) => stored.push((*view, rows)),
+                None => written.not_persisted += 1,
+            }
+        }
+        if stored.is_empty() {
+            return Ok(written);
+        }
+        let record = Record {
             start_ms,
             end_ms,
-            rows,
-        })
-        .map_err(std::io::Error::other)?;
-        let path = self.path(view);
-        let file = match self.files.entry(view) {
+            views: stored,
+        };
+        let file = match self.files.entry(group) {
             std::collections::btree_map::Entry::Occupied(file) => file.into_mut(),
             std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(OpenOptions::new().create(true).append(true).open(path)?)
+                let path = self.dir.join(format!("group-{group}.log"));
+                let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+                if file.metadata()?.len() == 0 {
+                    let header = Header {
+                        plan_hash: self.plan_hash,
+                        group,
+                    };
+                    file.write_all(&framed(&header)?)?;
+                }
+                entry.insert(file)
             }
         };
-        let length = u32::try_from(payload.len()).map_err(std::io::Error::other)?;
-        let mut record = Vec::with_capacity(4 + payload.len());
-        record.extend_from_slice(&length.to_le_bytes());
-        record.extend_from_slice(&payload);
-        file.write_all(&record)?;
+        let bytes = framed(&record)?;
+        file.write_all(&bytes)?;
         let synced = Instant::now();
         file.sync_data()?;
-        Ok(Written {
-            bytes: record.len() as u64,
-            sync_ns: synced.elapsed().as_nanos() as u64,
-            not_persisted: 0,
-        })
+        written.bytes = bytes.len() as u64;
+        written.sync_ns = synced.elapsed().as_nanos() as u64;
+        Ok(written)
     }
 
-    /// Loads into `views` each of `views_to_load`' records ending within its
-    /// retention of its newest record, oldest first, and returns how many
-    /// windows were loaded. A file that ends in a partial record (a crash
-    /// while writing) is read up to it; a record that does not decode, or
-    /// is not after the ones loaded, is skipped.
+    /// Loads into `views` the records of each group in `groups` (its views
+    /// with their output schemas) that end within each view's retention of
+    /// its newest record, oldest first; returns the (view, window) pairs
+    /// loaded. A file of another plan or group is renamed `*.stale`; a torn
+    /// record at a file's end is cut off; a record that does not decode, or
+    /// is not after the rows already loaded, is skipped.
     pub fn load(
         &self,
-        views_to_load: &[(MaterializedView, SchemaRef)],
+        groups: &[Vec<(MaterializedView, SchemaRef)>],
         views: &mut ViewStore,
     ) -> std::io::Result<u64> {
         let mut loaded = 0;
-        for (view, schema) in views_to_load {
-            let path = self.path(view.node_id);
-            let Ok(file) = File::open(&path) else {
+        for (group, group_views) in groups.iter().enumerate() {
+            let path = self.path(group);
+            let Some(records) = self.read_group(&path, group)? else {
                 continue;
             };
-            let records = read_records(file)?;
-            let Some(newest_end) = records.iter().map(|r| r.end_ms).max() else {
-                continue;
-            };
-            let retention_ms = i64::try_from(view.retention_ms()).unwrap_or(i64::MAX);
-            let oldest_kept_end = newest_end.saturating_sub(retention_ms);
-            for record in records
-                .into_iter()
-                .filter(|r| r.end_ms > oldest_kept_end || r.end_ms == newest_end)
-            {
-                let range = (record.start_ms, record.end_ms);
-                let Some(batch) = decode_rows(schema, record.rows) else {
-                    tracing::warn!(
-                        view = view.node_id,
-                        ?range,
-                        "skipping a view record that does not decode"
-                    );
+            let mut by_view: BTreeMap<PhysicalASAPNodeId, Vec<StoredWindow>> = BTreeMap::new();
+            for record in records {
+                for (view, rows) in record.views {
+                    by_view
+                        .entry(view)
+                        .or_default()
+                        .push((record.start_ms, record.end_ms, rows));
+                }
+            }
+            for (view, schema) in group_views {
+                let Some(own) = by_view.remove(&view.node_id) else {
                     continue;
                 };
-                if views.append(view, range, vec![batch]).is_ok() {
-                    loaded += 1;
+                let Some(newest_end) = own.iter().map(|r| r.1).max() else {
+                    continue;
+                };
+                let retention_ms = i64::try_from(view.retention_ms()).unwrap_or(i64::MAX);
+                let oldest_kept_end = newest_end.saturating_sub(retention_ms);
+                for (start, end, rows) in own {
+                    if end <= oldest_kept_end && end != newest_end {
+                        continue;
+                    }
+                    let Some(batch) = decode_rows(schema, rows) else {
+                        tracing::warn!(
+                            view = view.node_id,
+                            start,
+                            end,
+                            "skipping a view record that does not decode"
+                        );
+                        continue;
+                    };
+                    if views.append(view, (start, end), vec![batch]).is_ok() {
+                        loaded += 1;
+                    }
                 }
             }
         }
         Ok(loaded)
     }
+
+    /// The records of `group`'s file, after cutting off a torn tail; `None`
+    /// when there is no file or it belongs to another plan or group (it is
+    /// then renamed `*.stale`).
+    fn read_group(&self, path: &Path, group: usize) -> std::io::Result<Option<Vec<Record>>> {
+        let Ok(file) = File::open(path) else {
+            return Ok(None);
+        };
+        let (frames, good_len) = read_frames(file)?;
+        let mut frames = frames.into_iter();
+        let header: Option<Header> = frames.next().and_then(|f| rmp_serde::from_slice(&f).ok());
+        let expected = Header {
+            plan_hash: self.plan_hash,
+            group,
+        };
+        if header.as_ref() != Some(&expected) {
+            let stale = path.with_extension("log.stale");
+            tracing::warn!(path = %path.display(), ?header, ?expected, "view file of another plan or group; renamed, not loaded");
+            std::fs::rename(path, stale)?;
+            return Ok(None);
+        }
+        let file = OpenOptions::new().write(true).open(path)?;
+        if file.metadata()?.len() != good_len {
+            tracing::warn!(path = %path.display(), good_len, "cutting off a torn record");
+            file.set_len(good_len)?;
+            file.sync_data()?;
+        }
+        Ok(Some(
+            frames
+                .filter_map(|frame| rmp_serde::from_slice(&frame).ok())
+                .collect(),
+        ))
+    }
 }
 
-/// Every record of a view file, up to a partial one at its end.
-fn read_records(file: File) -> std::io::Result<Vec<Record>> {
+/// `value` as one record: its MessagePack length and bytes.
+fn framed<T: Serialize>(value: &T) -> std::io::Result<Vec<u8>> {
+    let payload = rmp_serde::to_vec(value).map_err(std::io::Error::other)?;
+    let length = u32::try_from(payload.len())
+        .ok()
+        .filter(|&len| (len as usize) <= MAX_RECORD_BYTES)
+        .ok_or_else(|| std::io::Error::other("view record too large"))?;
+    let mut bytes = Vec::with_capacity(4 + payload.len());
+    bytes.extend_from_slice(&length.to_le_bytes());
+    bytes.extend_from_slice(&payload);
+    Ok(bytes)
+}
+
+/// Every whole record of `file`'s, and the length up to the last one.
+fn read_frames(file: File) -> std::io::Result<(Vec<Vec<u8>>, u64)> {
     let mut reader = BufReader::new(file);
-    let mut records = Vec::new();
+    let end = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut frames = Vec::new();
+    let mut good_len = 0u64;
     loop {
         let mut length = [0u8; 4];
-        match reader.read_exact(&mut length) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e),
+        if reader.read_exact(&mut length).is_err() {
+            break;
         }
-        let mut payload = vec![0u8; u32::from_le_bytes(length) as usize];
-        match reader.read_exact(&mut payload) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e),
+        let length = u32::from_le_bytes(length) as u64;
+        if length as usize > MAX_RECORD_BYTES || good_len + 4 + length > end {
+            break;
         }
-        if let Ok(record) = rmp_serde::from_slice(&payload) {
-            records.push(record);
+        let mut payload = vec![0u8; length as usize];
+        if reader.read_exact(&mut payload).is_err() {
+            break;
         }
+        frames.push(payload);
+        good_len += 4 + length;
     }
-    Ok(records)
+    Ok((frames, good_len))
+}
+
+/// `state` as stored bytes, when its kernel can be rebuilt from them.
+fn encode_state(state: &dyn AggregateCore) -> Option<StoredValue> {
+    let any = state.as_any();
+    let sketch = |kernel, bytes: Result<Vec<u8>, _>| {
+        Some(StoredValue::Sketch {
+            kernel,
+            asapv1: bytes.ok()?,
+        })
+    };
+    if let Some(exact) = any.downcast_ref::<ExactAccumulator>() {
+        Some(StoredValue::Exact(exact.clone()))
+    } else if let Some(increase) = any.downcast_ref::<IncreaseAccumulator>() {
+        Some(StoredValue::Increase(increase.clone()))
+    } else if let Some(dd) = any.downcast_ref::<DDSketchAccumulator>() {
+        sketch(SketchKernel::DDSketch, dd.inner.to_asapv1())
+    } else if let Some(kll) = any.downcast_ref::<DatasketchesKLLAccumulator>() {
+        sketch(SketchKernel::Kll, kll.inner.to_asapv1())
+    } else if let Some(cms) = any.downcast_ref::<CountMinSketchAccumulator>() {
+        sketch(SketchKernel::CountMin, cms.inner.to_asapv1())
+    } else if let Some(kmv) = any.downcast_ref::<KmvAccumulator>() {
+        sketch(SketchKernel::Kmv, kmv.inner.to_asapv1())
+    } else if let Some(hydra) = any.downcast_ref::<HydraKllSketchAccumulator>() {
+        sketch(SketchKernel::HydraKll, hydra.inner.to_asapv1())
+    } else {
+        None
+    }
+}
+
+/// The kernel state `kernel` rebuilds from `asapv1`.
+pub fn decode_sketch(kernel: SketchKernel, asapv1: &[u8]) -> Option<Arc<dyn AggregateCore>> {
+    Some(match kernel {
+        SketchKernel::DDSketch => Arc::new(DDSketchAccumulator {
+            inner: DdSketch::from_asapv1(asapv1).ok()?,
+        }),
+        SketchKernel::Kll => Arc::new(DatasketchesKLLAccumulator {
+            inner: Kll::from_asapv1(asapv1).ok()?,
+        }),
+        SketchKernel::CountMin => Arc::new(CountMinSketchAccumulator {
+            inner: CountMinF64::from_asapv1(asapv1).ok()?,
+        }),
+        SketchKernel::Kmv => Arc::new(KmvAccumulator {
+            inner: Kmv::from_asapv1(asapv1).ok()?,
+        }),
+        SketchKernel::HydraKll => Arc::new(HydraKllSketchAccumulator {
+            inner: Hydra::from_asapv1(asapv1).ok()?,
+        }),
+    })
+}
+
+/// `state` as ASAPv1 bytes with its kernel, if it is one of the sketch
+/// kernels persisted.
+pub fn encode_sketch(state: &dyn AggregateCore) -> Option<(SketchKernel, Vec<u8>)> {
+    match encode_state(state)? {
+        StoredValue::Sketch { kernel, asapv1 } => Some((kernel, asapv1)),
+        _ => None,
+    }
 }
 
 /// The rows of `batches`, or `None` when one holds a state with no byte
@@ -190,15 +372,7 @@ fn encode_rows(batches: &[Batch]) -> Option<Vec<Vec<StoredValue>>> {
         .map(|row| {
             row.into_iter()
                 .map(|value| match value {
-                    Value::Summary { state, .. } => {
-                        let any = state.as_any();
-                        if let Some(exact) = any.downcast_ref::<ExactAccumulator>() {
-                            Some(StoredValue::Exact(exact.clone()))
-                        } else {
-                            any.downcast_ref::<IncreaseAccumulator>()
-                                .map(|increase| StoredValue::Increase(increase.clone()))
-                        }
-                    }
+                    Value::Summary { state, .. } => encode_state(state.as_ref()),
                     plain => Some(StoredValue::Plain(plain)),
                 })
                 .collect()
@@ -213,19 +387,166 @@ fn decode_rows(schema: &SchemaRef, rows: Vec<Vec<StoredValue>>) -> Option<Batch>
         .map(|row| {
             row.into_iter()
                 .zip(&schema.fields)
-                .map(|(value, field)| match value {
-                    StoredValue::Plain(value) => value,
-                    StoredValue::Exact(state) => Value::Summary {
+                .map(|(value, field)| {
+                    let state: Arc<dyn AggregateCore> = match value {
+                        StoredValue::Plain(value) => return Some(value),
+                        StoredValue::Exact(state) => Arc::new(state),
+                        StoredValue::Increase(state) => Arc::new(state),
+                        StoredValue::Sketch { kernel, asapv1 } => decode_sketch(kernel, &asapv1)?,
+                    };
+                    Some(Value::Summary {
                         family: field.dtype.clone(),
-                        state: Arc::new(state),
-                    },
-                    StoredValue::Increase(state) => Value::Summary {
-                        family: field.dtype.clone(),
-                        state: Arc::new(state),
-                    },
+                        state,
+                    })
                 })
-                .collect()
+                .collect::<Option<Vec<_>>>()
         })
-        .collect();
+        .collect::<Option<Vec<_>>>()?;
     Batch::try_new(schema.clone(), rows).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use asap_executor::planner::summary_type::SketchStatistic;
+
+    /// Two states of each persisted sketch kernel, built from different
+    /// samples.
+    type StatePair = (SketchKernel, Box<dyn AggregateCore>, Box<dyn AggregateCore>);
+
+    fn states() -> Vec<StatePair> {
+        let mut out: Vec<StatePair> = Vec::new();
+        let (mut a, mut b) = (
+            DDSketchAccumulator::new(0.01),
+            DDSketchAccumulator::new(0.01),
+        );
+        let (mut c, mut d) = (
+            DatasketchesKLLAccumulator::new(200),
+            DatasketchesKLLAccumulator::new(200),
+        );
+        let (mut e, mut f) = (
+            CountMinSketchAccumulator::new(3, 64).unwrap(),
+            CountMinSketchAccumulator::new(3, 64).unwrap(),
+        );
+        let (mut g, mut h) = (KmvAccumulator::new(64), KmvAccumulator::new(64));
+        let (mut i, mut j) = (
+            HydraKllSketchAccumulator::new(2, 8, 50),
+            HydraKllSketchAccumulator::new(2, 8, 50),
+        );
+        for n in 0..500 {
+            let v = (n * 37 % 1000) as f64 + 0.5;
+            let (first, key) = (n % 2 == 0, [format!("k{}", n % 5)]);
+            if first {
+                a.inner.add(&v);
+                c.update(v);
+                e.update(&key[0], 1.0 + v);
+                g.insert_sample(v);
+                i.update(&key, v);
+            } else {
+                b.inner.add(&v);
+                d.update(v);
+                f.update(&key[0], 1.0 + v);
+                h.insert_sample(v);
+                j.update(&key, v);
+            }
+        }
+        out.push((SketchKernel::DDSketch, Box::new(a), Box::new(b)));
+        out.push((SketchKernel::Kll, Box::new(c), Box::new(d)));
+        out.push((SketchKernel::CountMin, Box::new(e), Box::new(f)));
+        out.push((SketchKernel::Kmv, Box::new(g), Box::new(h)));
+        out.push((SketchKernel::HydraKll, Box::new(i), Box::new(j)));
+        out
+    }
+
+    /// What can be read from a state of `kernel`, to compare two states.
+    fn readout(kernel: SketchKernel, state: &dyn AggregateCore) -> Vec<f64> {
+        let any = state.as_any();
+        match kernel {
+            SketchKernel::DDSketch | SketchKernel::Kll => [0.1, 0.5, 0.99]
+                .iter()
+                .map(|&q| state.estimate(&SketchStatistic::Quantile { q }).unwrap())
+                .collect(),
+            SketchKernel::CountMin => {
+                let cms = any.downcast_ref::<CountMinSketchAccumulator>().unwrap();
+                (0..5).map(|k| cms.query_key(&[format!("k{k}")])).collect()
+            }
+            SketchKernel::Kmv => vec![state.estimate(&SketchStatistic::Cardinality).unwrap()],
+            SketchKernel::HydraKll => {
+                let hydra = any.downcast_ref::<HydraKllSketchAccumulator>().unwrap();
+                (0..5)
+                    .map(|k| hydra.query_key(&[format!("k{k}")], 0.5))
+                    .collect()
+            }
+        }
+    }
+
+    /// Each persisted kernel's state survives bytes: re-encoding gives the
+    /// same bytes, and estimates and merges read as before.
+    #[test]
+    fn sketch_states_round_trip_through_bytes() {
+        for (kernel, a, b) in states() {
+            let (kind, bytes_a) = encode_sketch(a.as_ref()).unwrap();
+            assert_eq!(kind, kernel);
+            let (_, bytes_b) = encode_sketch(b.as_ref()).unwrap();
+            let a2 = decode_sketch(kernel, &bytes_a).unwrap();
+            let b2 = decode_sketch(kernel, &bytes_b).unwrap();
+            assert_eq!(encode_sketch(a2.as_ref()).unwrap().1, bytes_a, "{kernel:?}");
+            assert_eq!(
+                readout(kernel, a.as_ref()),
+                readout(kernel, a2.as_ref()),
+                "{kernel:?}"
+            );
+            let merged = a.merge_with(b.as_ref()).unwrap();
+            let merged2 = a2.merge_with(b2.as_ref()).unwrap();
+            assert_eq!(
+                readout(kernel, merged.as_ref()),
+                readout(kernel, merged2.as_ref()),
+                "{kernel:?} merge"
+            );
+            assert_eq!(
+                encode_sketch(merged.as_ref()).unwrap().1,
+                encode_sketch(merged2.as_ref()).unwrap().1,
+                "{kernel:?} merge bytes"
+            );
+        }
+    }
+
+    /// A torn last record is cut off, so a record appended after it is
+    /// read back; a file of another plan is renamed and not loaded.
+    #[test]
+    fn torn_tails_are_cut_and_other_plans_are_not_loaded() {
+        let dir = std::env::temp_dir().join(format!("asap-persist-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut files = ViewFiles::open(&dir, 7).unwrap();
+        let empty: &[Batch] = &[];
+        files.append(0, (0, 10), &[(1, empty)]).unwrap();
+        drop(files);
+        let path = dir.join("group-0.log");
+        // A crash mid-record: a length announcing 100 bytes, 3 written.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[100, 0, 0, 0, 1, 2, 3]).unwrap();
+        drop(file);
+        let files = ViewFiles::open(&dir, 7).unwrap();
+        assert_eq!(files.read_group(&path, 0).unwrap().unwrap().len(), 1);
+        let mut files = ViewFiles::open(&dir, 7).unwrap();
+        files.append(0, (10, 20), &[(1, empty)]).unwrap();
+        let records = files.read_group(&path, 0).unwrap().unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.start_ms, r.end_ms))
+                .collect::<Vec<_>>(),
+            [(0, 10), (10, 20)]
+        );
+        // A garbage length past the end is a torn record, not an allocation.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        drop(file);
+        assert_eq!(files.read_group(&path, 0).unwrap().unwrap().len(), 2);
+        // Another plan's file is set aside.
+        let other = ViewFiles::open(&dir, 8).unwrap();
+        assert!(other.read_group(&path, 0).unwrap().is_none());
+        assert!(dir.join("group-0.log.stale").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

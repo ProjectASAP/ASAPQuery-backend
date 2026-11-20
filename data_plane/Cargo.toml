@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 asap-planner.workspace = true
 asap-executor.workspace = true
+asap_sketchlib.workspace = true
+serde_bytes = "0.11"
 ahash = "0.8"
 libc = "0.2"
 serde.workspace = true
