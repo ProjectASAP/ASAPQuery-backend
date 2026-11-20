@@ -70,6 +70,9 @@ impl std::hash::Hash for Series {
 struct Interner {
     /// Series ids by label-set hash; a hash collision lists several.
     by_hash: ahash::HashMap<u64, Vec<u32>>,
+    /// Series ids by identity text, for reading a query result's series
+    /// back without parsing its JSON.
+    by_identity: ahash::HashMap<Arc<str>, u32>,
     series: Vec<Arc<Series>>,
 }
 
@@ -146,7 +149,17 @@ pub fn intern_pairs<N: AsRef<str>, V: AsRef<str>>(pairs: &[(N, V)]) -> Arc<Serie
     });
     interner.series.push(series.clone());
     interner.by_hash.entry(hash).or_default().push(id);
+    interner.by_identity.insert(series.identity.clone(), id);
     series
+}
+
+/// The interned series whose identity text is `identity`, if one is: a
+/// query result row of an input series, rather than one whose labels the
+/// query changed.
+pub fn by_identity(identity: &str) -> Option<Arc<Series>> {
+    let interner = interner().read().expect("interner lock");
+    let id = *interner.by_identity.get(identity)?;
+    Some(interner.series[id as usize].clone())
 }
 
 /// The series of `labels`; interned on first sight.

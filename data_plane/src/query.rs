@@ -423,9 +423,22 @@ fn result_samples(schema: &Schema, batches: &[Batch]) -> Result<Vec<ResultSample
         for (field, cell) in schema.fields.iter().zip(&row) {
             match cell {
                 Value::Utf8(text) if field.name == PROMQL_SERIES_IDENTITY => {
-                    let identity: BTreeMap<String, String> = serde_json::from_str(text)
-                        .map_err(|e| Unanswered::Execution(format!("series identity: {e}")))?;
-                    labels.extend(identity);
+                    // An input series' identity is interned; parse only a
+                    // series the query built.
+                    match crate::series_ids::by_identity(text) {
+                        Some(series) => labels.extend(
+                            series
+                                .iter()
+                                .map(|(name, value)| (name.clone(), value.clone())),
+                        ),
+                        None => {
+                            let identity: BTreeMap<String, String> = serde_json::from_str(text)
+                                .map_err(|e| {
+                                    Unanswered::Execution(format!("series identity: {e}"))
+                                })?;
+                            labels.extend(identity);
+                        }
+                    }
                 }
                 Value::Utf8(text) if !text.is_empty() => {
                     labels.insert(field.name.clone(), text.to_string());
