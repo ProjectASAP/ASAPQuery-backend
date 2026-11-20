@@ -349,6 +349,7 @@ answers table. No percentile panels and no CPU-over-time lines.
 | View persistence | append-only file per view, synced per window, loaded within retention | a checkpoint of the whole store; persisting raw samples |
 | When views are computed | when their window closes | query time; background |
 | Operators | the Planner executor's | DataFusion's now (ASAPPlanner#1421) |
+| Should a view be bounded or unbounded? | stored views are bounded: one immutable instance per (definition, window). How a window is computed (one batch run when it closes, or incremental streaming updates) is a separate choice, and freshness for a query at "now" is a third one (reading the open window's partial state, flagged as partial), not in the demo | one unbounded, continuously updated view per definition |
 
 ### Target design beyond the demo
 
@@ -368,6 +369,41 @@ answers table. No percentile panels and no CPU-over-time lines.
 - **Vectorized sketch updates.** Batch updates per group
   (`update_batch(values, group_ids)`), the shape of DataFusion's
   `GroupsAccumulator`, whether or not DataFusion's code is reused.
+
+### Hierarchical rollups (after the demo)
+
+Today a chain has one width, the gcd of the evaluation interval, the
+window and the offsets (Pass 2 `add_chain_groups`,
+`stage1-pass2-reuse-candidates/src/rules/chains.rs`). So
+`quantile_over_time(0.99, lat[1h])` every 15 s over 10k series merges
+3600 / 15 = 240 DDSketches per series per evaluation (2.4M). At 1 Hz each
+holds 15 samples, so merging is no cheaper than scanning the raw rows
+(ProjectASAP/ASAPPlanner#1315 measured 3.5x at 1 Hz and 10 s windows, against
+145x at 10 Hz and 60 s windows).
+
+Design:
+
+- The plan decides the levels, and Stage 3 costs them.
+- A coarse chain is a view whose input is the fine chain's view, not raw
+  data. It is computed at ingestion time on the precompute thread when its
+  coarse window closes, in a refresh group ordered after the fine one, so
+  it needs no raw data and no background recompute.
+- A query's `TimeRange` tiles `(t − 1h, t]` from several chains: fine
+  windows at the unaligned edges, coarse windows in the middle.
+- Each level is its own view definition, keyed by width, so the store
+  needs nothing new.
+
+Numbers for the example: 15 s alone, 240 merges per series; 15 s + 5 min,
+at most about 49 (about 31 on average, 5–8x fewer); 15 s / 1 min / 5 min /
+15 min, about 10–15. The 5-minute level costs about 10k × 20 merges per
+5 minutes at ingestion, about 670 merges/s, and about 1/20 more storage.
+The fine level is still kept for the whole window (for the unaligned head).
+Mergeable sketches and exact accumulators keep their guarantees.
+
+Work: Planner Pass 2 candidates 1–2 days; plan representation and Stage 3
+cost 1–2 days; executor tiling from several slots about 1 day; data plane
+refresh ordering about 0.5 day. The demo reports the 1 Hz / 15 s case as
+this known limit and also runs workloads with more samples per window.
 
 ## Quality attributes and evidence
 
