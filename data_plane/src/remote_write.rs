@@ -187,15 +187,10 @@ fn decode_series(
         if samples.len() >= limits.max_samples {
             return Err(RemoteWriteError::TooManySamples(limits.max_samples));
         }
-        let (mut timestamp_ms, mut value) = (0i64, 0f64);
-        let mut fields = Reader::new(sample);
-        while let Some((field, field_value)) = fields.field()? {
-            match (field, field_value) {
-                (1, Value::Fixed64(bits)) => value = f64::from_bits(bits),
-                (2, Value::Varint(raw)) => timestamp_ms = raw as i64,
-                _ => {}
-            }
-        }
+        let (timestamp_ms, value) = match sample_fast(sample) {
+            Some(decoded) => decoded,
+            None => sample_generic(sample)?,
+        };
         samples.push(RawSample {
             labels: labels.clone(),
             timestamp_ms,
@@ -203,6 +198,36 @@ fn decode_series(
         });
     }
     Ok(())
+}
+
+/// A `Sample` in the layout senders write: `value` (tag 0x09, 8 bytes) then
+/// `timestamp` (tag 0x10, varint) and nothing else; `None` for any other
+/// layout, which [`sample_generic`] reads.
+fn sample_fast(sample: &[u8]) -> Option<(i64, f64)> {
+    if sample.len() < 11 || sample[0] != 0x09 || sample[9] != 0x10 {
+        return None;
+    }
+    let mut tail = Reader::new(&sample[10..]);
+    let raw = tail.varint().ok()?;
+    if tail.position != tail.bytes.len() {
+        return None;
+    }
+    let value = f64::from_bits(u64::from_le_bytes(sample[1..9].try_into().ok()?));
+    Some((raw as i64, value))
+}
+
+/// A `Sample` with its fields in any order, unknown fields skipped.
+fn sample_generic(sample: &[u8]) -> Result<(i64, f64), RemoteWriteError> {
+    let (mut timestamp_ms, mut value) = (0i64, 0f64);
+    let mut fields = Reader::new(sample);
+    while let Some((field, field_value)) = fields.field()? {
+        match (field, field_value) {
+            (1, Value::Fixed64(bits)) => value = f64::from_bits(bits),
+            (2, Value::Varint(raw)) => timestamp_ms = raw as i64,
+            _ => {}
+        }
+    }
+    Ok((timestamp_ms, value))
 }
 
 /// The series of the encoded labels `key` (a run of `TimeSeries` field-1
@@ -487,6 +512,52 @@ mod tests {
             decode_samples(&body, &one).err(),
             Some(RemoteWriteError::TooManySamples(1))
         );
+    }
+
+    /// The fast sample path reads what the generic one reads, and leaves
+    /// any other layout (fields swapped, an unknown field, a value-less or
+    /// negative-timestamp sample) to it.
+    #[test]
+    fn fast_and_generic_sample_paths_agree() {
+        let encoded = |sample: &Sample| sample.encode_to_vec();
+        for sample in [
+            Sample {
+                value: 1.5,
+                timestamp: 1_700_000_000_000,
+            },
+            Sample {
+                value: f64::NAN,
+                timestamp: 1,
+            },
+            Sample {
+                value: -2.0,
+                timestamp: -5,
+            },
+        ] {
+            let bytes = encoded(&sample);
+            let generic = sample_generic(&bytes).unwrap();
+            let fast = sample_fast(&bytes).expect("the sender's layout");
+            assert_eq!(fast.0, generic.0);
+            assert_eq!(fast.1.to_bits(), generic.1.to_bits());
+        }
+        // Timestamp before value, an unknown field after, a zero value
+        // (omitted by protobuf): read by the generic path only.
+        let swapped = [0x10, 0x07, 0x09, 0, 0, 0, 0, 0, 0, 0xf8, 0x3f];
+        assert_eq!(sample_fast(&swapped), None);
+        assert_eq!(sample_generic(&swapped).unwrap(), (7, 1.5));
+        let mut extra = encoded(&Sample {
+            value: 1.5,
+            timestamp: 7,
+        });
+        extra.extend_from_slice(&[0x18, 0x01]);
+        assert_eq!(sample_fast(&extra), None);
+        assert_eq!(sample_generic(&extra).unwrap(), (7, 1.5));
+        let zero = encoded(&Sample {
+            value: 0.0,
+            timestamp: 7,
+        });
+        assert_eq!(sample_fast(&zero), None);
+        assert_eq!(sample_generic(&zero).unwrap(), (7, 0.0));
     }
 
     /// Requests over a size limit are rejected before they are processed.
