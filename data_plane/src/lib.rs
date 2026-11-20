@@ -16,6 +16,7 @@ pub mod persist;
 pub mod prometheus;
 pub mod query;
 pub mod remote_write;
+pub mod result_cache;
 pub mod series_ids;
 pub mod store;
 
@@ -301,7 +302,10 @@ async fn query(
 /// Runs a planned instant query at its time, or now.
 async fn answer(state: &DataPlane, query: InstantQuery) -> Result<serde_json::Value, Unanswered> {
     let time_ms = query.time_ms.unwrap_or_else(ingestion::wall_clock_ms);
-    let samples = state.engine.evaluate(query.query, time_ms).await?;
+    let samples = match state.engine.cached(&query.query, time_ms) {
+        Some(samples) => samples,
+        None => state.engine.evaluate(query.query, time_ms).await?,
+    };
     Ok(prometheus::vector_response(time_ms, &samples))
 }
 
@@ -358,15 +362,26 @@ async fn answer_range(
     use futures::{StreamExt, TryStreamExt};
     let started = std::time::Instant::now();
     let query = &range.query;
+    // The steps the result cache answers; only the others run.
+    let cached: Vec<(i64, Option<_>)> = range
+        .times_ms()
+        .map(|time_ms| (time_ms, state.engine.cached(query, time_ms)))
+        .collect();
+    let from_cache = cached.iter().filter(|(_, hit)| hit.is_some()).count();
     // At most one step per query worker in flight, so a long range neither
     // floods the workers' queue nor starves instant queries; the first
     // failed step, or the client going away, drops the rest unrun.
-    let steps: Vec<_> = futures::stream::iter(range.times_ms())
-        .map(|time_ms| async move {
-            let samples = state
-                .engine
-                .evaluate_range_step(query.clone(), time_ms)
-                .await?;
+    let steps: Vec<_> = futures::stream::iter(cached)
+        .map(|(time_ms, hit)| async move {
+            let samples = match hit {
+                Some(samples) => samples,
+                None => {
+                    state
+                        .engine
+                        .evaluate_range_step(query.clone(), time_ms)
+                        .await?
+                }
+            };
             Ok::<_, Unanswered>((time_ms, samples))
         })
         .buffered(state.engine.query_threads())
@@ -376,6 +391,12 @@ async fn answer_range(
         metrics
             .range_latency
             .observe(started.elapsed().as_secs_f64());
+        metrics
+            .range_steps_cached
+            .fetch_add(from_cache as u64, Ordering::Relaxed);
+        metrics
+            .range_steps
+            .fetch_add(steps.len() as u64, Ordering::Relaxed);
     }
     Ok(prometheus::matrix_response(&steps))
 }

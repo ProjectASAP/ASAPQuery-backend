@@ -34,6 +34,7 @@ use asap_planner::InstallablePlan;
 use futures::executor::block_on;
 use futures::StreamExt;
 
+use crate::result_cache::{Answer, ResultCache};
 use crate::store::{PublishedStore, QueryTimeResults, RawShards, RunStore, ViewStore};
 
 /// One series of an instant-query result.
@@ -74,6 +75,11 @@ pub struct QueryEngine {
     shared: BTreeSet<PhysicalASAPNodeId>,
     results: QueryTimeResults,
     limits: Limits,
+    /// The query roots whose runs read raw data through a `Scan` (rather
+    /// than only materialized views).
+    reads_raw_data: BTreeSet<PhysicalASAPNodeId>,
+    /// Final answers of the query roots by evaluation time; `None`: off.
+    result_cache: Option<ResultCache>,
 }
 
 impl QueryEngine {
@@ -89,9 +95,16 @@ impl QueryEngine {
         limits: Limits,
         results: QueryTimeResults,
         share_one_evaluation: bool,
+        result_cache: Option<ResultCache>,
     ) -> anyhow::Result<Self> {
         let dag = &plan.dag;
         let view_ids: HashSet<PhysicalASAPNodeId> = views.iter().map(|v| v.node_id).collect();
+        let reads_raw_data = dag
+            .roots
+            .iter()
+            .copied()
+            .filter(|&root| scans_below(dag, root, &view_ids))
+            .collect();
         let shared = if share_one_evaluation {
             shared_nodes(dag, &view_ids)?
         } else {
@@ -142,6 +155,8 @@ impl QueryEngine {
             shared,
             results,
             limits,
+            reads_raw_data,
+            result_cache,
         })
     }
 
@@ -163,34 +178,69 @@ impl QueryEngine {
         &self.shared
     }
 
-    /// Answers `query` at `time_ms` from the newest snapshot of `store`.
-    pub fn evaluate(
-        &self,
-        query: &str,
-        time_ms: i64,
-        store: &PublishedStore,
-    ) -> Result<Vec<ResultSample>, Unanswered> {
+    /// The planned `query`'s root.
+    fn root(&self, query: &str) -> Result<PhysicalASAPNodeId, Unanswered> {
         let query = query.trim();
-        let root = *self
+        Ok(*self
             .roots
             .iter()
             .find(|(planned, _)| planned == query)
             .ok_or_else(|| Unanswered::NotPlanned(query.to_string()))?
             .1
             .as_ref()
-            .map_err(|reason| Unanswered::Unsupported(reason.clone()))?;
+            .map_err(|reason| Unanswered::Unsupported(reason.clone()))?)
+    }
+
+    /// The result cache's answer to `query` at `time_ms`, if it keeps one.
+    pub fn cached(&self, query: &str, time_ms: i64) -> Option<Answer> {
+        let cache = self.result_cache.as_ref()?;
+        cache.get(self.root(query).ok()?, time_ms)
+    }
+
+    /// The result cache, when it is on.
+    pub fn result_cache(&self) -> Option<&ResultCache> {
+        self.result_cache.as_ref()
+    }
+
+    /// Answers `query` at `time_ms` from the newest snapshot of `store`,
+    /// and keeps the answer in the result cache when it is final: the run
+    /// succeeded, so every view window it read was stored (a window is
+    /// appended once, when the watermark closes it, and never changes),
+    /// and, when the root reads raw data through a `Scan`, `time_ms` is at
+    /// or before the watermark the snapshot was published with (no sample
+    /// at or before it is expected any more). The result cache is not
+    /// read here: callers read it first ([`Self::cached`]).
+    pub fn evaluate(
+        &self,
+        query: &str,
+        time_ms: i64,
+        store: &PublishedStore,
+    ) -> Result<Answer, Unanswered> {
+        let root = self.root(query)?;
+        // The watermark first: raw data is published before the watermark
+        // that covers it, so the snapshot read next holds every sample at
+        // or before this watermark.
+        let watermark_ms = store.watermark_ms();
         let (raw_data, views) = store.snapshot();
         let snapshot = Snapshot {
             raw_data,
             views,
-            watermark_ms: store.watermark_ms(),
+            watermark_ms,
         };
         let batches = self.output(root, time_ms, &snapshot)?;
         let compiled = &self.runs[&root].compiled;
         let schema = compiled
             .output_schema(root as u64)
             .map_err(|e| Unanswered::Execution(e.to_string()))?;
-        result_samples(&schema, &batches)
+        let answer = Arc::new(result_samples(&schema, &batches)?);
+        if let Some(cache) = &self.result_cache {
+            let final_answer = !self.reads_raw_data.contains(&root)
+                || watermark_ms.is_some_and(|watermark| time_ms <= watermark);
+            if final_answer {
+                cache.insert(root, time_ms, answer.clone(), watermark_ms);
+            }
+        }
+        Ok(answer)
     }
 
     /// `node`'s output at `time_ms`: from the query-time partition when it
@@ -323,6 +373,36 @@ fn shared_nodes(
             cut.insert(id);
         }
     }
+}
+
+/// Whether a `Scan` is reachable from `root` without passing a view in
+/// `views`: its query run reads raw data.
+fn scans_below(
+    dag: &PhysicalASAPDAG,
+    root: PhysicalASAPNodeId,
+    views: &HashSet<PhysicalASAPNodeId>,
+) -> bool {
+    let nodes: HashMap<PhysicalASAPNodeId, _> = dag.nodes.iter().map(|n| (n.id, n)).collect();
+    let mut seen = HashSet::new();
+    let mut pending = vec![root];
+    while let Some(id) = pending.pop() {
+        if views.contains(&id) || !seen.insert(id) {
+            continue;
+        }
+        if matches!(
+            nodes[&id].payload,
+            Operator::NonASAP(NonASAPOp::Scan { .. })
+        ) {
+            return true;
+        }
+        pending.extend(
+            dag.edges
+                .iter()
+                .filter(|e| e.consumer == id)
+                .map(|e| e.producer),
+        );
+    }
+    false
 }
 
 /// The view slot a shared node is bound as: its whole output at the run's

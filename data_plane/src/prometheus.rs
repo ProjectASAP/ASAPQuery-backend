@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use crate::query::ResultSample;
+use crate::result_cache::Answer;
 
 /// Parameters of an instant query, from its URL query and form body.
 pub struct InstantQuery {
@@ -195,11 +196,11 @@ pub fn vector_response(time_ms: i64, samples: &[ResultSample]) -> Value {
 
 /// A Prometheus range-query response: each series' value at each
 /// evaluation time it has one, series sorted by labels.
-pub fn matrix_response(steps: &[(i64, Vec<ResultSample>)]) -> Value {
+pub fn matrix_response(steps: &[(i64, Answer)]) -> Value {
     let mut series: BTreeMap<&BTreeMap<String, String>, Vec<Value>> = BTreeMap::new();
     for (time_ms, samples) in steps {
         let time = *time_ms as f64 / 1000.0;
-        for sample in samples {
+        for sample in samples.iter() {
             series
                 .entry(&sample.labels)
                 .or_default()
@@ -226,6 +227,7 @@ fn format_value(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     /// Parameters come from the URL or the form body; times are Unix seconds.
     #[test]
@@ -296,8 +298,8 @@ mod tests {
             value,
         };
         let steps = [
-            (1000, vec![sample(&b, 1.0), sample(&a, 2.0)]),
-            (2000, vec![sample(&a, 3.0)]),
+            (1000, Arc::new(vec![sample(&b, 1.0), sample(&a, 2.0)])),
+            (2000, Arc::new(vec![sample(&a, 3.0)])),
         ];
         assert_eq!(
             matrix_response(&steps),

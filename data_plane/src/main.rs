@@ -85,6 +85,12 @@ struct Args {
     /// The most bytes of query-time results kept.
     #[arg(long, default_value_t = EngineOptions::default().query_time_results_max_bytes)]
     query_time_results_max_bytes: usize,
+    /// Do not keep final query answers: every request computes every step.
+    #[arg(long)]
+    no_result_cache: bool,
+    /// The most bytes of final query answers the result cache keeps.
+    #[arg(long, default_value_t = EngineOptions::default().result_cache_max_bytes)]
+    result_cache_bytes: usize,
     /// Where the materialized views are persisted (one file per view) and
     /// loaded from at startup.
     #[arg(long, default_value = "asap-views")]
@@ -129,6 +135,8 @@ async fn main() -> anyhow::Result<()> {
                 share_one_evaluation_results: !args.no_shared_results,
                 query_time_results_retention_ms: args.query_time_results_retention_ms,
                 query_time_results_max_bytes: args.query_time_results_max_bytes,
+                result_cache: !args.no_result_cache,
+                result_cache_max_bytes: args.result_cache_bytes,
                 view_dir: (!args.no_view_persistence).then_some(args.view_dir),
                 view_sync_interval_ms: args.view_sync_interval_ms,
             },

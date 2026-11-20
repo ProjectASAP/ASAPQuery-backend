@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::ingestion::IngestionStats;
+use crate::result_cache::ResultCache;
 use crate::store::QueryTimeResults;
 
 /// CPU time this thread has used, in nanoseconds.
@@ -136,6 +137,10 @@ pub struct QueryMetrics {
     pub range_step_run: PhaseStats,
     /// From a range request reaching the data plane to its answer.
     pub range_latency: Latency,
+    /// Steps of the range requests answered.
+    pub range_steps: AtomicU64,
+    /// Of those, the steps the result cache answered.
+    pub range_steps_cached: AtomicU64,
 }
 
 /// Every measurement the engine's threads record.
@@ -217,6 +222,8 @@ pub struct Gauges<'a> {
     pub persist_backlog_bytes: u64,
     pub now_ms: i64,
     pub query_time_results: &'a QueryTimeResults,
+    /// `None` when the result cache is off.
+    pub result_cache: Option<&'a ResultCache>,
 }
 
 /// `metrics` and `gauges` in the Prometheus text format.
@@ -281,6 +288,28 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
         query_metrics
             .range_latency
             .render(&mut out, "asap_range_query_latency_seconds", &labels);
+    }
+    for (name, help, count) in [
+        (
+            "asap_range_query_steps_total",
+            "Steps of the planned range requests answered.",
+            (|m: &QueryMetrics| &m.range_steps) as fn(&QueryMetrics) -> &AtomicU64,
+        ),
+        (
+            "asap_range_query_steps_cached_total",
+            "Steps of the planned range requests the result cache answered.",
+            |m: &QueryMetrics| &m.range_steps_cached,
+        ),
+    ] {
+        family(&mut out, name, "counter", help);
+        for (query, query_metrics) in &metrics.queries {
+            let _ = writeln!(
+                out,
+                "{name}{{query=\"{}\"}} {}",
+                escape(query),
+                count(query_metrics).load(Ordering::Relaxed)
+            );
+        }
     }
 
     family(
@@ -439,6 +468,40 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
         "Reads of a query-time OneEvaluation result already computed.",
     );
     let _ = writeln!(out, "asap_query_time_result_hits_total {}", results.hits());
+    if let Some(cache) = gauges.result_cache {
+        gauge(
+            &mut out,
+            "asap_result_cache_bytes",
+            "Bytes of final query answers the result cache keeps (estimated).",
+            cache.bytes() as f64,
+        );
+        gauge(
+            &mut out,
+            "asap_result_cache_entries",
+            "Final query answers the result cache keeps, by query and evaluation time.",
+            cache.len() as f64,
+        );
+        for (name, help, value) in [
+            (
+                "asap_result_cache_hits_total",
+                "Result cache lookups that found the answer.",
+                cache.hits(),
+            ),
+            (
+                "asap_result_cache_misses_total",
+                "Result cache lookups that found no answer.",
+                cache.misses(),
+            ),
+            (
+                "asap_result_cache_evictions_total",
+                "Answers the result cache dropped by age or by bytes.",
+                cache.evictions(),
+            ),
+        ] {
+            family(&mut out, name, "counter", help);
+            let _ = writeln!(out, "{name} {value}");
+        }
+    }
     if let Some(rss) = resident_bytes() {
         gauge(
             &mut out,
@@ -543,6 +606,7 @@ mod tests {
                 persist_backlog_bytes: 0,
                 now_ms: 0,
                 query_time_results: &QueryTimeResults::new(0, 0),
+                result_cache: None,
             },
         );
         assert!(

@@ -32,7 +32,8 @@ use crate::ingestion::{
 };
 use crate::metrics::{Gauges, Metrics, Timer};
 use crate::persist::{plan_hash, ViewFiles};
-use crate::query::{QueryEngine, ResultSample, Unanswered};
+use crate::query::{QueryEngine, Unanswered};
+use crate::result_cache::{Answer, ResultCache};
 use crate::store::{
     PublishedStore, QueryTimeResults, RawData, RawSample, RawShards, RunStore, ViewStore,
 };
@@ -84,6 +85,13 @@ pub struct EngineOptions {
     /// The most bytes of query-time results kept; the oldest are dropped
     /// first.
     pub query_time_results_max_bytes: usize,
+    /// Keep each planned query's final answer at each evaluation time
+    /// ([`crate::result_cache`]), so a range request recomputes only the
+    /// steps not answered before.
+    pub result_cache: bool,
+    /// The most bytes of answers the result cache keeps; the least
+    /// recently used are dropped first.
+    pub result_cache_max_bytes: usize,
     /// Where the materialized views are persisted and loaded from at
     /// startup ([`crate::persist`]); `None`: kept in memory only.
     pub view_dir: Option<std::path::PathBuf>,
@@ -111,6 +119,8 @@ impl Default for EngineOptions {
             share_one_evaluation_results: true,
             query_time_results_retention_ms: 60_000,
             query_time_results_max_bytes: 1 << 30,
+            result_cache: true,
+            result_cache_max_bytes: 256 << 20,
             view_dir: None,
             // VictoriaMetrics' default -inmemoryDataFlushInterval (v1.155.0).
             view_sync_interval_ms: 5_000,
@@ -412,11 +422,7 @@ impl EngineHandle {
     /// read different snapshots. A query does not wait for writes
     /// acknowledged before it; an event-time barrier does
     /// ([`Self::advance_watermark`]).
-    pub async fn evaluate(
-        &self,
-        query: String,
-        time_ms: i64,
-    ) -> Result<Vec<ResultSample>, Unanswered> {
+    pub async fn evaluate(&self, query: String, time_ms: i64) -> Result<Answer, Unanswered> {
         let started = std::time::Instant::now();
         let metrics = self.shared.metrics.query(&query);
         let answer = self.run_on_worker(query, time_ms, false).await;
@@ -434,8 +440,14 @@ impl EngineHandle {
         &self,
         query: String,
         time_ms: i64,
-    ) -> Result<Vec<ResultSample>, Unanswered> {
+    ) -> Result<Answer, Unanswered> {
         self.run_on_worker(query, time_ms, true).await
+    }
+
+    /// The result cache's answer to the planned `query` at `time_ms`, if
+    /// it keeps one ([`QueryEngine::cached`]).
+    pub fn cached(&self, query: &str, time_ms: i64) -> Option<Answer> {
+        self.query.cached(query, time_ms)
     }
 
     async fn run_on_worker(
@@ -443,7 +455,7 @@ impl EngineHandle {
         query: String,
         time_ms: i64,
         range_step: bool,
-    ) -> Result<Vec<ResultSample>, Unanswered> {
+    ) -> Result<Answer, Unanswered> {
         let stopped = || Unanswered::Execution("the query workers have stopped".into());
         let (reply, answer) = oneshot::channel();
         self.queries
@@ -494,6 +506,7 @@ impl EngineHandle {
                     .unwrap_or_else(|e| e.into_inner()),
                 now_ms: crate::ingestion::wall_clock_ms(),
                 query_time_results: self.query.query_time_results(),
+                result_cache: self.query.result_cache(),
             },
         )
     }
@@ -606,7 +619,7 @@ struct QueryJob {
     time_ms: i64,
     /// One step of a range query.
     range_step: bool,
-    reply: Reply<Vec<ResultSample>>,
+    reply: Reply<Answer>,
 }
 
 /// What crosses threads: the compiled queries and refresh runs, the store
@@ -703,6 +716,12 @@ fn install(
         limits.clone(),
         results,
         options.share_one_evaluation_results,
+        options.result_cache.then(|| {
+            ResultCache::new(
+                ResultCache::horizon_ms(&plan.dag, options.ingestion.view_retention_margin_ms),
+                options.result_cache_max_bytes,
+            )
+        }),
     )?;
     tracing::info!(
         shared = ?query.shared_nodes(),

@@ -177,10 +177,17 @@ fn points(plan: &InstallablePlan, start_ms: i64) -> Vec<Point> {
 
 /// The data plane running `plan` with `--no-forward`, fed `points` by
 /// Remote Write (one request per minute of event time) from `start_ms`,
-/// with the barrier at the evaluation time.
-async fn data_plane(plan: &InstallablePlan, points: &[Point], start_ms: i64) -> Router {
+/// with the barrier at the evaluation time, and its result cache on or
+/// off.
+async fn data_plane(
+    plan: &InstallablePlan,
+    points: &[Point],
+    start_ms: i64,
+    result_cache: bool,
+) -> Router {
     let options = EngineOptions {
         no_forward: true,
+        result_cache,
         ingestion: IngestionOptions {
             allowed_lateness_ms: 0,
             max_future_ms: 0,
@@ -588,6 +595,39 @@ fn answers(schema: &Schema, batches: &[Batch]) -> Vec<Answer> {
 
 /// Whether two answers are equal: the same series with the same values,
 /// within `relative` of each other.
+/// Both answers within `relative` of each other, or both errors.
+fn same_answers(
+    a: &Result<Vec<Answer>, String>,
+    b: &Result<Vec<Answer>, String>,
+    relative: f64,
+) -> bool {
+    match (a, b) {
+        (Ok(a), Ok(b)) => same_within(a, b, relative),
+        (Err(_), Err(_)) => true,
+        _ => false,
+    }
+}
+
+/// Both range answers equal at every step within `relative`, or both
+/// errors.
+fn same_matrices(
+    a: &Result<BTreeMap<i64, Vec<Answer>>, String>,
+    b: &Result<BTreeMap<i64, Vec<Answer>>, String>,
+    relative: f64,
+) -> bool {
+    match (a, b) {
+        (Ok(a), Ok(b)) => {
+            a.len() == b.len()
+                && a.iter().all(|(time_ms, rows)| {
+                    b.get(time_ms)
+                        .is_some_and(|other| same_within(rows, other, relative))
+                })
+        }
+        (Err(_), Err(_)) => true,
+        _ => false,
+    }
+}
+
 fn same_within(a: &[Answer], b: &[Answer], relative: f64) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(x, y)| {
@@ -639,12 +679,24 @@ async fn the_data_plane_answers_what_the_planner_executor_answers() {
             let start_ms = EVALUATION_MS - reach_back_ms(&plan);
             let points = points(&plan, start_ms);
             let expected = reference_answers(&plan, &points, start_ms);
-            let app = data_plane(&plan, &points, start_ms).await;
+            let app = data_plane(&plan, &points, start_ms, true).await;
+            let uncached = data_plane(&plan, &points, start_ms, false).await;
             let mut answered = 0;
             let mut non_empty = 0;
             let tolerance = tolerance(&plan);
             for (query, expected) in plan.query_texts.iter().zip(&expected) {
                 let served = served_answer(&app, query).await;
+                // Asked again: from the result cache, the same answer; and
+                // the same as without the cache.
+                let again = served_answer(&app, query).await;
+                let without_cache = served_answer(&uncached, query).await;
+                if !same_answers(&again, &served, 0.0)
+                    || !same_answers(&without_cache, &served, tolerance)
+                {
+                    mismatches.push(format!(
+                        "{label}: {query}: cached {again:?}, first {served:?}, without the cache {without_cache:?}"
+                    ));
+                }
                 match (expected, &served) {
                     (Ok(expected), Ok(served)) if same_within(served, expected, tolerance) => {
                         answered += 1;
@@ -742,7 +794,8 @@ async fn range_queries_answer_what_the_planner_executor_answers_at_each_step() {
                 })
                 .collect();
             let expected = reference_answers_at(&plan, &points, start_ms, &times);
-            let app = data_plane(&plan, &points, start_ms).await;
+            let uncached = data_plane(&plan, &points, start_ms, false).await;
+            let app = data_plane(&plan, &points, start_ms, true).await;
             let mut equal = 0;
             for ((query, expected), (step, times)) in plan
                 .query_texts
@@ -751,7 +804,19 @@ async fn range_queries_answer_what_the_planner_executor_answers_at_each_step() {
                 .zip(steps.iter().zip(&times))
             {
                 let range = (times[0], EVALUATION_MS, *step);
-                match served_range(&app, query, range).await {
+                let served = served_range(&app, query, range).await;
+                // Asked again: every step from the result cache, the same
+                // matrix; and the same as without the cache.
+                let again = served_range(&app, query, range).await;
+                let without_cache = served_range(&uncached, query, range).await;
+                if !same_matrices(&again, &served, 0.0)
+                    || !same_matrices(&without_cache, &served, tolerance(&plan))
+                {
+                    mismatches.push(format!(
+                        "{label}: {query}: cached {again:?}, first {served:?}, without the cache {without_cache:?}"
+                    ));
+                }
+                match served {
                     Ok(served) => {
                         for (time_ms, expected) in times.iter().zip(expected) {
                             let served = &served[time_ms];
