@@ -1,7 +1,10 @@
-//! The engine thread: owns the installed plan, compiled once when it is
-//! installed, the store, and everything that executes the plan; handlers
-//! send the engine commands. Runs execute one at a time, so the store
-//! changes only between runs.
+//! The engine: the installed plan, compiled once when it is installed,
+//! and the threads that execute it. The engine thread ingests samples and
+//! refreshes views, changing its working copy of the store and publishing
+//! a snapshot after each command; `query-N` worker threads answer queries,
+//! each run entirely on one worker over the newest published snapshot, so
+//! a query never waits for ingestion. A run's output stream is not `Send`,
+//! so a run never moves between threads.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -14,7 +17,7 @@ use tokio::sync::oneshot;
 
 use crate::ingestion::{Ingestion, IngestionOptions, IngestionStats};
 use crate::query::{QueryEngine, ResultSample, Unanswered};
-use crate::store::{scanned_metrics, RawSample, TimeIndexedStore};
+use crate::store::{scanned_metrics, PublishedStore, RawSample, RunStore, TimeIndexedStore};
 
 /// How the engine thread ingests samples and runs queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +34,10 @@ pub struct EngineOptions {
     /// The most bytes one ingestion or query run may hold
     /// (`asap_executor::runtime::Limits::max_bytes`).
     pub run_memory_limit_bytes: usize,
+    /// Query worker threads: the most queries run at once. Each run may
+    /// hold `run_memory_limit_bytes`, so queries may hold up to this many
+    /// times that.
+    pub query_threads: usize,
 }
 
 impl Default for EngineOptions {
@@ -41,6 +48,7 @@ impl Default for EngineOptions {
             max_queued_samples: 2_000_000,
             no_forward: false,
             run_memory_limit_bytes: 4 << 30,
+            query_threads: std::thread::available_parallelism().map_or(1, usize::from),
         }
     }
 }
@@ -49,11 +57,6 @@ type Reply<T> = oneshot::Sender<Result<T, Unanswered>>;
 
 enum Command {
     Ingest(Vec<RawSample>),
-    Evaluate {
-        query: String,
-        time_ms: i64,
-        reply: Reply<Vec<ResultSample>>,
-    },
     AdvanceWatermark {
         barrier_ms: i64,
         reply: tokio::sync::oneshot::Sender<i64>,
@@ -76,6 +79,8 @@ pub enum IngestError {
 #[derive(Clone)]
 pub struct EngineHandle {
     commands: Sender<Command>,
+    /// Queries for the worker threads.
+    queries: Sender<QueryJob>,
     /// Samples sent and not yet ingested.
     queued_samples: Arc<AtomicU64>,
     max_queued_samples: u64,
@@ -101,12 +106,16 @@ impl EngineHandle {
     pub fn spawn(plan_json: String, options: EngineOptions) -> anyhow::Result<(Self, Vec<String>)> {
         let (commands, receiver) = channel();
         let (installed, installation) = channel();
+        let (queries, query_jobs) = channel::<QueryJob>();
+        let published = Arc::new(PublishedStore::default());
+        let engine_published = published.clone();
         let running = Arc::new(AtomicBool::new(true));
         let queued_samples = Arc::new(AtomicU64::new(0));
         let stats = Arc::new(Mutex::new(IngestionStats::default()));
         let shared = Shared {
             queued_samples: queued_samples.clone(),
             stats: stats.clone(),
+            published: engine_published,
         };
         let guard = RunningGuard(running.clone());
         std::thread::Builder::new()
@@ -114,8 +123,8 @@ impl EngineHandle {
             .spawn(move || {
                 let _guard = guard;
                 match Engine::new(&plan_json, options) {
-                    Ok((engine, queries)) => {
-                        let _ = installed.send(Ok(queries));
+                    Ok((engine, query, queries)) => {
+                        let _ = installed.send(Ok((query, queries)));
                         engine.serve(receiver, shared);
                     }
                     Err(error) => {
@@ -123,17 +132,24 @@ impl EngineHandle {
                     }
                 }
             })?;
-        let queries = installation
+        let (query, query_texts) = installation
             .recv()
             .map_err(|_| anyhow::anyhow!("the engine thread exited while installing"))??;
+        spawn_query_workers(
+            Arc::new(query),
+            published,
+            query_jobs,
+            options.query_threads.max(1),
+        )?;
         let handle = Self {
             commands,
+            queries,
             queued_samples,
             max_queued_samples: options.max_queued_samples,
             running,
             stats,
         };
-        Ok((handle, queries))
+        Ok((handle, query_texts))
     }
 
     /// Queues `samples` for ingestion. `Busy` when the queue would hold
@@ -162,17 +178,21 @@ impl EngineHandle {
         })
     }
 
-    /// Answers the planned `query` at `time_ms`, after every write
-    /// acknowledged before; see [`QueryEngine::evaluate`].
+    /// Answers the planned `query` at `time_ms` on a query worker, from
+    /// the newest snapshot published when the run starts; see
+    /// [`QueryEngine::evaluate`]. Two queries at one evaluation time may
+    /// read different snapshots. A query does not wait for writes
+    /// acknowledged before it; an event-time barrier does
+    /// ([`Self::advance_watermark`]).
     pub async fn evaluate(
         &self,
         query: String,
         time_ms: i64,
     ) -> Result<Vec<ResultSample>, Unanswered> {
-        let stopped = || Unanswered::Execution("the engine has stopped".into());
+        let stopped = || Unanswered::Execution("the query workers have stopped".into());
         let (reply, answer) = oneshot::channel();
-        self.commands
-            .send(Command::Evaluate {
+        self.queries
+            .send(QueryJob {
                 query,
                 time_ms,
                 reply,
@@ -234,20 +254,66 @@ fn admit(queued: u64, count: u64, max_queued: u64) -> Result<u64, IngestError> {
     }
 }
 
-/// What the engine thread publishes to the HTTP side.
+/// What the engine thread publishes to the HTTP side and the query workers.
 struct Shared {
     queued_samples: Arc<AtomicU64>,
     stats: Arc<Mutex<IngestionStats>>,
+    published: Arc<PublishedStore>,
+}
+
+/// One query for a worker thread.
+struct QueryJob {
+    query: String,
+    time_ms: i64,
+    reply: Reply<Vec<ResultSample>>,
+}
+
+/// What crosses threads: the compiled queries, shared by every worker, and
+/// the store snapshots runs read.
+#[allow(dead_code)]
+fn assert_send_sync<T: Send + Sync>() {}
+const _: fn() = || {
+    assert_send_sync::<QueryEngine>();
+    assert_send_sync::<PublishedStore>();
+    assert_send_sync::<RunStore>();
+};
+
+/// Starts `threads` workers `query-0`, `query-1`, …, each running one query
+/// at a time to completion from `jobs`.
+fn spawn_query_workers(
+    query: Arc<QueryEngine>,
+    published: Arc<PublishedStore>,
+    jobs: Receiver<QueryJob>,
+    threads: usize,
+) -> std::io::Result<()> {
+    let jobs = Arc::new(Mutex::new(jobs));
+    for index in 0..threads {
+        let (query, published, jobs) = (query.clone(), published.clone(), jobs.clone());
+        std::thread::Builder::new()
+            .name(format!("query-{index}"))
+            .spawn(move || loop {
+                let job = match jobs.lock().unwrap_or_else(|e| e.into_inner()).recv() {
+                    Ok(job) => job,
+                    Err(_) => break,
+                };
+                let answer = query.evaluate(&job.query, job.time_ms, &published);
+                let _ = job.reply.send(answer);
+            })?;
+    }
+    Ok(())
 }
 
 struct Engine {
     store: TimeIndexedStore,
     ingestion: Ingestion,
-    query: QueryEngine,
 }
 
 impl Engine {
-    fn new(plan_json: &str, options: EngineOptions) -> anyhow::Result<(Self, Vec<String>)> {
+    /// The engine, the compiled queries and their texts.
+    fn new(
+        plan_json: &str,
+        options: EngineOptions,
+    ) -> anyhow::Result<(Self, QueryEngine, Vec<String>)> {
         let plan = InstallablePlan::from_json(plan_json)?;
         plan.validate()?;
         let views = plan.materialized_views()?;
@@ -275,14 +341,7 @@ impl Engine {
         let ingestion = Ingestion::new(&plan.dag, &views, groups, options.ingestion, limits)?;
         let store = TimeIndexedStore::for_metrics(&scanned_metrics(&plan.dag.nodes));
         let queries = plan.query_texts.clone();
-        Ok((
-            Self {
-                store,
-                ingestion,
-                query,
-            },
-            queries,
-        ))
+        Ok((Self { store, ingestion }, query, queries))
     }
 
     fn serve(mut self, commands: Receiver<Command>, shared: Shared) {
@@ -291,20 +350,15 @@ impl Engine {
                 Command::Ingest(samples) => {
                     let count = samples.len() as u64;
                     self.ingestion.ingest(&mut self.store, samples);
+                    shared.published.publish(&self.store);
                     *shared.stats.lock().unwrap_or_else(|e| e.into_inner()) = self.ingestion.stats;
                     shared.queued_samples.fetch_sub(count, Ordering::SeqCst);
-                }
-                Command::Evaluate {
-                    query,
-                    time_ms,
-                    reply,
-                } => {
-                    let _ = reply.send(self.query.evaluate(&query, time_ms, &self.store));
                 }
                 Command::AdvanceWatermark { barrier_ms, reply } => {
                     let barrier_ms = self
                         .ingestion
                         .advance_watermark(&mut self.store, barrier_ms);
+                    shared.published.publish(&self.store);
                     *shared.stats.lock().unwrap_or_else(|e| e.into_inner()) = self.ingestion.stats;
                     let _ = reply.send(barrier_ms);
                 }

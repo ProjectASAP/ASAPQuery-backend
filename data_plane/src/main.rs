@@ -49,6 +49,10 @@ struct Args {
     /// The most bytes one ingestion or query run may hold.
     #[arg(long, default_value_t = EngineOptions::default().run_memory_limit_bytes)]
     run_memory_limit_bytes: usize,
+    /// Query worker threads, the most queries run at once (default: one per
+    /// core). Queries may hold up to this many times the run memory limit.
+    #[arg(long, default_value_t = EngineOptions::default().query_threads)]
+    query_threads: usize,
 }
 
 #[tokio::main]
@@ -72,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
                 max_queued_samples: args.max_queued_samples,
                 no_forward: args.no_forward,
                 run_memory_limit_bytes: args.run_memory_limit_bytes,
+                query_threads: args.query_threads,
             },
         )?
         .with_forward_timeout(Duration::from_secs(args.forward_timeout_seconds)),

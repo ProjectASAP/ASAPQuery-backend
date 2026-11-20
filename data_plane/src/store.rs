@@ -8,15 +8,16 @@
 //!   series, and drop Prometheus stale markers.
 //! - **materialized views**: each view's rows, appended by the ingestion
 //!   run that refreshed them with the `(start, end]` they cover, kept for
-//!   the view's `retention_ms`. These are held in the executor's
-//!   `InMemoryDataStore`, which reads exactly the rows tiling a request and
-//!   fails when one is missing.
+//!   the view's `retention_ms` ([`ViewStore`]). A read returns exactly the
+//!   rows tiling the requested range and fails when one is missing.
 //!
-//! A run reads a [`RunStore`]: a snapshot that shares both parts, so the
-//! engine appends between runs, never during one.
+//! A run reads a [`RunStore`]: an immutable snapshot sharing both parts.
+//! The writer changes its own copy (copy on write: a part a run still
+//! reads is cloned first) and publishes it ([`PublishedStore`]), so a run
+//! never sees a change and never blocks one.
 
-use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex, RwLock};
 
 use asap_executor::arrow::array::{
     ArrayRef, DictionaryArray, Float64Array, StringArray, TimestampMillisecondArray, UInt32Array,
@@ -24,10 +25,9 @@ use asap_executor::arrow::array::{
 use asap_executor::planner::ir::operator::Source;
 use asap_executor::planner::ir::schema::{DataType, FieldDataType, PROMQL_SERIES_IDENTITY};
 use asap_executor::planner::plan::materialized_view::MaterializedView;
+use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
 use asap_executor::runtime::{OutputStream, RunContext};
-use asap_executor::sources::{
-    DataStore, InMemoryDataStore, MaterializedViewRequest, RawDataRequest,
-};
+use asap_executor::sources::{DataStore, MaterializedViewRequest, RawDataRequest};
 use asap_executor::values::{Batch, BatchColumn};
 use asap_executor::Error;
 use futures::{stream, StreamExt};
@@ -47,7 +47,7 @@ pub struct RawSample {
 }
 
 /// The raw samples of each metric the plan scans, in arrival order.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RawData {
     by_metric: HashMap<String, Vec<RawSample>>,
 }
@@ -204,12 +204,12 @@ fn series_text_column(
 /// cannot be answered from what is stored (rather than that it failed).
 pub struct RunStore {
     raw_data: Arc<RawData>,
-    views: Arc<InMemoryDataStore>,
+    views: Arc<ViewStore>,
     missing_view_rows: Mutex<Option<String>>,
 }
 
 impl RunStore {
-    pub fn new(raw_data: Arc<RawData>, views: Arc<InMemoryDataStore>) -> Self {
+    pub fn new(raw_data: Arc<RawData>, views: Arc<ViewStore>) -> Self {
         Self {
             raw_data,
             views,
@@ -257,7 +257,7 @@ impl DataStore for RunStore {
         context: RunContext,
     ) -> Result<OutputStream<'_, Batch>, Error> {
         self.views
-            .read_materialized_view(view, request, context)
+            .read(view, request, context)
             .inspect_err(|error| {
                 self.missing_view_rows
                     .lock()
@@ -267,12 +267,113 @@ impl DataStore for RunStore {
     }
 }
 
-/// The engine's store: raw data and materialized views, each shared with
-/// the [`RunStore`] of the run in progress and changed only between runs.
+/// Rows stored for one view: the `(start, end]` they cover and their
+/// batches, oldest first.
+type ViewRows = Vec<ViewWindow>;
+
+/// One window of a view's rows: the `(start, end]` they cover and their
+/// batches.
+type ViewWindow = ((i64, i64), Arc<Vec<Batch>>);
+
+/// Each materialized view's stored rows. Cloning shares every batch, so a
+/// writer copies only the per-view lists when a run still reads them.
+#[derive(Default, Clone)]
+pub struct ViewStore {
+    by_view: BTreeMap<PhysicalASAPNodeId, ViewRows>,
+}
+
+impl ViewStore {
+    /// Appends `batches` as `view`'s rows covering `time_range_ms`
+    /// (`(start, end]`), then drops its rows ending `view.retention_ms()`
+    /// or more before `end` (the newest are always kept). Bad input when
+    /// the range is empty or starts before the end of the rows appended
+    /// last (the store is append-only).
+    pub fn append(
+        &mut self,
+        view: &MaterializedView,
+        time_range_ms: (i64, i64),
+        batches: Vec<Batch>,
+    ) -> Result<(), Error> {
+        let (start, end) = time_range_ms;
+        let rows = self.by_view.entry(view.node_id).or_default();
+        if start >= end
+            || rows
+                .last()
+                .is_some_and(|((_, last_end), _)| start < *last_end)
+        {
+            return Err(Error::Invalid(format!(
+                "materialized view {}: appended rows ({start}, {end}] are empty or not after the stored ones",
+                view.node_id
+            )));
+        }
+        rows.push((time_range_ms, Arc::new(batches)));
+        let retention_ms = i64::try_from(view.retention_ms()).unwrap_or(i64::MAX);
+        let oldest_kept_end = end.saturating_sub(retention_ms);
+        rows.retain(|((_, row_end), _)| *row_end > oldest_kept_end || *row_end == end);
+        Ok(())
+    }
+
+    /// Bytes of the stored rows.
+    pub fn bytes(&self) -> usize {
+        self.by_view
+            .values()
+            .flatten()
+            .flat_map(|(_, batches)| batches.iter())
+            .map(Batch::memory_bytes)
+            .sum()
+    }
+
+    /// `view`'s rows whose ranges tile `request.time_range_ms` exactly;
+    /// fails when one is missing.
+    fn read(
+        &self,
+        view: &MaterializedView,
+        request: &MaterializedViewRequest,
+        context: RunContext,
+    ) -> Result<OutputStream<'_, Batch>, Error> {
+        let (start, end) = request.time_range_ms;
+        let missing = || {
+            Error::Invalid(format!(
+                "materialized view {} has no rows tiling ({start}, {end}]",
+                view.node_id
+            ))
+        };
+        let rows = self.by_view.get(&view.node_id).ok_or_else(missing)?;
+        let selected: Vec<&ViewWindow> = rows
+            .iter()
+            .filter(|((row_start, row_end), _)| *row_start >= start && *row_end <= end)
+            .collect();
+        // The selected ranges, oldest first, must tile `(start, end]`.
+        let mut covered_to = start;
+        for ((row_start, row_end), _) in &selected {
+            if *row_start != covered_to {
+                return Err(missing());
+            }
+            covered_to = *row_end;
+        }
+        if covered_to != end {
+            return Err(missing());
+        }
+        Ok(
+            stream::iter(selected.into_iter().flat_map(|(_, b)| b.iter().cloned()))
+                .map(move |batch| {
+                    if context.is_cancelled() {
+                        return Err(Error::Cancelled);
+                    }
+                    Ok(batch)
+                })
+                .boxed_local(),
+        )
+    }
+}
+
+/// The working copy of the store, owned by its writer: raw data and
+/// materialized views, each shared with the snapshots already published
+/// and cloned before it changes while one still reads it.
 #[derive(Default)]
 pub struct TimeIndexedStore {
     raw_data: Arc<RawData>,
-    views: Arc<InMemoryDataStore>,
+    views: Arc<ViewStore>,
 }
 
 impl TimeIndexedStore {
@@ -293,22 +394,43 @@ impl TimeIndexedStore {
         &self.raw_data
     }
 
-    /// The raw data, to append or evict; no run may be in progress.
+    /// The raw data, to append or evict.
     pub fn raw_data_mut(&mut self) -> &mut RawData {
-        Arc::get_mut(&mut self.raw_data).expect("no run reads the store while it changes")
+        Arc::make_mut(&mut self.raw_data)
     }
 
-    /// Appends `batches` as `view`'s rows covering `time_range_ms`; no run
-    /// may be in progress.
+    /// Appends `batches` as `view`'s rows covering `time_range_ms`.
     pub fn append_view_rows(
         &mut self,
         view: &MaterializedView,
         time_range_ms: (i64, i64),
         batches: Vec<Batch>,
     ) -> Result<(), Error> {
-        Arc::get_mut(&mut self.views)
-            .expect("no run reads the store while it changes")
-            .append_materialized_view(view, time_range_ms, batches)
+        Arc::make_mut(&mut self.views).append(view, time_range_ms, batches)
+    }
+}
+
+/// The newest published snapshot of the store, which every query run reads.
+#[derive(Default)]
+pub struct PublishedStore {
+    snapshot: RwLock<(Arc<RawData>, Arc<ViewStore>)>,
+}
+
+impl PublishedStore {
+    /// Makes `store` as it is now what new runs read.
+    pub fn publish(&self, store: &TimeIndexedStore) {
+        *self.snapshot.write().unwrap_or_else(|e| e.into_inner()) =
+            (store.raw_data.clone(), store.views.clone());
+    }
+
+    /// The snapshot one run reads: the newest published.
+    pub fn run_store(&self) -> Arc<RunStore> {
+        let (raw_data, views) = self
+            .snapshot
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        Arc::new(RunStore::new(raw_data, views))
     }
 }
 

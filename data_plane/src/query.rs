@@ -20,7 +20,7 @@ use asap_planner::InstallablePlan;
 use futures::executor::block_on;
 use futures::StreamExt;
 
-use crate::store::TimeIndexedStore;
+use crate::store::PublishedStore;
 
 /// One series of an instant-query result.
 #[derive(Debug, Clone, PartialEq)]
@@ -74,12 +74,12 @@ impl QueryEngine {
             .collect()
     }
 
-    /// Answers `query` at `time_ms` from `store`.
+    /// Answers `query` at `time_ms` from the newest snapshot of `store`.
     pub fn evaluate(
         &self,
         query: &str,
         time_ms: i64,
-        store: &TimeIndexedStore,
+        store: &PublishedStore,
     ) -> Result<Vec<ResultSample>, Unanswered> {
         let query = query.trim();
         let compiled = self
