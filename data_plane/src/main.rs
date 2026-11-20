@@ -3,6 +3,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+
+/// jemalloc: Remote Write decoding and query runs allocate many small,
+/// short-lived objects across threads.
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use data_plane::engine::EngineOptions;
 use data_plane::ingestion::IngestionOptions;
 use data_plane::{router, DataPlane, DEFAULT_FORWARD_TIMEOUT};

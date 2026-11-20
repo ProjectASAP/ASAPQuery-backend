@@ -32,7 +32,6 @@ use axum::Router;
 use engine::{EngineHandle, EngineOptions, IngestError};
 use prometheus::{InstantQuery, RangeQuery};
 use query::Unanswered;
-use store::RawSample;
 
 /// Response header naming what answered a query: `plan` or `forwarded`, or
 /// `refused` when `--no-forward` refused to forward it.
@@ -124,24 +123,8 @@ pub fn router(state: Arc<DataPlane>) -> Router {
 
 async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
     let timer = metrics::Timer::start();
-    match remote_write::decode(&body, &state.limits) {
-        Ok(request) => {
-            let mut samples = Vec::new();
-            for series in request.timeseries {
-                let pairs: Vec<(&str, &str)> = series
-                    .labels
-                    .iter()
-                    .map(|label| (label.name.as_str(), label.value.as_str()))
-                    .collect();
-                let labels = series_ids::intern_pairs(&pairs);
-                // Stale markers are kept: the executor's sample selector
-                // drops them from range windows and ends instant selectors.
-                samples.extend(series.samples.into_iter().map(|s| RawSample {
-                    labels: labels.clone(),
-                    timestamp_ms: s.timestamp,
-                    value: s.value,
-                }));
-            }
+    match remote_write::decode_samples(&body, &state.limits) {
+        Ok(samples) => {
             let count = samples.len() as u64;
             state.engine.metrics().remote_write_decode.record(timer);
             if count == 0 {

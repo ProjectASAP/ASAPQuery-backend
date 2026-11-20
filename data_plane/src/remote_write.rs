@@ -2,6 +2,8 @@
 
 use prost::Message;
 
+use crate::store::RawSample;
+
 #[derive(Clone, PartialEq, Message)]
 pub struct WriteRequest {
     #[prost(message, repeated, tag = "1")]
@@ -103,6 +105,29 @@ pub fn decode(body: &[u8], limits: &Limits) -> Result<WriteRequest, RemoteWriteE
         }
     }
     Ok(request)
+}
+
+/// The samples of a snappy-compressed Remote Write v1 body, each with its
+/// interned series, in request order. Stale markers are kept: the
+/// executor's sample selector drops them from range windows and ends
+/// instant selectors.
+pub fn decode_samples(body: &[u8], limits: &Limits) -> Result<Vec<RawSample>, RemoteWriteError> {
+    let request = decode(body, limits)?;
+    let mut samples = Vec::new();
+    for series in request.timeseries {
+        let pairs: Vec<(&str, &str)> = series
+            .labels
+            .iter()
+            .map(|label| (label.name.as_str(), label.value.as_str()))
+            .collect();
+        let labels = crate::series_ids::intern_pairs(&pairs);
+        samples.extend(series.samples.into_iter().map(|s| RawSample {
+            labels: labels.clone(),
+            timestamp_ms: s.timestamp,
+            value: s.value,
+        }));
+    }
+    Ok(samples)
 }
 
 /// Snappy-compressed encoding of `request`, as a Remote Write sender sends it.

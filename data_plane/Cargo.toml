@@ -10,6 +10,8 @@ asap_sketchlib.workspace = true
 serde_bytes = "0.11"
 ahash = "0.8"
 libc = "0.2"
+# The data plane's allocator (main.rs): many small per-request allocations.
+tikv-jemallocator = "0.6"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

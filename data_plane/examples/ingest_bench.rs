@@ -14,6 +14,10 @@
 //!
 //! `cargo run --release -p data_plane --example ingest_bench -- SERIES SECONDS [PLAN] [REQUESTS] [PERSIST]`
 
+/// The data plane's allocator, as `main.rs` sets it.
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::sync::Arc;
 use std::time::Instant;
 
