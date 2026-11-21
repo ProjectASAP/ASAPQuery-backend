@@ -14,6 +14,8 @@
 //! - `VIEW_READ=pread` reads cold windows with `pread`.
 //! - `WORKLOAD=path` plans another workload file (a planning workload,
 //!   as in `tests/workloads/`) instead, at 1 sample/s.
+//! - `RESULT_CACHE=0` turns the result cache off, so every round reads
+//!   its views.
 //! - `COLD=1` drops the segments' pages from the page cache
 //!   (`POSIX_FADV_DONTNEED`) before each round (B2).
 //!
@@ -88,7 +90,9 @@ async fn main() {
     let end_ms = (now_ms - 60_000).div_euclid(WINDOW_MS) * WINDOW_MS;
     let start_ms = end_ms - minutes * 60_000;
     let (view_cache_max_bytes, view_cache_idle_ms) = match budget.as_deref() {
-        Some("off") => (None, Some(0)),
+        // Every window stays decoded: no budget (not even the cgroup's
+        // default) and no idle eviction.
+        Some("off") => (Some(u64::MAX), Some(0)),
         Some(bytes) => (Some(bytes.parse().unwrap()), None),
         None => (None, None),
     };
@@ -98,6 +102,7 @@ async fn main() {
             ..IngestionOptions::default()
         },
         no_forward: true,
+        result_cache: std::env::var("RESULT_CACHE").map_or(true, |v| v != "0"),
         view_dir: Some(dir.clone()),
         view_cache_max_bytes,
         view_cache_idle_ms,

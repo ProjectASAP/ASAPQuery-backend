@@ -755,7 +755,16 @@ fn buffer(source: &Bytes, offset: usize, len: usize) -> Result<Buffer, Error> {
             // buffer keeps alive through its owner.
             Ok(unsafe { Buffer::from_custom_allocation(ptr, len, mapping.clone()) })
         }
-        Bytes::Owned(..) => Ok(Buffer::from(slice.to_vec())),
+        // Copied into 8-byte words, so the buffer is aligned for any
+        // fixed-width type (an empty `Vec<u8>` is not).
+        Bytes::Owned(..) => {
+            let mut words = vec![0u64; len.div_ceil(8)];
+            // SAFETY: `words` is at least `len` writable bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(slice.as_ptr(), words.as_mut_ptr().cast::<u8>(), len)
+            };
+            Ok(Buffer::from(words).slice_with_length(0, len))
+        }
     }
 }
 

@@ -1196,6 +1196,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A window with no rows (every series filtered out) reads back as an
+    /// empty batch from the active and from a sealed segment; its empty
+    /// fixed-width columns are aligned buffers too.
+    #[test]
+    fn an_empty_window_reads_back_empty() {
+        let dir = segment_dir("empty");
+        let (_, batch) = every_family().remove(0);
+        let empty = window_batch(10, batch.schema().fields[4].dtype.clone(), Vec::new());
+        assert_eq!(empty.num_rows(), 0);
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
+        let written = files
+            .append(0, (0, 10), &[(1, std::slice::from_ref(&empty))])
+            .unwrap();
+        let location = location_of(&written, 1);
+        for how in [ViewRead::Pread, ViewRead::Mmap] {
+            assert_eq!(location.read(empty.schema(), how).unwrap().num_rows(), 0);
+        }
+        files.seal(0).unwrap();
+        for how in [ViewRead::Pread, ViewRead::Mmap] {
+            assert_eq!(location.read(empty.schema(), how).unwrap().num_rows(), 0);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// V3. A view's fragment decodes without the record's other views,
     /// and a damaged fragment is an error, not a panic or wrong rows.
     #[test]
