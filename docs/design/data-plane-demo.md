@@ -659,6 +659,27 @@ retention are skipped at load.
 - `scripts/profile.sh` records a CPU profile (`perf record`) of a running
   data plane and writes a flame graph.
 
+Ingest threads, measured with `ingest_bench` (one in-process client
+sending Remote Write as fast as it is accepted, views persisted, 16 cores),
+one run each. "Acknowledged" is samples/s until every write is accepted;
+"refreshed" until every window's views are refreshed; the CPU is the sum
+over the `ingest-N` shards.
+
+| Plan | Series × seconds | Ingest threads | Acknowledged (samples/s) | Refreshed (samples/s) | `ingest-N` CPU |
+|---|---|---|---|---|---|
+| raw | 10k × 300 | 1 / 2 / 4 / 8 | 2.32M / 2.28M / 2.25M / 2.24M | 943k / 928k / 900k / 911k | 0.83 / 1.45 / 1.64 / 1.72 s |
+| raw | 100k × 120 | 1 / 2 / 4 / 8 | 1.84M / 1.76M / 1.78M / 1.80M | 659k / 574k / 528k / 618k | 3.86 / 5.47 / 7.04 / 7.30 s |
+| views | 10k × 300 | 1 / 2 / 4 / 8 | 2.34M / 2.25M / 2.21M / 2.20M | 46k / 44k / 44k / 45k | 0.86 / 1.13 / 1.27 / 1.37 s |
+| views | 100k × 120 | 1 / 2 / 4 / 8 | 1.87M / 1.76M / 1.65M / 1.67M | 38k / 38k / 38k / 42k | 3.34 / 4.74 / 5.65 / 6.25 s |
+
+More ingest threads do not raise throughput here: the single bench client,
+which decodes and sends every request itself, is the limit (about 2.3M
+samples/s at 10k series, 1.8M at 100k). The shards' CPU grows with their
+count (per-batch and flush overhead) while one shard is far from busy.
+View-heavy plans are limited by precompute and persistence (refreshed),
+not by ingestion. Measuring the shards' own limit needs several concurrent
+senders.
+
 ## Evaluation
 
 ### Arms
