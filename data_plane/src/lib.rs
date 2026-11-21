@@ -1,22 +1,25 @@
 //! Backend data plane: receives Prometheus Remote Write samples and serves
 //! the Prometheus query API for an installed plan.
 //!
-//! The installed plan is ASAPPlanner's selected `PhysicalASAPDAG`. The
-//! engine thread builds its ingestion-time outputs pane by pane and answers
-//! the plan's instant queries from them; every other query, and any planned
-//! query it cannot answer, is forwarded to Prometheus.
+//! The installed plan is ASAPPlanner's `InstallablePlan`: one selected
+//! physical ASAP DAG. The engine's ingest thread stores the raw samples its
+//! `Scan`s read, its precompute thread refreshes the materialized views in
+//! ingestion runs, and query worker threads answer the plan's instant
+//! queries with query runs, all through the Planner's executor
+//! ([`engine`]); every other query, and any planned query it cannot
+//! answer, is forwarded to Prometheus (or refused with `--no-forward`).
 
 pub mod engine;
-mod per_sample;
-pub mod precompute;
+pub mod ingestion;
+pub mod metrics;
+pub mod persist;
 pub mod prometheus;
 pub mod query;
-mod raw_sample_window;
 pub mod remote_write;
-pub mod sds;
+pub mod result_cache;
 pub mod series_ids;
+pub mod store;
 
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,8 +31,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use engine::{EngineHandle, EngineOptions, IngestError};
-use precompute::RawSample;
-use prometheus::InstantQuery;
+use prometheus::{InstantQuery, RangeQuery};
 use query::Unanswered;
 
 /// Response header naming what answered a query: `plan` or `forwarded`, or
@@ -58,17 +60,16 @@ pub struct DataPlane {
 }
 
 impl DataPlane {
-    /// Installs the plan serialized in `plan_json` (a
-    /// `asap_planner::InstallablePlan`) with [`EngineOptions::default`], except
-    /// that panes close `allowed_lateness_ms` after the newest sample passes
-    /// them.
+    /// Installs the plan file `plan_json` (an `asap_planner::InstallablePlan`)
+    /// with [`EngineOptions::default`], except that windows close
+    /// `allowed_lateness_ms` after the newest sample passes them.
     pub fn new(
         plan_json: String,
         prometheus_url: String,
         allowed_lateness_ms: u64,
     ) -> anyhow::Result<Self> {
         let mut options = EngineOptions::default();
-        options.precompute.allowed_lateness_ms = allowed_lateness_ms;
+        options.ingestion.allowed_lateness_ms = allowed_lateness_ms;
         Self::with_options(plan_json, prometheus_url, options)
     }
 
@@ -78,9 +79,10 @@ impl DataPlane {
         prometheus_url: String,
         options: EngineOptions,
     ) -> anyhow::Result<Self> {
+        let no_forward = options.no_forward;
         let (engine, queries) = EngineHandle::spawn(plan_json, options)?;
         Ok(Self {
-            no_forward: options.no_forward,
+            no_forward,
             queries,
             engine,
             prometheus_url: prometheus_url.trim_end_matches('/').to_string(),
@@ -114,31 +116,18 @@ pub fn router(state: Arc<DataPlane>) -> Router {
         .route("/api/v1/query", get(query).post(query))
         .route("/api/v1/query_range", get(query_range).post(query_range))
         .route("/api/v1/status/asap", get(status))
+        .route("/metrics", get(metrics))
         .route("/api/v1/precompute/watermark", post(watermark))
         .route("/-/ready", get(ready))
         .with_state(state)
 }
 
 async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
-    match remote_write::decode(&body, &state.limits) {
-        Ok(request) => {
-            let mut samples = Vec::new();
-            for series in request.timeseries {
-                let pairs: Vec<(&str, &str)> = series
-                    .labels
-                    .iter()
-                    .map(|label| (label.name.as_str(), label.value.as_str()))
-                    .collect();
-                let labels = series_ids::intern_pairs(&pairs);
-                // Stale markers are kept: the executor's sample selector
-                // drops them from range windows and ends instant selectors.
-                samples.extend(series.samples.into_iter().map(|s| RawSample {
-                    labels: labels.clone(),
-                    timestamp_ms: s.timestamp,
-                    value: s.value,
-                }));
-            }
+    let timer = metrics::Timer::start();
+    match remote_write::decode_samples(&body, &state.limits) {
+        Ok(samples) => {
             let count = samples.len() as u64;
+            state.engine.metrics().remote_write_decode.record(timer);
             if count == 0 {
                 return StatusCode::NO_CONTENT.into_response();
             }
@@ -169,11 +158,11 @@ async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
 
 /// `POST /api/v1/precompute/watermark?time_ms=T`: the producer states that
 /// every sample at or before `T` has been written. Once the engine has run
-/// every write acknowledged before this request, every pane with
-/// `end <= T` is closed, so the last pane of a series that stopped sending
-/// is built without a later sample. `T` is capped at the wall clock; a
+/// every write acknowledged before this request, every window with
+/// `end <= T` is closed, so the last window of a series that stopped sending
+/// is refreshed without a later sample. `T` is capped at the wall clock; a
 /// repeated or lower `T` does nothing. A sample that arrives later for a
-/// pane the barrier closed counts as late. Input stays open. With several
+/// window the barrier closed counts as late. Input stays open. With several
 /// producers, call it only after all of them have written through `T`.
 /// Answers `{"barrier_ms": B}`, the barrier in force (`T` capped at the wall
 /// clock, or a higher earlier barrier); 400 `bad_data` with the reason when
@@ -215,8 +204,8 @@ async fn watermark(State(state): State<Arc<DataPlane>>, RawQuery(query): RawQuer
     }
 }
 
-/// Ready while the engine thread runs; a stopped engine never ingests
-/// again, so the data plane must be restarted.
+/// Ready while the engine's ingest and precompute threads run; a stopped
+/// engine never ingests again, so the data plane must be restarted.
 async fn ready(State(state): State<Arc<DataPlane>>) -> StatusCode {
     if state.engine.is_running() {
         StatusCode::OK
@@ -225,18 +214,30 @@ async fn ready(State(state): State<Arc<DataPlane>>) -> StatusCode {
     }
 }
 
-/// The data plane's counters, as JSON: the precompute engine's sample and
-/// pane counters, the samples queued for it, and whether it runs.
+/// The data plane's counters, as JSON: ingestion's sample and window
+/// counters, the samples queued for it, the windows closed and not yet
+/// refreshed, and whether it runs.
 async fn status(State(state): State<Arc<DataPlane>>) -> Response {
     let body = serde_json::json!({
         "engine_running": state.engine.is_running(),
         "samples_queued": state.engine.queued_samples(),
-        "precompute": state.engine.stats(),
-        "query_run": state.engine.query_run_stats(),
+        "precompute_backlog": state.engine.precompute_backlog(),
+        "ingestion": state.engine.stats(),
     });
     (
         [(header::CONTENT_TYPE, "application/json")],
         body.to_string(),
+    )
+        .into_response()
+}
+
+/// The data plane's measurements in the Prometheus text format: per-phase
+/// thread CPU and wall time, query latency, counters, backlogs, watermark
+/// lag, bytes held and each thread's CPU time ([`metrics`]).
+async fn metrics(State(state): State<Arc<DataPlane>>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        state.engine.render_metrics(),
     )
         .into_response()
 }
@@ -276,7 +277,7 @@ async fn query(
             return (StatusCode::BAD_REQUEST, body).into_response();
         }
     };
-    let reason = match answer(&state, instant, &headers).await {
+    let reason = match answer(&state, instant).await {
         Ok(response) => {
             let mut response = axum::Json(response).into_response();
             response
@@ -298,41 +299,21 @@ async fn query(
     response
 }
 
-/// Runs a planned instant query. Bound raw-sample windows are read from Prometheus with
-/// the caller's end-to-end `headers`, as a forwarded query would be.
+/// Runs a planned instant query at its time, or now.
 async fn answer(
     state: &DataPlane,
     query: InstantQuery,
-    headers: &HeaderMap,
-) -> Result<serde_json::Value, Unanswered> {
-    let time_ms = query.time_ms.unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as i64)
-    });
-    let prepared = state
-        .engine
-        .bound_raw_sample_windows(query.query, time_ms)
-        .await?;
-    let ranges = &prepared.windows;
-    let mut fetch_headers = forwarded_headers(headers);
-    // The raw read is a GET without the caller's body.
-    fetch_headers.remove(header::CONTENT_TYPE);
-    // The bound raw-sample windows are fetched concurrently.
-    let fetches = ranges.iter().map(|range| async {
-        prometheus::fetch(&state.client, &state.prometheus_url, &fetch_headers, range)
-            .await
-            .map(|samples| (range.node, samples))
-    });
-    let raw: BTreeMap<u64, Vec<RawSample>> = futures::future::try_join_all(fetches)
-        .await
-        .map_err(|e| Unanswered::Execution(format!("fetching raw samples: {e}")))?
-        .into_iter()
-        .collect();
-    let samples = state.engine.evaluate(prepared, time_ms, raw).await?;
-    Ok(prometheus::vector_response(time_ms, &samples))
+) -> Result<prometheus::VectorResponse, Unanswered> {
+    let time_ms = query.time_ms.unwrap_or_else(ingestion::wall_clock_ms);
+    let samples = match state.engine.cached(&query.query, time_ms) {
+        Some(samples) => samples,
+        None => state.engine.evaluate(query.query, time_ms).await?,
+    };
+    Ok(prometheus::VectorResponse { time_ms, samples })
 }
 
+/// Answers a planned range query from the plan, one evaluation per step;
+/// forwards anything else.
 async fn query_range(
     state: State<Arc<DataPlane>>,
     method: Method,
@@ -340,10 +321,100 @@ async fn query_range(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if state.no_forward {
-        return not_answered("the data plane does not answer range queries yet");
+    let range = match RangeQuery::parse(query.0.as_deref(), &body) {
+        Ok(Some(range)) => range,
+        Ok(None) if state.no_forward => {
+            return not_answered(
+                "the request lacks query, start, end or step, or names a time that is not in Unix seconds",
+            );
+        }
+        Ok(None) => return forward(state, "query_range", method, query, headers, body).await,
+        Err(bad) => {
+            let body = axum::Json(prometheus::bad_data(&bad.to_string()));
+            return (StatusCode::BAD_REQUEST, body).into_response();
+        }
+    };
+    let reason = match answer_range(&state, range).await {
+        Ok(response) => {
+            let mut response = axum::Json(response).into_response();
+            response
+                .headers_mut()
+                .insert(EXECUTION_HEADER, HeaderValue::from_static("plan"));
+            return response;
+        }
+        Err(reason) if state.no_forward => return not_answered(&reason.to_string()),
+        Err(Unanswered::NotPlanned(_)) => None,
+        Err(reason) => {
+            tracing::debug!(%reason, "forwarding a planned range query");
+            Some(header_value(&reason.to_string()))
+        }
+    };
+    let mut response = forward(state, "query_range", method, query, headers, body).await;
+    if let Some(reason) = reason {
+        response.headers_mut().insert(FORWARD_REASON_HEADER, reason);
     }
-    forward(state, "query_range", method, query, headers, body).await
+    response
+}
+
+/// Runs a planned query at every step of `range`, the steps in parallel on
+/// the query workers; unanswered if any step is.
+async fn answer_range(
+    state: &DataPlane,
+    range: RangeQuery,
+) -> Result<prometheus::MatrixResponse, Unanswered> {
+    use futures::StreamExt;
+    let started = std::time::Instant::now();
+    let query = &range.query;
+    // The steps the result cache answers; only the others run.
+    let cached: Vec<(i64, Option<_>)> = range
+        .times_ms()
+        .map(|time_ms| (time_ms, state.engine.cached(query, time_ms)))
+        .collect();
+    let from_cache = cached.iter().filter(|(_, hit)| hit.is_some()).count();
+    // Every step reads the same snapshot, so the raw data they share is
+    // converted once ([`store::RawReads`]).
+    let snapshot = state.engine.snapshot();
+    // At most one step per query worker in flight, so a long range neither
+    // floods the workers' queue nor starves instant queries; the client
+    // going away drops the rest unrun. Every step runs even when one fails:
+    // with `final_query_results_cached` the plan keeps a step's inputs only
+    // for the refresh interval, so the older steps of a span are answered
+    // from the result cache, and a request whose older steps are not cached
+    // yet (the first span after a start) still caches the steps it can
+    // answer; a dashboard refreshing the range fills the cache within one
+    // span.
+    let results: Vec<Result<_, Unanswered>> = futures::stream::iter(cached)
+        .map(|(time_ms, hit)| {
+            let snapshot = snapshot.clone();
+            async move {
+                let samples = match hit {
+                    Some(samples) => samples,
+                    None => {
+                        state
+                            .engine
+                            .evaluate_range_step(query.clone(), time_ms, snapshot)
+                            .await?
+                    }
+                };
+                Ok::<_, Unanswered>((time_ms, samples))
+            }
+        })
+        .buffered(state.engine.query_threads())
+        .collect()
+        .await;
+    let steps: Vec<_> = results.into_iter().collect::<Result<_, _>>()?;
+    if let Some(metrics) = state.engine.metrics().query(query) {
+        metrics
+            .range_latency
+            .observe(started.elapsed().as_secs_f64());
+        metrics
+            .range_steps_cached
+            .fetch_add(from_cache as u64, Ordering::Relaxed);
+        metrics
+            .range_steps
+            .fetch_add(steps.len() as u64, Ordering::Relaxed);
+    }
+    Ok(prometheus::MatrixResponse::new(&steps))
 }
 
 /// With `--no-forward`, the answer to a query the plan does not answer: a

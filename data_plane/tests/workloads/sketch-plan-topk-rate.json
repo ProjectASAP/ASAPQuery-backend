@@ -1,0 +1,59 @@
+{
+  "query_workload": {
+    "language": "promql",
+    "repeating_queries": [
+      {
+        "query": "topk(5, sum by (job) (rate(data_total[5m])))",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 10000,
+            "evaluation_phase": 0
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "max_error": 0.05,
+            "failure_probability": 0.3,
+            "accuracy_scope": "whole_result"
+          }
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      }
+    ]
+  },
+  "data_workload": {
+    "arrival": {
+      "ingesting": {
+        "rows_per_second": 200000.0
+      }
+    },
+    "sources": {
+      "data": {
+        "series_count": 10000,
+        "metric_type": "gauge",
+        "column_signs": {"value": "non_negative"},
+        "sample_interval": 100,
+        "stream_norms": null,
+        "max_distinct_per_evaluation": null
+      },
+      "data_total": {
+        "series_count": 10000,
+        "metric_type": "counter",
+        "sample_interval": 100,
+        "stream_norms": null,
+        "max_distinct_per_evaluation": null
+      },
+      "events": {
+        "series_count": 10000,
+        "metric_type": null,
+        "sample_interval": null,
+        "stream_norms": null,
+        "max_distinct_per_evaluation": 10000
+      }
+    }
+  }
+}

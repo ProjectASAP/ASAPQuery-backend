@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use asap_planner::PlanningWorkload;
 use clap::Parser;
-use control_plane::{plan_workload, save_plan, DeploymentInputs};
+use control_plane::{plan_workload, save_plan, save_report, DeploymentInputs};
 
 /// Plan a workload with ASAPPlanner and write the selected plan.
 #[derive(Parser)]
@@ -15,26 +15,28 @@ struct Args {
     /// backend's data plane executes and keeps.
     #[arg(long)]
     deployment_capabilities: Option<PathBuf>,
-    /// Planner `PlanSelectionSettings` (JSON): Stage 3's cost model,
-    /// resource speed, measured operation costs and whether accuracy
-    /// guarantees are ignored; an omitted field takes the Planner's
+    /// Planner `CostInputs` (JSON): Stage 3's cost model, resource speed
+    /// and measured operation costs; an omitted field takes the Planner's
     /// default.
     #[arg(long)]
-    plan_selection_settings: Option<PathBuf>,
-    /// Planner `MeasuredOperationCosts` (JSON, or the earlier list of
-    /// `MeasuredOperationCost`) that Stage 3 prices operators from, in place
-    /// of the settings' table; by default every node is priced from the
-    /// Planner's formulas.
+    cost_inputs: Option<PathBuf>,
+    /// Planner `MeasuredOperationCosts` (JSON) that Stage 3 costs operators
+    /// from, in place of the cost inputs' table; by default every node is
+    /// costed from the Planner's formulas.
     #[arg(long)]
     measured_operation_costs: Option<PathBuf>,
-    /// Accept every query output regardless of its accuracy guarantee
-    /// (`PlanSelectionSettings::ignore_accuracy_guarantees`): candidates are
-    /// compared on cost alone; executability checks still apply.
+    /// Accept every query output regardless of its accuracy guarantee:
+    /// candidates are compared on cost alone; executability checks still
+    /// apply.
     #[arg(long)]
     ignore_accuracy_guarantees: bool,
     /// Where to write the plan the data plane installs.
     #[arg(long)]
     out: PathBuf,
+    /// Where to write Stage 3's report of the selected plan: its cost and
+    /// predicted resource usage, per node and per query.
+    #[arg(long)]
+    report: Option<PathBuf>,
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
@@ -51,30 +53,37 @@ fn main() -> anyhow::Result<()> {
     let workload: PlanningWorkload = read_json(&args.workload)?;
     let mut inputs = DeploymentInputs::default();
     if let Some(path) = &args.deployment_capabilities {
-        inputs.deployment_capabilities = read_json(path)?;
+        // The file's fields over this backend's own capabilities: a field it
+        // leaves out keeps the backend's value, not the Planner's default.
+        let mut capabilities = serde_json::to_value(control_plane::backend_capabilities())?;
+        let given: serde_json::Value = read_json(path)?;
+        if let (Some(capabilities), Some(given)) = (capabilities.as_object_mut(), given.as_object())
+        {
+            capabilities.extend(given.clone());
+        }
+        inputs.deployment_capabilities = serde_json::from_value(capabilities)
+            .with_context(|| format!("parsing {}", path.display()))?;
     }
-    if let Some(path) = &args.plan_selection_settings {
-        inputs.plan_selection = read_json(path)?;
+    if let Some(path) = &args.cost_inputs {
+        inputs.cost_inputs = read_json(path)?;
     }
     if let Some(path) = &args.measured_operation_costs {
-        inputs.plan_selection.measured_operation_costs = read_json(path)?;
+        inputs.cost_inputs.measured_operation_costs = read_json(path)?;
     }
-    inputs.plan_selection.ignore_accuracy_guarantees |= args.ignore_accuracy_guarantees;
-    let plan = plan_workload(&workload, &inputs)?;
+    inputs.ignore_accuracy_guarantees = args.ignore_accuracy_guarantees;
+    let (plan, report) = plan_workload(&workload, &inputs)?;
     save_plan(&plan, &args.out)?;
-    if let Some(selection) = &plan.selection {
-        if !selection.queries_accepted_without_guarantee.is_empty() {
-            println!(
-                "queries accepted without an accuracy guarantee (workload indices): {:?}",
-                selection.queries_accepted_without_guarantee
-            );
-        }
+    if let Some(path) = &args.report {
+        save_report(&report, path)?;
+    }
+    for fact in &report.assumed_data_facts {
+        println!("assumed data fact: {fact:?}");
     }
     println!(
         "wrote {} ({} queries, {} nodes)",
         args.out.display(),
-        plan.queries.len(),
-        plan.dag.dag.nodes.len()
+        plan.query_texts.len(),
+        plan.dag.nodes.len()
     );
     Ok(())
 }

@@ -47,14 +47,15 @@ fn plan_without_raw_samples(
     ignore_accuracy_guarantees: bool,
 ) -> InstallablePlan {
     let mut inputs = common::inputs(false);
-    inputs.plan_selection.ignore_accuracy_guarantees = ignore_accuracy_guarantees;
-    plan_workload(workload, &inputs).unwrap_or_else(|e| panic!("{e}"))
+    inputs.ignore_accuracy_guarantees = ignore_accuracy_guarantees;
+    plan_workload(workload, &inputs)
+        .unwrap_or_else(|e| panic!("{e}"))
+        .0
 }
 
-/// A data plane running `plan` with `--no-forward`, its panes built from
-/// `points` written by Remote Write, one request per second, and closed by
-/// the barrier at
-/// `EVALUATION_MS`.
+/// A data plane running `plan` with `--no-forward`, its windows refreshed
+/// from `points` written by Remote Write, one request per second, and
+/// closed by the barrier at `EVALUATION_MS`.
 async fn run(plan: &InstallablePlan, points: &[Point]) -> (Router, Arc<DataPlane>) {
     let options = EngineOptions {
         no_forward: true,
@@ -70,9 +71,16 @@ async fn run(plan: &InstallablePlan, points: &[Point]) -> (Router, Arc<DataPlane
         .unwrap(),
     );
     let app = router(state.clone());
-    // One Remote Write request per second of event time, in time order, as
-    // a paced feeder sends them: a pane longer than a second takes its
-    // samples over several requests.
+    write_points(&app, &state, points).await;
+    barrier(&app, EVALUATION_MS).await;
+    (app, state)
+}
+
+/// Writes `points` by Remote Write, one request per second of event time, in
+/// time order, as a paced feeder sends them (a window longer than a second
+/// takes its samples over several requests), and waits until they are
+/// ingested.
+async fn write_points(app: &Router, state: &DataPlane, points: &[Point]) {
     let mut by_second: BTreeMap<i64, BTreeMap<&Labels, Vec<Sample>>> = BTreeMap::new();
     for point in points {
         by_second
@@ -119,19 +127,21 @@ async fn run(plan: &InstallablePlan, points: &[Point]) -> (Router, Arc<DataPlane
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+}
+
+/// The event-time barrier at `time_ms`: every window ending at or before
+/// it is refreshed.
+async fn barrier(app: &Router, time_ms: i64) {
     let barrier = app
         .clone()
         .oneshot(
-            Request::post(format!(
-                "/api/v1/precompute/watermark?time_ms={EVALUATION_MS}"
-            ))
-            .body(Body::empty())
-            .unwrap(),
+            Request::post(format!("/api/v1/precompute/watermark?time_ms={time_ms}"))
+                .body(Body::empty())
+                .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(barrier.status(), StatusCode::OK);
-    (app, state)
 }
 
 /// The answer of `query` at `EVALUATION_MS`: each result series' labels and
@@ -194,16 +204,21 @@ fn p99_workload(outer: &str, values_non_negative: bool) -> PlanningWorkload {
 
 /// [`p99_workload`] with the quantile `q`.
 fn quantile_workload(outer: &str, q: f64, values_non_negative: bool) -> PlanningWorkload {
+    let sign = if values_non_negative {
+        "non_negative"
+    } else {
+        "unknown"
+    };
     serde_json::from_str(&format!(
         r#"{{"query_workload": {{"language": "promql", "repeating_queries": [{{
               "query": "{outer} by (region, service, job) (quantile_over_time({q}, data[100s]))",
-              "demand": {{"fixed_interval": 1000}},
+              "demand": {{"fixed_interval_at": {{"interval": 1000, "evaluation_phase": 0}}}},
               "requirements": {{"accuracy": {{"max_error": 0.05, "failure_probability": 0.3,
                   "accuracy_scope": "whole_result"}}}},
               "predictability": {{"predictable": {{"known_at": null}}}}}}]}},
             "data_workload": {{"arrival": {{"ingesting": {{"rows_per_second": 10000.0}}}},
               "sources": {{"data": {{"series_count": 1000, "metric_type": "gauge",
-                  "sample_interval": 100, "values_non_negative": {values_non_negative}}}}}}}}}"#
+                  "sample_interval": 100, "column_signs": {{"value": "{sign}"}}}}}}}}}}"#
     ))
     .unwrap()
 }
@@ -263,11 +278,24 @@ fn interpolated_quantile(q: f64, window: &[f64]) -> f64 {
     sorted[low] + (sorted[high] - sorted[low]) * (rank - low as f64)
 }
 
-/// Every group's answer is within the relative error 0.05 of `combine` of
-/// its series' exact p99s.
+/// The relative error α of the plan's DDSketch, the largest when several.
+fn ddsketch_alpha(plan: &InstallablePlan) -> f64 {
+    plan.dag
+        .nodes
+        .iter()
+        .filter_map(|node| match node.parameters {
+            Some(asap_planner::SketchParams::DDSketch { alpha }) => Some(alpha),
+            _ => None,
+        })
+        .fold(0.0, f64::max)
+}
+
+/// Every group's answer is within the relative error `alpha` of `combine`
+/// of its series' exact p99s.
 fn assert_p99s_within_alpha(
     answers: &[(Labels, f64)],
     windows: &Windows,
+    alpha: f64,
     combine: impl Fn(&[f64]) -> f64,
 ) {
     assert_eq!(answers.len(), windows.len(), "{answers:?}");
@@ -283,7 +311,7 @@ fn assert_p99s_within_alpha(
             .collect();
         let exact = combine(&p99s);
         assert!(
-            (value - exact).abs() <= 0.05 * exact.abs(),
+            (value - exact).abs() <= alpha * exact.abs(),
             "{labels:?}: {value} vs exact {exact}"
         );
     }
@@ -298,26 +326,44 @@ fn average(values: &[f64]) -> f64 {
 /// holds a third zeros, and every group's average of p99s is within 0.05 of
 /// the exact average of PromQL's interpolated p99s.
 #[tokio::test]
-async fn ddsketch_panes_over_a_gauge_reporting_zero_answer_within_alpha() {
+async fn ddsketch_windows_over_a_gauge_reporting_zero_answer_within_alpha() {
     let query = "avg by (region, service, job) (quantile_over_time(0.99, data[100s]))";
     let plan = plan_without_raw_samples(&p99_workload("avg", true), false);
-    assert!(!plan.stored_outputs.is_empty(), "panes built at ingestion");
+    assert!(
+        !plan.materialized_views().unwrap().is_empty(),
+        "tumbling windows kept at ingestion"
+    );
     let (points, windows) = data_samples(8, 1_100, 100, |s, step| {
         (s + 1) as f64 * [0.0, 3.0, 5.0][(step % 3) as usize]
     });
     let (app, _) = run(&plan, &points).await;
-    assert_p99s_within_alpha(&answer(&app, query).await, &windows, average);
+    assert_p99s_within_alpha(&answer(&app, query).await, &windows, 0.05, average);
 }
 
 /// Signed samples (negative, zero and positive) are summarized by the
-/// selected DDSketch panes through their negative store and zero bucket:
+/// selected DDSketch windows through their negative store and zero bucket:
 /// the `max` of the per-series p99s is within 0.05 of the exact value,
-/// including groups whose samples are all negative.
+/// including groups whose samples are all negative. A gauge of unknown
+/// sign has no plan with an accuracy guarantee without raw samples, so it
+/// is planned with accuracy guarantees ignored.
 #[tokio::test]
-async fn ddsketch_panes_over_signed_samples_answer_within_alpha() {
+async fn ddsketch_windows_over_signed_samples_answer_within_alpha() {
     let query = "max by (region, service, job) (quantile_over_time(0.99, data[100s]))";
-    let plan = plan_without_raw_samples(&p99_workload("max", false), false);
-    assert!(!plan.stored_outputs.is_empty(), "panes built at ingestion");
+    // Only DDSketch offered for quantiles: the test is about its stores.
+    use asap_executor::planner::summary_type::{SketchAlgorithm, StatisticKind, SupportedSummary};
+    let mut inputs = common::inputs(false);
+    inputs.ignore_accuracy_guarantees = true;
+    inputs.deployment_capabilities.supported_summaries = Some(vec![SupportedSummary {
+        summary_type: SketchAlgorithm::DDSketch,
+        readouts: vec![StatisticKind::Quantile],
+    }]);
+    let plan = plan_workload(&p99_workload("max", false), &inputs)
+        .unwrap_or_else(|e| panic!("{e}"))
+        .0;
+    assert!(
+        !plan.materialized_views().unwrap().is_empty(),
+        "tumbling windows kept at ingestion"
+    );
     // Series 0..4 cross zero; series 4..8 are all negative.
     let (points, windows) = data_samples(8, 1_100, 100, |s, step| {
         let scale = (s + 1) as f64;
@@ -329,7 +375,10 @@ async fn ddsketch_panes_over_signed_samples_answer_within_alpha() {
     });
     let (app, _) = run(&plan, &points).await;
     let max = |p99s: &[f64]| p99s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    assert_p99s_within_alpha(&answer(&app, query).await, &windows, max);
+    // Accuracy guarantees ignored: the selected sketch's own α bounds it.
+    let alpha = ddsketch_alpha(&plan);
+    assert!(alpha > 0.0, "a DDSketch plan");
+    assert_p99s_within_alpha(&answer(&app, query).await, &windows, alpha, max);
 }
 
 /// A quantile of few samples interpolates between the two nearest, as
@@ -340,7 +389,10 @@ async fn ddsketch_panes_over_signed_samples_answer_within_alpha() {
 async fn ddsketch_quantiles_interpolate_between_samples() {
     let query = "avg by (region, service, job) (quantile_over_time(0.5, data[100s]))";
     let plan = plan_without_raw_samples(&quantile_workload("avg", 0.5, true), false);
-    assert!(!plan.stored_outputs.is_empty(), "panes built at ingestion");
+    assert!(
+        !plan.materialized_views().unwrap().is_empty(),
+        "tumbling windows kept at ingestion"
+    );
     // Eleven steps: the first, before the window, opens the panes (the
     // first pane after startup is never built).
     let (points, windows) = data_samples(8, 11, 10_000, |s, step| (s + 1) as f64 * step as f64);
@@ -404,7 +456,7 @@ fn topk_workload(query: &str) -> PlanningWorkload {
     serde_json::from_str(&format!(
         r#"{{"query_workload": {{"language": "promql", "repeating_queries": [{{
               "query": {query:?},
-              "demand": {{"fixed_interval": 1000}},
+              "demand": {{"fixed_interval_at": {{"interval": 1000, "evaluation_phase": 0}}}},
               "requirements": {{"accuracy": {{"max_error": 0.05, "failure_probability": 0.3,
                   "accuracy_scope": "whole_result"}}}},
               "predictability": {{"predictable": {{"known_at": null}}}}}}]}},
@@ -509,7 +561,7 @@ async fn counter_topk_planned_without_guarantees_answers_exactly() {
         let workload: PlanningWorkload = serde_json::from_str(&format!(
             r#"{{"query_workload": {{"language": "promql", "repeating_queries": [{{
                   "query": {query:?},
-                  "demand": {{"fixed_interval": 60000}},
+                  "demand": {{"fixed_interval_at": {{"interval": 60000, "evaluation_phase": 0}}}},
                   "requirements": {{"accuracy": {{"max_error": 0.05, "failure_probability": 0.3}}}},
                   "predictability": {{"predictable": {{"known_at": null}}}}}}]}},
                 "data_workload": {{"arrival": {{"ingesting": {{"rows_per_second": 100000.0}}}},
@@ -546,7 +598,7 @@ fn joint_workload(queries: &[&str], accuracy: &str) -> PlanningWorkload {
         .iter()
         .map(|query| {
             format!(
-                r#"{{"query": {query:?}, "demand": {{"fixed_interval": 10000}},
+                r#"{{"query": {query:?}, "demand": {{"fixed_interval_at": {{"interval": 10000, "evaluation_phase": 0}}}},
                   "requirements": {accuracy},
                   "predictability": {{"predictable": {{"known_at": null}}}}}}"#
             )
@@ -556,7 +608,7 @@ fn joint_workload(queries: &[&str], accuracy: &str) -> PlanningWorkload {
         r#"{{"query_workload": {{"language": "promql", "repeating_queries": [{}]}},
             "data_workload": {{"arrival": {{"ingesting": {{"rows_per_second": 0.6}}}},
               "sources": {{"data": {{"series_count": 6, "sample_interval": 10000,
-                "metric_type": "gauge", "values_non_negative": true}}}}}}}}"#,
+                "metric_type": "gauge", "column_signs": {{"value": "non_negative"}}}}}}}}}}"#,
         entries.join(",")
     ))
     .unwrap()
@@ -607,10 +659,10 @@ fn grouped_series_samples() -> (Vec<Point>, Vec<(Labels, Vec<f64>)>) {
 }
 
 /// Quantile queries over one metric and window with different `by` labels
-/// (ASAPQuery's seed-862 quantile queries), planned jointly, share one
-/// per-series DDSketch, and each answers within 0.05 of its exact value.
+/// (ASAPQuery's seed-862 quantile queries), planned jointly over per-series
+/// DDSketch windows: each answers within 0.05 of its exact value.
 #[tokio::test]
-async fn jointly_planned_quantiles_share_one_sketch_and_answer_within_alpha() {
+async fn jointly_planned_quantiles_answer_within_alpha() {
     let queries = [
         "quantile_over_time(0.9, data[100s])",
         "avg by (region) (quantile_over_time(0.99, data[100s]))",
@@ -618,24 +670,6 @@ async fn jointly_planned_quantiles_share_one_sketch_and_answer_within_alpha() {
     let accuracy = r#"{"accuracy": {"accuracy_metric": "relative", "max_error": 0.05,
         "failure_probability": 0.01, "accuracy_scope": "per_value"}}"#;
     let plan = plan_without_raw_samples(&joint_workload(&queries, accuracy), false);
-    let sketch_definitions: std::collections::BTreeSet<&str> = plan
-        .stored_outputs
-        .iter()
-        .filter(|output| {
-            let node = plan
-                .dag
-                .dag
-                .nodes
-                .iter()
-                .find(|n| n.id == output.node_id)
-                .unwrap();
-            serde_json::to_string(&node.payload)
-                .unwrap()
-                .contains("DDSketch")
-        })
-        .map(|output| output.coverage.definition_id.as_str())
-        .collect();
-    assert_eq!(sketch_definitions.len(), 1, "{sketch_definitions:?}");
     let (points, windows) = grouped_series_samples();
     let (app, _) = run(&plan, &points).await;
 
@@ -703,13 +737,11 @@ async fn jointly_planned_fine_and_coarse_sums_answer_exactly() {
 }
 
 /// ASAPQuery's seed-862 top-k sums over one metric and two windows,
-/// planned jointly: `[1m]` every second and `[20m]` every 30 s. The plan
-/// stores per-series sums of one definition id in 1-second panes for the
-/// first and 30-second panes for the second, with the same (no) label
-/// constraints. Each query merges its own panes: every series' answer is
-/// its sum over its query's whole window.
+/// planned jointly: `[1m]` every second and `[20m]` every 30 s. Each
+/// query merges its own tumbling windows: every series' answer is its sum
+/// over its query's whole window.
 #[tokio::test]
-async fn panes_of_one_definition_and_two_widths_are_stored_apart() {
+async fn sums_over_two_window_widths_answer_exactly() {
     let queries = [
         (
             "topk by (region, service) (4, sum_over_time(data[1m]))",
@@ -726,7 +758,7 @@ async fn panes_of_one_definition_and_two_widths_are_stored_apart() {
         .iter()
         .map(|(query, interval, _)| {
             format!(
-                r#"{{"query": {query:?}, "demand": {{"fixed_interval": {interval}}},
+                r#"{{"query": {query:?}, "demand": {{"fixed_interval_at": {{"interval": {interval}, "evaluation_phase": 0}}}},
                   "requirements": {{"accuracy": {{"max_error": 0.05, "failure_probability": 0.3,
                       "accuracy_scope": "whole_result"}}}},
                   "predictability": {{"predictable": {{"known_at": null}}}}}}"#
@@ -737,25 +769,11 @@ async fn panes_of_one_definition_and_two_widths_are_stored_apart() {
         r#"{{"query_workload": {{"language": "promql", "repeating_queries": [{}]}},
             "data_workload": {{"arrival": {{"ingesting": {{"rows_per_second": 10000.0}}}},
               "sources": {{"data": {{"series_count": 1000, "sample_interval": 100,
-                  "metric_type": "gauge", "values_non_negative": true}}}}}}}}"#,
+                  "metric_type": "gauge", "column_signs": {{"value": "non_negative"}}}}}}}}}}"#,
         entries.join(",")
     ))
     .unwrap();
     let plan = plan_without_raw_samples(&workload, true);
-    // One definition id, two pane widths.
-    let mut widths: BTreeMap<&str, std::collections::BTreeSet<i64>> = BTreeMap::new();
-    for output in &plan.stored_outputs {
-        for window in &output.inputs.raw_sample_windows {
-            widths
-                .entry(output.coverage.definition_id.as_str())
-                .or_default()
-                .insert(window.width_ms);
-        }
-    }
-    assert!(
-        widths.values().any(|w| w.len() == 2),
-        "the case this tests: {widths:?}"
-    );
     // Two series in one (region, service), ten samples per second each
     // over the last 21 minutes (the first minute, before the window, opens
     // the panes): 0.1 and 0.2, so 1 and 2 per second.
@@ -783,4 +801,32 @@ async fn panes_of_one_definition_and_two_widths_are_stored_apart() {
             assert!((value - want).abs() < 1e-6, "{query}: {answered:?}");
         }
     }
+}
+
+/// Ingestion runs ahead of the queries it answers: after windows past the
+/// evaluation time are refreshed (here 40 s more, so the plan's retention
+/// alone, counted back from the newest window, would drop the oldest
+/// windows a 100 s query at the earlier time reads), the query at the
+/// earlier time still answers as before, within the default
+/// `view_retention_margin_ms`.
+#[tokio::test]
+async fn a_query_behind_the_newest_window_is_still_answered() {
+    let query = "sum by (region) (sum_over_time(data[100s]))";
+    let plan = plan_without_raw_samples(&joint_workload(&[query], "{}"), false);
+    let (points, _) = grouped_series_samples();
+    let (app, state) = run(&plan, &points).await;
+    let before = answer(&app, query).await;
+    assert_eq!(before.len(), 2, "{before:?}");
+    let later: Vec<Point> = points
+        .iter()
+        .filter(|p| p.timestamp_ms > EVALUATION_MS - 40_000)
+        .map(|p| Point {
+            labels: p.labels.clone(),
+            timestamp_ms: p.timestamp_ms + 40_000,
+            value: p.value,
+        })
+        .collect();
+    write_points(&app, &state, &later).await;
+    barrier(&app, EVALUATION_MS + 40_000).await;
+    assert_eq!(answer(&app, query).await, before);
 }

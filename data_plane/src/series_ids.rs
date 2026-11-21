@@ -1,10 +1,9 @@
 //! Series interning: each label set is mapped to one shared [`Series`], with
-//! a `u32` id, once, when Remote Write (or a raw-sample fetch from
-//! Prometheus) delivers it. Everything downstream (the per-series cells of
-//! each raw-sample window, the per-sample group numbers, the latest sample
-//! per series of an instant selector) keys by the id, and the metric is read
-//! from the series, so no stage builds, hashes or compares a label map per
-//! sample.
+//! a `u32` id, once, when Remote Write delivers it, and its identity text
+//! (the canonical JSON of its labels) is computed then. The raw store's
+//! chunks hold each row's series as an index into their series, and the
+//! metric is read from the series, so no stage builds, hashes or compares a
+//! label map per sample.
 //!
 //! The interner is process-wide: ids are the same for a label set whichever
 //! request, worker or query thread meets it. It never forgets a series.
@@ -23,7 +22,19 @@ pub struct Series {
     pub id: u32,
     /// The `__name__` label (empty without one).
     pub metric: Arc<str>,
-    labels: BTreeMap<String, String>,
+    /// The canonical JSON of every label, `__name__` included: the series
+    /// identity column of a raw-data read, computed once when interned.
+    pub identity: Arc<str>,
+    /// Shared with every query result row of this series.
+    labels: Arc<BTreeMap<String, String>>,
+}
+
+impl Series {
+    /// The label set, shared: a query result row of this series holds it
+    /// without copying.
+    pub fn labels(&self) -> &Arc<BTreeMap<String, String>> {
+        &self.labels
+    }
 }
 
 impl Deref for Series {
@@ -68,6 +79,9 @@ impl std::hash::Hash for Series {
 struct Interner {
     /// Series ids by label-set hash; a hash collision lists several.
     by_hash: ahash::HashMap<u64, Vec<u32>>,
+    /// Series ids by identity text, for reading a query result's series
+    /// back without parsing its JSON.
+    by_identity: ahash::HashMap<Arc<str>, u32>,
     series: Vec<Arc<Series>>,
 }
 
@@ -137,11 +151,24 @@ pub fn intern_pairs<N: AsRef<str>, V: AsRef<str>>(pairs: &[(N, V)]) -> Arc<Serie
     let series = Arc::new(Series {
         id,
         metric: labels.get("__name__").map_or("", String::as_str).into(),
-        labels,
+        identity: serde_json::to_string(&labels)
+            .expect("labels serialize")
+            .into(),
+        labels: Arc::new(labels),
     });
     interner.series.push(series.clone());
     interner.by_hash.entry(hash).or_default().push(id);
+    interner.by_identity.insert(series.identity.clone(), id);
     series
+}
+
+/// The interned series whose identity text is `identity`, if one is: a
+/// query result row of an input series, rather than one whose labels the
+/// query changed.
+pub fn by_identity(identity: &str) -> Option<Arc<Series>> {
+    let interner = interner().read().expect("interner lock");
+    let id = *interner.by_identity.get(identity)?;
+    Some(interner.series[id as usize].clone())
 }
 
 /// The series of `labels`; interned on first sight.
@@ -151,4 +178,26 @@ pub fn intern(labels: &BTreeMap<String, String>) -> Arc<Series> {
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
     intern_pairs(&pairs)
+}
+
+/// The labels of a query result series whose identity text is `identity`
+/// and that is not an input series (the query changed its labels, e.g.
+/// `max_over_time` drops `__name__`): parsed once and shared by every
+/// result row and cached answer of that series. Never forgets a label
+/// set, as the interner never forgets a series.
+pub fn result_labels(identity: &str) -> Result<Arc<BTreeMap<String, String>>, serde_json::Error> {
+    static RESULT_LABELS: OnceLock<
+        RwLock<ahash::HashMap<Arc<str>, Arc<BTreeMap<String, String>>>>,
+    > = OnceLock::new();
+    let table = RESULT_LABELS.get_or_init(RwLock::default);
+    if let Some(labels) = table.read().expect("result labels lock").get(identity) {
+        return Ok(labels.clone());
+    }
+    let labels: Arc<BTreeMap<String, String>> = Arc::new(serde_json::from_str(identity)?);
+    Ok(table
+        .write()
+        .expect("result labels lock")
+        .entry(identity.into())
+        .or_insert(labels)
+        .clone())
 }

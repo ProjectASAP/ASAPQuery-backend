@@ -10,8 +10,11 @@ version = "0.1.0"
 # The backend depends on two Planner crates, at one immutable revision:
 # `asap-planner` to plan and `asap-executor` to execute. Planner IR types
 # are reached through `asap_executor::planner`.
-asap-planner = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "05fb36e4e9ff0b8e2ff6d43685785117ec0b9225" }
-asap-executor = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "05fb36e4e9ff0b8e2ff6d43685785117ec0b9225" }
+asap-planner = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "fb50f152714623e607fc519d4a2c2e569f721450" }
+asap-executor = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "fb50f152714623e607fc519d4a2c2e569f721450" }
+# The sketch library the Planner's executor pins, for the byte encodings of
+# the sketch states the data plane persists; keep it at the Planner's rev.
+asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", rev = "cbce5dca82c3bbc4a19341cfb3db9460b6cbee29" }
 
 serde = { version = "1.0", features = ["derive"] }
 # `float_roundtrip`: a plan file reloads to the plan it was written from
