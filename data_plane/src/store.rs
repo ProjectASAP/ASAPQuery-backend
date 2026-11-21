@@ -150,28 +150,48 @@ impl Chunk {
     }
 
     /// The rows of the series in `partition`, in order: the chunk itself
-    /// when every series is, `None` when none is.
+    /// when every series is, `None` when none is. One pass over the rows,
+    /// with no lookup per row: each series' new code is found once.
     fn in_partition(self: &Arc<Self>, partition: SeriesPartition) -> Option<Arc<Self>> {
-        let kept: Vec<bool> = self
-            .series
-            .iter()
-            .map(|series| partition.holds(series.id))
-            .collect();
-        if kept.iter().all(|&k| k) {
+        const DROPPED: u32 = u32::MAX;
+        let mut new_code = vec![DROPPED; self.series.len()];
+        let mut series = Vec::new();
+        for (code, one) in self.series.iter().enumerate() {
+            if partition.holds(one.id) {
+                new_code[code] = series.len() as u32;
+                series.push(one.clone());
+            }
+        }
+        if series.len() == self.series.len() {
             return Some(self.clone());
         }
-        if !kept.iter().any(|&k| k) {
+        if series.is_empty() {
             return None;
         }
-        Self::new(
-            self.codes
-                .values()
-                .iter()
-                .zip(self.rows())
-                .filter(|(&code, _)| kept[code as usize])
-                .map(|(_, row)| row),
-        )
-        .map(Arc::new)
+        let (mut times, mut values, mut codes) = (Vec::new(), Vec::new(), Vec::new());
+        let rows = self
+            .codes
+            .values()
+            .iter()
+            .zip(self.time.values().iter())
+            .zip(self.value.values().iter());
+        for ((&code, &time), &value) in rows {
+            let code = new_code[code as usize];
+            if code != DROPPED {
+                times.push(time);
+                values.push(value);
+                codes.push(code);
+            }
+        }
+        let time_bounds_ms = (*times.iter().min()?, *times.iter().max()?);
+        Some(Arc::new(Self {
+            time: TimestampMillisecondArray::from(times),
+            value: Float64Array::from(values),
+            codes: UInt32Array::from(codes),
+            series,
+            identities: std::sync::OnceLock::new(),
+            time_bounds_ms,
+        }))
     }
 
     fn column(&self, kind: &ColumnKind) -> Result<ArrayRef, Error> {
@@ -335,7 +355,7 @@ impl RawData {
         metric: &str,
         request: &RawDataRequest,
         reads: Option<&RawReads>,
-        partition: Option<SeriesPartition>,
+        partition: Option<&PartitionReads>,
     ) -> Result<Vec<Batch>, Error> {
         let columns = column_kinds(metric, request)?;
         let Some(metric) = self.by_metric.get(metric) else {
@@ -359,7 +379,8 @@ impl RawData {
                 continue;
             };
             let Some(chunk) = (match partition {
-                Some(partition) => chunk.in_partition(partition),
+                Some(partition) if Arc::ptr_eq(stored, &chunk) => partition.chunk(stored),
+                Some(partition) => chunk.in_partition(partition.partition),
                 None => Some(chunk),
             }) else {
                 continue;
@@ -394,6 +415,38 @@ pub struct SeriesPartition {
 impl SeriesPartition {
     fn holds(&self, series_id: u32) -> bool {
         series_id % self.count == self.index
+    }
+}
+
+/// One run's part of the series and the stored chunks it has cut to that
+/// part, so the run's scans filter each chunk (and build its series
+/// identities) once, as a whole run reads each chunk's cached ones.
+pub struct PartitionReads {
+    partition: SeriesPartition,
+    /// By chunk address; each entry holds the chunk, so its address is not
+    /// reused while it is kept.
+    chunks: Mutex<HashMap<usize, CutChunk>>,
+}
+
+/// A stored chunk and its rows of one part of the series (`None`: none).
+type CutChunk = (Arc<Chunk>, Option<Arc<Chunk>>);
+
+impl PartitionReads {
+    pub fn new(partition: SeriesPartition) -> Self {
+        Self {
+            partition,
+            chunks: Mutex::default(),
+        }
+    }
+
+    fn chunk(&self, stored: &Arc<Chunk>) -> Option<Arc<Chunk>> {
+        let key = Arc::as_ptr(stored) as usize;
+        let mut chunks = self.chunks.lock().unwrap_or_else(|e| e.into_inner());
+        chunks
+            .entry(key)
+            .or_insert_with(|| (stored.clone(), stored.in_partition(self.partition)))
+            .1
+            .clone()
     }
 }
 
@@ -496,7 +549,7 @@ pub struct RunStore {
     /// Chunks converted by the other evaluations of the same range request.
     raw_reads: Option<Arc<RawReads>>,
     /// The series the run reads raw samples of; `None`: every series.
-    partition: Option<SeriesPartition>,
+    partition: Option<PartitionReads>,
     /// The query-time results the run reads, by node: each computed for
     /// the run's evaluation time before the run starts and held by the run.
     query_time_results: HashMap<PhysicalASAPNodeId, Arc<Vec<Batch>>>,
@@ -533,7 +586,7 @@ impl RunStore {
         partition: Option<SeriesPartition>,
     ) -> Self {
         Self {
-            partition,
+            partition: partition.map(PartitionReads::new),
             ..Self::new(raw_data, views)
         }
     }
@@ -565,7 +618,7 @@ impl DataStore for RunStore {
                 metric,
                 request,
                 self.raw_reads.as_deref(),
-                self.partition,
+                self.partition.as_ref(),
             )?);
         }
         Ok(stream::iter(batches)
