@@ -362,7 +362,7 @@ async fn answer_range(
     state: &DataPlane,
     range: RangeQuery,
 ) -> Result<prometheus::MatrixResponse, Unanswered> {
-    use futures::{StreamExt, TryStreamExt};
+    use futures::StreamExt;
     let started = std::time::Instant::now();
     let query = &range.query;
     // The steps the result cache answers; only the others run.
@@ -375,9 +375,15 @@ async fn answer_range(
     // converted once ([`store::RawReads`]).
     let snapshot = state.engine.snapshot();
     // At most one step per query worker in flight, so a long range neither
-    // floods the workers' queue nor starves instant queries; the first
-    // failed step, or the client going away, drops the rest unrun.
-    let steps: Vec<_> = futures::stream::iter(cached)
+    // floods the workers' queue nor starves instant queries; the client
+    // going away drops the rest unrun. Every step runs even when one fails:
+    // with `final_query_results_cached` the plan keeps a step's inputs only
+    // for the refresh interval, so the older steps of a span are answered
+    // from the result cache, and a request whose older steps are not cached
+    // yet (the first span after a start) still caches the steps it can
+    // answer; a dashboard refreshing the range fills the cache within one
+    // span.
+    let results: Vec<Result<_, Unanswered>> = futures::stream::iter(cached)
         .map(|(time_ms, hit)| {
             let snapshot = snapshot.clone();
             async move {
@@ -394,8 +400,9 @@ async fn answer_range(
             }
         })
         .buffered(state.engine.query_threads())
-        .try_collect()
-        .await?;
+        .collect()
+        .await;
+    let steps: Vec<_> = results.into_iter().collect::<Result<_, _>>()?;
     if let Some(metrics) = state.engine.metrics().query(query) {
         metrics
             .range_latency

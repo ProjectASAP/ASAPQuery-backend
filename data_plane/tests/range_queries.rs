@@ -226,3 +226,134 @@ async fn range_steps_are_measured_apart_from_instant_queries() {
     assert!(line("asap_phase_runs_total{phase=\"query\",").ends_with(" 0"));
     assert!(line("asap_query_latency_seconds_count{").ends_with(" 0"));
 }
+
+/// With the result cache declared (`final_query_results_cached`), the plan
+/// keeps a range evaluation's inputs only for its refresh interval: a data
+/// plane whose older steps are not cached cannot answer a 60 s span over
+/// 10 s windows from the views alone, but each refresh caches the steps it
+/// can answer, so within one span every step is answered (from the cache),
+/// as the steps' instant answers. One query worker, so a range's steps run
+/// one after another.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refreshed_range_reads_its_older_steps_from_the_result_cache() {
+    let workload = serde_json::from_value(json!({
+        "query_workload": {"language": "promql", "repeating_queries": [{
+            "query": QUERY,
+            "demand": {"fixed_interval_at": {"interval": 10000, "evaluation_phase": 0}},
+            "requirements": {},
+            "predictability": {"predictable": {"known_at": null}},
+            "range_evaluation": {"step_ms": 10000, "span_ms": 60000},
+        }]},
+        "data_workload": {"arrival": {"ingesting": {"rows_per_second": 2.0}},
+          "sources": {"data": {"series_count": 2, "sample_interval": 1000,
+            "metric_type": "gauge", "column_signs": {"value": "non_negative"}}}},
+    }))
+    .unwrap();
+    let inputs = common::inputs(false);
+    assert!(inputs.deployment_capabilities.final_query_results_cached);
+    let plan = serde_json::to_string(&plan_workload(&workload, &inputs).unwrap().0).unwrap();
+    let start = || {
+        let options = EngineOptions {
+            no_forward: true,
+            ingestion: IngestionOptions {
+                allowed_lateness_ms: 0,
+                stream_start_ms: Some(0),
+                view_retention_margin_ms: 0,
+                ..IngestionOptions::default()
+            },
+            query_threads: 1,
+            ..EngineOptions::default()
+        };
+        router(Arc::new(
+            DataPlane::with_options(plan.clone(), "http://127.0.0.1:1".into(), options).unwrap(),
+        ))
+    };
+    // Each second's samples of jobs a (value s) and b (value 2 s), then a
+    // barrier at `to_s`.
+    let write = |app: Router, from_s: i64, to_s: i64| async move {
+        let timeseries = ["a", "b"]
+            .iter()
+            .enumerate()
+            .map(|(index, job)| TimeSeries {
+                labels: vec![
+                    Label {
+                        name: "__name__".into(),
+                        value: "data".into(),
+                    },
+                    Label {
+                        name: "job".into(),
+                        value: (*job).into(),
+                    },
+                ],
+                samples: (from_s + 1..=to_s)
+                    .map(|s| Sample {
+                        timestamp: s * 1000,
+                        value: (s * (index as i64 + 1)) as f64,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let written = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/write")
+                    .body(Body::from(encode(&WriteRequest { timeseries })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(written.status(), StatusCode::NO_CONTENT);
+        let barrier = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/v1/precompute/watermark?time_ms={}",
+                    to_s * 1000
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(barrier.status(), StatusCode::OK);
+    };
+    let range = |end_s: i64| {
+        format!(
+            "/api/v1/query_range?query={}&start={}&end={end_s}&step=10",
+            encoded(QUERY),
+            end_s - 60
+        )
+    };
+
+    // Started with a minute of data already in (as after a restart), then
+    // refreshed every 10 s: the first requests fail on their uncached older
+    // steps, yet cache their newer ones; after one span every step is
+    // answered.
+    let refreshed = start();
+    write(refreshed.clone(), 0, 60).await;
+    let (status, _, body) = get(&refreshed, range(60)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    for to_s in (70..=120).step_by(10) {
+        write(refreshed.clone(), to_s - 10, to_s).await;
+        get(&refreshed, range(to_s)).await;
+    }
+    let (status, _, body) = get(&refreshed, range(120)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for series in body["data"]["result"].as_array().unwrap() {
+        let scale = if series["metric"]["job"] == "a" { 1 } else { 2 };
+        let values = series["values"].as_array().unwrap();
+        assert_eq!(values.len(), 7, "{series}");
+        for point in values {
+            let t = point[0].as_f64().unwrap() as i64;
+            let expected: i64 = (t - 9..=t).map(|s| s * scale).sum();
+            assert_eq!(point[1], json!(expected.to_string()), "{series}");
+        }
+    }
+
+    // The same data written at once and asked once: the older steps'
+    // windows are gone and nothing is cached.
+    let cold = start();
+    write(cold.clone(), 0, 120).await;
+    let (status, _, body) = get(&cold, range(120)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
