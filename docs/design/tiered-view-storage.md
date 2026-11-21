@@ -132,7 +132,7 @@ window cache (hot tier) ◄───── persist-N threads: encode once, appen
   CLOCK eviction, single-flight    every interval, roll and delete segments
   decode on miss                   past retention
    ▲
-   │ hit: Arc<Vec<Batch>>; miss: pread record slice → decode → insert
+   │ hit: Arc<Vec<Batch>>; miss: decode the fragment from the mapped segment → insert
 query workers (RunStore::read_materialized_view)
 ```
 
@@ -190,39 +190,59 @@ against the budget first, and the cache gets the rest.
 ### On-disk format
 
 Per refresh group, a directory `group-<g>/` of time segments
-`<first window end ms>.seg`. A segment is the existing framing (a
-little-endian `u32` length and a MessagePack payload per frame) with:
+`<first window end ms>.seg`. Each segment is append-only. It is
+**active** while its persist thread appends to it and **sealed** once the
+thread rolls to the next one; a sealed segment never changes again until
+it is deleted whole. A segment holds the existing framing (a little-endian
+`u32` length and a payload per frame), with every frame starting on an
+8-byte boundary (zero padding) so fixed-width columns can be borrowed in
+place:
 
-- a header frame: plan hash, group, **format version 2**, and the segment
-  start;
-- one record frame per refreshed window, as today, but with each part
-  separately addressable:
+- a header frame (MessagePack): plan hash, group, **format version 2**,
+  and the segment start;
+- one record frame per refreshed window. Its head is a small MessagePack
+  map, followed by the parts it points at:
 
 ```
-Record v2 = { start_ms, end_ms,
-              texts:  bytes,   // MessagePack Vec<String>: texts new to this segment
-              grids:  bytes,   // Hydra-Count-Min grids, ASAPv1, once per record
-              views:  [(view id, rows: bytes)] }   // MessagePack Vec<Vec<StoredValue>>
+Record v2 head = { start_ms, end_ms,
+                   texts: (offset, len),   // texts new to this segment
+                   grids: (offset, len),   // Hydra-Count-Min grids, ASAPv1, once per record
+                   views: [(view id, offset, len)] }   // one columnar fragment per view
 ```
 
-`StoredValue` and every state's encoding (serde form for plain values and
-exact states, ASAPv1 through `sketch()`/`restore_from_disk` for sketches)
-are unchanged. Only the nesting changes: a view's rows are a byte string
-inside the record, so a reader decodes one (view, window) without decoding
-the record's other views.
+**Columnar fragments.** Each view's rows of the window are one fragment,
+laid out by column (all offsets relative to the fragment, every section
+8-byte aligned):
+
+```
+Fragment = { rows: u32, columns: [(kind, offset, len)] }
+  text column       u32 keys into the segment's dictionary (+ validity bitmap)
+  timestamp column  i64 per row, or one i64 when every row has the same value
+                    (the window end, today stored once per row)
+  plain column      f64 / i64 / u64 / bool per row (+ validity bitmap)
+  state column      family tag, then u32 offsets[rows + 1] and the states'
+                    bytes back to back: ASAPv1 through sketch() for sketches,
+                    the existing serde form for exact and increase states,
+                    a grid index plus group name for Hydra-Count-Min groups
+```
+
+What each state's bytes are does not change; only the layout around them
+does (columns instead of row-wise `Vec<Vec<StoredValue>>`). That removes
+the per-value enum tags and the per-row identity indices interleaved with
+states (exact states take about 140 B per state on disk today for a 48 B
+counter), and it lets fixed-width columns be read without decoding.
+
+**Segment dictionary.** Texts (series identities and label values) are
+stored once per segment: a record's `texts` part is a string column
+(`u32` offsets and UTF-8 bytes, the Arrow layout) of texts new to the
+segment, and a segment's first use of a text writes it again. Deleting an
+old segment then never strands a later one's keys. At 10k series and about
+96 B per identity this costs about 1–2 MB per segment.
 
 Index: `WindowLocation { segment: Arc<Segment>, offset: u64, len: u32 }`
-points at that byte string. It lives in the `ViewWindow` in memory (about
+points at a view's fragment. It lives in the `ViewWindow` in memory (about
 40 B per (view, window)); there is no index file. At startup the index is
-rebuilt by scanning record frames and parsing only their small parts
-(range, texts, the views' offsets), never the rows.
-
-Texts (series identities and label values) are dictionary indices, as
-today, but the dictionary is **per segment**: a segment's first use of a
-text writes it again. Deleting an old segment then never strands a later
-one's indices. At 10k series and about 96 B per identity this costs about
-1–2 MB per segment. Each live segment's dictionary is held in memory
-(`Vec<Arc<str>>`) for decoding.
+rebuilt by reading only record heads, never fragments.
 
 The index is per (view, window), not per (series, window). A view read
 (`MaterializedViewRequest { time_range_ms, schema }`) always returns whole
@@ -231,10 +251,10 @@ would add bytes to every row for no reader.
 
 Segments roll every `--view-segment-ms` (default 15 min, so a 1 h view
 spans about five). The persist thread that owns a group deletes (unlinks)
-a segment once every record in it ends at or before every view's oldest
-kept window end. Readers holding an `Arc<Segment>` keep its file
-descriptor, so an unlinked segment stays readable until they finish.
-Disk use is then retention plus one segment, not unbounded.
+a sealed segment once every record in it ends at or before every view's
+oldest kept window end. Readers holding an `Arc<Segment>` keep its mapping
+and file descriptor, so an unlinked segment stays readable until they
+finish. Disk use is then retention plus one segment, not unbounded.
 
 A file in the old format (`group-<g>.log`, version 1) is renamed
 `*.stale` and not loaded, as a file of another plan is today.
@@ -248,29 +268,49 @@ tiling the range, as today. Each window yields:
 - `Stored` and in the cache: the cached `Arc<Vec<Batch>>` (reference bit
   set);
 - `Stored` and not cached: the cache's single-flight `get_or_load`, which
-  `pread`s `len` bytes at `offset` into a buffer, decodes them with the
-  segment's dictionary and the record's grids (`decode_rows`), inserts the
-  batches and returns them. Other runs needing the same window wait for
-  that decode.
+  decodes the fragment from its segment's bytes, inserts the batches and
+  returns them. Other runs needing the same window wait for that decode.
 
 Decoding happens lazily as the stream is pulled, so a `SummaryMerge` over
 240 windows holds at most the window it is merging plus its accumulator,
 not 240 decoded windows.
 
-**`pread`, not `mmap`.** Decoding copies anyway: MessagePack rows become
-owned values, and ASAPv1 bytes become owned sketch structures, so a
-mapping saves no copy. `pread` errors are `io::Error`s, never `SIGBUS`.
-Pages read with `pread` are ordinary page cache, which the kernel reclaims
-before mapped pages, and they are not counted in the process's RSS, so the
-RSS comparison with VictoriaMetrics stays per process. One syscall reads a
-whole (view, window) slice (hundreds of KB to a few MB), so the syscall
-cost is negligible against decoding. VictoriaMetrics maps its files by
-default and has `-fs.disableMmap` to use `pread`; a micro-benchmark (B3)
-compares both before the code is final.
+**`mmap` of sealed segments.** A sealed segment is mapped once, read-only
+(`MAP_SHARED`, `PROT_READ`), when its first window is read cold, and
+unmapped when its last `Arc<Segment>` drops. Decoding reads directly from
+the mapped bytes:
 
-**Decode cost** (measured below) is per state and dominated by rebuilding
-sketch structures and the row-to-batch conversion in `decode_rows`. It is
-paid once per cache miss, not per read.
+- text keys, timestamps and plain columns become Arrow buffers over the
+  mapping itself (`Buffer::from_custom_allocation` with the
+  `Arc<Segment>` as owner): no copy;
+- the segment dictionary is a `StringArray` over the mapping, shared by
+  every fragment of the segment, and a text column is a
+  `DictionaryArray<UInt32>` of borrowed keys over it: no copy and no
+  per-row allocation;
+- states are rebuilt from their bytes in place (`from_asapv1(&[u8])` on
+  the mapped slice) into owned sketch structures; this is the remaining
+  copy, inherent to the executor's in-memory state types.
+
+`SIGBUS` comes only from accessing a mapped page past the end of the file.
+That cannot happen here: only sealed segments are mapped, a sealed
+segment's length never changes, a torn tail is cut off only at startup
+before any mapping, and deletion is `unlink`, which keeps the mapped pages
+valid. A disk read error under a mapping would also raise `SIGBUS`
+instead of an error; `--view-read=pread` reads every fragment with
+`pread` into a buffer and decodes the same way (with copies), for hosts
+where that matters or a measured case prefers it. B3 compares the two.
+
+**The active segment** holds the newest windows, which are mostly still
+in the cache. A cold read of one of them uses `pread` of the fragment
+into an 8-byte-aligned buffer, then the same decoder; mapping a file that
+is still growing would need re-mapping as it grows and is not worth it for
+the few windows involved. When the segment is sealed, later reads map it.
+
+**Decode cost** (measured below, today's row-wise format) is about 3 µs
+per state, dominated by rebuilding sketch structures and the row-to-batch
+conversion. The columnar fragment removes the conversion and the per-row
+text decode; B3 reports the new cost per kernel. It is paid once per cache
+miss, not per read.
 
 **Range requests.** A range request takes one snapshot for all its steps
 (the demo design's read-once snapshot). Its steps share cold windows
@@ -334,13 +374,21 @@ anonymous sum stays under `memory.max`:
   (`background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0`) become
   the default in `main.rs`; otherwise evicted windows stay resident as
   dirty pages.
-- **Hints.** Segment file descriptors get `POSIX_FADV_RANDOM` (a read
-  takes exactly one slice; readahead of neighbors wastes page cache under
-  a limit), and the startup scan uses `POSIX_FADV_SEQUENTIAL`. No
-  `POSIX_FADV_DONTNEED` after writing: whether a just-written window will
-  be read cold is not known, and the kernel's LRU already evicts unread
-  pages first. With `mmap` (if B3 favors it), `MADV_RANDOM` per segment and
-  `MADV_COLD` when a window leaves the cache.
+- **Hints.** Each mapping gets `MADV_RANDOM` (a read takes exactly one
+  fragment; readahead of neighbors wastes page cache under a limit); a
+  fragment about to be decoded gets `MADV_WILLNEED` over its range; when
+  a window leaves the cache its fragment's range gets `MADV_COLD`, so the
+  kernel reclaims those pages first. The startup scan of record heads
+  uses `POSIX_FADV_SEQUENTIAL`. No `POSIX_FADV_DONTNEED` after writing:
+  whether a just-written window will be read cold is not known, and the
+  kernel's LRU already evicts unread pages first.
+- **RSS reporting.** Mapped pages that were touched count in the
+  process's RSS as `RssFile`, although they are clean and reclaimable.
+  Reports split RSS into `RssAnon` (what can OOM) and `RssFile`, next to
+  the cgroup's `anon` and `file`, so the comparison with VictoriaMetrics
+  (which also maps its files) stays fair. A cached decoded window whose
+  fixed-width columns borrow the mapping holds those columns in page
+  cache, not in the heap.
 
 `asap_view_bytes` is split: `asap_view_cache_bytes` (hot, decoded),
 `asap_view_pending_bytes`, `asap_view_pinned_bytes`, and
@@ -428,8 +476,8 @@ run of each step.
 So the encoded windows are about 2.7x smaller than the decoded ones (3.8x
 for KLL, 1.6x for the exact states), and decoding costs about 3 µs per
 state. The row-wise MessagePack encoding is bloated for exact states
-(140 B for a 48 B counter state plus a 4 B identity index); see open
-question Q2.
+(140 B for a 48 B counter state plus a 4 B identity index), which is why
+version 2 is columnar.
 
 **Expected after tiering** (derived from the numbers above, to be measured
 by B1 and B2):
@@ -478,7 +526,8 @@ here changes the Planner.
 | Question | Decision | Rejected and why |
 | --- | --- | --- |
 | Where cold windows live | the persistence files | a second cold file (double write); encoded bytes in the heap (compact, but not reclaimable, so the cgroup OOM stays) |
-| Read primitive | `pread` of one (view, window) slice | `mmap`: no copy saved since decode copies; `SIGBUS` on truncation; mapped pages count in RSS and are reclaimed after unmapped ones. Revisited by B3 |
+| Read primitive | `mmap` of sealed segments, decoding in place (fixed-width columns and the dictionary borrowed, states rebuilt from the mapped bytes); `pread` for the active segment and as `--view-read=pread` | `pread` everywhere: copies every fragment into a buffer, and the row data again into Arrow arrays; kept as the fallback. `mmap` of the active segment: needs re-mapping as it grows, for windows that are mostly still cached |
+| Fragment encoding | columnar per (view, window), state bytes unchanged | row-wise `Vec<Vec<StoredValue>>` as today: per-value tags and interleaved identity indices (140 B per exact state), a row-to-batch conversion on every decode, nothing to borrow |
 | Index granularity | (view, window) → slice, in memory | (series, window) → offset: no reader reads one series of a view window; an index file: rebuilt from the frames at startup instead |
 | Hot policy | CLOCK recency + idle time + byte budget, insert on commit | plan-derived next-read (couples the store to the executor's tiling; follow-up if B2 shows bad evictions); LRU list (a lock on every read) |
 | Text dictionary | per segment | per file (deleting old segments strands indices); none (every row repeats a 96 B identity) |
@@ -487,38 +536,30 @@ here changes the Planner.
 | Shrink decoded states instead | complementary, not instead | compact sealed KLL, shared identity columns and smaller exact states cut the hot bytes about 4x (memory investigation), but they stay unreclaimable and still grow with retention; tiering bounds them. Both are wanted |
 | Budget source | cgroup `memory.max` minus bounded pools, plus a 1 s monitor | a fixed default (wrong on every host); `memory.high` throttling alone (slows the whole process, including ingest) |
 
-### Open questions for the reviewer
+### Decided at review
 
-- **Q1. Hot policy.** Recency (CLOCK, idle time, budget) as proposed, or
-  a plan-derived next-read time from the readers' ranges and intervals
-  from the start? Recency needs no knowledge of the executor's tiling;
-  the plan-derived order evicts better for long-interval readers.
-- **Q2. Slice encoding.** The record changes anyway (version 2). Keep
-  each view slice as today's row-wise `Vec<Vec<StoredValue>>` (proposed:
-  reuse, one encoder), or make it columnar now (a `u32` text-index
-  column, plain columns, and a states column of ASAPv1 or serde blobs with
-  offsets)? Columnar would shrink the exact states' 140 B on disk and
-  skip the row-to-batch conversion in decoding (3 µs per state today). B3
-  reports the decode breakdown either way.
-- **Q3. Default without a cgroup.** Unbounded budget with idle eviction
-  (proposed), or tiering off unless a budget is given?
-- **Q4. Old view files.** Renamed `*.stale` (proposed) or read once and
-  rewritten as segments?
+- **Read path:** `mmap` of sealed segments with in-place decoding;
+  `pread` only for the active segment and as a fallback option. B3 still
+  compares the two.
+- **Hot policy:** recency (CLOCK, idle time, byte budget).
+- **Fragment encoding:** columnar, with format version 2.
+- **No cgroup limit:** no budget, plus idle eviction.
+- **Old view files:** renamed `*.stale`.
 
 ## Acceptance and test design (for approval)
 
 Each test states what it verifies, its inputs, the expected result, and
 whether it fails today ("fails today" means it fails or cannot be built).
-The tests are written after this plan is approved and before the
-implementation. Unless a row says otherwise, tiering is compared with the
+The tests were written after this plan was approved and before the
+implementation; they fail until it lands. Unless a row says otherwise, tiering is compared with the
 same build with tiering off (`--view-cache-max-bytes` unbounded and
 `--view-cache-idle-ms 0`, which keeps every window hot).
 
 | # | Behavior verified | Inputs | Expected | Today |
 | --- | --- | --- | --- | --- |
 | V1 | Answers are identical with tiering on and off. | All parity workloads (`tests/workloads/`), raw data kept and not kept, ingest shards 1, 4 and 8 (`PARITY_INGEST_THREADS`), instant and range queries; tiering with a budget of zero (every read cold). | Equal to the Planner executor and to tiering off. KLL plans within the existing 5 %, as today. | Fails: no tiering options. |
-| V2 | A cold window decodes to the rows that were committed. | Every persisted kernel (DDSketch, KLL, Count-Min, KMV, HLL at several precisions, weighted frequency ×4, UnivMon, Hydra-KLL, Hydra-Count-Min, exact, increase, plain and text columns); one window each, evicted, then read. | Same rows: texts equal, states equal by `sketch()` bytes or exact value. | Fails: no cold read. |
-| V3 | A view's slice decodes without the record's other views. | A group with four views; corrupt the bytes of view 2's slice in the file. | Views 1, 3 and 4 read cold correctly; view 2's read fails that run with an error naming the view and window, and is counted. | Fails: one MessagePack record per window. |
+| V2 | A cold window decodes, from its columnar fragment, to the rows that were committed. | One window per state family a view column can hold (DDSketch, KLL, Count-Min, KMV, HLL, Count-Min and Count Sketch with heap, UnivMon, Hydra-Count-Min groups, exact Sum/Max/Rate, increase), with a text column, a timestamp column and nulls; written, then read back through its location from a sealed (mapped) and from the active segment. | Same rows: texts equal, states equal by `sketch()` bytes or exact value. (Hydra-KLL and heapless weighted frequency cannot be a view column today.) | Fails: no fragment format, no locations. |
+| V3 | A view's fragment decodes without the record's other views. | A record with four views; the bytes of view 2's fragment overwritten. | Views 1, 3 and 4 read correctly; view 2's read returns an error naming the view and window. | Fails: as V2. |
 | V4 | The cache keeps windows recent reads touched and evicts idle ones. | Unit test on the cache: idle time 30 s, budget unbounded; windows read every 15 s and windows never read. | Read windows stay; unread ones leave after 30 s; eviction never touches `Pending` or `Pinned`. | Fails: no cache. |
 | V5 | The byte budget holds. | Budget = 3 windows' bytes; 10 windows committed; reads of every window in turn. | Cached bytes ≤ budget after every insert; reads all answered; misses counted. | Fails: no cache. |
 | V6 | Concurrent reads of one cold window decode it once. | 8 query workers reading the same cold window at once (a hook slows the decode). | One decode (`asap_view_cold_reads_total` +1), 8 equal answers. | Fails: no cache. |
@@ -535,7 +576,9 @@ same build with tiering off (`--view-cache-max-bytes` unbounded and
 | V17 | Metrics. | Any plan, a few windows, budget zero. | `asap_view_cache_{bytes,entries}`, `asap_view_{pending,pinned,file}_bytes`, `asap_view_cache_{hits,misses,evictions}_total`, `asap_view_cold_reads_total`, `asap_view_cold_read_bytes_total`, `phase="view_decode"` CPU. | Fails: new series. |
 | B1 | Bench at 10k (reported, not CI). | Dashboard-heavy and typical-dashboard at 10k series, 1 sample/s, in the harness's cgroups with the same `memory.max` for both engines; tiering off, on with the default budget, on with a budget of zero. | RSS, `memory.current` split into anon and file, peak and steady; query latency per query; CPU per phase incl. `view_decode`; disk bytes. | Tiering-off numbers come from today's code. |
 | B2 | Cold versus warm page cache (reported). | As B1, budget zero; before a round of queries, drop the segments' pages (`POSIX_FADV_DONTNEED` on each file) for the cold case. | Query latency and read bytes cold vs warm; cache hit ratio over a run (checks the recency policy). | — |
-| B3 | `pread` versus `mmap` (reported). | Micro-benchmark over one 10k-series segment: read and decode each window both ways, warm and cold. | ns per window and RSS; decides the read primitive. | — |
+| V18 | Fixed-width columns and texts are borrowed from the mapping, not copied. | A window of 1,000 rows read cold from a sealed segment. | The text keys' and timestamps' buffer addresses lie inside the segment's mapping; the dictionary values array is shared by every window of the segment. With `--view-read=pread` they lie outside it, and the rows are equal. | Fails: as V2. |
+| V19 | No `SIGBUS`: only sealed segments are mapped, and a sealed segment is never shortened. | Read a window of the active segment (by `pread`), seal it, read again (mapped); unlink a mapped segment and read through a held location; restart over a segment with a torn tail. | All reads equal; the torn tail is cut before any mapping; no crash. | Fails: as V2. |
+| B3 | `pread` versus `mmap` (reported). | `examples/view_read_bench.rs` over one 10k-series segment of the dashboard plan: decode each window with `--view-read=mmap` and `pread`, page cache warm and cold. | ns per window and per state by family, bytes copied, `RssAnon`/`RssFile`. | — |
 
 Parity, crash recovery and eviction are V1, V12 and V15. The test design is
 by the author of this document; an independent review is requested in the
