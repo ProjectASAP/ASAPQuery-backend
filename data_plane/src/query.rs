@@ -40,9 +40,10 @@ use crate::store::{PublishedStore, QueryTimeResults, RawReads, RawShards, RunSto
 /// One series of an instant-query result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResultSample {
-    /// Shared with the interned series when the row is an input series
-    /// unchanged (no other label column), so a result and the result cache
-    /// hold no copy of it.
+    /// Shared with the interned series (an input series) or with every
+    /// other row of the same result series (`series_ids::result_labels`)
+    /// when the row has no other label column, so results and the result
+    /// cache hold no copy of it.
     pub labels: Arc<BTreeMap<String, String>>,
     pub value: f64,
 }
@@ -530,14 +531,17 @@ fn result_samples(schema: &Schema, batches: &[Batch]) -> Result<Vec<ResultSample
                             None => shared = Some(series.labels().clone()),
                         },
                         None => {
-                            let identity: BTreeMap<String, String> = serde_json::from_str(text)
-                                .map_err(|e| {
-                                    Unanswered::Execution(format!("series identity: {e}"))
-                                })?;
-                            own.get_or_insert_with(|| {
-                                shared.take().map(|s| (*s).clone()).unwrap_or_default()
-                            })
-                            .extend(identity);
+                            let identity = crate::series_ids::result_labels(text).map_err(|e| {
+                                Unanswered::Execution(format!("series identity: {e}"))
+                            })?;
+                            match own.as_mut() {
+                                Some(own) => own.extend(
+                                    identity
+                                        .iter()
+                                        .map(|(name, value)| (name.clone(), value.clone())),
+                                ),
+                                None => shared = Some(identity),
+                            }
                         }
                     }
                 }

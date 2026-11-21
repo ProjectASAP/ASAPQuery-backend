@@ -179,3 +179,25 @@ pub fn intern(labels: &BTreeMap<String, String>) -> Arc<Series> {
         .collect();
     intern_pairs(&pairs)
 }
+
+/// The labels of a query result series whose identity text is `identity`
+/// and that is not an input series (the query changed its labels, e.g.
+/// `max_over_time` drops `__name__`): parsed once and shared by every
+/// result row and cached answer of that series. Never forgets a label
+/// set, as the interner never forgets a series.
+pub fn result_labels(identity: &str) -> Result<Arc<BTreeMap<String, String>>, serde_json::Error> {
+    static RESULT_LABELS: OnceLock<
+        RwLock<ahash::HashMap<Arc<str>, Arc<BTreeMap<String, String>>>>,
+    > = OnceLock::new();
+    let table = RESULT_LABELS.get_or_init(RwLock::default);
+    if let Some(labels) = table.read().expect("result labels lock").get(identity) {
+        return Ok(labels.clone());
+    }
+    let labels: Arc<BTreeMap<String, String>> = Arc::new(serde_json::from_str(identity)?);
+    Ok(table
+        .write()
+        .expect("result labels lock")
+        .entry(identity.into())
+        .or_insert(labels)
+        .clone())
+}
