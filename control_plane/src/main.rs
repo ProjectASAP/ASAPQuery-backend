@@ -53,7 +53,16 @@ fn main() -> anyhow::Result<()> {
     let workload: PlanningWorkload = read_json(&args.workload)?;
     let mut inputs = DeploymentInputs::default();
     if let Some(path) = &args.deployment_capabilities {
-        inputs.deployment_capabilities = read_json(path)?;
+        // The file's fields over this backend's own capabilities: a field it
+        // leaves out keeps the backend's value, not the Planner's default.
+        let mut capabilities = serde_json::to_value(control_plane::backend_capabilities())?;
+        let given: serde_json::Value = read_json(path)?;
+        if let (Some(capabilities), Some(given)) = (capabilities.as_object_mut(), given.as_object())
+        {
+            capabilities.extend(given.clone());
+        }
+        inputs.deployment_capabilities = serde_json::from_value(capabilities)
+            .with_context(|| format!("parsing {}", path.display()))?;
     }
     if let Some(path) = &args.cost_inputs {
         inputs.cost_inputs = read_json(path)?;
