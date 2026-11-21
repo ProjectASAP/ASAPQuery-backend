@@ -1075,16 +1075,20 @@ mod tests {
                         },
                     ) => {
                         assert_eq!(fx, fy, "{what}: row {row} column {column} family");
-                        // A DDSketch read back is shrunk (sealed), so its
-                        // bytes may be shorter than the written state's;
-                        // its answers are the same.
+                        // A DDSketch read back is shrunk (sealed), and a
+                        // KLL read from its view is rebuilt as an
+                        // accumulator (level 0 sorted), so their bytes may
+                        // differ from the written state's; their answers
+                        // are the same.
                         match encode_sketch(sx.as_ref()) {
-                            Some((kernel @ SketchKernel::DDSketch, _)) => assert_same_readout(
-                                kernel,
-                                readout(kernel, sx.as_ref()),
-                                readout(kernel, sy.as_ref()),
-                                &format!("{what}: row {row} column {column} state"),
-                            ),
+                            Some((kernel @ (SketchKernel::DDSketch | SketchKernel::Kll), _)) => {
+                                assert_same_readout(
+                                    kernel,
+                                    readout(kernel, sx.as_ref()),
+                                    readout(kernel, sy.as_ref()),
+                                    &format!("{what}: row {row} column {column} state"),
+                                )
+                            }
                             _ => assert_eq!(
                                 state_bytes(sx.as_ref()),
                                 state_bytes(sy.as_ref()),
@@ -1304,6 +1308,14 @@ mod tests {
             l1.maps(values.values().as_ptr() as usize),
             "values are copied, not borrowed"
         );
+        // The KLL states are read where they are mapped, not rebuilt.
+        let states = r1.state_column(4).expect("a state column");
+        for index in [0, 999] {
+            let address = states
+                .mapped_state_address(index)
+                .expect("a mapped state column");
+            assert!(l1.maps(address), "state {index} was copied");
+        }
         assert!(
             Arc::ptr_eq(identity(&r1).values(), identity(&r2).values()),
             "one dictionary per segment"

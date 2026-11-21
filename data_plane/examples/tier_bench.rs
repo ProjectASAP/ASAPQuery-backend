@@ -59,7 +59,13 @@ async fn main() {
     let path = std::env::var("WORKLOAD")
         .ok()
         .filter(|path| !path.is_empty())
-        .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/tests/workloads/dashboard.json").into());
+        .unwrap_or_else(|| {
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/workloads/dashboard.json"
+            )
+            .into()
+        });
     let mut workload: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let metrics: Vec<String> = workload["data_workload"]["sources"]

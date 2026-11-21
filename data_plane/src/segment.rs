@@ -32,7 +32,9 @@ use asap_executor::arrow::datatypes::{
 use asap_executor::planner::ir::schema::{DataType, FieldDataType, Schema};
 use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
 use asap_executor::summary_kernels::HydraCms;
-use asap_executor::values::{Batch, BatchColumn, SchemaRef, Value};
+use asap_executor::values::{
+    family_has_mapped_form, state_view_bytes, Batch, BatchColumn, SchemaRef, Value,
+};
 use asap_executor::Error;
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +58,10 @@ const TIMESTAMP: u32 = 4;
 /// Any other plain column: MessagePack of its values.
 const GENERIC: u32 = 5;
 const STATES: u32 = 6;
+/// A state column in the executor's mapped layout: `u32` offsets in the
+/// data section, the states (each 8-byte aligned) in the second section;
+/// read in place, never rebuilt.
+const MAPPED_STATES: u32 = 7;
 /// Flag: a timestamp column whose rows all hold one value, stored once.
 const CONSTANT: u32 = 1;
 /// Bytes of one column descriptor: kind, flags, data offset and length,
@@ -626,6 +632,9 @@ pub(crate) fn encode_fragment(
             .iter()
             .map(|row| matches!(row[column], Value::Null))
             .collect();
+        // The second section: the validity bitmap, or a mapped state
+        // column's states.
+        let mut second: Option<Vec<u8>> = None;
         let (kind, mut flags, data): (u32, u32, Vec<u8>) = match &field.dtype {
             FieldDataType::Plain(DataType::Utf8) => {
                 let mut data = Vec::with_capacity(rows.len() * 4);
@@ -681,6 +690,11 @@ pub(crate) fn encode_fragment(
                 let values: Vec<&Value> = values.collect();
                 (GENERIC, 0, rmp_serde::to_vec(&values).ok()?)
             }
+            family if family_has_mapped_form(family) && mapped_states(rows, column).is_some() => {
+                let (offsets, states) = mapped_states(rows, column).expect("checked");
+                second = Some(states);
+                (MAPPED_STATES, 0, offsets)
+            }
             _ => {
                 // States: u32 offsets[rows + 1], then each state's stored bytes.
                 let mut offsets = Vec::with_capacity(rows.len() + 1);
@@ -701,6 +715,7 @@ pub(crate) fn encode_fragment(
         };
         let (data_offset, data_len) = section(&mut out, &data);
         let (valid_offset, valid_len) = match (kind, validity(&nulls)) {
+            (MAPPED_STATES, _) => section(&mut out, &second.take().expect("states")),
             (STATES, _) | (GENERIC, _) => (0, 0),
             (_, Some(bits)) => section(&mut out, &bits),
             (_, None) => (0, 0),
@@ -724,6 +739,24 @@ pub(crate) fn encode_fragment(
     }
     out.resize(padded(out.len()), 0);
     Some(out)
+}
+
+/// Column `column` of `rows` in the executor's mapped state layout: the
+/// `u32` offsets (`rows + 1`) and the states back to back, each padded to 8
+/// bytes; `None` when a state has no mapped form.
+fn mapped_states(rows: &[Vec<Value>], column: usize) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut offsets = Vec::with_capacity((rows.len() + 1) * 4);
+    let mut states = Vec::new();
+    offsets.extend_from_slice(&0u32.to_le_bytes());
+    for row in rows {
+        let Value::Summary { state, .. } = &row[column] else {
+            return None;
+        };
+        states.extend(state_view_bytes(state.as_ref())?);
+        states.resize(padded(states.len()), 0);
+        offsets.extend_from_slice(&u32::try_from(states.len()).ok()?.to_le_bytes());
+    }
+    Some((offsets, states))
 }
 
 /// A little-endian `u64` at `at` of `bytes`.
@@ -822,7 +855,7 @@ fn decode_fragment(
         {
             return Err(damaged());
         }
-        let nulls = if valid.1 == 0 {
+        let nulls = if valid.1 == 0 || kind == MAPPED_STATES {
             None
         } else {
             if valid.1 != rows.div_ceil(8) {
@@ -864,6 +897,26 @@ fn decode_fragment(
                     return Err(damaged());
                 }
                 one_column(field, values.into_iter().map(|v| vec![v]).collect())?.0
+            }
+            MAPPED_STATES => {
+                // Read in place: the offsets and the states are borrowed
+                // from the mapping (copied for `pread`), never rebuilt.
+                if data.1 != (rows + 1) * 4 {
+                    return Err(damaged());
+                }
+                let offsets =
+                    ScalarBuffer::<u32>::new(buffer(source, data.0, data.1)?, 0, rows + 1);
+                let states = buffer(source, valid.0, valid.1)?;
+                let column = asap_executor::values::StateColumn::from_mapped(
+                    field.dtype.clone(),
+                    states,
+                    offsets,
+                )?;
+                out.push(BatchColumn::States {
+                    indices: UInt32Array::from_iter_values(0..rows as u32),
+                    states: Arc::new(column),
+                });
+                continue;
             }
             STATES => {
                 let slice = &bytes[data.0..data.0 + data.1];

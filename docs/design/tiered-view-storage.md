@@ -685,6 +685,18 @@ same build with tiering off (`--view-cache-max-bytes` unbounded and
 | V22 | Compressed-sample windows through the data plane. | A plan with a `CompressedSamples` chain (Planner fixture): commit, persist, read sealed and active, restart; a query reading the open window. | Blob bytes on disk equal the block the executor sealed; decoded rows equal the raw samples; the open window's samples are included when `reads_unsealed_window`; decoded rows are not kept after the run. | Fails: no compressed-sample chains in the pinned Planner. |
 | B3 | `pread` versus `mmap` (reported). | `examples/view_read_bench.rs` over one 10k-series segment of the dashboard plan: decode each window with `--view-read=mmap` and `pread`, page cache warm and cold. | ns per window and per state by family, bytes copied, `RssAnon`/`RssFile`. | — |
 
+Status of the revision's tests: V2 and V18 (revised) read DDSketch, KLL,
+Count-Min and every exact family through mapped views (same answers as
+owned states; state bytes inside the mapping); V20 runs as
+`tests/view_cold_allocations.rs`; V21 is ASAPPlanner's executor test
+`mapped_states.rs` (mapped, owned and mixed windows merge alike; mapped
+counter windows out of order merge in time order); its "one input batch at
+a time" check could not be made to separate the two merge paths through
+the run's reservations and is covered by V20 instead. V22 waits for the
+compressed-sample codec, which lives in this repository (a separate PR
+implementing the executor's codec trait): the fragments store its blocks
+as blobs once it lands.
+
 Parity, crash recovery and eviction are V1, V12 and V15. The test design is
 by the author of this document; an independent review is requested in the
 PR.

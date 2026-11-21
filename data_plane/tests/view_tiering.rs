@@ -391,7 +391,7 @@ async fn a_segment_deleted_during_a_read_stays_readable() {
         &plan,
         EngineOptions {
             view_segment_ms: 10_000,
-            cold_decode_delay_ms: 1_000,
+            cold_decode_delay_ms: 3_000,
             ..options(&dir, Some(0), None)
         },
     );
@@ -401,7 +401,7 @@ async fn a_segment_deleted_during_a_read_stays_readable() {
         let app = app.clone();
         tokio::spawn(async move { answer(&app, SUM, 300).await })
     };
-    // While the query decodes its windows (a second each), later windows
+    // While the query decodes its windows (3 s each), later windows
     // push those it reads past retention and their segments are deleted.
     write(&app, 300, 600).await;
     let started = std::time::Instant::now();
