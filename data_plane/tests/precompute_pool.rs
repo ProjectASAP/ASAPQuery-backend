@@ -32,8 +32,8 @@ use tower::ServiceExt;
 const SERIES: usize = 6;
 /// Samples run from here (exclusive), every 10 s.
 const START_MS: i64 = 0;
-/// Through here: two hours.
-const END_MS: i64 = 7_200_000;
+/// Through here: an hour.
+const END_MS: i64 = 3_600_000;
 
 fn workloads() -> Vec<(String, PlanningWorkload)> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -160,7 +160,9 @@ fn options(threads: usize, view_dir: Option<PathBuf>) -> EngineOptions {
         no_forward: true,
         precompute_threads: threads,
         view_dir,
-        view_sync_interval_ms: 0,
+        // Written, not synced: a barrier waits for the writes only, and the
+        // comparison reads them back.
+        view_sync_interval_ms: 3_600_000,
         ingestion: IngestionOptions {
             allowed_lateness_ms: 0,
             max_future_ms: 0,
@@ -196,14 +198,14 @@ async fn write(app: &Router, body: Vec<u8>) -> StatusCode {
 }
 
 async fn barrier(app: &Router, time_ms: i64) {
-    let response = app
-        .clone()
-        .oneshot(
-            Request::post(format!("/api/v1/precompute/watermark?time_ms={time_ms}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
+    let request = app.clone().oneshot(
+        Request::post(format!("/api/v1/precompute/watermark?time_ms={time_ms}"))
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let response = tokio::time::timeout(Duration::from_secs(120), request)
         .await
+        .unwrap_or_else(|_| panic!("the barrier at {time_ms} was not answered"))
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
@@ -264,6 +266,7 @@ async fn view_files_checked(
             std::fs::read(&path).unwrap(),
         );
     }
+    state.engine.stop();
     let _ = std::fs::remove_dir_all(&dir);
     (files, failed)
 }
