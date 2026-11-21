@@ -430,17 +430,15 @@ async fn a_full_precompute_backlog_refuses_remote_write() {
     let mut refused = false;
     let mut largest = 0;
     let deadline = Instant::now() + Duration::from_secs(60);
-    'feed: for body in requests(&plan, SERIES, START_MS, END_MS) {
-        loop {
-            largest = largest.max(state.engine.precompute_backlog());
-            match write(&app, body.clone()).await {
-                StatusCode::NO_CONTENT => break,
-                StatusCode::SERVICE_UNAVAILABLE => {
-                    refused = true;
-                    break 'feed;
-                }
-                status => panic!("Remote Write answered {status}"),
+    for body in requests(&plan, SERIES, START_MS, END_MS) {
+        largest = largest.max(state.engine.precompute_backlog());
+        match write(&app, body).await {
+            StatusCode::NO_CONTENT => {}
+            StatusCode::SERVICE_UNAVAILABLE => {
+                refused = true;
+                break;
             }
+            status => panic!("Remote Write answered {status}"),
         }
         assert!(Instant::now() < deadline, "Remote Write was never refused");
     }
