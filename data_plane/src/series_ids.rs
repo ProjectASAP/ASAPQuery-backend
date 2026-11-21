@@ -25,7 +25,16 @@ pub struct Series {
     /// The canonical JSON of every label, `__name__` included: the series
     /// identity column of a raw-data read, computed once when interned.
     pub identity: Arc<str>,
-    labels: BTreeMap<String, String>,
+    /// Shared with every query result row of this series.
+    labels: Arc<BTreeMap<String, String>>,
+}
+
+impl Series {
+    /// The label set, shared: a query result row of this series holds it
+    /// without copying.
+    pub fn labels(&self) -> &Arc<BTreeMap<String, String>> {
+        &self.labels
+    }
 }
 
 impl Deref for Series {
@@ -145,7 +154,7 @@ pub fn intern_pairs<N: AsRef<str>, V: AsRef<str>>(pairs: &[(N, V)]) -> Arc<Serie
         identity: serde_json::to_string(&labels)
             .expect("labels serialize")
             .into(),
-        labels,
+        labels: Arc::new(labels),
     });
     interner.series.push(series.clone());
     interner.by_hash.entry(hash).or_default().push(id);

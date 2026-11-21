@@ -300,13 +300,16 @@ async fn query(
 }
 
 /// Runs a planned instant query at its time, or now.
-async fn answer(state: &DataPlane, query: InstantQuery) -> Result<serde_json::Value, Unanswered> {
+async fn answer(
+    state: &DataPlane,
+    query: InstantQuery,
+) -> Result<prometheus::VectorResponse, Unanswered> {
     let time_ms = query.time_ms.unwrap_or_else(ingestion::wall_clock_ms);
     let samples = match state.engine.cached(&query.query, time_ms) {
         Some(samples) => samples,
         None => state.engine.evaluate(query.query, time_ms).await?,
     };
-    Ok(prometheus::vector_response(time_ms, &samples))
+    Ok(prometheus::VectorResponse { time_ms, samples })
 }
 
 /// Answers a planned range query from the plan, one evaluation per step;
@@ -358,7 +361,7 @@ async fn query_range(
 async fn answer_range(
     state: &DataPlane,
     range: RangeQuery,
-) -> Result<serde_json::Value, Unanswered> {
+) -> Result<prometheus::MatrixResponse, Unanswered> {
     use futures::{StreamExt, TryStreamExt};
     let started = std::time::Instant::now();
     let query = &range.query;
@@ -404,7 +407,7 @@ async fn answer_range(
             .range_steps
             .fetch_add(steps.len() as u64, Ordering::Relaxed);
     }
-    Ok(prometheus::matrix_response(&steps))
+    Ok(prometheus::MatrixResponse::new(&steps))
 }
 
 /// With `--no-forward`, the answer to a query the plan does not answer: a
