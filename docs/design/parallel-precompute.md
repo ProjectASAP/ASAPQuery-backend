@@ -2,203 +2,236 @@
 
 ## Audience and context
 
-Developers and architects of the backend data plane. This design extends
-[the data plane demo design](data-plane-demo.md): ingestion shards samples
-by series hash, one `precompute` thread runs `execute_ingestion` once per
-closed refresh window, and the results go to the materialized view store,
-which query workers read. Persistence runs in the background. A query-time
-`OneEvaluation` node is computed once per evaluation time (single flight).
-This document changes only how views are computed at ingestion time. What
-is computed, the view store, queries and the file format stay the same.
+This document is for developers and architects of the backend data plane.
+It extends [the data plane demo design](data-plane-demo.md). In that design:
 
-Terms used below, as databases use them:
+- Remote Write is sharded by series across `--ingest-threads` ingest shards
+  (`ingest-N`).
+- An `ingest` coordinator moves the watermark, but only behind a flush of
+  every shard.
+- The precompute side runs `execute_ingestion` once per closed refresh
+  window, over every shard's raw data, and stores the result in the
+  materialized view store.
+- Queries run on worker threads. Shared query-time results use single
+  flight, and final answers go to a result cache.
+- Views are persisted asynchronously.
+
+That design computes windows in parallel at the granularity of a refresh
+group's window: one task per (group, window) on a pool. This document goes
+below that granularity. It changes only how ingestion-time views are
+computed. What is computed stays the same, and so do the view store, the
+queries, the result cache and the file format.
+
+Terms, as databases use them:
 
 - **Pipeline**: a maximal chain of operators that pass each batch on as it
-  arrives. It starts at a source (a `Scan`, or the output of an earlier
-  pipeline) and ends at a sink (a pipeline breaker or a view). Example:
-  `Scan lat → TimeRange → SummaryTumblingWindowChain`.
-- **Morsel**: one batch pushed through a pipeline, here the samples of one
-  Remote Write request that one shard receives for one metric.
+  arrives, from a source (a `Scan`, or an earlier pipeline's output) to
+  one sink (a pipeline breaker or a view).
+- **Morsel**: one batch pushed through a pipeline. Here it is the samples
+  of one Remote Write request that one shard owns, for one metric.
 - **Pipeline breaker**: an operator that must see all of its input before
-  it can output anything. It is always its pipeline's sink.
+  it outputs anything. It is its pipeline's sink.
 - **Instance**: one running copy of a pipeline for one (shard, refresh
   window).
-- **Combine**: the step at window close that turns the instances' partial
-  outputs into the window's single output.
-- **Commit**: appending a window's rows to the view store, publishing the
-  new snapshot, and queueing the rows for persistence.
+- **Seal**: at window close, a shard ends an instance's input and the
+  breaker emits its partial output.
+- **Combine**: turns the K partial outputs of a window into the window's
+  one output.
+- **Commit**: appends a window's rows to the view store, publishes the
+  snapshot and queues the rows for persistence.
+
+The decisions are recorded in "Decisions D1–D10" below. Each one lists its
+options, precedents, evidence and conclusion. Several decisions are made
+by experiments E1–E5. Their result slots are left open until the runs
+finish. The evidence comes from two inputs:
+
+- a survey of push and streaming engines: DuckDB, HyPer/Umbra, Velox,
+  DataFusion, ClickHouse, Flink, Arroyo, Kafka Streams, Timely and
+  Differential Dataflow, RisingWave, Materialize, VictoriaMetrics, vmagent
+  and Prometheus;
+- a classification of what the Planner puts at ingestion time, over 3,731
+  public corpus queries (real-world PromQL, Prometheus engine tests, SQL
+  data-quality, TPC-H and BGP), both raw-not-kept (mvp) and raw-kept
+  deployments, plus 49 multi-query workloads (8,002 planner runs).
 
 ## Problem and why now
 
-All ingestion-time work runs on one thread. Each closed window of each
-refresh group is one `execute_ingestion` run over the raw samples of that
-window. Three limits follow:
-
-- **CPU.** Precompute cannot use more than one core. The dashboard plan
-  (example 4 of the demo design) has a single refresh group, with all four
-  views at W = 15 s. Every 15 s one run builds 10k KLL sketches, 10k Max
-  states, 10k Rate states and 10k Increase states from 150k samples per
-  metric. If the series count goes up 10x, the run takes 10x as long on
-  the same core. Once it takes longer than 15 s, the backlog grows, the
-  ingest thread waits and Remote Write gets 503.
-- **Memory.** Raw samples are kept until the windows that read them close.
-  A view whose plan does not keep raw data still holds about input rate ×
-  window width × bytes per sample. A sample is 20 bytes (time, value,
-  series code). At 100k samples/s that is 60 MB for a 30 s window and
-  600 MB for a 300 s window (the 5-minute KLL chain of
-  `sketch-plan-chains-10m-5m-3m-10s`). The summary built from those samples
+- **Close-time work.** All of a window's view computation happens when the
+  window closes: one batch run over buffered raw samples.
+  - One precompute thread took 0.75–1.3 s per window at 10k series.
+  - With the window-task pool, different windows run on different
+    threads, but one window of one group is still one core.
+  - The dashboard plan has a single refresh group, so the pool helps it
+    only when consecutive windows overlap.
+- **Memory.** Raw samples are kept until the windows that read them close,
+  even when the plan does not keep raw data. A sample is 20 bytes. At 100k
+  samples/s that is 60 MB for a 30 s window and 600 MB for the 5-minute
+  chain of `sketch-plan-chains-10m-5m-3m-10s`. The summary built from them
   is far smaller.
-- **Latency peaks.** All of a window's work happens at once when it
-  closes, so precompute CPU is idle most of the time and then spikes.
+- **Per-core rate.** The data plane ingests about 132k samples/s per core.
+  VictoriaMetrics ingests 385–443k samples/s per core. Parallelism does not
+  close that gap by itself. The per-sample path must also become a cheap
+  append plus per-batch work. Folding each batch into the open window's
+  summaries, instead of keeping raw rows and recomputing at close, is part
+  of that.
 
-Ingestion is now sharded by series hash. Each shard already holds a
-disjoint set of series, so the same shards can run the view pipelines. No
-new partitioning is needed.
+Ingestion is already sharded by series, and each shard owns a disjoint set
+of series. The same shards can run the view pipelines without
+repartitioning.
 
 ## Inputs, outputs, and end-to-end behavior
 
-- Inputs: the same as before. Remote Write samples go to the ingest shards,
-  and the plan is installed in the same way.
-- Outputs: the same views, rows and view files. Queries get the same
-  answers. A sketch whose build is randomized (KLL), or whose merge breaks
-  ties among heap candidates (heap-carrying sketches, UnivMon), answers
-  within the tolerance the parity tests already allow.
+- Inputs and installed plans are the same as before.
+- Outputs are the same views, rows and view files, and queries get the
+  same answers.
+  - Concatenated per-series states and integer-count merges are
+    identical.
+  - Float sums and KLL merges stay within the plan's accuracy target and
+    use a fixed merge order (by shard index).
 - Changed behavior:
-  - Each shard pushes its samples into the open windows' pipeline
-    instances as they arrive.
-  - At window close, each shard finalizes its instances, a pool combines
-    the partial outputs, and one committer commits the windows in window
+  - Each shard pushes its morsels into the open windows' instances as they
+    arrive, inline on its own thread.
+  - At window close, each shard seals its instances, a combine merges the
+    partials, and a committer commits each group's windows in window
     order.
-  - When a plan does not keep raw samples, they are no longer buffered for
-    views. Each sample is folded into the summaries as soon as it arrives.
-  - `/metrics` breaks precompute CPU down by refresh group, shard and step
-    (push, finalize, combine, commit).
-- `--no-parallel-precompute` keeps the single-thread precompute described
-  in the demo design, for comparison and for the parity tests.
+  - When raw data is not kept, it is no longer buffered for views.
+  - `/metrics` breaks precompute down by group, shard and step.
+- `--precompute-mode=window` keeps the window-task pool path, for
+  comparison and for plans that cannot be pushed (D4, D7).
+  `--precompute-mode=push` is the new path. The default is decided by E1
+  (D9).
 
 ## Goals and non-goals
 
 Goals:
 
-- Precompute throughput grows with the shard count on plans whose
-  ingestion-time breakers are per-series summaries. That covers every
-  ingestion-time view in the current parity workloads.
-- When raw data is not kept, raw memory no longer depends on window width.
-  Only the open instances' summary state and the in-flight morsels are
-  held.
-- Answers and stored view rows are the same as with single-thread
-  precompute, on every parity workload, for shard counts 1, 2, 4 and 8.
-- No change to the Planner executor is needed for the plans in the parity
-  workloads. The changes some other operators would need are listed, as
-  separate ASAPPlanner work.
+- Move the view work from window close to arrival time (D5). Throughput
+  should scale with the shard count for plans whose ingestion-time
+  breakers are per-arrival folds.
+- When raw data is not kept, raw memory should no longer grow with window
+  width.
+- Answers and stored rows should match the window path, on every parity
+  workload, at 1, 2, 4 and 8 shards.
+- No Planner executor change for the plans in today's workloads.
 
 Non-goals:
 
-- Parallel query execution. Queries already run on parallel workers, one
-  run per worker.
-- Changing the shard count while the data plane runs, or moving series
-  between shards.
-- A generic push-operator interface in the executor. Push is built from
-  today's pull operators fed by a channel (see "Executor reuse").
-- Exchange (repartitioning by group key) for non-mergeable breakers. It is
-  specified here, but v1 implements only the single-partition route. No
-  plan in the workloads has a non-mergeable ingestion-time breaker (see
-  "Combine").
-- Persisting open windows or raw samples. A restart loses open windows, as
-  it does today.
+- Parallel query execution.
+- Changing the shard count at run time.
+- A generic push-operator interface in the executor (D1).
+- A parallel combine for sort, exact quantile and exact distinct
+  (ordered-merge). It is listed as future work in D4.
+- Persisting open windows or raw samples.
 
 ## Heilmeier questions
 
-- **What are we trying to do?** Compute the views the plan precomputes on
-  all cores, as samples arrive, instead of on one core when each window
-  closes.
-- **How is it done today, and what are the limits?** One thread runs one
-  batch execution per closed window, over buffered raw samples. Throughput
-  is capped at one core and raw memory grows with window width.
-- **What is new?** The refresh group's ingestion DAG is split into push
-  pipelines at its pipeline breakers. Each ingest shard runs its own
-  instance of each pipeline. At window close, the breakers' partial states
-  are combined by a rule taken from the plan: concatenate per-series
-  states, merge mergeable states, or route non-mergeable ones to a single
-  partition. The executor's existing operators and `SummaryMerge` do the
-  work.
-- **Who cares?** Anyone running the demo or a deployment at high series
-  counts. Today the precompute backlog is the first limit reached.
-- **Risks and costs?**
-  - Partial states are multiplied by the shard count for views grouped by
-    coarse labels.
-  - Combine and commit add a step at every window close.
-  - The executor's runs are not `Send`, so an instance stays on its shard
-    thread.
-- **How long?** About 4 days after the test plan is approved (see
-  "Implementation plan").
-- **Checks?** Midterm: the parity test passes at shard counts 1, 2, 4 and
-  8 with raw data kept and not kept. Final: the throughput benchmark shows
-  samples/s and CPU against single-thread precompute at 10k and 100k
-  series.
+- **What are we trying to do?** Compute the planned views as samples
+  arrive, on every ingest shard, instead of in one batch run per window at
+  close.
+- **How is it done today?** One task per closed (group, window) runs over
+  buffered raw samples. Work comes in bursts at close, a single group
+  cannot use more than one core, and raw memory grows with window width.
+- **What is new?** The DuckDB-style contract, driven by the watermark
+  instead of end-of-input:
+  - Sink: push a morsel into the thread-local state of the shard that
+    owns its series.
+  - Combine: seal each shard's state at window close and merge the
+    partials.
+  - Finalize: commit.
+
+  Today's executor runs this unchanged, fed by a channel.
+- **Who cares?** Anyone ingesting at high series counts. The window path
+  is the first limit reached.
+- **Risks and costs?** Shard threads now do the view work. A hot series is
+  bounded by one core. Grouped and global partials multiply open-window
+  state by the shard count.
+- **How long?** About 5 days after the test plan is approved.
+- **Checks?** Midterm: parity at 1, 2, 4 and 8 shards. Final: B1 and B2
+  against the window path at 1k, 10k and 100k series.
+
+## What the Planner puts at ingestion time (corpus evidence)
+
+These are the breaker classes in plans with ingestion work, in the mvp
+deployment. Plans are counted when they contain the class.
+
+| Breaker class | Mergeable | Real-world PromQL (355 plans) | Engine tests (250) | SQL (514) |
+| --- | --- | --- | --- | --- |
+| per-series exact chain: Rate / Increase | yes | 254 / 85 | 79 / 15 | 0 |
+| per-series exact chain: Max, Min, Sum, Count | yes | 15 | 86 | 0 |
+| per-series sketch chain (KLL) | yes | 0 | 7 | 0 |
+| raw window buffer, PromQL subquery at ingestion | no | 2 | 88 | 0 |
+| grouped or global exact chain (Count, Sum, Min, Max) | yes | 0 | 0 | 51 |
+| grouped sketch chain (KLL) | yes | 0 | 0 | 2 |
+| global running exact Aggregate (count, sum, avg, …) | yes | 0 | 0 | 397 |
+| global exact quantile / exact distinct | no | 0 | 0 | 39 / 17 |
+| join or SQL window function at ingestion | no | 0 | 4 | 25 |
+
+Roll-ups:
+
+- Every real-world PromQL ingestion plan has only per-series breakers, so
+  series-hash partitioning needs no combine beyond concatenation.
+- Every SQL plan needs a cross-partition combine. In 15.6% of SQL plans
+  (all whole-table data-quality checks) the breaker is non-mergeable.
+- No plan has a view that reads another view.
+- 36% of real-world plans have two or more views. Dashboards put 5–6
+  views (seed-862 workloads) up to 13 views (an o11y dashboard) on one
+  source, at one to four window widths.
+- In 9% of real-world plans at 60 s refresh, and in every dashboard
+  workload, a query merges more than 20 panes per evaluation.
 
 ## Proposed design
 
 ```
-Remote Write ─► HTTP threads: decode, intern, route by series hash
-                     │ (per-shard FIFO queues: samples and Close events,
-                     │  in the order the router decided them)
-        ┌────────────┼────────────┬────────────┐
+Remote Write ─► HTTP threads: decode, intern, send each series' samples
+                to its ingest shard (whole request between two flushes)
+        ┌────────────┬────────────┬────────────┐
         ▼            ▼            ▼            ▼
-     shard 0      shard 1       ...         shard K-1
+     ingest-0     ingest-1       ...       ingest-(K-1)
      append raw (only what query-time Scans read)
-     push each morsel into the open instances of every refresh
-     group that scans its metric:
-        instance(g, window e): Scan → Filter/Project/TimeRange → breaker
-     on Close(g, e): end the instance's input, run it to completion,
-     send its partial output (Send batches) to the combine stage
+     push the morsel, inline, into every open instance of every refresh
+     group that scans its metric: Scan → Filter/Project/TimeRange →
+     {breaker, breaker, …} (one shared batch, no queue between views)
+     on Seal(g, e): end the instance's input; the breakers emit; send the
+     partial (Send batches) onward; chunked so ingest keeps running
         └────────────┴─────┬──────┴────────────┘
+                           │       ▲ Flush / Seal(g, e) to every shard
+                           │       │ (watermark moves only behind a flush)
+                           │   ingest coordinator
                            ▼
-       combine pool (`--precompute-threads`): once all K partials of
-       (g, e) are in, run the breaker's combine (concatenate / SummaryMerge
-       / single partition), then the pipelines above the breaker
+       combine (window-task pool threads): when all K partials of (g, e)
+       are in: concatenate / merge / single partition; then the
+       pipelines above the breakers
                            ▼
-       committer (the existing `precompute` thread): commits each group's
-       windows in window order; publishes the view snapshot; queues
-       persistence; schedules groups that read this group's views
+       committer (`precompute`): per group in window order; publish
+       snapshot; queue persistence; schedule groups that read this one
                            ▼
                  materialized view store  ◄── query workers (unchanged)
 ```
 
 ### Pipelines from the refresh group's DAG
 
-Each refresh group's ingestion run is compiled once at install, as it is
-today (`compile` over the group's views). Then it is split into pipelines
-by walking down from each view to its sources and classifying each
-operator:
+Each refresh group's ingestion DAG is compiled once at install, as today.
+It is split at its breakers:
 
-| Operator (physical) | Class | Note |
-| --- | --- | --- |
-| `Scan` (raw data slot) | source | One per scanned metric. Each shard feeds its own copy. |
-| `Filter`, `Project`, `TimeRange` (ingestion window), `TimeShift`, label operators, scalar functions per row | non-blocking | Each row is kept, dropped or changed on its own. |
-| `SummaryTumblingWindowChain`, `SummaryAgg` (every summary build: per group, keyed, all-groups) | breaker | Emits states at window close. Keeps one state per group while the window is open. |
-| `Aggregate` (exact; sum, count, min, max, avg, quantile, count_values, topk, …) | breaker | Exact quantile and exact distinct hold their rows. |
-| `Sort`, `Sort` + `Limit` | breaker | |
-| Hash join: build side | breaker | The probe side is non-blocking once the build side has finished. |
-| `SummaryMerge`, `SummaryEstimate`, `FinalizeExactAccumulator` above a breaker | non-blocking on the breaker's output | These run in the pipeline that starts at the breaker's output. |
-| Materialized view slot of another group | source of a post-commit pipeline | See "Pipelines across refresh groups". |
+| Operator (physical) | Class |
+| --- | --- |
+| `Scan` (raw data slot) | source; each shard feeds its own copy |
+| `Filter`, `Project`, `TimeRange` (ingestion window), `TimeShift`, label and scalar row functions | non-blocking |
+| `SummaryTumblingWindowChain`, `SummaryAgg` (per group, keyed, all-groups) | breaker; folds each morsel into per-group state and emits at close |
+| exact `Aggregate` | breaker; decomposable functions fold, holistic ones (quantile, distinct) hold rows |
+| `Sort`, `Sort` + `Limit`, join build side, SQL window function, ingestion-time `TimeRange` kept as a raw window buffer, PromQL subquery | breaker; holds rows (not a per-arrival fold) |
+| `SummaryMerge`, `SummaryEstimate`, `FinalizeExactAccumulator` above a breaker | non-blocking, in the pipeline after combine |
+| a view slot of another group | source of a post-commit pipeline (D7) |
 
-A pipeline runs from a source through non-blocking operators to a breaker
-or a view. A node that feeds several breakers (one `Scan` under two chains)
-stays a single node in the instance. The executor's ingestion runtime
-already sends each batch to every consumer, so a morsel is read once and
-reaches every chain.
+All of a group's pipelines over one source share the scan node inside
+the instance. The executor's ingestion runtime hands each batch to every
+consumer, so one morsel reaches all views of its source on the shard
+thread, without a copy and without a queue (D2).
 
-The output of a breaker starts the next pipeline. That pipeline runs once
-per window, after combine, on the combined rows. For example, if a view is
-`topk` over an exact `sum by (job)` built at ingestion, the second
-pipeline is `combined sum → topk → view`. The stage between the two
-pipelines is reached only at window close.
+### Example 1: the dashboard plan
 
-### Example 1: the dashboard plan (one refresh group, four views)
-
-This is the plan of example 4 in the demo design (`dashboard.json`,
-10k series per metric, 1 sample/s, every query every 15 s):
+`dashboard.json` (example 4 of the demo design): 10k series per metric,
+1 sample/s, every query every 15 s.
 
 ```
 n0   Ingestion None               Scan lat
@@ -207,41 +240,30 @@ n6   Ingestion AcrossEvaluations  SummaryTumblingWindowChain Max W=15s       <- 
 n10  Ingestion None               Scan reqs
 n11  Ingestion AcrossEvaluations  SummaryTumblingWindowChain Rate W=15s      <- n10
 n17  Ingestion AcrossEvaluations  SummaryTumblingWindowChain Increase W=15s  <- n10
-(query-time nodes as in the demo design)
 ```
 
-(Plans from newer Planner revisions may pick DDSketch instead of KLL, or
-compute the quantile at query time. The pipeline shapes do not change.)
+(Newer Planner revisions may choose DDSketch, or compute the quantile at
+query time. The shape stays the same.)
 
-- Pipelines: there is one refresh group {n1, n6, n11, n17} with
-  W = 15 s and phase 0, and two pipelines.
-  - P1 is `Scan lat → {KLL chain n1, Max chain n6}`.
-  - P2 is `Scan reqs → {Rate chain n11, Increase chain n17}`.
-  - All four sinks are breakers. Each is `PerEntity`: one state per series.
-- Execution with K = 4 shards:
-  - Each shard owns about 2.5k `lat` series and 2.5k `reqs` series.
-  - When a Remote Write request reaches shard s, its `lat` samples become
-    one morsel. The morsel is pushed into instance (s, window e) of P1,
-    where it updates s's KLL and Max states for those series. The `reqs`
-    morsel updates s's Rate and Increase states in P2 the same way.
-  - Nothing is kept for these views after the push. This plan does not
-    keep raw data, so the shard keeps nothing at all.
-- Window close at e:
-  - The router sends Close(g, e) to all four shards.
-  - Each shard ends its instances' input and runs them to the end. Each
-    chain emits the rows for its 2.5k series as `(window_end, series
-    keys, state)`.
-  - The combine concatenates the four partial outputs per view. The
-    series sets are disjoint, so no state is merged.
-  - The committer appends the four views' rows for (e − 15 s, e].
-- Query: unchanged. For example, `topk(10, sum by (job) (rate(reqs[1h])))`
-  still merges 240 windows of n11 per series, then aggregates by `job` at
-  query time.
+- **Pipelines.** One refresh group, two pipelines: `Scan lat → {KLL n1,
+  Max n6}` and `Scan reqs → {Rate n11, Increase n17}`. All four breakers
+  are `PerEntity`.
+- **Push with K = 4.** Each shard owns about 2.5k series per metric. Each
+  request's `lat` morsel updates that shard's KLL and Max states, and its
+  `reqs` morsel updates the Rate and Increase states. Nothing else is
+  kept, because the plan keeps no raw data.
+- **Close at e.** Each shard seals its instances and emits its 2.5k series
+  per view as `(window_end, series keys, state)`. The combine concatenates
+  the partials, and the committer appends the four views for
+  (e − 15 s, e].
+- **Query.** Unchanged. For example, `topk(10, sum by (job)
+  (rate(reqs[1h])))` merges 240 windows of n11 per series, then
+  aggregates by `job` at query time.
 
-### Example 2: a grouped query, aggregated at query time
+### Example 2: a `by` grouping applied at query time
 
 `avg by (region) (quantile_over_time(0.9, data[5m]))`
-(`sketch-plan-quantile-grouped`), raw data not kept:
+(`sketch-plan-quantile-grouped`):
 
 ```
 n0  Ingestion None               Scan
@@ -253,427 +275,625 @@ n5  Query     None               Project                                        
 n6  Query     OneEvaluation      Aggregate avg() by (region)                        <- n5   (root)
 ```
 
-The `by (region)` grouping is applied at query time. The ingestion-time
-breaker n1 is per series (`PerEntity`), so the combine concatenates the
-partial outputs, as in example 1. Every ingestion-time view in the current
-parity workloads has this form: a per-series chain whose grouping happens
-at query time. This is why v1 is expected to need no merge for them.
+The ingestion-time breaker is per series, so the combine concatenates. As
+the corpus shows, this is the shape of every real-world PromQL ingestion
+plan.
 
 ### Example 3: an ingestion-time view grouped by coarser labels
 
-The plan IR allows a chain or `SummaryAgg` grouped by a label set
-(`Reduction::Reduce(GroupKeys)`), for example
-`sum by (job) (sum_over_time(m[1m]))` built at ingestion as a single
-`ExactAggregate(Sum)` chain grouped by `job`:
+The IR allows a chain grouped by labels (`Reduction::Reduce`). The SQL
+corpus has 51 plans of this shape, for example a rolling
+`SELECT operation, count(*) … GROUP BY operation` over 1-day windows. In
+PromQL terms:
 
 ```
 n0  Ingestion None               Scan m
 n1  Ingestion AcrossEvaluations  SummaryTumblingWindowChain ExactAggregate(Sum) W=60s by (job)  <- n0
 ```
 
-- Series of `job="api"` are spread over all K shards, so each shard's
-  instance holds a partial sum for `job="api"`.
-- At close, the combine runs the executor's `SummaryMerge` grouped by
-  `(window_end, job)` over the union of the K partial outputs.
-  `ExactAggregate(Sum)` merges are exact, so the merged state equals the
-  single-thread state.
-- The same applies to Max, Min, Count, DDSketch, HLL, Count-Min and KMV:
-  their merges do not depend on order. KLL merges are randomized, and
-  heap-carrying sketches (Count-Min or Count Sketch with heap, UnivMon)
-  re-rank their candidate heaps when they merge. For those, the merged
-  state equals the single-thread state only within the sketch's error.
-- The current Planner does not select this shape on the parity workloads.
-  The tests use a hand-written plan for it (see the test plan).
+- Each shard holds a partial sum for every `job` it has seen.
+- At close, `Union(K) → SummaryMerge`, grouped by `(window_end, job)`,
+  gives one state per job.
+- The current Planner selects no PromQL plan of this shape. The tests use
+  a hand-written plan.
 
-### Combine: which rule, chosen how, recorded where
+### Combine rules
 
-The rule is chosen once at install, per breaker, from the plan node alone:
+The rule is chosen once at install, per breaker, from the plan node
+alone. A breaker that matches no row makes install fail; no rule is
+guessed.
 
-| Breaker | Condition | Combine | Result vs single thread |
+| Class | Breaker and condition | Combine | Equality with the window path |
 | --- | --- | --- | --- |
-| Summary build (chain or `SummaryAgg`) | `Reduction::PerEntity`: one state per series, and series are partitioned by shard | **Concatenate** the K outputs. Rows are disjoint. | identical states |
-| Summary build | `Reduction::Reduce(keys)`, and `SummaryTypeCapability::of(summary_type).merge_inputs` is `Disjoint` or `MayOverlap` (`merges_groups`) | **Merge**: `Union(K) → SummaryMerge` grouped by the output's group columns (and `window_end` for a chain) | identical for exact accumulators, DDSketch, HLL, Count-Min, KMV; within the sketch's error for KLL and heap-carrying sketches |
-| Hydra summary build (one grid for all groups, `shares_one_state_across_groups`) | any | **Merge** the K grids (`SummaryMerge` merges Hydra grids pairwise) | identical counters |
-| Summary build | `Reduce(keys)`, and the family has no group merge (counters Rate, Increase, irate: `DisjointInTime`; or `merge_inputs: None`) | **Single partition** | identical |
-| Exact `Aggregate` sum, min, max, count, topk, bottomk | grouped or global | **Re-aggregate**: run the same function over the K partial results (count becomes a sum of counts) | identical, except float sums, which may differ in the last bits because addition order changes |
-| Exact `Aggregate` avg, quantile, count distinct, stddev and other non-decomposable functions; `Sort` without `Limit`; join build side | any | **Single partition** (v1); **exchange by group-key hash** when profiling shows the single partition is the bottleneck | identical |
+| **Concatenate** | Summary build with `Reduction::PerEntity` (one state per series; each series lives on one shard) | Concatenate the K outputs in shard order | identical |
+| **Merge** | Summary build with `Reduce(keys)` whose `SummaryTypeCapability` merges groups (`Disjoint`/`MayOverlap`); a Hydra grid; exact `Aggregate` sum, min, max, count, topk, bottomk (re-aggregate) | `Union(K) → SummaryMerge` grouped by the output's group columns (and `window_end`), or the same aggregate again over the partials | integer counts, min and max: identical. Float sums: within the plan target. KLL and heap sketches: within the plan target. Merge order fixed by shard index |
+| **Ordered-merge** (not in v1) | `Sort`, exact quantile (sorted runs), exact distinct (set union, radix-partitioned by value) | A parallel merge (Merge Path, radix partitions) | identical |
+| **Single partition** (v1 for the row above, plus joins, window functions, counters `Reduce`d across series, exact avg until it is lowered to sum + count) | Shard 0 owns the breaker. The other shards run the non-blocking prefix and forward its output batches to shard 0 | none needed | identical |
 
-- **Concatenate.** No executor call is needed. The combined output is the
-  K partial batch lists in shard order. Row order inside a view is not
-  part of the store's contract: reads select windows and keys, and the
-  parity test compares answers by series.
-- **Merge.** At install, a combine DAG is built for each breaker:
-  `Operator::source` × K → `Operator::union(K)` →
-  `Operator::summary_merge(state, groups)`. Each shard emits the empty
-  global row when its build has no group keys and no input
-  (`emit_empty_global`), so merging K such rows gives the one empty row
-  the single-thread run stores for an empty window.
-- **Single partition.** The breaker's pipeline instance exists only on
-  shard 0. The other shards run the non-blocking prefix of the pipeline
-  (`Scan → Filter → Project`) and forward its output batches to shard 0's
-  instance through a channel. This is an exchange with one target. The
-  forwarded rows are filtered and projected, but they are still rows
-  until the window closes.
-- **Exchange (specified, not in v1).** There is one breaker instance per
-  shard. Each shard routes a prefix-output row to shard
-  `hash(group key) mod K`. The combine is then a concatenation. It is
-  needed only when a non-mergeable breaker's single partition limits
-  throughput. No plan in the workloads has such a breaker.
-- **Where the choice is recorded.**
-  - The data plane's compiled refresh group keeps the rule for each
-    breaker node.
-  - The install log line lists `group, node, operator, rule`.
-  - `/api/v1/status/asap` reports the rule per breaker under
-    `ingestion.pipelines`.
-  - The rule is derived from the plan (`Reduction` and the Planner's
-    `SummaryTypeCapability`, which is the authoritative merge rule). The
-    plan format does not change.
-
-### Inter-operator parallelism
-
-- **Pipelines in one window run at the same time.** On one shard, P1 and
-  P2 of the dashboard plan are separate instances. A morsel of `lat` goes
-  only to P1. Different shards run their instances in parallel.
-- **Windows and refresh groups run at the same time.** Windows of
-  different groups close independently, and their combines run on
-  different pool threads. Consecutive windows of one group may also be
-  combined at the same time. The committer restores order (see
-  "Scheduling").
-- **Pipeline DAG.** At install, the refresh groups and their pipelines
-  form a DAG:
-  - A pipeline whose source is another pipeline's breaker output depends
-    on that breaker's combine.
-  - A group that reads another group's views (`inputs.materialized_views`,
-    already ordered by `ingestion_refresh_groups`) depends on that group's
-    commits.
-
-### Pipelines across refresh groups
-
-A group whose ingestion run reads another group's view, such as a coarse
-chain over a fine chain (the "Hierarchical rollups" target design), reads
-no raw samples through that view. It runs as a post-commit pipeline: one
-task in the combine pool per closed window (e − W_B, e] of group B, over
-the view snapshot. The task is scheduled once group A has committed every
-window inside (e − W_B, e]. This is today's batch `refresh`, triggered by
-commits instead of by the watermark.
-
-A group that reads both raw samples and another group's views runs, in v1,
-as a single-thread batch run at window close over the raw panes and
-views, as it does today. Its scanned metrics keep their raw panes until
-that run.
+- The rule is derived from the plan: from `Reduction` and from the
+  Planner's `SummaryTypeCapability`, which is the authoritative merge
+  rule. The plan format does not change.
+- The rule is recorded at install. It appears in the log line
+  `group, node, operator, rule` and in `/api/v1/status/asap` under
+  `ingestion.pipelines`.
+- **Empty windows.** Every shard opens every window and seals it even
+  when it saw no sample. Its empty partial costs nothing (no allocation).
+  A global build with no input emits its one empty row
+  (`emit_empty_global`), and K of those merge into one. That is what the
+  window path stores for an empty window.
 
 ### Scheduling
 
-- **Shard threads (push).**
-  - Each shard thread owns its instances. An instance is the group's
-    `CompiledPhysicalDAG` instantiated over a per-instance store, whose
-    `read_raw_data` returns the receiving end of a channel.
-  - `execute_ingestion` gives a future. The shard keeps it in a local
-    executor (`futures::executor::LocalPool`).
-  - After pushing a morsel into an instance's channel, the shard runs the
-    pool until it stalls. The morsel then passes through the pipeline to
-    the breaker's state before the next morsel is read.
-  - Instances are created when a window opens. A window opens when the
-    group starts or the previous window's end passes, for every group on
-    every shard. Every shard opens every window, so an idle shard still
-    produces its part, and the empty-window rule stays the same.
+- **Push.** Each shard thread owns its instances, which are not `Send`
+  because the executor's runs use `Rc`.
+  - An instance is the group's `CompiledPhysicalDAG`, instantiated over a
+    per-instance store whose `read_raw_data` returns a channel's receiving
+    end.
+  - Its `execute_ingestion` future lives in a `LocalPool` on the shard
+    thread.
+  - After appending a request (if raw is kept), the shard sends the
+    morsel to each instance of a group that scans its metric. Then it
+    runs the pool until it stalls, so the morsel reaches every breaker
+    before the shard takes the next request. The channel never holds more
+    than one morsel.
+- **Opening windows.**
+  - An instance is created when its window opens on the shard, for every
+    group on every shard.
   - With allowed lateness L, a group has at most ⌈L / W⌉ + 1 windows open
-    on a shard at a time.
-- **Close (event).**
-  - The router decides when the watermark passes a window end e, exactly
-    as `close_windows` does today (the global watermark is the minimum
-    over shards, and idle shards are sent the time).
-  - It then puts Close(g, e) in every shard's FIFO, after every sample it
-    routed before that decision. A shard therefore closes the window
-    after exactly the samples the single-thread engine would have read.
-  - On Close, the shard ends the instance's input channel, runs the
-    instance to completion (the breaker finalizes and emits), and sends
-    `(g, e, shard, Result<batches>)` to the combine stage.
-  - Finalizing on the shard thread is required: the instance's future is
-    not `Send` (the executor's runtime uses `Rc`). Only its output
-    batches, which are `Send`, leave the thread.
-- **Combine (task).**
-  - The combine stage counts the partials of each (g, e). When all K have
-    arrived, it schedules one task on the combine pool
-    (`--precompute-threads`).
-  - The task runs each breaker's combine, then the pipelines above the
-    breakers, and returns the group's view rows for the window.
-- **Commit (ordered).**
-  - The committer is the existing `precompute` thread. It keeps a
-    reorder buffer per group and commits window e only after every
-    earlier closed window of that group has been committed or has failed.
-  - Each commit appends the rows, publishes the view snapshot and queues
-    persistence, as today. Then the committer schedules the post-commit
-    pipelines that were waiting on the commit.
-  - A view's windows therefore always appear in window order, and a
-    persist thread receives each group's windows in order.
+    per shard.
+  - A window that every view of the group already stores (loaded from the
+    view files) is not opened.
+- **Seal.**
+  - The coordinator closes windows as it does today: only behind a
+    flush, after every shard has run the requests admitted before the
+    flush.
+  - In push mode, the flush carries `Seal(g, e)` for every window the
+    pass closes.
+  - A shard seals after the samples it ran for the flush and before any
+    later request. So each instance has seen exactly the samples the
+    window path reads from the shards' raw data.
+  - Idle shards answer the flush at once and seal empty, so they never
+    hold the watermark or a window back.
+- **Chunked seal (D5).** Emitting a shard's states for a large group is
+  split into chunks of a bounded time (target about 2 ms; E5 sets it).
+  Ingest requests run between the chunks, so close work does not stall
+  ingestion.
+- **Combine.**
+  - When all K partials of (g, e) have arrived, one task is queued on the
+    window-task pool.
+  - The task combines each breaker, then runs the pipelines above the
+    breakers. Those pipelines are compiled with each breaker bound as a
+    view slot over the combined rows, the same trick the query engine
+    uses for shared `OneEvaluation` nodes.
+- **Commit.**
+  - The `precompute` thread commits each group's windows in window order
+    through a reorder buffer.
+  - The buffer is bounded by `--max-precompute-backlog`, so it doubles as
+    backpressure.
+  - The committer publishes the snapshot, queues persistence, and
+    schedules post-commit groups.
 - **Barrier.** The event-time barrier answers once every window it closed
-  has been committed and queued for persistence, as today.
+  is committed and queued for persistence, as today.
 
 ### Watermark and late data
 
-The rules stay the same. Only where they apply changes:
+The rules from the demo design stay the same:
 
-- A sample whose window on its shard is still open (it is within the
-  allowed lateness) is pushed into that instance and counted, as the
-  single-thread run would count it from the panes.
-- A sample whose window has already closed on its shard does not change
-  the stored window, as today. It is still appended to the raw panes if a
-  query-time `Scan` reads its metric. A new counter,
-  `asap_samples_total{outcome="late_for_views"}`, counts such samples, so
-  the loss is visible.
-- A sample older than every open window and older than every query-time
-  `Scan`'s lookback is dropped (`dropped_late`), as today.
-- Counter states (Rate, Increase) see each series' samples in the order
-  they arrived. A series lives on one shard, and that shard's queue is
-  FIFO, so the order is the same as in the single-thread run, which reads
-  chunks in arrival order.
+- A window (s, e] closes once event time is past e.
+- The watermark moves only behind a flush and is capped at the flush
+  time.
+
+In push mode:
+
+- A sample for a window that is still open on its shard (within the
+  allowed lateness) is pushed into that window's instance.
+- A sample for a window already sealed does not change the stored window,
+  as today. It is still appended to the raw data if a query-time `Scan`
+  reads its metric. `asap_samples_total{outcome="late_for_views"}` counts
+  it.
+- Counter states see each series' samples in arrival order. A series is
+  on one shard, and each shard's queue is FIFO. This is the same order as
+  the chunks the window path reads.
 
 ### Backpressure
 
-- The shard input queues are bounded as before (`--max-queued-samples`,
-  503 when full). A shard does its push work inline, so a slow pipeline
-  slows its own shard and fills its own queue.
-- Windows that have closed but are not yet committed (waiting for
-  partials, combining, or waiting for an earlier window) are bounded by
-  `--max-precompute-backlog`, with the same meaning and metric
-  (`asap_precompute_backlog_windows`). When the backlog is full, the
-  router stops issuing Close events and stops taking from its queue.
-  Remote Write then gets 503 as before.
-- The channel between a shard and an instance never holds more than one
-  morsel, because the shard drains it right away.
-- In single-partition mode, the channel from the other shards to shard 0
-  is bounded in bytes. A full channel makes those shards wait.
+- Shard queues are bounded (`--max-queued-samples`), and a request is
+  admitted whole or refused with 503, as today. A slow pipeline slows only
+  its own shard's queue.
+- Windows that are closed but not yet committed are bounded by
+  `--max-precompute-backlog`. When the backlog is full, the coordinator
+  stops issuing flushes, so the shard queues fill up and Remote Write gets
+  503.
+- Memory reservations (D8) wait instead of failing while older windows
+  are still open on the shard.
 
-### Memory accounting
+### Persistence, metrics, failure handling
 
-- **Per-series breaker (`PerEntity`).** The states add up to the same
-  total as with a single thread, because each series' state lives on
-  exactly one shard. Each instance adds a fixed overhead (group table,
-  operator buffers), multiplied by K × groups × open windows.
-- **Breaker grouped by coarser labels (`Reduce`).** Every shard can hold a
-  state for every group. With G groups the cost is up to min(K, series per
-  group) × G states instead of G. A Hydra grid is multiplied by K. A
-  low-cardinality view, such as `sum by (job)` with 10 jobs, therefore
-  costs up to K times as much while its window is open. The stored
-  (combined) view does not change.
-- **Raw panes.** Only query-time `Scan` lookback, and groups that run as a
-  batch over raw data, keep raw panes. For a plan with raw data not kept,
-  `asap_raw_data_bytes` stays near zero instead of growing to rate × W ×
-  20 bytes.
-- **Limits.** Each instance has its own `RunContext` with
-  `--run-memory-limit-bytes`, so open instances can hold up to
-  K × groups × open windows × the limit in total. A new gauge,
-  `asap_precompute_state_bytes{group,shard}`, reports what the open
-  instances hold.
-- **Cost model.** The Planner's ingestion memory term needs:
-  - the K multiplier for `Reduce`-grouped and Hydra views;
-  - zero raw buffer for streamed pipelines, in place of input rate ×
-    longest window × bytes per sample.
+- **Persistence.**
+  - The committer persists the combined rows. Per-shard partials are never
+    persisted.
+  - The file format and the per-group writer are unchanged.
+  - The shard count is not in the files, so a restart with any shard
+    count or mode loads them.
+  - Series-to-shard routing (series id modulo K) is not persisted either,
+    because no per-shard state outlives a window.
+- **Metrics.** Each of these goes into `asap_phase_cpu_seconds_total`,
+  `_wall_seconds_total` and `_runs_total`:
+  - `phase="precompute_push"` with `group` and `shard`, measured once per
+    morsel and group;
+  - `precompute_seal` with `group` and `shard`;
+  - `precompute_combine` with `group`;
+  - `precompute_commit`.
 
-  This is the cost-model note of the demo design's sharded-ingestion
-  target. It belongs in Planner cost inputs (a shard count, and whether
-  the backend streams ingestion-time pipelines), as separate Planner work.
-
-### Persistence
-
-- The committer queues the combined rows of a window: the rows that went
-  into the view store, as today. Partial per-shard states are never
-  persisted.
-- The file format, one file per refresh group, the per-group writer and
-  syncing are unchanged. The shard count is not stored in the files, so a
-  restart with a different shard count, or with
-  `--no-parallel-precompute`, loads the same files.
-- At startup, a window that every view of a group already stores is not
-  opened on any shard. This is today's `AlreadyStored`, checked when a
-  window opens instead of when it closes.
-
-### Metrics
-
-Each of these is added to `asap_phase_cpu_seconds_total`,
-`asap_phase_wall_seconds_total` and `asap_phase_runs_total`, with thread
-CPU from `CLOCK_THREAD_CPUTIME_ID` as before:
-
-- `phase="precompute_push"` with `group` and `shard`: the time to push one
-  morsel through one group's pipelines, measured once per morsel and
-  group, not per row.
-- `phase="precompute_finalize"` with `group` and `shard`.
-- `phase="precompute_combine"` with `group`, and
-  `phase="precompute_commit"`.
-- `asap_precompute_state_bytes{group,shard}`,
+  New gauges and counters: `asap_precompute_state_bytes{group,shard}`,
   `asap_precompute_open_instances{shard}`,
-  `asap_samples_total{outcome="late_for_views"}`.
-- The single-thread `phase="precompute"` series is kept for
-  `--no-parallel-precompute`.
+  `asap_window_commit_lag_seconds` (from window end to commit: the newest
+  window's lag), and `asap_samples_total{outcome="late_for_views"}`.
+- **Failures.**
+  - When an instance fails (an operator error, or a memory reservation
+    that cannot be met, see D8), its shard sends `Err`. The window is
+    failed and not committed: `windows_failed` goes up and queries that
+    read the window are not answered, as today. Later windows still
+    commit.
+  - A panic in a combine task is caught and fails the window. A panic in
+    a shard thread stops the engine, as today.
 
-### Failure handling
+### Executor reuse and ASAPPlanner changes
 
-- **An instance fails** (an operator error, such as a counter sample out
-  of order beyond the declared bound, or the memory limit). The shard
-  stops feeding it and later sends `Err` as its partial. The combine marks
-  (g, e) failed and the committer skips it. `windows_failed` is
-  incremented, and queries that read the window are not answered (missing
-  rows), as with a failed run today. Later windows commit normally.
-- **A combine task panics.** The panic is caught. The window is failed
-  and logged, and the pool thread keeps serving, as query workers do
-  today.
-- **A shard thread panics.** The engine stops (`RunningGuard`), as an
-  ingest thread panic does today.
-- **The committer or a persist thread fails.** Unchanged.
+Reused unchanged at the pinned revision:
 
-### Executor reuse and what would need an ASAPPlanner change
+- `compile` and `instantiate`, once per (shard, window);
+- `execute_ingestion` over a channel-fed `read_raw_data`. Summary builds
+  already fold their input stream batch by batch, which makes this push
+  execution without a new operator interface. Arroyo reuses DataFusion
+  operators inside its own streaming runtime the same way, and so does
+  DataFusion's "Inbox" push leaf.
+- `Operator::source`, `union` and `summary_merge` for the merge combine.
 
-Reused unchanged (all public at the pinned revision):
+These would need an ASAPPlanner PR, and only when a plan needs them:
 
-- `compile` and `CompiledPhysicalDAG::instantiate`, once per (shard,
-  window) instance, with a per-instance `DataStore` whose
-  `read_raw_data` returns a channel stream.
-- `execute_ingestion`, which polls the roots together and sends each batch
-  to every consumer. Summary builds already update their state batch by
-  batch from a stream (`build_per_group_summary` loops over
-  `input.next().await`), so a channel-fed run is push execution without a
-  new operator interface.
-- `Operator::source`, `Operator::union`, `Operator::summary_merge` and
-  `PhysicalDAG::execute`, for the merge combine.
-- The pipelines above a breaker reuse `compile` with the breaker bound as
-  a materialized view slot, read from an in-memory store holding the
-  combined rows. This is the same trick the query engine uses to cut out a
-  shared `OneEvaluation` node.
+1. Lowering ingestion-time exact `avg` and other decomposable aggregates
+   to `SummaryAgg ExactAggregate` (sum and count) + `SummaryMerge` +
+   `FinalizeExactAccumulator`, so that they merge instead of running on a
+   single partition. This is a physical-compiler change only.
+2. Ordered-merge combines for sort, exact quantile and exact distinct
+   (D4).
+3. A "latest sample per series" chain state, which the Planner does not
+   offer yet. 619 of 1,025 real-world PromQL queries (60%) need raw data
+   only for it. It is a per-arrival overwrite (concatenate class), and it
+   will be the most frequent view once offered, so push mode must make it
+   cheap. It is listed here because it changes the mix, not because v1
+   implements it.
+4. Optionally, a seeded KLL compaction coin (`asap_sketchlib`), if
+   bit-identical KLL parity is wanted.
 
-Would need an ASAPPlanner PR, only when a plan needs it:
+## Decisions D1–D10
 
-1. **Partial exact aggregation.** An ingestion-time exact `Aggregate` avg
-   (or any decomposable function whose partial is not its final value)
-   needs either a partial-state output (sum and count as exact
-   accumulator states) or a lowering to `SummaryAgg ExactAggregate` +
-   `SummaryMerge` + `FinalizeExactAccumulator`. The second option needs no
-   new runtime interface, only a physical-compiler change.
-2. **Thread-local state with a combine, for exact quantile, distinct,
-   Sort and join build.** There is no partial state to merge. Exchange
-   needs no executor change, because rows are routed before the operator.
-   An executor interface (`PhysicalOperator` with
-   `partial_state()`/`combine()`) would be needed only to merge sorted
-   runs or hash tables without moving rows. That is not proposed.
-3. **Deterministic KLL merge** (a seeded compaction coin). This is needed
-   only if bit-identical parity is wanted for KLL; today's tolerance
-   already covers it. It is an `asap_sketchlib` change.
+Each decision lists its options, precedents, the corpus and local
+evidence, its experiment if one decides it, and the conclusion. An
+experiment result slot reads *pending* until the run is reported. A
+conclusion marked *provisional* holds until its experiment confirms it or
+overturns it.
+
+### D1. Execution model
+
+- **Options:**
+  - (a) Keep the window-task pool: batch at close, one task per
+    (group, window).
+  - (b) Per-source push pipelines on owned shards, with breakers as sinks
+    sealed by the watermark.
+  - (c) Morsel-driven execution on a shared pool (DuckDB, HyPer): any
+    thread takes any morsel, and every breaker keeps thread-local plus
+    global state.
+  - (d) DataFusion's runtime (partitioned pull streams, `RepartitionExec`).
+- **Precedents:**
+  - (b) is DuckDB's Sink/Combine/Finalize (push since 2021), with Combine
+    triggered per window by the watermark instead of at end of input.
+  - Kafka Streams tasks, Timely workers and RisingWave actors run the
+    same shape on owned partitions.
+  - Shaikhha et al. found no general advantage of push over pull; what
+    matters is where the thread boundaries are.
+  - DuckDB criticizes (d)-style plan-time exchange for plan explosion and
+    load imbalance.
+- **Evidence:**
+  - Per-arrival folds into mergeable window states cover 100% of
+    real-world PromQL ingestion plans and 84% of SQL plans.
+  - No plan has a view that reads a view, so no general dataflow graph is
+    needed.
+  - With (c), the executor's runs (not `Send`) would have to move between
+    threads, and order-dependent per-series counters (Rate, Increase)
+    could not be updated from any thread.
+  - With (a), one window of the single-group dashboard plan is still one
+    core.
+- **Experiment:** E1 (fold throughput per core and scaling, push against
+  the window path and against DuckDB, ClickHouse and DataFusion arms).
+  Result: *pending*.
+- **Conclusion:** (b). The window-task pool stays, both as the slow path
+  for groups that cannot be pushed (D4, D7) and as the pool that runs
+  combine tasks.
+
+### D2. Fan-out: one morsel to many views
+
+- **Options:**
+  - (a) Same-thread fan-out: the shard thread runs every view of the
+    source on the same batch.
+  - (b) Cross-thread fan-out: views of one source on different threads,
+    connected by queues.
+  - (c) Materialize the morsel once, and let the views scan it.
+- **Precedents:**
+  - DuckDB's 2026 pipeline broadcast exchange pushes chunks directly into
+    each consumer pipeline, inline on the producer thread. DuckDB also
+    found buffered multi-consumer fan-out costlier than materializing.
+  - HyPer measured that independent pipelines on different threads hurt
+    cache locality.
+  - Snowflake's push execution handles DAG-shaped plans by having the
+    producer call every consumer.
+  - ClickHouse runs insert-time materialized views sequentially by
+    default. Its `parallel_view_processing` cuts one insert's latency at
+    the cost of CPU and memory.
+  - vmagent pushes N aggregators serially per batch.
+- **Evidence:**
+  - 36% of real-world plans have two or more views.
+  - The seed-862 workloads put 5–6 views on one source at up to 4
+    widths, and the o11y dashboard puts 13 views on one source.
+  - The executor's ingestion runtime already gives each batch to every
+    consumer with no copy.
+- **Experiment:** E2 (one insert feeding 1 to 13 views; same-thread
+  against cross-thread). Result: *pending*.
+- **Conclusion:** (a). The earlier draft said pipelines of different views
+  would run on different threads. That is withdrawn: the pipeline DAG
+  orders dependent work (seal, combine, dependent group, commit) and does
+  not spread views over threads. Cross-thread fan-out would be considered
+  only if E2 shows one view's cost dominating a shard. An example is a
+  1 s DDSketch next to a 60 s Sum on the same source.
+
+### D3. Partitioning
+
+- **Options:**
+  - (a) Series hash, using the ingest shards that exist today: series id
+    modulo `--ingest-threads`.
+  - (b) A fixed virtual space (`hash(series) % V`, V = 256) with vnode
+    ranges mapped to shards.
+  - (c) Round-robin plus per-partition partials and a merge.
+  - (d) Hash by group key.
+- **Precedents:**
+  - Prometheus keeps mutable per-series heads under 16,384 lock stripes.
+  - Kafka Streams, Timely and Seastar give each thread exclusive
+    ownership.
+  - VictoriaMetrics appends round-robin because nothing it computes at
+    ingest depends on series order.
+  - Flink key groups and RisingWave vnodes keep the key-to-partition map
+    fixed under rescaling.
+  - RisingWave puts the vnode in the local group key and drops it in the
+    global phase.
+  - DataFusion names the per-key case `SinglePartitioned`: no merge
+    needed.
+- **Evidence:**
+  - Every real-world PromQL ingestion breaker is per series, and
+    `sum by`, `topk` and `histogram_quantile` run at query time.
+  - SQL breakers are grouped or global and have no series identity. Key
+    counts range from 2 (BGP `operation`) to 10k (netflow `srcip`).
+- **Experiment:** E4 (series hash with no combine; round-robin plus merge
+  against key-hash for 2 and 10k keys; single owner). Result: *pending*.
+- **Conclusion:**
+  - Time series: (a). This adds no partitioning of its own.
+  - (b) is not needed. No per-shard state is persisted or outlives a
+    window, so changing the shard count needs no state movement. Revisit
+    if state is ever kept per shard across restarts.
+  - Table sources (SQL), when the data plane takes them: (c) with a merge
+    at close. Use (d) only when keys are many and E4 shows the merge
+    dominating. Never use (d) on a 2-key group-by (skew).
+  - Known limit: a hot series is bounded by one core, because
+    order-dependent per-series state cannot be split. No surveyed engine
+    splits it either. Prometheus series rarely exceed a few samples per
+    second.
+
+### D4. Non-mergeable breakers
+
+- **Options:**
+  - (a) Single partition: shard 0 owns the breaker and the others forward.
+  - (b) Exchange by group-key hash.
+  - (c) Ordered-merge combines: per-shard sorted runs merged with Merge
+    Path, and exact distinct as a radix-partitioned union.
+  - (d) Have the Planner replace them with sketches where accuracy
+    allows.
+- **Precedents:**
+  - Velox runs LocalMerge single-threaded, and Flink runs non-keyed
+    windows at parallelism 1. Both match (a).
+  - DuckDB and HyPer use (c) for sort, and DuckDB uses radix partitions
+    for distinct.
+  - DuckDB excludes holistic aggregates only from its partitioned
+    pre-aggregation path, not from parallel execution.
+- **Evidence:**
+  - Non-mergeable breakers appear in 0.6% of real-world PromQL plans and
+    15.6% of SQL plans. All of the SQL ones are whole-table data-quality
+    checks: 39 exact quantile, 17 exact distinct, 13 joins and 12 window
+    functions.
+  - Rolling-window SQL has none, and windowed non-mergeable queries do
+    not plan without raw data.
+- **Experiment:** E4 (single owner), E5 (per-arrival set insert against
+  close-time recompute for exact distinct). Result: *pending*.
+- **Conclusion:** (a) in v1, as a list of breakers awaiting (c) rather
+  than a permanent class. A group that contains any breaker which is not
+  a per-arrival fold (raw window buffer, subquery, join, window function)
+  runs on the window-task pool, as today, until E5 says otherwise. (d) is
+  a Planner preference, not engine work.
+
+### D5. Per-arrival folding versus close-time computation
+
+- **Options:**
+  - (a) Fold each morsel into the open window's state on arrival; at
+    close, only seal and emit (O(series) per window).
+  - (b) Buffer raw rows and compute at close (today).
+  - (c) Per class: fold where the state is a fold, and compute at close
+    for holistic states.
+- **Precedents:**
+  - RisingWave's emit-on-window-close and Kafka Streams'
+    `emitStrategy(ON_WINDOW_CLOSE)` emit the final result once, at close,
+    from incrementally maintained state. RisingWave recommends it for
+    percentile-like aggregates that update poorly.
+  - Umbra schedules about 2 ms tasks, because fixed-size morsels varied
+    more than 30× in duration.
+  - Flink notes that barriers wait behind timers firing at once.
+- **Evidence:**
+  - Folds cover 87% of all ingestion plans.
+  - Close-time emission is series ÷ width states per second: 10k/s at
+    1 s widths (seed-862) and 17/s at 60 s with 1k series.
+  - The window path took 0.75–1.3 s per window at 10k series.
+- **Experiment:** E5 (W = 1 s and 60 s for the Rate chain, 1 s DDSketch
+  windows, exact distinct; close latency and ingest stalls). Result:
+  *pending*. E5 also sets the seal chunk size.
+- **Conclusion:** (c). Fold every per-arrival breaker. Cut seal work into
+  time-bounded chunks interleaved with ingest. Keep close-time
+  computation for holistic states (D4).
+
+### D6. Idle shards and watermarks
+
+- **Options:**
+  - (a) Global watermark = min over shards, with idleness timeouts
+    (Flink's `withIdleness`).
+  - (b) The router broadcasts watermark ticks to every shard.
+  - (c) The coordinator moves the watermark only behind a flush that every
+    shard answers. An idle shard answers at once (the demo design's
+    rule). Every shard opens and seals every window.
+- **Precedents:**
+  - Flink inherits the stalled-min failure and adds idleness handling and
+    watermark alignment.
+  - Arroyo returns watermarks to broadcast.
+  - RisingWave aligns barriers at fan-in.
+  - Timely advances time per batch, never per record.
+- **Evidence:**
+  - 58% of ingestion plans are windowed, with widths down to 1 s.
+  - 17% of real-world plans read two or more sources.
+  - Alert matchers are selective, so a few series may land on one shard.
+  - The sharded ingestion found and fixed two races: a min over queued
+    shards, and reports from a shard running ahead. Both are now covered
+    by tests.
+- **Experiment:** none needed. The rule is already in the data plane and
+  tested (`ingest_shards.rs`).
+- **Conclusion:** (c). It is (b) in its in-process form. The commit
+  barrier is a fixed count of K partials per (group, window). Seal travels
+  with the flush, so no separate tick is needed.
+
+### D7. Shared intermediate state and views over views
+
+- **Options:**
+  - (a) A group that reads another group's views runs as a post-commit
+    task on the window-task pool, scheduled once the windows it reads are
+    committed.
+  - (b) Push sealed partials of the fine view directly into the coarse
+    view's per-shard instance.
+- **Precedents:**
+  - ClickHouse chains materialized views (insert into `q_15s` fires
+    `q_5m`).
+  - DuckDB's event DAG and HyPer's QEPobject order dependent work.
+  - Differential Dataflow's shared arrangements cut latency 1.3–3× and
+    memory 2–4×.
+- **Evidence:**
+  - No current plan reads a view from a view.
+  - In 9% of real-world plans at 60 s, and in every dashboard workload at
+    15 s, a query merges more than 20 panes per evaluation. That is the
+    hierarchical-rollup case of the demo design.
+  - Shared chains are common: 4–5 of 7–8 views in seed-862 and 15 of 23
+    in the o11y dashboard are read by two or more queries.
+- **Experiment:** E3 (shared chains and chained rollups 15 s → 5 min →
+  1 h). Result: *pending*.
+- **Conclusion:** (a) now. It is the next event in the per-window DAG,
+  not a second scheduler. (b) would be considered only if E3 shows the
+  post-commit task on the critical path, since a coarse window over
+  combined fine windows is small.
+
+### D8. Memory
+
+- **Options for the per-instance limit:**
+  - (a) Each instance has its own `--run-memory-limit-bytes`.
+  - (b) That limit divided by K.
+  - (c) Reserve before applying a morsel, in coarse quanta, per (group,
+    shard, open window), against one engine-wide precompute budget. When a
+    reservation fails while older windows are open on the shard, wait for
+    them to seal (backpressure). Fail the window only when nothing else
+    is open.
+- **Precedents:**
+  - Photon reserves before it allocates, so a half-applied batch is
+    impossible.
+  - Velox checks only at the root, in 1, 4 or 8 MB quanta, and an
+    arbitrator pauses or aborts tasks.
+  - vmagent's event-time mode doubles its state memory and caps lateness
+    at 90% of an interval.
+- **Evidence:**
+  - Retained state is about series × (window ÷ width + 1) × state size:
+    about 10 MB per real-world plan at 1k series, and 3.5–5.2 GB for
+    the seed-862 dashboards with 1 s sketch windows.
+  - Holistic whole-table states reach 6.4 GB.
+  - Per-shard open state for `PerEntity` breakers adds up to the same
+    total as one thread. For `Reduce` breakers it is up to
+    min(K, series per group) times larger.
+- **Experiment:** E2 records state bytes per view as fan-out grows.
+  Result: *pending*.
+- **Conclusion:** (c), with no spill. Shrinking allowed lateness to close
+  windows sooner is an opt-in last resort, not automatic.
+  `asap_precompute_state_bytes` reports what is held.
+
+### D9. Thread defaults
+
+- **Options:**
+  - (a) Keep `--ingest-threads` at a quarter of the cores and add a
+    separate combine pool.
+  - (b) Shards = available cores minus the decode threads, with combine on
+    the existing window-task pool (2–4 threads).
+  - (c) Size shards per source by measured fold rate (source rows/s
+    divided by per-thread fold rate with all of its views), capped at the
+    core count.
+- **Precedents:**
+  - HyPer pins fixed threads.
+  - VictoriaMetrics sizes pools to the available CPUs and admits inserts
+    at 2× CPU.
+- **Evidence:**
+  - Corpus sources run 1k–10k series at 1–10 samples/s (1k–100k rows/s),
+    with 1–13 views each.
+  - Shards now do the view work, so a quarter of the cores leaves
+    precompute capacity unused.
+- **Experiment:** E1 (fold rate per thread for each view class; scaling
+  at 1, 2, 4 and 8 shards). Result: *pending*.
+- **Conclusion:** *provisional* (b). Combine runs on the window-task pool,
+  so no new pool and no `--precompute-threads` flag. (c) only if E1 shows
+  per-source rates differ widely within one deployment. Push becomes the
+  default mode when:
+  - parity passes on every workload, and
+  - E1 and B1 show higher sustained samples/s and lower newest-window
+    commit lag than the window path at 1k and 10k series.
+
+  The window mode stays behind `--precompute-mode=window`.
+
+### D10. Planner memory term
+
+- **Options:**
+  - (a) Add a shard count to the Planner's cost inputs.
+  - (b) A deployment calibration input: an open-state multiplier per
+    breaker class, plus whether the deployment buffers raw rows for
+    views. The Planner never sees shards.
+  - (c) No change.
+- **Precedents:**
+  - DuckDB sizes partitions by memory.
+  - vmagent documents its doubled state.
+- **Evidence:**
+  - The Planner already charges retained bytes per view.
+  - It does not see that `Reduce` partials are multiplied by the shard
+    count while open.
+  - It does not see that push removes the raw buffer, which today
+    dominates for long windows.
+- **Experiment:** E3 and E4 measure the open-state multipliers. Result:
+  *pending*.
+- **Conclusion:** (b). The term is: `PerEntity` × 1, `Reduce` and Hydra
+  partials × shards × open windows, and single-partition breakers × 1
+  plus their buffered rows. This keeps the Planner deployment-agnostic
+  and is separate Planner work, after E3 and E4.
 
 ## Minimal complexity
 
-- **No new partitioning.** The ingest shards' series hash is the partition
-  key. Per-series views, which are all ingestion-time views in today's
-  plans, need no merge.
-- **No new operator layer.** Push is a channel-fed `DataStore` read
-  together with a local executor on each shard. The merge combine is the
-  executor's `SummaryMerge`. The rule table reads the Planner's
-  capability table and does not restate it.
-- **One committer.** The existing precompute thread becomes the committer,
-  so the view store keeps a single writer and the copy-on-write snapshots
-  of the demo design.
-- **Exchange is specified but not built.** Single partition covers the
-  non-mergeable case until a plan and a profile need more.
+- **No new partitioning, pool or flag for combine.** The ingest shards, the
+  coordinator's flush, the window-task pool and the `precompute` thread
+  already exist. This design adds instances on the shards, a seal message
+  in the flush, and a reorder buffer in the committer.
+- **No new operator layer.** Push is a channel-fed `DataStore` read and a
+  local pool. Merge uses the executor's `SummaryMerge`, and the rule table
+  reads the Planner's capability table without restating it.
+- **One writer.** The committer keeps the view store single-writer, which
+  copy-on-write snapshots, persistence order and barriers rely on.
+- **Ordered-merge and exchange are specified, not built.**
 
 ## Alternatives and decisions
 
-| Question | Decision | Rejected, and why |
+| Question | Decision | Rejected |
 | --- | --- | --- |
-| Unit of parallelism | (shard, window) instances of push pipelines, partitioned by series hash | **Window-level tasks only** (today's batch run, several (group, window) runs on a pool). This needs no executor work, but one window of one group is still one core. The dashboard plan has a single group, so it would gain only the overlap of consecutive windows. Raw samples would still be buffered for the whole window. |
-| Scheduling model | push per morsel on the shard threads; window close as a scheduled combine task | **Morsel-driven, DuckDB-style** (a pool pulls morsels from any partition, with work stealing). The executor's runs are not `Send`, so an instance cannot move between threads. Every breaker would need thread-local and global state for any row from any thread, which mergeable summaries have but exact operators do not. The ingest shards already balance by series hash. |
-| Runtime | the Planner executor | **DataFusion's runtime** (partitioned `ExecutionPlan`, `RepartitionExec`). It replaces the executor's operator layer, which ASAPPlanner#1421 tracks as separate multi-week work. Its streams are pull-based per partition, so ingestion would still need a push adapter. |
-| Combine rule source | derived at install from `Reduction` and `SummaryTypeCapability` | A new field in the plan. The Planner would then decide a deployment detail (the shard count) that it does not know. |
-| Non-mergeable breakers | single partition in v1; exchange specified | Exchange now: no plan needs it yet. |
-| Where breakers finalize | on the shard thread that owns the instance | Moving states to the pool: the instance is not `Send`, and its outputs (states) already are. |
-| Commit | one committer, in window order per group | Lock-free commits from pool threads: the view store's single-writer snapshots, persistence order and barriers all assume a single writer. |
-| Opening windows | every shard opens every window | Lazy opening, at the first sample: an idle shard would have no part to send, and empty global rows would need a special case. |
+| Execution model | per-source push on owned shards (D1) | window tasks only; morsel-driven shared pool; DataFusion runtime |
+| Views of one source | inline on the shard thread (D2) | a thread per view or per pipeline (cache locality; buffered fan-out cost) |
+| Partition key | today's series routing (D3) | vnodes (no per-shard state persists); round-robin for series-affine state |
+| Non-mergeable | single partition, listed for ordered-merge (D4) | exchange now |
+| Close work | fold on arrival, chunked seal (D5) | compute at close |
+| Idle shards | flush-gated watermark, every shard seals every window (D6) | min over shards with idleness timeouts |
+| Views over views | post-commit task (D7) | push sealed partials into coarse instances |
+| Memory | reserve, then backpressure, no spill (D8) | a separate limit per instance |
+| Threads | shards do the folding; combine on the window-task pool (D9) | a separate combine pool |
+| Planner term | deployment calibration multipliers (D10) | shard count in the Planner |
+| Where an instance seals | on its shard thread (its future is not `Send`) | moving states to a pool |
+| Rule source | derived at install; install fails on no rule | a plan field; guessing |
 
 ## Quality attributes and evidence
 
-- **Throughput.** Sustained samples/s at a bounded backlog, against
-  single-thread precompute, at K = 1, 2, 4, 8 (benchmark below).
-- **CPU.** Per-phase CPU (push, finalize, combine, commit) by group and
-  shard. The total should be within the cost of single-thread precompute
-  plus the combine.
-- **Memory.** `asap_raw_data_bytes`, `asap_precompute_state_bytes` and RSS,
-  against single-thread precompute.
-- **Debuggability.** The install log and `/api/v1/status/asap` show each
-  breaker's rule. A failed window names its group, window and shard.
+- **Throughput:** sustained samples/s with a bounded backlog; samples/s
+  per core against the window path (and the per-core context of 132k for
+  the data plane against 385–443k for VictoriaMetrics).
+- **Latency:** newest-window commit lag (`asap_window_commit_lag_seconds`)
+  and ingest stalls during seal.
+- **CPU:** push, seal, combine and commit, by group and shard.
+- **Memory:** `asap_raw_data_bytes`, `asap_precompute_state_bytes`, RSS.
+- **Debuggability:** the install log and status show each breaker's rule.
+  A failed window names its group, window and shard.
 
 ## Acceptance and test design (for approval)
 
 Each test states the behavior it verifies, its inputs, the expected
-result, and whether it fails today. The tests are written after this plan
-is approved and before the implementation. "Fails today" means the test
-fails, or cannot be built, against the current data plane. A guard (marked
-"passes today") keeps a property that the single-thread engine has by
-construction and that the parallel engine could break.
+result, and whether it fails today. Tests are written after this plan is
+approved and before the implementation. "Fails today" means the test fails
+or cannot be built against the current data plane. A guard ("passes
+today") protects a property the window path has by construction and the
+push path could break. K is the ingest shard count (`--ingest-threads`).
+Unless a row says otherwise, the push path is compared with the window
+path of the same build.
 
 | # | Behavior verified | Inputs | Expected | Today |
 | --- | --- | --- | --- | --- |
-| T1 | Parallel precompute answers what single-thread precompute and the Planner executor answer, on every parity workload. | Every workload of the parity test (`tests/workloads/`, `examples/`), planned with raw data kept and not kept; K = 1, 2, 4, 8; the parity test's samples and queries; instant and range queries. | Each answer equals the Planner executor's reference and the `--no-parallel-precompute` data plane's answer. They are exact except for plans with KLL, which stay within the existing 5% tolerance. | Fails: there is no parallel precompute to select. |
-| T2 | Stored view rows, not only answers, are the same as with a single thread. | The same workloads, K = 4. For each (view, window), the rows are compared after sorting by key, with states compared by their `sketch()` bytes or exact values. | Equal for every non-KLL state. KLL states answer within tolerance. | Fails: as T1. |
-| T3 | A per-series breaker's outputs are concatenated, with each series exactly once. | A DDSketch chain per series (W = 10 s), 1000 series spread over K = 8 shards, 3 windows. | One row per (window, series), equal to the single-thread row; the combine is `Concatenate` in the status. | Fails: as T1. |
-| T4 | A grouped mergeable breaker's partials are merged into one state per group. | A hand-written plan with an ingestion-time chain grouped by `job` for each of ExactAggregate(Sum), Max, DDSketch, HLL and Count-Min; 4 jobs whose series are spread over K = 4 shards; one window with no sample; a global (`sum()`) variant. | One row per (window, job), equal to the single-thread row. The global variant has one row per window, and the empty window has one empty row. The rule is `Merge`. | Fails: as T1. |
-| T5 | A non-mergeable breaker runs as a single partition and answers as with a single thread. | A hand-written plan with an ingestion-time breaker the rule table routes to single partition (an exact grouped quantile `Aggregate`, or a Rate chain grouped by `job`), K = 4. If the executor's compiler refuses such a view, this is replaced by the unit test of the rule (T6) plus a combine-level test that feeds the forwarded batches to shard 0's instance. | Equal to single-thread; the rule is `SinglePartition`. | Fails: as T1. |
-| T6 | The combine rule is derived from the plan node as the table says. | Unit test over plan nodes: PerEntity and Reduce chains for each supported summary family, Hydra, the counters, exact `Aggregate` functions, `Sort`, `Sort` + `Limit`. | Each gets the rule in the table. | Fails: no rule exists. |
-| T7 | Windows commit in window order even when combines finish out of order. | A test hook delays the combine of window 2 of a group until window 3's combine has finished; K = 2. | The view's stored windows and the persisted records appear in the order 1, 2, 3. Before window 2 commits, a query reading windows 2–3 is not answered with window 2 missing (the barrier waits). | Passes today (guard): there is one thread and no hook. |
-| T8 | A group that reads another group's views runs after the windows it reads are committed. | A hand-written plan in which group B (W = 60 s) reads group A's view (W = 15 s); a hook delays A's combine of its last 15 s window inside B's window. | B's window runs only after A commits all four windows. B's rows equal the single-thread rows. | Passes today (guard), if the compiler accepts the plan. |
-| T9 | Backpressure: a slow combine first fills the backlog, then the shard queues, then Remote Write gets 503. No window is lost. | The combine is gated (as `hold_precompute` does), `--max-precompute-backlog 2`, small `--max-queued-samples`, K = 4. | 503 once the queues are full. After the gate opens, every window commits and the answers equal those of an ungated run. | Fails: the parallel path does not exist. A single-thread backpressure test already exists. |
-| T10 | Mergeable-summary pipelines do not buffer raw samples (bounded memory). | The dashboard plan with raw data not kept, 10k series at 1 sample/s, W = 15 s, K = 4. `/metrics` is sampled before every window close. | `asap_raw_data_bytes` stays below one request's samples, not rate × W × 20 bytes (3 MB per metric here). `asap_precompute_state_bytes` is reported. With a query-time `Scan` (raw kept), raw bytes match its lookback only. | Fails: today the raw panes grow until the window closes. |
-| T11 | Late and out-of-order samples count in the same windows as with a single thread. | An allowed lateness of 5 s; series whose samples arrive up to 4 s late (still in the window) and 20 s late (after close); counters among them; K = 4; raw kept and not kept. | Stored windows equal single-thread. The 20 s-late samples are not in the views, are counted as `late_for_views`, and are read by query-time `Scan`s when raw is kept. | Fails: as T1 (and the counter is new). |
-| T12 | An idle shard does not hold windows open. | One series (so K − 1 shards get nothing), K = 8; barriers close windows. | Every window commits when the barrier passes it, as with a single thread. | Fails: as T1. |
-| T13 | A restart over the same view files loads them whatever the shard count. | Run with K = 4 and persistence on, stop, restart with K = 2 and again with `--no-parallel-precompute`, writing no sample. | Answers equal before and after. No window is appended twice (`AlreadyStored`). | Fails: as T1. |
-| T14 | A failing instance fails only its window. | A memory limit that one shard's instance exceeds in window 2 (skewed series); separately, a combine task forced to panic. | Window 2 is counted in `windows_failed` and queries reading it are not answered. Windows 1 and 3 commit. The engine keeps running. | Fails: as T1. |
-| T15 | Per-shard, per-group precompute CPU is exported. | Any plan, K = 4, after a few windows. | `/metrics` has `precompute_push`, `precompute_finalize`, `precompute_combine` and `precompute_commit`, with `group` and `shard` labels where applicable, and the run counts match the windows and morsels. | Fails: the series are new. |
-| B1 | Throughput benchmark (reported, not a CI gate). | `examples/ingest_bench.rs` with the dashboard workload, raw data not kept, at 10k and 100k series. Single-thread precompute and K = 1, 2, 4, 8. Paced, then unpaced to saturation. | Report the highest samples/s at which the backlog stays bounded, CPU per phase, RSS and raw bytes for each setting. | Single-thread numbers come from today's code. |
+| T1 | Push answers what the window path and the Planner executor answer on every parity workload. | All parity workloads (`tests/workloads/`, `examples/`), raw data kept and not kept, K = 1, 2, 4, 8 (`PARITY_INGEST_THREADS`), instant and range queries. | Equal to the reference. Plans with KLL are within the existing 5%. | Fails: no push mode. |
+| T2 | Stored view rows, not only answers, equal the window path's. | The same workloads, K = 4. Each (view, window) is compared by sorted keys, with states compared as `sketch()` bytes or exact values. | Equal, except KLL states and float sums from a `Reduce` merge, which are within the plan target. | Fails: no push mode. |
+| T3 | One morsel reaches every view of its source, inline, read once. | seed-862-01 (5–6 views on `data`), plus an o11y-shaped plan with 13 chains on one source (hand-written if the Planner does not produce it), K = 4. | Equal to the window path. `precompute_push` runs once per morsel and group, not per view. No queue between views. | Fails: no push mode. |
+| T4 | Per-series breakers are concatenated, with each series exactly once. | A DDSketch chain per series, 1,000 series, K = 8, 3 windows. | One row per (window, series), equal to the window path. The rule is `Concatenate`. | Fails: no rule exists. |
+| T5 | `Reduce` breakers merge to one state per group, including empty and global cases. | A hand-written plan with chains grouped by `job` for ExactAggregate(Sum, Count, Max), DDSketch, HLL and Count-Min; 4 jobs spread over K = 4; one window with no sample; a global `sum()` variant; a 2-key group-by. | One row per (window, job), equal to the window path (float sums within target). Global: one row per window, and the empty window has one empty row. The rule is `Merge`. | Fails: as T4. |
+| T6 | A non-mergeable breaker runs on a single partition. A group with a breaker that is not a fold runs on the window-task pool. | A hand-written plan with an ingestion-time exact grouped quantile (single partition), and one with a raw window buffer (window path), K = 4. If the executor's compiler refuses either plan, a combine-level test is used instead. | Equal to the window path. The rules are `SinglePartition` and `WindowPath`. | Fails: as T4. |
+| T7 | The combine rule follows the table, and install fails for a breaker with no rule. | Unit test over plan nodes: `PerEntity` and `Reduce` chains of every supported family, Hydra, counters, each exact `Aggregate` function, `Sort`, join, window function, and an unknown operator. | Each gets its rule. The unknown operator refuses install with its node named. | Fails: as T4. |
+| T8 | Windows commit in window order when combines finish out of order. | A hook delays window 2's combine until window 3's is done, K = 2. | Stored and persisted order is 1, 2, 3. A barrier past window 3 answers only after window 2 commits. | Guard: passes today with one precompute thread. Needs the window-task pool once it lands. |
+| T9 | A group that reads another group's views runs after the windows it reads commit. | A hand-written plan with group B (60 s) reading group A (15 s), and a hook delaying A's last window. | B runs only after A's four windows commit, and B's rows equal the window path. | Guard, if the compiler accepts the plan. |
+| T10 | Seal is exact under shard skew: each instance gets exactly the samples admitted before the flush that seals it. | `shard_delay_ms` slowing all shards but the first, 8 shards; samples stamped up to 1 s ahead of the clock (the demo design's two race tests, run in push mode). | No late drops, and every window equals the 1-shard result. | Fails: no push mode. The window-path versions pass. |
+| T11 | Idle shards seal empty and hold nothing back. | One series, K = 8. A selective plan whose series all hash to two shards. | Every window commits when the barrier passes it. Each shard sends one partial per window; idle shards send empty ones. | Fails: no push mode. |
+| T12 | Pushed pipelines do not buffer raw samples. | The dashboard plan, raw data not kept, 10k series at 1 sample/s, W = 15 s, K = 4. `/metrics` is sampled before each close. With a query-time `Scan`, raw data is kept. | `asap_raw_data_bytes` stays below one request's samples, not rate × W × 20 B (3 MB per metric here), and `asap_precompute_state_bytes` is reported. With a `Scan`, raw bytes follow its lookback only. | Fails: raw panes grow until the window closes. |
+| T13 | Late and out-of-order samples count in the same windows as the window path. | 5 s allowed lateness; samples 4 s late (window still open) and 20 s late (window sealed); counters included; K = 4; raw kept and not kept. | Stored windows equal the window path. The 20 s-late samples are counted as `late_for_views` and are read by query-time `Scan`s when raw is kept. | Fails: no push mode; the counter is new. |
+| T14 | Backpressure goes from the commit backlog to the shard queues to 503, and loses nothing. | A gated combine, `--max-precompute-backlog 2`, a small `--max-queued-samples`, K = 4. | 503 once full. After the gate opens, every window commits and the answers equal an ungated run. | Fails: no push mode. |
+| T15 | A memory reservation waits while older windows are open, and fails the window only when nothing else is open. | A precompute budget that fits one open window; lateness so that two windows overlap; then a single window over budget. | The first case delays ingest (queue then 503) with no failed window. The second fails that window only, and later windows commit. | Fails: no reservation exists. |
+| T16 | Seal work is chunked, so ingest keeps running during a large seal. | 100k series, one 1 s DDSketch view, K = 2; requests sent continuously across window ends. | The longest gap between two ingested requests on a shard during a seal stays below the chunk bound times a small factor (the bound is set by E5). | Fails: no push mode. |
+| T17 | A restart loads the view files whatever the shard count or mode. | Push with K = 4, then restart with K = 2, and again with `--precompute-mode=window`, writing no sample. | Answers are equal, and no window is appended twice. | Fails: no push mode. |
+| T18 | A failing instance or combine fails only its window. | One shard exceeds an operator limit in window 2; separately, a combine forced to panic. | Window 2 is counted in `windows_failed` and its readers are not answered. Windows 1 and 3 commit, and the engine keeps running. | Fails: no push mode. |
+| T19 | Precompute CPU and state are exported per group and shard. | Any plan, K = 4, a few windows. | `/metrics` has `precompute_push`, `precompute_seal`, `precompute_combine`, `precompute_commit`, `asap_precompute_state_bytes`, `asap_window_commit_lag_seconds`, with run counts matching windows and morsels. | Fails: the series are new. |
+| B1 | Throughput benchmark (reported, not a CI gate). | `examples/ingest_bench.rs`: dashboard and seed-862-01, raw data not kept, 1k, 10k and 100k series; window path and push at K = 1, 2, 4, 8; paced, then unpaced to saturation. | The highest samples/s with a bounded backlog, samples/s per core, CPU per phase, RSS and raw bytes for each setting. | The window-path numbers come from today's code. |
+| B2 | Close latency benchmark (reported). | As B1 at 10k series. | Newest-window commit lag (median and max) and ingest stall during seal, for the window path against push. | As B1. |
 
-The existing tests (parity, range parity, concurrency, persistence,
-shared results) keep running with the default setting. Test design is by
-the author of this document. An independent review of the test plan is
-requested in the PR, not claimed.
+Experiments E1–E5 (run separately, results recorded in D1–D10) decide the
+design. T1–T19 accept the implementation, and B1–B2 report it. The test
+design is by the author of this document. An independent review of this
+plan is requested in the PR, not claimed.
 
 ## Implementation plan
 
 | Day | Work |
 | --- | --- |
-| 0 | Tests T1–T15 and B1, failing (after approval) |
-| 1 | Rule table (T6); per-instance channel store; shard-side instances and push; Close events in the shard FIFOs |
-| 2 | Combine stage and pool (concatenate, merge, single partition); committer reorder buffer; pipelines above breakers |
-| 3 | Post-commit pipelines across groups; backpressure; late-data counter; metrics; failure paths |
-| 4 | Parity at K = 1–8; benchmark; fixes |
+| 0 | T1–T19 and B1–B2, failing (after approval) |
+| 1 | Rule table and install refusal (T7); per-instance channel store; instances and push on the shards |
+| 2 | Seal in the flush; chunked seal; combine (concatenate, merge, single partition) on the window-task pool |
+| 3 | Committer reorder buffer; pipelines above breakers; post-commit groups; window-path routing for groups that cannot be pushed |
+| 4 | Reservations and backpressure; late-data counter; metrics; failure paths |
+| 5 | Parity at K = 1–8; B1, B2; fixes |
 
 ## Risks, rollout, and exit criteria
 
-- **Rollout.** Parallel precompute is on by default once T1–T15 pass;
-  `--no-parallel-precompute` restores the single-thread path. Exit
-  criteria: B1 shows higher sustained samples/s than single-thread
-  precompute at 100k series without higher total CPU per sample beyond the
-  combine and commit cost. If it does not, the default stays single-thread
-  and the profile is reported.
-- **Shard threads do the pipeline work.** Heavy views slow ingestion on
-  every shard, and appends and pushes share a core. `precompute_push` CPU
-  makes this visible.
-- **Memory for coarse groupings is multiplied by K** (see "Memory
-  accounting"). The Planner's cost model does not include this yet.
-- **Finalize on shard threads.** Emitting 10k states is expected to take
-  milliseconds. If profiling shows otherwise, emission can be split
-  across shards in the same way.
-- **KLL and heap-carrying sketches** stay within tolerance only.
-- **This depends on the sharded ingestion design.** Its router, its global
-  watermark and its per-shard queues must deliver Close events in the
-  same order as samples. If that design changes, this one changes with it.
-
-Open questions for a human decision:
-
-1. The default for `--precompute-threads` (the combine pool). Shard
-   threads, query workers and persist threads already use the cores.
-   Proposed: a quarter of the cores, 1 to 4, as for persistence.
-2. The per-instance memory limit: the full `--run-memory-limit-bytes`
-   (proposed), or that limit divided by K so that the total matches the
-   single-thread run.
-3. Whether v1 should implement exchange as well as single partition. No
-   current plan needs either.
-4. The B1 target that makes parallel precompute the default (proposed:
-   higher sustained samples/s at 100k series with K = 4 than single-thread
-   precompute).
-5. Whether the Planner's cost inputs should get the shard count and a
-   "streams ingestion pipelines" flag now (a Planner PR), or after B1.
+- **Rollout.** Push becomes the default by the D9 rule.
+  `--precompute-mode=window` stays for one release.
+- **Exit.** If B1 shows no gain at 10k series, the default stays window
+  mode and the profile is reported. The per-sample path (append plus
+  per-batch fold) is then the next target.
+- **Shard threads now do view work.** Heavy views slow ingestion on every
+  shard. `precompute_push` shows it.
+- **Hot series.** One series is bounded by one core (D3).
+- **`Reduce` partials are multiplied by K while open.** The Planner term
+  waits for D10.
+- **KLL and float-sum merges** match within the plan target only.
+- **Coupling to the coordinator's flush protocol.** Seal travels with the
+  flush, so a change to that protocol changes this design.
