@@ -261,7 +261,9 @@ HTTP queries ─► query workers: one query run per worker thread over
   added later run serially until classified). A test
   (`data_plane/tests/precompute_pool.rs`) fails any window whose run
   starts before the views it reads are committed through its end, or
-  whose raw shards or views change while it runs.
+  whose raw shards or views change while it runs. No public workload's
+  plan has a group reading another group's views at ingestion today, so
+  that order is covered by the scheduler's unit tests.
 - At most `--max-precompute-backlog` (default 256) windows wait for their
   refresh, plus at most two per precompute thread taken by the committer
   (one with a single thread) and one held by the thread that hands them

@@ -54,17 +54,15 @@ fn workloads() -> Vec<(String, PlanningWorkload)> {
         .collect()
 }
 
-/// Every plan of every public workload, raw data kept and not.
-fn plans() -> Vec<(String, InstallablePlan)> {
-    let mut plans = Vec::new();
-    for (name, workload) in workloads() {
-        for raw in [true, false] {
-            if let Ok((plan, _)) = plan_workload(&workload, &common::inputs(raw)) {
-                plans.push((format!("{name} (raw data retained: {raw})"), plan));
-            }
-        }
-    }
-    plans
+/// Every plan of every public workload, raw data kept and not, planned
+/// as they are taken.
+fn plans() -> impl Iterator<Item = (String, InstallablePlan)> {
+    workloads().into_iter().flat_map(|(name, workload)| {
+        [true, false].into_iter().filter_map(move |raw| {
+            let (plan, _) = plan_workload(&workload, &common::inputs(raw)).ok()?;
+            Some((format!("{name} (raw data retained: {raw})"), plan))
+        })
+    })
 }
 
 /// For each refresh group, the other groups whose views it reads.
@@ -243,8 +241,18 @@ async fn view_files_checked(
             ..options(threads, Some(dir.clone()))
         },
     );
-    for body in requests(plan, SERIES, START_MS, END_MS) {
+    for (minute, body) in requests(plan, SERIES, START_MS, END_MS)
+        .into_iter()
+        .enumerate()
+    {
         assert_eq!(write(&app, body).await, StatusCode::NO_CONTENT);
+        // A barrier after each minute moves the watermark one minute at a
+        // time, so no run skips windows past their retention when the
+        // watermark jumps (how far it jumps depends on timing); checking
+        // inputs, ingestion runs on while windows compute instead.
+        if !check_task_inputs {
+            barrier(&app, START_MS + (minute as i64 + 1) * 60_000).await;
+        }
     }
     barrier(&app, END_MS).await;
     let failed = state.engine.stats().windows_failed;
@@ -307,7 +315,6 @@ fn first_window_end(plan: &InstallablePlan, group: usize) -> i64 {
 /// and no KLL sketch, chosen by `pick`.
 fn plan_where(pick: impl Fn(&InstallablePlan) -> bool) -> (String, InstallablePlan) {
     plans()
-        .into_iter()
         .find(|(_, plan)| !has_kll(plan) && pick(plan))
         .expect("no public workload plan fits")
 }

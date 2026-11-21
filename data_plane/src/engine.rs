@@ -1350,8 +1350,8 @@ fn compute_window(
     (result, TaskTimes { started, computed })
 }
 
-/// What a window's run reads, for tests: each raw shard's identity and
-/// size, the view store's identity, and how far each view of the groups
+/// What a window's run reads, for tests: each raw shard's identity,
+/// samples and panes, the view store's identity, and how far each view of the groups
 /// it reads is stored.
 #[derive(Debug, PartialEq, Eq)]
 struct TaskInputs {
@@ -1372,7 +1372,9 @@ impl TaskInputs {
         let inputs = Self {
             raw_shards: raw_data
                 .iter()
-                .map(|shard| (Arc::as_ptr(shard) as usize, shard.len(), shard.bytes()))
+                // Samples and panes, not bytes: a chunk builds its series
+                // identity column once, on first read, and counts it.
+                .map(|shard| (Arc::as_ptr(shard) as usize, shard.len(), shard.panes()))
                 .collect(),
             views: Arc::as_ptr(views) as usize,
             read_views_stored_through: precompute.tasks().reads[window.group]
