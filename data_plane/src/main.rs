@@ -122,20 +122,21 @@ struct Args {
     #[arg(long, default_value_t = EngineOptions::default().view_sync_interval_ms)]
     view_sync_interval_ms: u64,
     /// Bytes of decoded view windows kept in memory; the other windows are
-    /// read from the view files. Default: from the cgroup's memory.max, or
-    /// no limit. Not implemented yet.
+    /// read from the view files (mapped segments, states read in place).
+    /// 0: every read is served from the files. Default: from the cgroup's
+    /// memory.max, or no limit. Needs view persistence.
     #[arg(long)]
     view_cache_max_bytes: Option<u64>,
     /// A decoded window not read for this long leaves memory (0: never).
-    /// Default: twice the longest evaluation interval of the plan's view
-    /// readers. Not implemented yet.
+    /// Default: 60 s.
     #[arg(long)]
     view_cache_idle_ms: Option<u64>,
-    /// Milliseconds of windows per view file segment. Not implemented yet.
+    /// Milliseconds of windows per view file segment; segments past every
+    /// view's retention are deleted.
     #[arg(long, default_value_t = EngineOptions::default().view_segment_ms)]
     view_segment_ms: i64,
     /// How cold view windows are read: `mmap` (sealed segments mapped) or
-    /// `pread`. Not implemented yet.
+    /// `pread`.
     #[arg(long, default_value = "mmap", value_parser = ["mmap", "pread"])]
     view_read: String,
 }
