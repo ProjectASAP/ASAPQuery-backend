@@ -25,7 +25,16 @@ pub struct Series {
     /// The canonical JSON of every label, `__name__` included: the series
     /// identity column of a raw-data read, computed once when interned.
     pub identity: Arc<str>,
-    labels: BTreeMap<String, String>,
+    /// Shared with every query result row of this series.
+    labels: Arc<BTreeMap<String, String>>,
+}
+
+impl Series {
+    /// The label set, shared: a query result row of this series holds it
+    /// without copying.
+    pub fn labels(&self) -> &Arc<BTreeMap<String, String>> {
+        &self.labels
+    }
 }
 
 impl Deref for Series {
@@ -145,7 +154,7 @@ pub fn intern_pairs<N: AsRef<str>, V: AsRef<str>>(pairs: &[(N, V)]) -> Arc<Serie
         identity: serde_json::to_string(&labels)
             .expect("labels serialize")
             .into(),
-        labels,
+        labels: Arc::new(labels),
     });
     interner.series.push(series.clone());
     interner.by_hash.entry(hash).or_default().push(id);
@@ -169,4 +178,26 @@ pub fn intern(labels: &BTreeMap<String, String>) -> Arc<Series> {
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
     intern_pairs(&pairs)
+}
+
+/// The labels of a query result series whose identity text is `identity`
+/// and that is not an input series (the query changed its labels, e.g.
+/// `max_over_time` drops `__name__`): parsed once and shared by every
+/// result row and cached answer of that series. Never forgets a label
+/// set, as the interner never forgets a series.
+pub fn result_labels(identity: &str) -> Result<Arc<BTreeMap<String, String>>, serde_json::Error> {
+    static RESULT_LABELS: OnceLock<
+        RwLock<ahash::HashMap<Arc<str>, Arc<BTreeMap<String, String>>>>,
+    > = OnceLock::new();
+    let table = RESULT_LABELS.get_or_init(RwLock::default);
+    if let Some(labels) = table.read().expect("result labels lock").get(identity) {
+        return Ok(labels.clone());
+    }
+    let labels: Arc<BTreeMap<String, String>> = Arc::new(serde_json::from_str(identity)?);
+    Ok(table
+        .write()
+        .expect("result labels lock")
+        .entry(identity.into())
+        .or_insert(labels)
+        .clone())
 }

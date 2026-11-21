@@ -150,28 +150,48 @@ impl Chunk {
     }
 
     /// The rows of the series in `partition`, in order: the chunk itself
-    /// when every series is, `None` when none is.
+    /// when every series is, `None` when none is. One pass over the rows,
+    /// with no lookup per row: each series' new code is found once.
     fn in_partition(self: &Arc<Self>, partition: SeriesPartition) -> Option<Arc<Self>> {
-        let kept: Vec<bool> = self
-            .series
-            .iter()
-            .map(|series| partition.holds(series.id))
-            .collect();
-        if kept.iter().all(|&k| k) {
+        const DROPPED: u32 = u32::MAX;
+        let mut new_code = vec![DROPPED; self.series.len()];
+        let mut series = Vec::new();
+        for (code, one) in self.series.iter().enumerate() {
+            if partition.holds(one.id) {
+                new_code[code] = series.len() as u32;
+                series.push(one.clone());
+            }
+        }
+        if series.len() == self.series.len() {
             return Some(self.clone());
         }
-        if !kept.iter().any(|&k| k) {
+        if series.is_empty() {
             return None;
         }
-        Self::new(
-            self.codes
-                .values()
-                .iter()
-                .zip(self.rows())
-                .filter(|(&code, _)| kept[code as usize])
-                .map(|(_, row)| row),
-        )
-        .map(Arc::new)
+        let (mut times, mut values, mut codes) = (Vec::new(), Vec::new(), Vec::new());
+        let rows = self
+            .codes
+            .values()
+            .iter()
+            .zip(self.time.values().iter())
+            .zip(self.value.values().iter());
+        for ((&code, &time), &value) in rows {
+            let code = new_code[code as usize];
+            if code != DROPPED {
+                times.push(time);
+                values.push(value);
+                codes.push(code);
+            }
+        }
+        let time_bounds_ms = (*times.iter().min()?, *times.iter().max()?);
+        Some(Arc::new(Self {
+            time: TimestampMillisecondArray::from(times),
+            value: Float64Array::from(values),
+            codes: UInt32Array::from(codes),
+            series,
+            identities: std::sync::OnceLock::new(),
+            time_bounds_ms,
+        }))
     }
 
     fn column(&self, kind: &ColumnKind) -> Result<ArrayRef, Error> {
@@ -335,7 +355,7 @@ impl RawData {
         metric: &str,
         request: &RawDataRequest,
         reads: Option<&RawReads>,
-        partition: Option<SeriesPartition>,
+        partition: Option<&PartitionReads>,
     ) -> Result<Vec<Batch>, Error> {
         let columns = column_kinds(metric, request)?;
         let Some(metric) = self.by_metric.get(metric) else {
@@ -359,7 +379,8 @@ impl RawData {
                 continue;
             };
             let Some(chunk) = (match partition {
-                Some(partition) => chunk.in_partition(partition),
+                Some(partition) if Arc::ptr_eq(stored, &chunk) => partition.chunk(stored),
+                Some(partition) => chunk.in_partition(partition.partition),
                 None => Some(chunk),
             }) else {
                 continue;
@@ -394,6 +415,38 @@ pub struct SeriesPartition {
 impl SeriesPartition {
     fn holds(&self, series_id: u32) -> bool {
         series_id % self.count == self.index
+    }
+}
+
+/// One run's part of the series and the stored chunks it has cut to that
+/// part, so the run's scans filter each chunk (and build its series
+/// identities) once, as a whole run reads each chunk's cached ones.
+pub struct PartitionReads {
+    partition: SeriesPartition,
+    /// By chunk address; each entry holds the chunk, so its address is not
+    /// reused while it is kept.
+    chunks: Mutex<HashMap<usize, CutChunk>>,
+}
+
+/// A stored chunk and its rows of one part of the series (`None`: none).
+type CutChunk = (Arc<Chunk>, Option<Arc<Chunk>>);
+
+impl PartitionReads {
+    pub fn new(partition: SeriesPartition) -> Self {
+        Self {
+            partition,
+            chunks: Mutex::default(),
+        }
+    }
+
+    fn chunk(&self, stored: &Arc<Chunk>) -> Option<Arc<Chunk>> {
+        let key = Arc::as_ptr(stored) as usize;
+        let mut chunks = self.chunks.lock().unwrap_or_else(|e| e.into_inner());
+        chunks
+            .entry(key)
+            .or_insert_with(|| (stored.clone(), stored.in_partition(self.partition)))
+            .1
+            .clone()
     }
 }
 
@@ -496,7 +549,7 @@ pub struct RunStore {
     /// Chunks converted by the other evaluations of the same range request.
     raw_reads: Option<Arc<RawReads>>,
     /// The series the run reads raw samples of; `None`: every series.
-    partition: Option<SeriesPartition>,
+    partition: Option<PartitionReads>,
     /// The query-time results the run reads, by node: each computed for
     /// the run's evaluation time before the run starts and held by the run.
     query_time_results: HashMap<PhysicalASAPNodeId, Arc<Vec<Batch>>>,
@@ -533,7 +586,7 @@ impl RunStore {
         partition: Option<SeriesPartition>,
     ) -> Self {
         Self {
-            partition,
+            partition: partition.map(PartitionReads::new),
             ..Self::new(raw_data, views)
         }
     }
@@ -565,7 +618,7 @@ impl DataStore for RunStore {
                 metric,
                 request,
                 self.raw_reads.as_deref(),
-                self.partition,
+                self.partition.as_ref(),
             )?);
         }
         Ok(stream::iter(batches)
@@ -717,8 +770,13 @@ impl SharedTexts {
 #[derive(Default, Clone)]
 pub struct ViewStore {
     by_view: BTreeMap<PhysicalASAPNodeId, ViewRows>,
-    /// Per view and text column index, the texts its windows share.
-    texts: BTreeMap<(PhysicalASAPNodeId, usize), Arc<Mutex<SharedTexts>>>,
+    /// Per view, window part and text column index, the texts its windows
+    /// share. A window split by series keeps one batch per part (the
+    /// parts' series are stable across windows), and each part has its own
+    /// texts: a run charges each batch it reads for its buffers, the shared
+    /// values included, so one view-wide array in every part's batch would
+    /// be charged once per part per window.
+    texts: BTreeMap<(PhysicalASAPNodeId, usize, usize), Arc<Mutex<SharedTexts>>>,
 }
 
 impl ViewStore {
@@ -750,7 +808,8 @@ impl ViewStore {
         }
         let batches = batches
             .into_iter()
-            .map(|batch| self.share_texts(view.node_id, batch))
+            .enumerate()
+            .map(|(part, batch)| self.share_texts(view.node_id, part, batch))
             .collect::<Result<Vec<_>, Error>>()?;
         let bytes = batches.iter().map(window_batch_bytes).sum();
         let rows = self.by_view.entry(view.node_id).or_default();
@@ -768,8 +827,14 @@ impl ViewStore {
         Ok(())
     }
 
-    /// `batch` with each text column keyed into `view`'s shared texts.
-    fn share_texts(&mut self, view: PhysicalASAPNodeId, batch: Batch) -> Result<Batch, Error> {
+    /// `batch`, part `part` of its window, with each text column keyed into
+    /// that part's shared texts of `view`.
+    fn share_texts(
+        &mut self,
+        view: PhysicalASAPNodeId,
+        part: usize,
+        batch: Batch,
+    ) -> Result<Batch, Error> {
         let schema = batch.schema().clone();
         let mut changed = false;
         let mut columns = Vec::with_capacity(schema.fields.len());
@@ -789,7 +854,7 @@ impl ViewStore {
             }
             let column = batch.column(index);
             let shared = if field.dtype == FieldDataType::Plain(DataType::Utf8) {
-                let texts = self.texts.entry((view, index)).or_default().clone();
+                let texts = self.texts.entry((view, part, index)).or_default().clone();
                 let mut texts = texts.lock().unwrap_or_else(|e| e.into_inner());
                 texts.share(column)?
             } else {
@@ -1462,6 +1527,63 @@ mod tests {
             added < identities / 2,
             "a window added {added} bytes; identities are {identities}"
         );
+    }
+
+    /// A window split by series keeps one batch per part; each part's text
+    /// columns share that part's texts across windows, holding only the
+    /// part's own series, so a run charged per batch read is not charged a
+    /// whole view's texts once per part.
+    #[test]
+    fn split_window_parts_keep_their_own_shared_texts() {
+        let view: MaterializedView = serde_json::from_value(serde_json::json!({
+            "node_id": 1,
+            "refresh": "on_first_read",
+            "coverage": {"definition_id": "test-view", "selection": []},
+            "inputs": {"materialized_views": []},
+            "retention_ms": 1_000_000,
+        }))
+        .unwrap();
+        let schema = schema();
+        let part = |end: i64, series: std::ops::Range<usize>| {
+            let rows = series
+                .map(|s| {
+                    vec![
+                        Value::Timestamp(end),
+                        Value::Float64(s as f64),
+                        Value::Utf8(format!("series-{s}").into()),
+                        Value::Utf8(format!("job-{}", s % 3).into()),
+                    ]
+                })
+                .collect();
+            Batch::try_new(schema.clone(), rows).unwrap()
+        };
+        let mut views = ViewStore::default();
+        for end in [10, 20] {
+            views
+                .append(
+                    &view,
+                    (end - 10, end),
+                    vec![part(end, 0..50), part(end, 50..100)],
+                )
+                .unwrap();
+        }
+        let identities = |window: &ViewWindow, part: usize| {
+            window.batches[part]
+                .column(2)
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+                .unwrap()
+                .values()
+                .clone()
+        };
+        let stored = &views.by_view[&1];
+        for part in [0, 1] {
+            assert_eq!(identities(&stored[0], part).len(), 50);
+            assert!(Arc::ptr_eq(
+                &identities(&stored[0], part),
+                &identities(&stored[1], part)
+            ));
+        }
     }
 
     /// A query-time result at a time the watermark has passed is computed

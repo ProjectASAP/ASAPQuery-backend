@@ -190,14 +190,17 @@ impl ResultCache {
     }
 }
 
-/// The heap bytes an answer holds, estimated: each sample, and each label's
-/// name, value and tree node.
+/// The heap bytes an answer holds, estimated: each sample, and each label
+/// map only this answer holds (an input series' map is the interner's,
+/// shared by every answer of that series) with its names, values and tree
+/// nodes.
 fn answer_bytes(answer: &[ResultSample]) -> usize {
     const LABEL_NODE_BYTES: usize = 2 * std::mem::size_of::<String>() + 16;
     std::mem::size_of_val(answer)
         + answer
             .iter()
-            .flat_map(|sample| &sample.labels)
+            .filter(|sample| Arc::strong_count(&sample.labels) == 1)
+            .flat_map(|sample| sample.labels.iter())
             .map(|(name, value)| name.capacity() + value.capacity() + LABEL_NODE_BYTES)
             .sum::<usize>()
 }
@@ -210,7 +213,7 @@ mod tests {
         Arc::new(
             (0..series)
                 .map(|i| ResultSample {
-                    labels: [("job".to_string(), format!("j{i}"))].into(),
+                    labels: Arc::new([("job".to_string(), format!("j{i}"))].into()),
                     value: i as f64,
                 })
                 .collect(),

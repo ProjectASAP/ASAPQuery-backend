@@ -839,6 +839,10 @@ async fn compare_range_answers(views: Views) {
             let label = format!("{name} as ranges (raw data retained: {raw_data_retained})");
             let mut inputs = DeploymentInputs::default();
             inputs.deployment_capabilities.raw_data_retained = raw_data_retained;
+            // Each range is asked once, cold, after all its data is in: the
+            // result cache holds none of its earlier steps, so the plan
+            // must keep every step's inputs (no final_query_results_cached).
+            inputs.deployment_capabilities.final_query_results_cached = false;
             let plan = match plan_workload(&workload, &inputs) {
                 Ok((plan, _)) => plan,
                 Err(error) => {

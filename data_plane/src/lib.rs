@@ -302,13 +302,16 @@ async fn query(
 }
 
 /// Runs a planned instant query at its time, or now.
-async fn answer(state: &DataPlane, query: InstantQuery) -> Result<serde_json::Value, Unanswered> {
+async fn answer(
+    state: &DataPlane,
+    query: InstantQuery,
+) -> Result<prometheus::VectorResponse, Unanswered> {
     let time_ms = query.time_ms.unwrap_or_else(ingestion::wall_clock_ms);
     let samples = match state.engine.cached(&query.query, time_ms) {
         Some(samples) => samples,
         None => state.engine.evaluate(query.query, time_ms).await?,
     };
-    Ok(prometheus::vector_response(time_ms, &samples))
+    Ok(prometheus::VectorResponse { time_ms, samples })
 }
 
 /// Answers a planned range query from the plan, one evaluation per step;
@@ -360,8 +363,8 @@ async fn query_range(
 async fn answer_range(
     state: &DataPlane,
     range: RangeQuery,
-) -> Result<serde_json::Value, Unanswered> {
-    use futures::{StreamExt, TryStreamExt};
+) -> Result<prometheus::MatrixResponse, Unanswered> {
+    use futures::StreamExt;
     let started = std::time::Instant::now();
     let query = &range.query;
     // The steps the result cache answers; only the others run.
@@ -374,9 +377,15 @@ async fn answer_range(
     // converted once ([`store::RawReads`]).
     let snapshot = state.engine.snapshot();
     // At most one step per query worker in flight, so a long range neither
-    // floods the workers' queue nor starves instant queries; the first
-    // failed step, or the client going away, drops the rest unrun.
-    let steps: Vec<_> = futures::stream::iter(cached)
+    // floods the workers' queue nor starves instant queries; the client
+    // going away drops the rest unrun. Every step runs even when one fails:
+    // with `final_query_results_cached` the plan keeps a step's inputs only
+    // for the refresh interval, so the older steps of a span are answered
+    // from the result cache, and a request whose older steps are not cached
+    // yet (the first span after a start) still caches the steps it can
+    // answer; a dashboard refreshing the range fills the cache within one
+    // span.
+    let results: Vec<Result<_, Unanswered>> = futures::stream::iter(cached)
         .map(|(time_ms, hit)| {
             let snapshot = snapshot.clone();
             async move {
@@ -393,8 +402,9 @@ async fn answer_range(
             }
         })
         .buffered(state.engine.query_threads())
-        .try_collect()
-        .await?;
+        .collect()
+        .await;
+    let steps: Vec<_> = results.into_iter().collect::<Result<_, _>>()?;
     if let Some(metrics) = state.engine.metrics().query(query) {
         metrics
             .range_latency
@@ -406,7 +416,7 @@ async fn answer_range(
             .range_steps
             .fetch_add(steps.len() as u64, Ordering::Relaxed);
     }
-    Ok(prometheus::matrix_response(&steps))
+    Ok(prometheus::MatrixResponse::new(&steps))
 }
 
 /// With `--no-forward`, the answer to a query the plan does not answer: a

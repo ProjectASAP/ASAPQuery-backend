@@ -797,11 +797,41 @@ impl Texts<'_> {
 }
 
 /// The rows of `batches`, texts as dictionary indices; `None` when one
-/// holds a state with no byte encoding.
+/// holds a state with no byte encoding. A window split by series is kept
+/// as one batch per part; its rows are written in the order one run over
+/// every series emits them (by their plain columns' values), so a window's
+/// record is the same whichever way its run was split.
 fn encode_rows(batches: &[Batch], texts: &mut Texts) -> Option<Vec<Vec<StoredValue>>> {
-    batches
-        .iter()
-        .flat_map(Batch::to_rows)
+    let mut rows: Vec<Vec<Value>> = batches.iter().flat_map(Batch::to_rows).collect();
+    if batches.len() > 1 {
+        let plain: Vec<usize> = batches[0]
+            .schema()
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| {
+                matches!(
+                    field.dtype,
+                    asap_executor::planner::ir::schema::FieldDataType::Plain(_)
+                )
+            })
+            .map(|(column, _)| column)
+            .collect();
+        let mut keyed = rows
+            .into_iter()
+            .map(|row| {
+                let key = plain
+                    .iter()
+                    .map(|&column| row[column].key())
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()?;
+                Some((key, row))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        rows = keyed.into_iter().map(|(_, row)| row).collect();
+    }
+    rows.into_iter()
         .map(|row| {
             row.into_iter()
                 .map(|value| match value {

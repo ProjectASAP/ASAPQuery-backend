@@ -40,7 +40,11 @@ use crate::store::{PublishedStore, QueryTimeResults, RawReads, RawShards, RunSto
 /// One series of an instant-query result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResultSample {
-    pub labels: BTreeMap<String, String>,
+    /// Shared with the interned series (an input series) or with every
+    /// other row of the same result series (`series_ids::result_labels`)
+    /// when the row has no other label column, so results and the result
+    /// cache hold no copy of it.
+    pub labels: Arc<BTreeMap<String, String>>,
     pub value: f64,
 }
 
@@ -507,7 +511,10 @@ fn result_samples(schema: &Schema, batches: &[Batch]) -> Result<Vec<ResultSample
     }
     let mut samples = Vec::new();
     for row in batches.iter().flat_map(Batch::to_rows) {
-        let mut labels = BTreeMap::new();
+        // An interned input series' shared labels, until another label
+        // column (or a series the query built) needs a map of its own.
+        let mut shared: Option<Arc<BTreeMap<String, String>>> = None;
+        let mut own: Option<BTreeMap<String, String>> = None;
         let mut value = None;
         for (field, cell) in schema.fields.iter().zip(&row) {
             match cell {
@@ -515,22 +522,34 @@ fn result_samples(schema: &Schema, batches: &[Batch]) -> Result<Vec<ResultSample
                     // An input series' identity is interned; parse only a
                     // series the query built.
                     match crate::series_ids::by_identity(text) {
-                        Some(series) => labels.extend(
-                            series
-                                .iter()
-                                .map(|(name, value)| (name.clone(), value.clone())),
-                        ),
+                        Some(series) => match own.as_mut() {
+                            Some(own) => own.extend(
+                                series
+                                    .iter()
+                                    .map(|(name, value)| (name.clone(), value.clone())),
+                            ),
+                            None => shared = Some(series.labels().clone()),
+                        },
                         None => {
-                            let identity: BTreeMap<String, String> = serde_json::from_str(text)
-                                .map_err(|e| {
-                                    Unanswered::Execution(format!("series identity: {e}"))
-                                })?;
-                            labels.extend(identity);
+                            let identity = crate::series_ids::result_labels(text).map_err(|e| {
+                                Unanswered::Execution(format!("series identity: {e}"))
+                            })?;
+                            match own.as_mut() {
+                                Some(own) => own.extend(
+                                    identity
+                                        .iter()
+                                        .map(|(name, value)| (name.clone(), value.clone())),
+                                ),
+                                None => shared = Some(identity),
+                            }
                         }
                     }
                 }
                 Value::Utf8(text) if !text.is_empty() => {
-                    labels.insert(field.name.clone(), text.to_string());
+                    own.get_or_insert_with(|| {
+                        shared.take().map(|s| (*s).clone()).unwrap_or_default()
+                    })
+                    .insert(field.name.clone(), text.to_string());
                 }
                 Value::Float64(v) => value = Some(*v),
                 _ => {}
@@ -538,6 +557,11 @@ fn result_samples(schema: &Schema, batches: &[Batch]) -> Result<Vec<ResultSample
         }
         let value =
             value.ok_or_else(|| Unanswered::Execution("a result row without a value".into()))?;
+        let labels = match (own, shared) {
+            (Some(own), _) => Arc::new(own),
+            (None, Some(shared)) => shared,
+            (None, None) => Arc::default(),
+        };
         samples.push(ResultSample { labels, value });
     }
     Ok(samples)

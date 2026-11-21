@@ -349,7 +349,17 @@ async fn ddsketch_windows_over_a_gauge_reporting_zero_answer_within_alpha() {
 #[tokio::test]
 async fn ddsketch_windows_over_signed_samples_answer_within_alpha() {
     let query = "max by (region, service, job) (quantile_over_time(0.99, data[100s]))";
-    let plan = plan_without_raw_samples(&p99_workload("max", false), true);
+    // Only DDSketch offered for quantiles: the test is about its stores.
+    use asap_executor::planner::summary_type::{SketchAlgorithm, StatisticKind, SupportedSummary};
+    let mut inputs = common::inputs(false);
+    inputs.ignore_accuracy_guarantees = true;
+    inputs.deployment_capabilities.supported_summaries = Some(vec![SupportedSummary {
+        summary_type: SketchAlgorithm::DDSketch,
+        readouts: vec![StatisticKind::Quantile],
+    }]);
+    let plan = plan_workload(&p99_workload("max", false), &inputs)
+        .unwrap_or_else(|e| panic!("{e}"))
+        .0;
     assert!(
         !plan.materialized_views().unwrap().is_empty(),
         "tumbling windows kept at ingestion"
