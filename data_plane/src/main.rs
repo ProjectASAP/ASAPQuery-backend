@@ -19,7 +19,7 @@ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[export_name = "_rjem_malloc_conf"]
 pub static malloc_conf: &[u8] =
     b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0,narenas:8\0";
-use data_plane::engine::EngineOptions;
+use data_plane::engine::{EngineOptions, PrecomputeMode};
 use data_plane::ingestion::IngestionOptions;
 use data_plane::{router, DataPlane, DEFAULT_FORWARD_TIMEOUT};
 
@@ -65,6 +65,14 @@ struct Args {
     /// series hashed to it. Default: a quarter of the cores, at least 1.
     #[arg(long, default_value_t = EngineOptions::default().ingest_threads)]
     ingest_threads: usize,
+    /// How the views of a closed window are built: `window` (one ingestion
+    /// run per closed window) or `push` (shards fold samples as they
+    /// arrive; not implemented yet, so install refuses it).
+    #[arg(long, default_value = "window", value_parser = ["window", "push"])]
+    precompute_mode: String,
+    /// Push mode: bytes of open-window state all shards may hold together.
+    #[arg(long)]
+    precompute_memory_budget_bytes: Option<u64>,
     /// Threads computing closed refresh windows at once: windows of
     /// different refresh groups, and of one group, run in parallel and are
     /// stored in window order. 1 computes one window at a time. Default: a
@@ -160,6 +168,12 @@ async fn main() -> anyhow::Result<()> {
                 result_cache_max_bytes: args.result_cache_bytes,
                 view_dir: (!args.no_view_persistence).then_some(args.view_dir),
                 view_sync_interval_ms: args.view_sync_interval_ms,
+                precompute_mode: match args.precompute_mode.as_str() {
+                    "push" => PrecomputeMode::Push,
+                    _ => PrecomputeMode::Window,
+                },
+                precompute_memory_budget_bytes: args.precompute_memory_budget_bytes,
+                panic_in_combine_of_window_end_ms: None,
             },
         )?
         .with_forward_timeout(Duration::from_secs(args.forward_timeout_seconds)),

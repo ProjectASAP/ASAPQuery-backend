@@ -310,6 +310,14 @@ pub struct Snapshot {
     raw_reads: Arc<RawReads>,
 }
 
+impl Snapshot {
+    /// Every stored view's rows: per view, each window's `(start, end]`
+    /// and batches, oldest first (for comparing two engines' views).
+    pub fn view_rows(&self) -> BTreeMap<PhysicalASAPNodeId, Vec<((i64, i64), Vec<Batch>)>> {
+        self.views.rows()
+    }
+}
+
 /// Whether `node`'s run, and every shared node's run it reads, compiled.
 fn runnable(
     node: PhysicalASAPNodeId,
