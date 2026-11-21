@@ -159,6 +159,9 @@ struct ShardReport {
     newest_ms: Option<i64>,
     /// Each metric's first sample, while a group waits for one.
     first_seen: Vec<(Arc<str>, i64)>,
+    /// Samples of the batch reported, counted out of the queues when the
+    /// coordinator applies the report.
+    samples: u64,
 }
 
 /// What an ingest shard does next.
@@ -431,8 +434,12 @@ impl EngineHandle {
                 .send(ShardMessage::Samples(samples))
                 .is_err()
             {
+                // This shard and the ones not sent to yet were admitted
+                // but get nothing.
                 shared.queued_samples.fetch_sub(count, Ordering::SeqCst);
-                shared.shard_queued[shard].fetch_sub(count, Ordering::SeqCst);
+                for (queued, &later) in shared.shard_queued[shard..].iter().zip(&counts[shard..]) {
+                    queued.fetch_sub(later, Ordering::SeqCst);
+                }
                 return Err(IngestError::Stopped);
             }
         }
@@ -848,13 +855,13 @@ fn serve_shard(
             raw_data: raw_data.clone(),
             newest_ms,
             first_seen,
+            samples: count,
         };
-        let sent = coordinator.send(Command::Report(report));
-        // Counted out after the report, so the coordinator never takes the
-        // shard for caught up before it knows the samples' times.
-        shared.shard_queued[index].fetch_sub(count, Ordering::SeqCst);
-        shared.queued_samples.fetch_sub(count, Ordering::SeqCst);
-        if sent.is_err() {
+        // The coordinator counts the samples out of the queues when it
+        // applies the report, so samples stay counted while it cannot keep
+        // up (waiting for the precompute workers): the queues fill and
+        // Remote Write gets 503, and reports waiting for it stay bounded.
+        if coordinator.send(Command::Report(report)).is_err() {
             break;
         }
     }
@@ -888,6 +895,10 @@ fn serve_ingest(
                  raw_shards: &mut Vec<Arc<RawData>>,
                  newest: &mut Vec<Option<i64>>| {
         ingestion.observe(&report.first_seen);
+        shared.shard_queued[report.shard].fetch_sub(report.samples, Ordering::SeqCst);
+        shared
+            .queued_samples
+            .fetch_sub(report.samples, Ordering::SeqCst);
         raw_shards[report.shard] = report.raw_data;
         newest[report.shard] = report.newest_ms;
     };

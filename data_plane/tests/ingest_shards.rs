@@ -506,3 +506,79 @@ async fn status_and_answer_of(app: &Router, query: &str, time_ms: i64) -> (Statu
     }
     (status, body)
 }
+
+/// When the precompute cannot keep up (here its persist queue is full and
+/// every window's write is slow), the coordinator waits for it; the shards'
+/// samples then stay counted in their queues until the coordinator takes
+/// their reports, so the queues fill and Remote Write gets 503, rather than
+/// shards draining into an unbounded backlog of reports.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_precompute_that_cannot_keep_up_reaches_remote_write() {
+    let dir =
+        std::env::temp_dir().join(format!("ingest-shards-backpressure-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let options = EngineOptions {
+        no_forward: true,
+        ingest_threads: 4,
+        max_queued_samples: 2_000,
+        max_precompute_backlog: 1,
+        view_dir: Some(dir.clone()),
+        persist_threads: 1,
+        persist_delay_ms: 2_000,
+        max_persist_backlog_bytes: 1,
+        ingestion: IngestionOptions {
+            allowed_lateness_ms: 0,
+            stream_start_ms: Some(0),
+            ..IngestionOptions::default()
+        },
+        ..EngineOptions::default()
+    };
+    let state = Arc::new(
+        DataPlane::with_options(plan_json(), "http://127.0.0.1:1".into(), options).unwrap(),
+    );
+    let app = router(state.clone());
+    let mut refused = false;
+    // A minute of 64 series per request, each closing six windows.
+    for minute in 0..40i64 {
+        let timeseries = (0..64usize)
+            .map(|i| TimeSeries {
+                labels: [
+                    ("__name__", "data".to_string()),
+                    ("instance", format!("i{i}")),
+                    ("job", format!("job{}", i % 4)),
+                ]
+                .into_iter()
+                .map(|(name, value)| Label {
+                    name: name.into(),
+                    value,
+                })
+                .collect(),
+                samples: (minute * 60 + 1..=minute * 60 + 60)
+                    .map(|second| Sample {
+                        timestamp: second * 1000,
+                        value: value(i, second),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let written = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/write")
+                    .body(Body::from(encode(&WriteRequest { timeseries })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if written.status() == StatusCode::SERVICE_UNAVAILABLE {
+            refused = true;
+            break;
+        }
+        assert_eq!(written.status(), StatusCode::NO_CONTENT);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(refused, "40 requests admitted while the precompute waited");
+    drop(app);
+    drop(state);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -221,7 +221,10 @@ HTTP queries ─► query workers: one query run per worker thread over
 - At most `--max-precompute-backlog` (default 256) windows wait for their
   refresh; when the backlog is full the coordinator waits, the shards'
   queues fill up to `--max-queued-samples`, and Remote Write gets 503 so
-  senders retry. The backlog is exported: a growing backlog means the data plane
+  senders retry. A shard's samples count as queued until the coordinator
+  applies the shard's report, not only until the shard has run them, so
+  the queues fill while the coordinator waits even though the shards keep
+  running, and the reports waiting for it stay bounded. The backlog is exported: a growing backlog means the data plane
   cannot keep up with the input rate.
 
 ### Queries
