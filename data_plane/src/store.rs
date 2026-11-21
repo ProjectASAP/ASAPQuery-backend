@@ -149,6 +149,31 @@ impl Chunk {
         Self::new(self.rows().filter(|(_, t, _)| start < *t && *t <= end)).map(Arc::new)
     }
 
+    /// The rows of the series in `partition`, in order: the chunk itself
+    /// when every series is, `None` when none is.
+    fn in_partition(self: &Arc<Self>, partition: SeriesPartition) -> Option<Arc<Self>> {
+        let kept: Vec<bool> = self
+            .series
+            .iter()
+            .map(|series| partition.holds(series.id))
+            .collect();
+        if kept.iter().all(|&k| k) {
+            return Some(self.clone());
+        }
+        if !kept.iter().any(|&k| k) {
+            return None;
+        }
+        Self::new(
+            self.codes
+                .values()
+                .iter()
+                .zip(self.rows())
+                .filter(|(&code, _)| kept[code as usize])
+                .map(|(_, row)| row),
+        )
+        .map(Arc::new)
+    }
+
     fn column(&self, kind: &ColumnKind) -> Result<ArrayRef, Error> {
         Ok(match kind {
             ColumnKind::Time => Arc::new(self.time.clone()),
@@ -310,6 +335,7 @@ impl RawData {
         metric: &str,
         request: &RawDataRequest,
         reads: Option<&RawReads>,
+        partition: Option<SeriesPartition>,
     ) -> Result<Vec<Batch>, Error> {
         let columns = column_kinds(metric, request)?;
         let Some(metric) = self.by_metric.get(metric) else {
@@ -332,6 +358,12 @@ impl RawData {
             let Some(chunk) = stored.in_range((start, end)) else {
                 continue;
             };
+            let Some(chunk) = (match partition {
+                Some(partition) => chunk.in_partition(partition),
+                None => Some(chunk),
+            }) else {
+                continue;
+            };
             let convert = || -> Result<Batch, Error> {
                 let columns = columns
                     .iter()
@@ -348,6 +380,20 @@ impl RawData {
             batches.push(batch);
         }
         Ok(batches)
+    }
+}
+
+/// One of `count` disjoint parts of the series, by series id: a window's
+/// ingestion run split by series reads one part per run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeriesPartition {
+    pub index: u32,
+    pub count: u32,
+}
+
+impl SeriesPartition {
+    fn holds(&self, series_id: u32) -> bool {
+        series_id % self.count == self.index
     }
 }
 
@@ -449,6 +495,8 @@ pub struct RunStore {
     views: Arc<ViewStore>,
     /// Chunks converted by the other evaluations of the same range request.
     raw_reads: Option<Arc<RawReads>>,
+    /// The series the run reads raw samples of; `None`: every series.
+    partition: Option<SeriesPartition>,
     /// The query-time results the run reads, by node: each computed for
     /// the run's evaluation time before the run starts and held by the run.
     query_time_results: HashMap<PhysicalASAPNodeId, Arc<Vec<Batch>>>,
@@ -472,8 +520,21 @@ impl RunStore {
             raw_data,
             views,
             raw_reads,
+            partition: None,
             query_time_results,
             missing_view_rows: Mutex::new(None),
+        }
+    }
+
+    /// A run reading the raw samples of `partition`'s series only.
+    pub fn for_partition(
+        raw_data: RawShards,
+        views: Arc<ViewStore>,
+        partition: Option<SeriesPartition>,
+    ) -> Self {
+        Self {
+            partition,
+            ..Self::new(raw_data, views)
         }
     }
 
@@ -500,7 +561,12 @@ impl DataStore for RunStore {
         };
         let mut batches = Vec::new();
         for shard in self.raw_data.iter() {
-            batches.extend(shard.read(metric, request, self.raw_reads.as_deref())?);
+            batches.extend(shard.read(
+                metric,
+                request,
+                self.raw_reads.as_deref(),
+                self.partition,
+            )?);
         }
         Ok(stream::iter(batches)
             .map(move |batch| {
@@ -1180,7 +1246,7 @@ mod tests {
             schema,
             predicates: &[],
         };
-        raw.read("m_store_test", &request, reads)
+        raw.read("m_store_test", &request, reads, None)
             .unwrap()
             .iter()
             .flat_map(Batch::to_rows)

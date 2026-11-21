@@ -18,7 +18,8 @@
 //! precompute and persist backlogs seen; `PERSIST_THREADS=n` sets the
 //! persist threads; `INGEST_THREADS=n` the ingest shards;
 //! `PRECOMPUTE_THREADS=n` the threads computing windows; `SCRAPE_MS=ms`
-//! scrapes every `ms` instead of every second. Per refresh group it
+//! scrapes every `ms` instead of every second; `LATENESS_MS=ms` sets the
+//! allowed lateness (default 15 s). Per refresh group it
 //! prints the time from a window's end to its commit (for a paced run,
 //! counted from when the scrape at the window's end was sent), split into
 //! the precompute queue wait, compute and commit wait.
@@ -105,6 +106,11 @@ async fn main() {
     let options = EngineOptions {
         ingestion: IngestionOptions {
             stream_start_ms: Some(start_ms),
+            allowed_lateness_ms: std::env::var("LATENESS_MS")
+                .ok()
+                .map_or(IngestionOptions::default().allowed_lateness_ms, |ms| {
+                    ms.parse().unwrap()
+                }),
             ..IngestionOptions::default()
         },
         view_dir: view_dir.clone(),

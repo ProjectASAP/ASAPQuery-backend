@@ -140,6 +140,8 @@ pub struct WindowLatency {
     /// From the window's end (event time) to its commit (wall clock).
     pub ready_ms: AtomicU64,
     pub ready_max_ms: AtomicU64,
+    /// The runs a window is split into, by series (1: one run).
+    pub parts: AtomicU64,
 }
 
 impl WindowLatency {
@@ -521,6 +523,19 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
             out,
             "asap_window_ready_seconds_max{{group=\"{group}\"}} {}",
             windows.ready_max_ms.load(Ordering::Relaxed) as f64 / 1e3
+        );
+    }
+    family(
+        &mut out,
+        "asap_precompute_window_parts",
+        "gauge",
+        "The runs a refresh group's window is split into, by series; 1 when some node combines series.",
+    );
+    for (group, windows) in metrics.precompute_windows.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "asap_precompute_window_parts{{group=\"{group}\"}} {}",
+            windows.parts.load(Ordering::Relaxed)
         );
     }
     family(

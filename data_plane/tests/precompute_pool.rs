@@ -212,12 +212,13 @@ async fn barrier(app: &Router, time_ms: i64) {
 
 /// Feeds `plan` its samples through `END_MS` and closes every window,
 /// with views persisted to a fresh directory; returns each view file's
-/// bytes and the windows that failed.
+/// bytes, the windows that failed, and whether some group's windows were
+/// split by series.
 async fn view_files(
     plan: &InstallablePlan,
     threads: usize,
     slow: Vec<SlowRefresh>,
-) -> (BTreeMap<String, Vec<u8>>, u64) {
+) -> (BTreeMap<String, Vec<u8>>, u64, bool) {
     view_files_checked(plan, threads, slow, false).await
 }
 
@@ -228,7 +229,7 @@ async fn view_files_checked(
     threads: usize,
     slow: Vec<SlowRefresh>,
     check_task_inputs: bool,
-) -> (BTreeMap<String, Vec<u8>>, u64) {
+) -> (BTreeMap<String, Vec<u8>>, u64, bool) {
     let dir = std::env::temp_dir().join(format!(
         "precompute-pool-{}-{threads}-{}",
         std::process::id(),
@@ -258,6 +259,10 @@ async fn view_files_checked(
     }
     barrier(&app, END_MS).await;
     let failed = state.engine.stats().windows_failed;
+    let split = state.engine.render_metrics().lines().any(|line| {
+        line.starts_with("asap_precompute_window_parts{")
+            && line.rsplit(' ').next().is_some_and(|parts| parts != "1")
+    });
     let mut files = BTreeMap::new();
     for entry in std::fs::read_dir(&dir).unwrap() {
         let path = entry.unwrap().path();
@@ -268,7 +273,7 @@ async fn view_files_checked(
     }
     state.engine.stop();
     let _ = std::fs::remove_dir_all(&dir);
-    (files, failed)
+    (files, failed, split)
 }
 
 fn rand_suffix() -> u128 {
@@ -279,19 +284,25 @@ fn rand_suffix() -> u128 {
 }
 
 /// Every public workload plan without a KLL sketch stores byte-identical
-/// view files with 1, 2 and 4 precompute threads, and no window fails.
+/// view files with 1, 4, 8 and 12 precompute threads, and no window fails.
+/// With more than one thread, a window of a group whose nodes compute each
+/// series alone is split into one run per thread, by series, and merged;
+/// with 12 threads most parts of the 6-series fixtures are empty.
 #[tokio::test(flavor = "multi_thread")]
-async fn views_are_byte_identical_with_one_two_and_four_threads() {
+async fn views_are_byte_identical_with_one_four_eight_and_twelve_threads() {
     let mut compared = 0;
+    let mut split = 0;
     let mut mismatches = Vec::new();
     for (label, plan) in plans() {
         if has_kll(&plan) {
             continue;
         }
-        let (one, failed) = view_files(&plan, 1, Vec::new()).await;
+        let (one, failed, _) = view_files(&plan, 1, Vec::new()).await;
         assert_eq!(failed, 0, "{label}: windows failed with one thread");
-        for threads in [2, 4] {
-            let (many, failed) = view_files(&plan, threads, Vec::new()).await;
+        let mut was_split = false;
+        for threads in [4, 8, 12] {
+            let (many, failed, parts) = view_files(&plan, threads, Vec::new()).await;
+            was_split |= parts;
             if failed > 0 || many != one {
                 mismatches.push(format!(
                     "{label}: {threads} threads: {failed} windows failed, files equal: {}",
@@ -300,9 +311,11 @@ async fn views_are_byte_identical_with_one_two_and_four_threads() {
             }
         }
         compared += 1;
+        split += usize::from(was_split);
     }
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     assert!(compared >= 10, "only {compared} plans compared");
+    assert!(split >= 5, "only {split} plans had a group split by series");
 }
 
 /// The end of refresh group `group`'s first window after `START_MS`.
@@ -322,20 +335,22 @@ fn plan_where(pick: impl Fn(&InstallablePlan) -> bool) -> (String, InstallablePl
         .expect("no public workload plan fits")
 }
 
-/// A group's first window computed last (it is slow; the windows after it
-/// finish first) is still stored first: the later windows wait in the
-/// group's reorder buffer, every window is stored and the views equal
-/// one thread's.
+/// A group's first window computed last (one part of it is slow; the
+/// windows after it finish first) is still stored first: the later windows
+/// wait in the group's reorder buffer, every window is stored and the
+/// views equal one thread's.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slow_window_is_committed_before_the_later_windows_of_its_group() {
     let (label, plan) = plan_where(|plan| !plan.ingestion_refresh_groups().unwrap().is_empty());
     let slow = vec![SlowRefresh {
         group: Some(0),
         end_ms: Some(first_window_end(&plan, 0)),
+        part: Some(0),
         delay_ms: 1_000,
+        ..SlowRefresh::default()
     }];
-    let (one, _) = view_files(&plan, 1, Vec::new()).await;
-    let (four, failed) = view_files(&plan, 4, slow).await;
+    let (one, _, _) = view_files(&plan, 1, Vec::new()).await;
+    let (four, failed, _) = view_files(&plan, 4, slow).await;
     assert_eq!(failed, 0, "{label}");
     assert!(four == one, "{label}: views differ from one thread's");
 }
@@ -381,6 +396,8 @@ async fn groups_closing_together_are_ready_within_the_query_delay() {
             group: Some(group),
             end_ms: Some(instant),
             delay_ms: 600,
+            per_series: true,
+            ..SlowRefresh::default()
         })
         .collect();
     let (app, _state) = data_plane(
@@ -423,6 +440,7 @@ async fn a_full_precompute_backlog_refuses_remote_write() {
                 group: None,
                 end_ms: None,
                 delay_ms: 200,
+                ..SlowRefresh::default()
             }],
             ..options(threads, None)
         },
@@ -470,8 +488,49 @@ async fn a_window_reads_only_committed_views_and_unchanging_raw_data() {
             group: None,
             end_ms: None,
             delay_ms: 2,
+            ..SlowRefresh::default()
         }];
-        let (_, failed) = view_files_checked(&plan, 4, slow, true).await;
+        let (_, failed, _) = view_files_checked(&plan, 4, slow, true).await;
         assert_eq!(failed, 0, "{label}: a run read inputs not fixed before it");
     }
+}
+
+/// One refresh group of per-series views (the 60 s, 10 Hz dashboard), its
+/// run taking 4 s over every series and a share of that over a share of
+/// them, is ready within its 2 s deadline once a window is split by
+/// series over eight threads; computed whole, on one thread, it is not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_big_window_split_by_series_is_ready_within_its_deadline() {
+    const DEADLINE: Duration = Duration::from_secs(2);
+    let (label, plan) = plans()
+        .find(|(label, _)| {
+            label.starts_with("typical-dashboard-60s-10hz (raw data retained: false)")
+        })
+        .expect("the 60 s dashboard plan");
+    assert_eq!(plan.ingestion_refresh_groups().unwrap().len(), 1, "{label}");
+    let (app, state) = data_plane(
+        &plan,
+        EngineOptions {
+            slow_refreshes: vec![SlowRefresh {
+                group: Some(0),
+                end_ms: Some(1_200_000),
+                delay_ms: 4_000,
+                per_series: true,
+                ..SlowRefresh::default()
+            }],
+            ..options(8, None)
+        },
+    );
+    for body in requests(&plan, SERIES, START_MS, 1_200_000) {
+        assert_eq!(write(&app, body).await, StatusCode::NO_CONTENT);
+    }
+    barrier(&app, 1_140_000).await;
+    let started = Instant::now();
+    barrier(&app, 1_200_000).await;
+    let ready = started.elapsed();
+    assert_eq!(state.engine.stats().windows_failed, 0, "{label}");
+    assert!(
+        ready < DEADLINE,
+        "{label}: the window was ready after {ready:?}"
+    );
 }
