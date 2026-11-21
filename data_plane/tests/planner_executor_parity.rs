@@ -914,7 +914,11 @@ async fn range_queries_answer_what_the_planner_executor_answers_at_each_step() {
 async fn push_precompute_answers_what_the_planner_executor_answers() {
     let mut mismatches = Vec::new();
     let mut compared = 0;
-    for ingest_threads in [1, 2, 4, 8] {
+    // `PARITY_PUSH_SHARDS=1,4,8,12` overrides the shard counts.
+    let shard_counts: Vec<usize> = std::env::var("PARITY_PUSH_SHARDS")
+        .map(|v| v.split(',').map(|n| n.parse().unwrap()).collect())
+        .unwrap_or_else(|_| vec![1, 2, 4, 8]);
+    for ingest_threads in shard_counts {
         let shards = Shards {
             ingest_threads,
             precompute_mode: PrecomputeMode::Push,

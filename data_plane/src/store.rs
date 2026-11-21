@@ -350,7 +350,7 @@ impl RawData {
     /// when `None`) as batches of `request`'s schema: one per chunk of the
     /// panes overlapping the range, the open pane's included. A chunk read
     /// whole is converted once per `reads` and shared by its later reads.
-    fn read(
+    pub(crate) fn read(
         &self,
         metric: &str,
         request: &RawDataRequest,

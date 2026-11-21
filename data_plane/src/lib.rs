@@ -15,6 +15,7 @@ pub mod metrics;
 pub mod persist;
 pub mod pipelines;
 pub mod prometheus;
+pub mod push;
 pub mod query;
 pub mod remote_write;
 pub mod result_cache;

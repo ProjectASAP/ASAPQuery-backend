@@ -485,6 +485,15 @@ fn regrouped_by_job(plan: &InstallablePlan) -> Option<InstallablePlan> {
                 .unwrap()
                 .iter()
                 .position(|f| f["name"] == "job")
+                // A per-series scan has no `job` column: its first label
+                // column (the series identity).
+                .or_else(|| {
+                    fields
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .position(|f| f["name"] != "ts" && f["name"] != "value")
+                })
         })?;
     let mut regrouped = false;
     for node in json["dag"]["nodes"].as_array_mut().unwrap() {
@@ -633,7 +642,7 @@ fn combine_rules_follow_the_table_and_refuse_unknown_breakers() {
     use data_plane::pipelines::combine_rule;
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut seen: BTreeMap<String, CombineRule> = BTreeMap::new();
+    let mut seen: Vec<CombineRule> = Vec::new();
     for dir in ["../examples", "tests/workloads"] {
         let mut paths: Vec<_> = std::fs::read_dir(root.join(dir))
             .unwrap()
@@ -684,8 +693,7 @@ fn combine_rules_follow_the_table_and_refuse_unknown_breakers() {
                         };
                         assert_eq!(rule, expected, "{}: node {}", path.display(), node.id);
                         if let Some(rule) = rule {
-                            let name = serde_json::to_value(&node.payload).unwrap().to_string();
-                            seen.insert(name.chars().take(48).collect(), rule);
+                            seen.push(rule);
                         }
                     }
                 }
@@ -693,7 +701,7 @@ fn combine_rules_follow_the_table_and_refuse_unknown_breakers() {
         }
     }
     for rule in [CombineRule::Concatenate, CombineRule::Merge] {
-        assert!(seen.values().any(|r| *r == rule), "no node got {rule:?}");
+        assert!(seen.contains(&rule), "no node got {rule:?}");
     }
     // A breaker no rule covers: a reserved ASAP operator.
     let plan = plan(
@@ -949,6 +957,8 @@ async fn late_samples_count_in_the_window_paths_windows() {
             for second in 60..=61i64 {
                 post(&app, body(&metrics, 0..16, &[second * 1000])).await;
             }
+            // Behind a barrier, so the window (40, 50] is sealed first.
+            barrier(&app, 61_000).await;
             let late = body(&metrics, 0..4, &[40_500]);
             post(&app, late).await;
             barrier(&app, 61_000).await;
@@ -958,10 +968,30 @@ async fn late_samples_count_in_the_window_paths_windows() {
             results.push((answers(&app, &plan, &times).await, late_for_views));
         }
         assert_eq!(results[1].0, results[0].0, "raw kept {raw}: same windows");
+        // 4 late samples per metric an ingestion-time view reads (with raw
+        // data kept, the Planner may answer from raw data at query time,
+        // and then no view holds them).
+        let viewed_metrics = metrics
+            .iter()
+            .filter(|metric| {
+                plan.dag.nodes.iter().any(|node| {
+                    node.output_state.timing
+                        == asap_executor::planner::ir::properties::ExecutionTiming::IngestionTime
+                        && serde_json::to_value(&node.payload)
+                            .unwrap()
+                            .pointer("/NonASAP/Scan/source/TimeSeries/metric")
+                            .is_some_and(|m| m == **metric)
+                })
+            })
+            .count();
         assert_eq!(
             results[1].1,
-            Some(8.0),
-            "raw kept {raw}: 8 samples late for views"
+            Some(4.0 * viewed_metrics as f64),
+            "raw kept {raw}: 4 samples late for views per metric a view reads"
+        );
+        assert!(
+            raw || viewed_metrics == 2,
+            "without raw data both metrics are viewed"
         );
     }
 }
@@ -989,6 +1019,9 @@ async fn backpressure_reaches_remote_write_and_loses_nothing() {
 
     let options = EngineOptions {
         max_precompute_backlog: 2,
+        // One window computed at a time: the task pool's slots would
+        // otherwise hold more windows than this test writes.
+        precompute_threads: 1,
         max_queued_samples: 64 * 4,
         ..options(PUSH, 4)
     };
