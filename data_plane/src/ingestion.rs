@@ -818,10 +818,12 @@ impl Precompute {
     }
 
     /// The whole run of a window split by series, from its parts' runs: each
-    /// view's rows of every part, in the order one run over every series
-    /// emits them (its group values' key order, as the executor orders
-    /// groups), as one batch. The parts hold disjoint series, so no two
-    /// rows share a key.
+    /// view's rows of every part, as the parts' own batches in part order.
+    /// The parts hold disjoint series, so no two rows share a key. The
+    /// batches are kept as they are (no row is decoded or re-encoded), so
+    /// a sealed window keeps its compact state columns (exact records at
+    /// their family's size, shrunk sketches); a window's rows are a set,
+    /// read by series, so their order across batches is not significant.
     pub fn merge(&self, parts: Vec<Computed>) -> Result<Computed, asap_executor::Error> {
         let mut ran = Vec::new();
         for part in parts {
@@ -834,39 +836,23 @@ impl Precompute {
             return Ok(Computed::AlreadyStored);
         };
         let views: Vec<usize> = first.iter().map(|(index, _)| *index).collect();
-        let mut merged = Vec::with_capacity(views.len());
-        for (position, view) in views.into_iter().enumerate() {
-            let batches: Vec<&Batch> = ran
-                .iter()
-                .flat_map(|part| part[position].1.iter())
-                .collect();
-            if batches.iter().all(|batch| batch.num_rows() == 0) {
-                merged.push((view, ran[0][position].1.clone()));
-                continue;
-            }
-            let schema = batches[0].schema().clone();
-            let plain: Vec<usize> = (0..schema.fields.len())
-                .filter(|&column| {
-                    matches!(
-                        schema.fields[column].dtype,
-                        asap_executor::planner::ir::schema::FieldDataType::Plain(_)
-                    )
-                })
-                .collect();
-            let mut keyed = Vec::new();
-            for batch in batches {
-                for row in batch.to_rows() {
-                    let key = plain
-                        .iter()
-                        .map(|&column| row[column].key())
-                        .collect::<Result<Vec<_>, _>>()?;
-                    keyed.push((key, row));
+        let merged = views
+            .into_iter()
+            .enumerate()
+            .map(|(position, view)| {
+                let batches: Vec<Batch> = ran
+                    .iter()
+                    .flat_map(|part| part[position].1.iter())
+                    .filter(|batch| batch.num_rows() > 0)
+                    .cloned()
+                    .collect();
+                if batches.is_empty() {
+                    (view, ran[0][position].1.clone())
+                } else {
+                    (view, batches)
                 }
-            }
-            keyed.sort_by(|a, b| a.0.cmp(&b.0));
-            let rows = keyed.into_iter().map(|(_, row)| row).collect();
-            merged.push((view, vec![Batch::try_new(schema, rows)?]));
-        }
+            })
+            .collect();
         Ok(Computed::Ran(merged))
     }
 
