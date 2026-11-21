@@ -11,6 +11,7 @@
 
 pub mod engine;
 pub mod ingestion;
+pub mod memory_budget;
 pub mod metrics;
 pub mod persist;
 pub mod prometheus;
@@ -19,6 +20,7 @@ pub mod remote_write;
 pub mod result_cache;
 pub mod series_ids;
 pub mod store;
+pub mod window_cache;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

@@ -21,6 +21,7 @@ pub static malloc_conf: &[u8] =
     b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0,narenas:8\0";
 use data_plane::engine::EngineOptions;
 use data_plane::ingestion::IngestionOptions;
+use data_plane::persist::ViewRead;
 use data_plane::{router, DataPlane, DEFAULT_FORWARD_TIMEOUT};
 
 /// Serve Remote Write ingestion and the Prometheus query API for a plan.
@@ -120,6 +121,23 @@ struct Args {
     /// VictoriaMetrics' default -inmemoryDataFlushInterval.
     #[arg(long, default_value_t = EngineOptions::default().view_sync_interval_ms)]
     view_sync_interval_ms: u64,
+    /// Bytes of decoded view windows kept in memory; the other windows are
+    /// read from the view files. Default: from the cgroup's memory.max, or
+    /// no limit. Not implemented yet.
+    #[arg(long)]
+    view_cache_max_bytes: Option<u64>,
+    /// A decoded window not read for this long leaves memory (0: never).
+    /// Default: twice the longest evaluation interval of the plan's view
+    /// readers. Not implemented yet.
+    #[arg(long)]
+    view_cache_idle_ms: Option<u64>,
+    /// Milliseconds of windows per view file segment. Not implemented yet.
+    #[arg(long, default_value_t = EngineOptions::default().view_segment_ms)]
+    view_segment_ms: i64,
+    /// How cold view windows are read: `mmap` (sealed segments mapped) or
+    /// `pread`. Not implemented yet.
+    #[arg(long, default_value = "mmap", value_parser = ["mmap", "pread"])]
+    view_read: String,
 }
 
 #[tokio::main]
@@ -160,6 +178,15 @@ async fn main() -> anyhow::Result<()> {
                 result_cache_max_bytes: args.result_cache_bytes,
                 view_dir: (!args.no_view_persistence).then_some(args.view_dir),
                 view_sync_interval_ms: args.view_sync_interval_ms,
+                view_cache_max_bytes: args.view_cache_max_bytes,
+                view_cache_idle_ms: args.view_cache_idle_ms,
+                view_segment_ms: args.view_segment_ms,
+                view_read: match args.view_read.as_str() {
+                    "pread" => ViewRead::Pread,
+                    _ => ViewRead::Mmap,
+                },
+                cold_decode_delay_ms: 0,
+                unpersistable_views: Vec::new(),
             },
         )?
         .with_forward_timeout(Duration::from_secs(args.forward_timeout_seconds)),

@@ -133,13 +133,85 @@ type StoredWindow = (
 );
 
 /// What persisting one window wrote.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone)]
 pub struct Written {
     pub bytes: u64,
     pub sync_ns: u64,
     /// Views whose window could not be encoded.
     pub not_persisted: u64,
+    /// Where each persisted view's fragment of the window is, for reading
+    /// it back cold (docs/design/tiered-view-storage.md). Empty until the
+    /// segment format is implemented.
+    pub locations: Vec<(PhysicalASAPNodeId, WindowLocation)>,
 }
+
+/// The view file format version: 2 is per-group directories of time
+/// segments with columnar fragments (docs/design/tiered-view-storage.md).
+/// Not written yet: the files are still version 1.
+pub const FORMAT_VERSION: u32 = 2;
+
+/// How a cold window's fragment is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewRead {
+    /// Sealed segments mapped and decoded in place; the active segment
+    /// read with `pread`.
+    #[default]
+    Mmap,
+    /// Every fragment read with `pread` into a buffer.
+    Pread,
+}
+
+/// Where one view's rows of one window are on disk: its fragment in a
+/// segment. Not implemented yet: no write returns one.
+#[derive(Debug, Clone)]
+pub struct WindowLocation {
+    segment: PathBuf,
+    offset: u64,
+    len: u32,
+}
+
+impl WindowLocation {
+    /// The segment file holding the fragment.
+    pub fn segment_path(&self) -> &Path {
+        &self.segment
+    }
+
+    /// The fragment's byte offset in its segment.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// The fragment's length in bytes.
+    pub fn len(&self) -> u32 {
+        self.len
+    }
+
+    /// Whether the fragment is empty (never, for a written window).
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Whether its segment is sealed (and so read through a mapping).
+    pub fn is_sealed(&self) -> bool {
+        false
+    }
+
+    /// Whether `address` lies inside its segment's mapping.
+    pub fn maps(&self, _address: usize) -> bool {
+        false
+    }
+
+    /// The fragment's rows as one batch of `schema`.
+    pub fn read(&self, _schema: &SchemaRef, _how: ViewRead) -> Result<Batch, asap_executor::Error> {
+        Err(asap_executor::Error::Invalid(
+            "reading a view window from its segment is not implemented".into(),
+        ))
+    }
+}
+
+/// The windows indexed at startup, by view: each window's range and
+/// location, oldest first.
+pub type ViewIndex = BTreeMap<PhysicalASAPNodeId, Vec<((i64, i64), WindowLocation)>>;
 
 /// A group file's text dictionary: each text's index, in the order the
 /// records added them.
@@ -209,6 +281,38 @@ impl ViewFiles {
             out[group % shards].dictionaries.insert(group, dictionary);
         }
         out
+    }
+
+    /// Rolls each group to a new segment once its active one spans
+    /// `segment_ms` of windows. Not implemented yet: ignored.
+    pub fn with_segment_ms(self, _segment_ms: i64) -> Self {
+        self
+    }
+
+    /// Seals `group`'s active segment now; its next window starts a new
+    /// one. Not implemented yet.
+    pub fn seal(&mut self, _group: usize) -> std::io::Result<()> {
+        Err(std::io::Error::other("view segments are not implemented"))
+    }
+
+    /// Deletes `group`'s sealed segments whose every record ends at or
+    /// before `oldest_kept_end_ms`; returns how many. Not implemented yet.
+    pub fn delete_expired(
+        &mut self,
+        _group: usize,
+        _oldest_kept_end_ms: i64,
+    ) -> std::io::Result<usize> {
+        Err(std::io::Error::other("view segments are not implemented"))
+    }
+
+    /// The windows of `groups` within each view's retention, with their
+    /// locations, read from record heads only (no fragment decoded). Not
+    /// implemented yet.
+    pub fn index(
+        &mut self,
+        _groups: &[Vec<(MaterializedView, SchemaRef)>],
+    ) -> std::io::Result<ViewIndex> {
+        Err(std::io::Error::other("view segments are not implemented"))
     }
 
     /// How often the files are synced.
@@ -1016,5 +1120,500 @@ mod tests {
         assert!(other.read_group(&path, 0).unwrap().is_none());
         assert!(dir.join("group-0.log.stale").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ── Tiered view storage: segments and columnar fragments ──────────
+    // docs/design/tiered-view-storage.md, tests V2, V3, V9, V12, V13,
+    // V18, V19. They fail until the segment format is implemented.
+
+    use asap_executor::arrow::array::{DictionaryArray, Float64Array};
+    use asap_executor::arrow::datatypes::UInt32Type;
+    use asap_executor::planner::ir::schema::{
+        DataType, Field, FieldDataType, Schema, PROMQL_SERIES_IDENTITY,
+    };
+    use asap_executor::planner::summary_type::{ExactKind, ExactParams, SketchAlgorithm};
+
+    /// A fresh directory for one test's segments.
+    fn segment_dir(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("asap-segments-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// The view column family a state of `kernel` has, if a view column
+    /// can hold it (Hydra-KLL and heapless weighted frequency cannot).
+    fn family(kernel: SketchKernel) -> Option<FieldDataType> {
+        use SketchAlgorithm as A;
+        Some(FieldDataType::Sketch(match kernel {
+            SketchKernel::DDSketch => A::DDSketch,
+            SketchKernel::Kll => A::Kll,
+            SketchKernel::CountMin => A::Cms,
+            SketchKernel::Kmv => A::Kmv,
+            SketchKernel::Hll(_) => A::Hll,
+            SketchKernel::WeightedFrequency(FrequencyKind::CmsHeap) => A::CmsWithHeap,
+            SketchKernel::WeightedFrequency(FrequencyKind::CountSketchHeap) => {
+                A::CountSketchWithHeap
+            }
+            SketchKernel::UnivMon { .. } => A::UnivMon,
+            _ => return None,
+        }))
+    }
+
+    /// A view window's batch: a time column, a series identity, a label,
+    /// a nullable value with one null, and a state column of `family`
+    /// holding `states` (one row each).
+    fn window_batch(
+        end_ms: i64,
+        family: FieldDataType,
+        states: Vec<Arc<dyn AggregateCore>>,
+    ) -> Batch {
+        let schema = Arc::new(Schema::with_time_index(
+            vec![
+                Field::plain("ts", DataType::Timestamp, false),
+                Field::plain(PROMQL_SERIES_IDENTITY, DataType::Utf8, false),
+                Field::plain("job", DataType::Utf8, false),
+                Field::plain("v", DataType::Float64, true),
+                Field::new("state", family.clone(), false),
+            ],
+            0,
+            vec![],
+        ));
+        let rows = states
+            .into_iter()
+            .enumerate()
+            .map(|(row, state)| {
+                vec![
+                    Value::Timestamp(end_ms),
+                    Value::Utf8(format!(r#"{{"__name__":"data","instance":"i{row}"}}"#).into()),
+                    Value::Utf8(format!("job{}", row % 2).into()),
+                    if row == 1 {
+                        Value::Null
+                    } else {
+                        Value::Float64(row as f64 + 0.25)
+                    },
+                    Value::Summary {
+                        family: family.clone(),
+                        state,
+                    },
+                ]
+            })
+            .collect();
+        Batch::try_new(schema, rows).unwrap()
+    }
+
+    /// A state's bytes, to compare two states: ASAPv1 for sketches, the
+    /// serde form for exact states, the grid's bytes and the group for a
+    /// Hydra-Count-Min group.
+    fn state_bytes(state: &dyn AggregateCore) -> Vec<u8> {
+        if let Some((_, bytes)) = encode_sketch(state) {
+            return bytes;
+        }
+        let any = state.as_any();
+        if let Some(exact) = any.downcast_ref::<ExactAccumulator>() {
+            return rmp_serde::to_vec(exact).unwrap();
+        }
+        if let Some(group) = any.downcast_ref::<HydraCmsGroup>() {
+            let mut bytes = group.grid.sketch().to_asapv1().unwrap();
+            bytes.extend_from_slice(group.group.as_bytes());
+            return bytes;
+        }
+        panic!("no byte form for this state");
+    }
+
+    /// Whether `read` holds the rows of `written`: plain values equal,
+    /// states equal by their bytes.
+    fn assert_same_rows(written: &Batch, read: &Batch, what: &str) {
+        let (a, b) = (written.to_rows(), read.to_rows());
+        assert_eq!(a.len(), b.len(), "{what}: row count");
+        for (row, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert_eq!(x.len(), y.len(), "{what}: row {row} width");
+            for (column, (x, y)) in x.iter().zip(y).enumerate() {
+                match (x, y) {
+                    (
+                        Value::Summary {
+                            family: fx,
+                            state: sx,
+                        },
+                        Value::Summary {
+                            family: fy,
+                            state: sy,
+                        },
+                    ) => {
+                        assert_eq!(fx, fy, "{what}: row {row} column {column} family");
+                        assert_eq!(
+                            state_bytes(sx.as_ref()),
+                            state_bytes(sy.as_ref()),
+                            "{what}: row {row} column {column} state"
+                        );
+                    }
+                    (x, y) => assert_eq!(
+                        format!("{x:?}"),
+                        format!("{y:?}"),
+                        "{what}: row {row} column {column}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The location `written` reports for `view`.
+    fn location_of(written: &Written, view: PhysicalASAPNodeId) -> WindowLocation {
+        written
+            .locations
+            .iter()
+            .find(|(v, _)| *v == view)
+            .map(|(_, location)| location.clone())
+            .unwrap_or_else(|| panic!("no location for view {view}: segments are not implemented"))
+    }
+
+    /// One window per state family a view column can hold, plus exact
+    /// Sum and Max and Hydra-Count-Min groups.
+    fn every_family() -> Vec<(String, Batch)> {
+        let mut out = Vec::new();
+        for (kernel, a, b) in states() {
+            let Some(family) = family(kernel) else {
+                continue;
+            };
+            let (a, b): (Arc<dyn AggregateCore>, Arc<dyn AggregateCore>) =
+                (Arc::from(a), Arc::from(b));
+            out.push((
+                format!("{kernel:?}"),
+                window_batch(10, family, vec![a.clone(), b, a]),
+            ));
+        }
+        for (kind, params) in [
+            (ExactKind::Sum, ExactParams::Sum),
+            (ExactKind::Max, ExactParams::Max),
+        ] {
+            let family = FieldDataType::ExactAggregate(kind, params);
+            let states: Vec<Arc<dyn AggregateCore>> = (0..3)
+                .map(|row| {
+                    let mut state = ExactAccumulator::new(family.clone(), false).unwrap();
+                    for sample in 0..15 {
+                        state.update(None, (row * 100 + sample) as f64 * 0.5, sample * 1000);
+                    }
+                    Arc::new(state) as Arc<dyn AggregateCore>
+                })
+                .collect();
+            out.push((format!("{kind:?}"), window_batch(10, family, states)));
+        }
+        let mut grid = HydraCms::new(2, 16, 32, 3).unwrap();
+        for (group, item) in [("g1", "a"), ("g1", "b"), ("g2", "a")] {
+            grid.count(group, item, 1).unwrap();
+        }
+        let grid = Arc::new(grid);
+        let groups: Vec<Arc<dyn AggregateCore>> = ["g1", "g2", "g3"]
+            .iter()
+            .map(|group| {
+                Arc::new(HydraCmsGroup {
+                    grid: grid.clone(),
+                    group: group.to_string(),
+                }) as Arc<dyn AggregateCore>
+            })
+            .collect();
+        out.push((
+            "HydraCms".into(),
+            window_batch(10, FieldDataType::Sketch(SketchAlgorithm::HydraCms), groups),
+        ));
+        out
+    }
+
+    /// V2. A cold window decodes, from its columnar fragment, to the rows
+    /// that were committed, read from the active segment (by `pread`) and
+    /// again once the segment is sealed (mapped), and with `ViewRead::Pread`.
+    #[test]
+    fn every_family_reads_back_from_its_fragment() {
+        let dir = segment_dir("families");
+        for (what, batch) in every_family() {
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
+            let written = files
+                .append(0, (0, 10), &[(1, std::slice::from_ref(&batch))])
+                .unwrap();
+            assert_eq!(written.not_persisted, 0, "{what}");
+            let location = location_of(&written, 1);
+            assert!(
+                !location.is_sealed(),
+                "{what}: the newest segment is active"
+            );
+            let active = location.read(batch.schema(), ViewRead::Mmap).unwrap();
+            assert_same_rows(&batch, &active, &format!("{what}, active segment"));
+            files.seal(0).unwrap();
+            assert!(location.is_sealed(), "{what}");
+            let mapped = location.read(batch.schema(), ViewRead::Mmap).unwrap();
+            assert_same_rows(&batch, &mapped, &format!("{what}, mapped"));
+            let pread = location.read(batch.schema(), ViewRead::Pread).unwrap();
+            assert_same_rows(&batch, &pread, &format!("{what}, pread"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// V3. A view's fragment decodes without the record's other views,
+    /// and a damaged fragment is an error, not a panic or wrong rows.
+    #[test]
+    fn each_views_fragment_reads_alone() {
+        let dir = segment_dir("fragments");
+        let batches: Vec<Batch> = every_family().into_iter().take(4).map(|(_, b)| b).collect();
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
+        let views: Vec<(PhysicalASAPNodeId, &[Batch])> = batches
+            .iter()
+            .enumerate()
+            .map(|(i, batch)| (i as PhysicalASAPNodeId + 1, std::slice::from_ref(batch)))
+            .collect();
+        let written = files.append(0, (0, 10), &views).unwrap();
+        files.seal(0).unwrap();
+        let damaged = location_of(&written, 2);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(damaged.segment_path())
+            .unwrap();
+        file.seek(SeekFrom::Start(damaged.offset())).unwrap();
+        file.write_all(&vec![0xff; damaged.len() as usize]).unwrap();
+        drop(file);
+        for (i, batch) in batches.iter().enumerate() {
+            let view = i as PhysicalASAPNodeId + 1;
+            let read = location_of(&written, view).read(batch.schema(), ViewRead::Mmap);
+            if view == 2 {
+                assert!(read.is_err(), "a damaged fragment must not decode");
+            } else {
+                assert_same_rows(batch, &read.unwrap(), &format!("view {view}"));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// V18. Reading a sealed segment borrows the text keys and plain
+    /// columns from the mapping, and every window of the segment shares one
+    /// dictionary; `ViewRead::Pread` copies them and reads the same rows.
+    #[test]
+    fn mapped_reads_borrow_fixed_width_columns() {
+        let dir = segment_dir("borrow");
+        let (_, a, b) = states().remove(1);
+        let (a, b): (Arc<dyn AggregateCore>, Arc<dyn AggregateCore>) = (Arc::from(a), Arc::from(b));
+        let kll = FieldDataType::Sketch(SketchAlgorithm::Kll);
+        let rows = |end| {
+            window_batch(
+                end,
+                kll.clone(),
+                (0..1000)
+                    .map(|i| if i % 2 == 0 { a.clone() } else { b.clone() })
+                    .collect(),
+            )
+        };
+        let (first, second) = (rows(10), rows(20));
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
+        let w1 = files
+            .append(0, (0, 10), &[(1, std::slice::from_ref(&first))])
+            .unwrap();
+        let w2 = files
+            .append(0, (10, 20), &[(1, std::slice::from_ref(&second))])
+            .unwrap();
+        files.seal(0).unwrap();
+        let (l1, l2) = (location_of(&w1, 1), location_of(&w2, 1));
+        let r1 = l1.read(first.schema(), ViewRead::Mmap).unwrap();
+        let r2 = l2.read(second.schema(), ViewRead::Mmap).unwrap();
+        assert_same_rows(&first, &r1, "mapped");
+        let identity = |batch: &Batch| {
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+                .expect("a cold text column is a dictionary over the segment's texts")
+                .clone()
+        };
+        let keys = identity(&r1).keys().values().as_ptr() as usize;
+        assert!(l1.maps(keys), "text keys are copied, not borrowed");
+        let values = r1
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(
+            l1.maps(values.values().as_ptr() as usize),
+            "values are copied, not borrowed"
+        );
+        assert!(
+            Arc::ptr_eq(identity(&r1).values(), identity(&r2).values()),
+            "one dictionary per segment"
+        );
+        let copied = l1.read(first.schema(), ViewRead::Pread).unwrap();
+        assert_same_rows(&first, &copied, "pread");
+        assert!(!l1.maps(identity(&copied).keys().values().as_ptr() as usize));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// V19. A segment unlinked while a location still holds it stays
+    /// readable (the mapping keeps its pages); no read can touch past the
+    /// end of a mapped file.
+    #[test]
+    fn an_unlinked_sealed_segment_stays_readable() {
+        let dir = segment_dir("unlinked");
+        let (_, batch) = every_family().remove(0);
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
+        let written = files
+            .append(0, (0, 10), &[(1, std::slice::from_ref(&batch))])
+            .unwrap();
+        files.seal(0).unwrap();
+        let location = location_of(&written, 1);
+        let before = location.read(batch.schema(), ViewRead::Mmap).unwrap();
+        std::fs::remove_file(location.segment_path()).unwrap();
+        let after = location.read(batch.schema(), ViewRead::Mmap).unwrap();
+        assert_same_rows(&before, &after, "after unlink");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// V9 (unit). Segments roll every `segment_ms` of windows, and only
+    /// sealed segments whose every record is past the cutoff are deleted.
+    #[test]
+    fn segments_roll_and_expire_whole() {
+        let dir = segment_dir("roll");
+        let (_, batch) = every_family().remove(0);
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO)
+            .unwrap()
+            .with_segment_ms(20);
+        for end in (10..=60).step_by(10) {
+            files
+                .append(0, (end - 10, end), &[(1, std::slice::from_ref(&batch))])
+                .unwrap();
+        }
+        let segments = |dir: &Path| -> usize {
+            std::fs::read_dir(dir.join("group-0"))
+                .map(|entries| {
+                    entries
+                        .filter(|e| {
+                            e.as_ref()
+                                .unwrap()
+                                .path()
+                                .extension()
+                                .is_some_and(|x| x == "seg")
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(segments(&dir), 3, "(0, 20], (20, 40], (40, 60]");
+        assert_eq!(files.delete_expired(0, 40).unwrap(), 2);
+        assert_eq!(segments(&dir), 1);
+        // The active segment is never deleted.
+        assert_eq!(files.delete_expired(0, 1_000).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// V12 (unit). A torn record at the end of the active segment is cut
+    /// off before indexing (so before any mapping), and later appends stay
+    /// aligned; indexing decodes no fragment.
+    #[test]
+    fn a_torn_segment_tail_is_cut_and_appends_continue() {
+        let dir = segment_dir("torn");
+        let (_, batch) = every_family().remove(0);
+        let view: MaterializedView = serde_json::from_value(serde_json::json!({
+            "node_id": 1,
+            "refresh": "at_ingestion",
+            "coverage": {"definition_id": "v", "selection": []},
+            "inputs": {"materialized_views": []},
+            "retention_ms": 1_000_000,
+        }))
+        .unwrap();
+        let groups = vec![vec![(view, batch.schema().clone())]];
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
+        let written = files
+            .append(0, (0, 10), &[(1, std::slice::from_ref(&batch))])
+            .unwrap();
+        files
+            .append(0, (10, 20), &[(1, std::slice::from_ref(&batch))])
+            .unwrap();
+        let path = location_of(&written, 1).segment_path().to_path_buf();
+        drop(files);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[100, 0, 0, 0, 1, 2, 3]).unwrap();
+        drop(file);
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
+        let index = files.index(&groups).unwrap();
+        let ranges: Vec<(i64, i64)> = index[&1].iter().map(|(range, _)| *range).collect();
+        assert_eq!(ranges, [(0, 10), (10, 20)]);
+        files
+            .append(0, (20, 30), &[(1, std::slice::from_ref(&batch))])
+            .unwrap();
+        let index = ViewFiles::open(&dir, 7, Duration::ZERO)
+            .unwrap()
+            .index(&groups)
+            .unwrap();
+        assert_eq!(index[&1].len(), 3);
+        for (_, location) in &index[&1] {
+            assert_same_rows(
+                &batch,
+                &location.read(batch.schema(), ViewRead::Mmap).unwrap(),
+                "after the cut",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// V13 (unit). A version 1 file and a segment of another plan are
+    /// renamed `*.stale` and not indexed.
+    #[test]
+    fn old_format_and_other_plan_files_are_set_aside() {
+        let dir = segment_dir("stale");
+        let (_, batch) = every_family().remove(0);
+        let view: MaterializedView = serde_json::from_value(serde_json::json!({
+            "node_id": 1,
+            "refresh": "at_ingestion",
+            "coverage": {"definition_id": "v", "selection": []},
+            "inputs": {"materialized_views": []},
+            "retention_ms": 1_000_000,
+        }))
+        .unwrap();
+        let groups = vec![vec![(view, batch.schema().clone())]];
+        std::fs::create_dir_all(&dir).unwrap();
+        // A version 1 file of the same plan: its header frame and one empty
+        // record, in the version 1 layout (spelled out here, since the
+        // writer no longer produces it).
+        #[derive(Serialize)]
+        struct V1Header {
+            plan_hash: u64,
+            group: usize,
+        }
+        #[derive(Serialize)]
+        struct V1Record {
+            start_ms: i64,
+            end_ms: i64,
+            new_texts: Vec<String>,
+            hydra_cms_grids: Vec<serde_bytes::ByteBuf>,
+            views: Vec<(PhysicalASAPNodeId, Vec<Vec<u8>>)>,
+        }
+        let v1 = dir.join("group-0.log");
+        let mut bytes = framed(&V1Header {
+            plan_hash: 7,
+            group: 0,
+        })
+        .unwrap();
+        bytes.extend(
+            framed(&V1Record {
+                start_ms: 0,
+                end_ms: 10,
+                new_texts: vec![],
+                hydra_cms_grids: vec![],
+                views: vec![],
+            })
+            .unwrap(),
+        );
+        std::fs::write(&v1, bytes).unwrap();
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
+        let index = files.index(&groups).unwrap();
+        assert!(index.get(&1).is_none_or(Vec::is_empty));
+        assert!(!v1.exists() && dir.join("group-0.log.stale").exists());
+        // A segment of plan 7 is set aside by a data plane of plan 8.
+        let written = files
+            .append(0, (0, 10), &[(1, std::slice::from_ref(&batch))])
+            .unwrap();
+        let segment = location_of(&written, 1).segment_path().to_path_buf();
+        drop(files);
+        let index = ViewFiles::open(&dir, 8, Duration::ZERO)
+            .unwrap()
+            .index(&groups)
+            .unwrap();
+        assert!(index.get(&1).is_none_or(Vec::is_empty));
+        assert!(!segment.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
