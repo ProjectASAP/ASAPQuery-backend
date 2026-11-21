@@ -752,6 +752,7 @@ async fn windows_commit_in_window_order() {
                 group: None,
                 end_ms: Some(20_000),
                 delay_ms: 500,
+                ..SlowRefresh::default()
             }],
             ..options(mode, 2)
         };

@@ -17,6 +17,12 @@
 //! second of wall time, as a live producer does, and reports the largest
 //! precompute and persist backlogs seen; `PERSIST_THREADS=n` sets the
 //! persist threads; `INGEST_THREADS=n` the ingest shards;
+//! `PRECOMPUTE_THREADS=n` the threads computing windows; `SCRAPE_MS=ms`
+//! scrapes every `ms` instead of every second; `LATENESS_MS=ms` sets the
+//! allowed lateness (default 15 s). Per refresh group it
+//! prints the time from a window's end to its commit (for a paced run,
+//! counted from when the scrape at the window's end was sent), split into
+//! the precompute queue wait, compute and commit wait.
 //! `PRECOMPUTE_MODE=push` builds views by push pipelines instead of one
 //! ingestion run per closed window (B1: dashboard and seed-862-01, raw data
 //! not kept, 1k/10k/100k series, K = 1, 2, 4, 8, paced then unpaced). With
@@ -62,6 +68,10 @@ async fn main() {
     let custom = std::env::var("WORKLOAD").ok();
     let path = custom.clone().unwrap_or_else(|| default_path.to_string());
     let paced = std::env::var("PACED").is_ok_and(|v| v == "1");
+    let scrape_ms: i64 = std::env::var("SCRAPE_MS")
+        .ok()
+        .map_or(1000, |ms| ms.parse().unwrap());
+    let scrapes = seconds * 1000 / scrape_ms;
     let mut workload: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     for source in workload["data_workload"]["sources"]
@@ -70,7 +80,7 @@ async fn main() {
         .values_mut()
     {
         source["series_count"] = series.into();
-        source["sample_interval"] = 1000.into();
+        source["sample_interval"] = scrape_ms.into();
     }
     // The metrics fed: the custom workload's every source, else `data`.
     let metrics: Vec<String> = match custom {
@@ -82,7 +92,8 @@ async fn main() {
             .collect(),
         None => vec!["data".to_string()],
     };
-    workload["data_workload"]["arrival"]["ingesting"]["rows_per_second"] = (series as f64).into();
+    workload["data_workload"]["arrival"]["ingesting"]["rows_per_second"] =
+        (series as f64 * 1000.0 / scrape_ms as f64).into();
     let workload = serde_json::from_value(workload).unwrap();
     let mut inputs = DeploymentInputs::default();
     inputs.deployment_capabilities.raw_data_retained = raw_data_retained;
@@ -100,6 +111,11 @@ async fn main() {
     let options = EngineOptions {
         ingestion: IngestionOptions {
             stream_start_ms: Some(start_ms),
+            allowed_lateness_ms: std::env::var("LATENESS_MS")
+                .ok()
+                .map_or(IngestionOptions::default().allowed_lateness_ms, |ms| {
+                    ms.parse().unwrap()
+                }),
             ..IngestionOptions::default()
         },
         view_dir: view_dir.clone(),
@@ -112,6 +128,11 @@ async fn main() {
             Ok("push") => PrecomputeMode::Push,
             _ => PrecomputeMode::Window,
         },
+        precompute_threads: std::env::var("PRECOMPUTE_THREADS")
+            .ok()
+            .map_or(EngineOptions::default().precompute_threads, |n| {
+                n.parse().unwrap()
+            }),
         persist_threads: std::env::var("PERSIST_THREADS")
             .ok()
             .map_or(EngineOptions::default().persist_threads, |n| {
@@ -158,9 +179,9 @@ async fn main() {
         .collect();
     let slice = labels.len().div_ceil(requests_per_scrape.max(1));
     let requests_per_second = labels.len().div_ceil(slice);
-    let bodies: Vec<Vec<u8>> = (1..=seconds)
-        .flat_map(|second| {
-            let timestamp = start_ms + second * 1000;
+    let bodies: Vec<Vec<u8>> = (1..=scrapes)
+        .flat_map(|scrape| {
+            let timestamp = start_ms + scrape * scrape_ms;
             labels
                 .chunks(slice)
                 .enumerate()
@@ -172,7 +193,7 @@ async fn main() {
                             labels: labels.clone(),
                             samples: vec![Sample {
                                 timestamp,
-                                value: (((chunk * slice + i) as i64 * 7 + second) % 100) as f64,
+                                value: (((chunk * slice + i) as i64 * 7 + scrape) % 100) as f64,
                             }],
                         })
                         .collect();
@@ -184,12 +205,20 @@ async fn main() {
 
     let cpu_before = thread_cpu_seconds();
     let started = Instant::now();
+    // Paced, the scrape at event time `t` is sent at wall time `t + lag_ms`.
+    let lag_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        - start_ms;
     let mut retries = 0u64;
     let (mut max_precompute_backlog, mut max_persist_backlog) = (0u64, 0f64);
     let mut commit_lags: Vec<f64> = Vec::new();
     for (index, body) in bodies.into_iter().enumerate() {
         if paced && index % requests_per_second == 0 {
-            let due = std::time::Duration::from_secs((index / requests_per_second) as u64);
+            let due = std::time::Duration::from_millis(
+                (index / requests_per_second) as u64 * scrape_ms as u64,
+            );
             if let Some(wait) = due.checked_sub(started.elapsed()) {
                 tokio::time::sleep(wait).await;
             }
@@ -238,7 +267,7 @@ async fn main() {
         .oneshot(
             Request::post(format!(
                 "/api/v1/precompute/watermark?time_ms={}",
-                start_ms + seconds * 1000
+                start_ms + scrapes * scrape_ms
             ))
             .body(Body::empty())
             .unwrap(),
@@ -249,7 +278,7 @@ async fn main() {
     let wall = started.elapsed().as_secs_f64();
     let cpu_after = thread_cpu_seconds();
 
-    let samples = (series * metrics.len()) as f64 * seconds as f64;
+    let samples = (series * metrics.len()) as f64 * scrapes as f64;
     println!(
         "series {series}, seconds {seconds}, samples {samples}: every write acknowledged after {acknowledged:.2} s \
          ({:.0} samples/s), every window refreshed after {wall:.2} s ({:.0} samples/s), 503 retries {retries}",
@@ -289,6 +318,47 @@ async fn main() {
     }
     println!("  cpu {:<24} {total:8.2} s", "(all threads)");
     let metrics = state.engine.render_metrics();
+    let value = |name: &str, labels: &str| -> f64 {
+        let prefix = format!("{name}{labels} ");
+        metrics
+            .lines()
+            .find_map(|l| l.strip_prefix(prefix.as_str()))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0)
+    };
+    println!(
+        "  precompute threads {}, busy {:.2} s",
+        value("asap_precompute_threads", ""),
+        value("asap_precompute_busy_seconds_total", "")
+    );
+    for group in 0.. {
+        let labels = format!("{{group=\"{group}\"}}");
+        let windows = value("asap_precompute_windows_total", &labels);
+        if !metrics.contains(&format!("asap_precompute_windows_total{labels}")) {
+            break;
+        }
+        let per_window = |name: &str| value(name, &labels) / windows.max(1.0);
+        let compute = metrics
+            .lines()
+            .find(|l| {
+                l.starts_with("asap_phase_wall_seconds_total{phase=\"precompute\"")
+                    && l.contains(&format!("group=\"{group}\""))
+            })
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+            / windows.max(1.0);
+        let lag_s = if paced { lag_ms as f64 / 1e3 } else { 0.0 };
+        println!(
+            "  group {group}: {windows} windows; ready after end mean {:.3} s, max {:.3} s; \
+             queue wait {:.3} s, compute {:.3} s, commit wait {:.3} s (means)",
+            per_window("asap_window_ready_seconds_total") - lag_s,
+            value("asap_window_ready_seconds_max", &labels) - lag_s,
+            per_window("asap_precompute_queue_wait_seconds_total"),
+            compute,
+            per_window("asap_precompute_commit_wait_seconds_total"),
+        );
+    }
     for name in [
         "asap_view_persisted_bytes_total",
         "asap_view_sync_seconds_total",

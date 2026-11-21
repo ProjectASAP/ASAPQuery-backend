@@ -40,7 +40,7 @@ use asap_executor::runtime::{Limits, RunContext, Scope};
 use asap_executor::values::{Batch, SchemaRef};
 use futures::executor::block_on;
 
-use crate::store::{RawData, RawSample, RawShards, RunStore, ViewStore};
+use crate::store::{RawData, RawSample, RawShards, RunStore, SeriesPartition, ViewStore};
 
 /// How ingestion treats sample times.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,8 +198,14 @@ impl Ingestion {
             )));
         }
         let index = DagIndex::new(dag);
+        let group_of: HashMap<PhysicalASAPNodeId, usize> = groups
+            .iter()
+            .enumerate()
+            .flat_map(|(index, group)| group.views.iter().map(move |v| (v.node_id, index)))
+            .collect();
         let mut runs = Vec::new();
         let mut clocks = Vec::new();
+        let mut tasks = RefreshTaskGraph::default();
         for group in groups {
             let ids: Vec<PhysicalASAPNodeId> = group.views.iter().map(|v| v.node_id).collect();
             let Some(window) = group.refresh_window else {
@@ -220,6 +226,33 @@ impl Ingestion {
                 .filter(|v| read.contains(&v.node_id))
                 .cloned()
                 .collect();
+            let read_groups: BTreeSet<usize> = read
+                .iter()
+                .filter_map(|id| group_of.get(id).copied())
+                .collect();
+            tasks.reads.push(read_groups.into_iter().collect());
+            let stop: HashSet<PhysicalASAPNodeId> = read.iter().copied().collect();
+            let below = index.below(&ids, &stop);
+            tasks.serial.push(
+                below
+                    .iter()
+                    .any(|id| carries_state_across_windows(&index.nodes[id].payload)),
+            );
+            let by_series = read.is_empty()
+                && below
+                    .iter()
+                    .all(|id| computes_each_series_alone(&index.nodes[id].payload));
+            tracing::info!(
+                views = ?ids,
+                split_by_series = by_series,
+                "refresh group: a window's run {}",
+                if by_series {
+                    "is split by series over the precompute threads"
+                } else {
+                    "runs whole: some node combines series, or reads other views"
+                }
+            );
+            tasks.split_by_series.push(by_series);
             let roots: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
             let compiled =
                 compile(dag, &read_views, &roots).map_err(|error| IngestionError::Compile {
@@ -289,7 +322,14 @@ impl Ingestion {
             barrier_ms: None,
             stats: IngestionStats::default(),
         };
-        Ok((ingestion, Precompute { runs, limits }))
+        Ok((
+            ingestion,
+            Precompute {
+                runs,
+                tasks,
+                limits,
+            },
+        ))
     }
 
     /// After a restart that loaded views from files: the raw samples before
@@ -598,9 +638,102 @@ pub enum Refreshed {
     AlreadyStored,
 }
 
+/// A window's ingestion run, computed and not yet stored.
+#[derive(Debug)]
+pub enum Computed {
+    /// The rows of each view of the group that did not store the window
+    /// yet, by its index in the group.
+    Ran(Vec<(usize, Vec<Batch>)>),
+    /// Every view of the group already stores the window.
+    AlreadyStored,
+}
+
+/// Which refresh windows may be computed at once, decided when the plan
+/// is installed.
+///
+/// A window's task (group `G`, window `(e - W, e]`) is a pure function of
+/// immutable inputs: the raw data as it was when the window closed (every
+/// ingest shard flushed up to `e`, panes shared by `Arc` and never changed
+/// in place, including the earlier panes a `Scan`'s lookback reads), and
+/// the committed views of the groups `G` reads. Its output, `G`'s views for
+/// that window, is disjoint from every other task's and invisible until
+/// committed. An `execute_ingestion` run starts with fresh state, so no
+/// state passes from one window to the next. Hence tasks run in parallel,
+/// with two orders kept:
+///
+/// - `(H, windows covering (e - W, e])` before `(G, (e - W, e])` when `G`
+///   reads `H`'s views (`reads`);
+/// - a group's windows commit in window order (the store is append-only).
+///
+/// A group whose runs contain an operator that may carry state from one
+/// window to the next (`serial`) computes one window at a time, in order;
+/// other groups stay parallel.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefreshTaskGraph {
+    /// For each refresh group, the other groups whose views its runs read.
+    pub reads: Vec<Vec<usize>>,
+    /// For each refresh group, whether its windows must be computed one at
+    /// a time.
+    pub serial: Vec<bool>,
+    /// For each refresh group, whether a window's run may be split into
+    /// runs over disjoint sets of series whose rows, merged, are the whole
+    /// run's: every node computes each series alone and no other group's
+    /// views are read.
+    pub split_by_series: Vec<bool>,
+}
+
+/// Whether `operator` computes each series' rows from that series' input
+/// rows alone, so a run over a subset of the series yields exactly those
+/// series' rows. Conservative: a raw `Scan` that keeps the series
+/// identity, a row filter, and summaries that never merge entities
+/// (`Reduction::PerEntity`); anything else may combine series.
+fn computes_each_series_alone<C>(operator: &Operator<C>) -> bool {
+    use asap_executor::planner::ir::operator::arguments::Reduction;
+    use asap_executor::planner::ir::schema::PROMQL_SERIES_IDENTITY;
+    use asap_executor::planner::ir::ASAPOp;
+    match operator {
+        Operator::NonASAP(NonASAPOp::Scan {
+            source: Source::TimeSeries { .. },
+            schema,
+            ..
+        }) => schema
+            .fields
+            .iter()
+            .any(|field| field.name == PROMQL_SERIES_IDENTITY),
+        Operator::NonASAP(NonASAPOp::Filter { .. }) => true,
+        Operator::ASAP(
+            ASAPOp::SummaryAgg { reduction, .. }
+            | ASAPOp::SummaryTumblingWindowChain { reduction, .. },
+        ) => *reduction == Reduction::PerEntity,
+        _ => false,
+    }
+}
+
+/// Whether `operator` may carry state from one window's run to the next.
+/// Conservative: only operators known to compute from the run's own
+/// inputs are not; any operator added later is, until classified.
+fn carries_state_across_windows<C>(operator: &Operator<C>) -> bool {
+    use asap_executor::planner::ir::ASAPOp;
+    match operator {
+        Operator::NonASAP(_) => false,
+        Operator::ASAP(
+            ASAPOp::SummaryAgg { .. }
+            | ASAPOp::SummaryEstimate { .. }
+            | ASAPOp::FinalizeExactAccumulator { .. }
+            | ASAPOp::EvaluatePopulation { .. }
+            | ASAPOp::SummaryMerge { .. }
+            | ASAPOp::SummaryTumblingWindowChain { .. },
+        ) => false,
+        // `MaintainPopulation` maintains membership over time; the others
+        // are reserved and not implemented.
+        _ => true,
+    }
+}
+
 /// The ingestion runs of the plan's refresh groups.
 pub struct Precompute {
     runs: Vec<RefreshGroupRun>,
+    tasks: RefreshTaskGraph,
     limits: Limits,
 }
 
@@ -617,24 +750,41 @@ impl Precompute {
         raw_data: RawShards,
         views: &mut Arc<ViewStore>,
     ) -> Result<Refreshed, asap_executor::Error> {
+        let computed = self.compute(window, raw_data, views.clone(), None)?;
+        self.commit(window, computed, views)
+    }
+
+    /// The first half of [`Self::refresh`]: runs the window over
+    /// `raw_data` and `views` without storing its rows. Windows of one
+    /// group may be computed at once on several threads ([`RefreshTaskGraph`]);
+    /// their rows must be committed in window order, and a window must be
+    /// computed over views that store the windows it reads.
+    /// With `partition`, the run reads the raw samples of that part of the
+    /// series only (for a group split by series); [`Self::merge`] joins the
+    /// parts.
+    pub fn compute(
+        &self,
+        window: ClosedWindow,
+        raw_data: RawShards,
+        views: Arc<ViewStore>,
+        partition: Option<SeriesPartition>,
+    ) -> Result<Computed, asap_executor::Error> {
         let group = &self.runs[window.group];
         let end = window.end_ms;
         let start = end - group.width_ms;
         // Views loaded from files may already store the window.
-        let missing: Vec<&MaterializedView> = group
-            .views
-            .iter()
-            .filter(|view| {
+        let missing: Vec<usize> = (0..group.views.len())
+            .filter(|&index| {
                 views
-                    .stored_through(view.node_id)
+                    .stored_through(group.views[index].node_id)
                     .is_none_or(|stored| stored < end)
             })
             .collect();
         if missing.is_empty() {
-            return Ok(Refreshed::AlreadyStored);
+            return Ok(Computed::AlreadyStored);
         }
         let outputs = {
-            let store = Arc::new(RunStore::new(raw_data, views.clone()));
+            let store = Arc::new(RunStore::for_partition(raw_data, views, partition));
             let instance = group.compiled.instantiate(store)?;
             let context = RunContext::new(
                 Scope::Ingestion {
@@ -646,28 +796,106 @@ impl Precompute {
             let outputs = block_on(instance.execute_ingestion(group.compiled.roots(), context)?)?;
             outputs
         };
-        let by_root: BTreeMap<u64, Vec<_>> = group
+        let mut by_root: BTreeMap<u64, Vec<_>> = group
             .compiled
             .roots()
             .iter()
             .copied()
             .zip(outputs)
             .collect();
+        Ok(Computed::Ran(
+            missing
+                .into_iter()
+                .map(|index| {
+                    let batches = by_root
+                        .remove(&(group.views[index].node_id as u64))
+                        .map(|batches| batches.iter().map(|batch| (**batch).clone()).collect())
+                        .unwrap_or_default();
+                    (index, batches)
+                })
+                .collect(),
+        ))
+    }
+
+    /// The whole run of a window split by series, from its parts' runs: each
+    /// view's rows of every part, in the order one run over every series
+    /// emits them (its group values' key order, as the executor orders
+    /// groups), as one batch. The parts hold disjoint series, so no two
+    /// rows share a key.
+    pub fn merge(&self, parts: Vec<Computed>) -> Result<Computed, asap_executor::Error> {
+        let mut ran = Vec::new();
+        for part in parts {
+            match part {
+                Computed::AlreadyStored => return Ok(Computed::AlreadyStored),
+                Computed::Ran(rows) => ran.push(rows),
+            }
+        }
+        let Some(first) = ran.first() else {
+            return Ok(Computed::AlreadyStored);
+        };
+        let views: Vec<usize> = first.iter().map(|(index, _)| *index).collect();
+        let mut merged = Vec::with_capacity(views.len());
+        for (position, view) in views.into_iter().enumerate() {
+            let batches: Vec<&Batch> = ran
+                .iter()
+                .flat_map(|part| part[position].1.iter())
+                .collect();
+            if batches.iter().all(|batch| batch.num_rows() == 0) {
+                merged.push((view, ran[0][position].1.clone()));
+                continue;
+            }
+            let schema = batches[0].schema().clone();
+            let plain: Vec<usize> = (0..schema.fields.len())
+                .filter(|&column| {
+                    matches!(
+                        schema.fields[column].dtype,
+                        asap_executor::planner::ir::schema::FieldDataType::Plain(_)
+                    )
+                })
+                .collect();
+            let mut keyed = Vec::new();
+            for batch in batches {
+                for row in batch.to_rows() {
+                    let key = plain
+                        .iter()
+                        .map(|&column| row[column].key())
+                        .collect::<Result<Vec<_>, _>>()?;
+                    keyed.push((key, row));
+                }
+            }
+            keyed.sort_by(|a, b| a.0.cmp(&b.0));
+            let rows = keyed.into_iter().map(|(_, row)| row).collect();
+            merged.push((view, vec![Batch::try_new(schema, rows)?]));
+        }
+        Ok(Computed::Ran(merged))
+    }
+
+    /// The second half of [`Self::refresh`]: appends a computed window's
+    /// rows to `views`.
+    pub fn commit(
+        &self,
+        window: ClosedWindow,
+        computed: Computed,
+        views: &mut Arc<ViewStore>,
+    ) -> Result<Refreshed, asap_executor::Error> {
+        let Computed::Ran(rows) = computed else {
+            return Ok(Refreshed::AlreadyStored);
+        };
+        let group = &self.runs[window.group];
+        let range = (window.end_ms - group.width_ms, window.end_ms);
         let views = Arc::make_mut(views);
-        let appended: Vec<(PhysicalASAPNodeId, Vec<Batch>)> = missing
-            .iter()
-            .map(|view| {
-                let batches = by_root
-                    .get(&(view.node_id as u64))
-                    .map(|batches| batches.iter().map(|batch| (**batch).clone()).collect())
-                    .unwrap_or_default();
-                (view.node_id, batches)
-            })
-            .collect();
-        for (view, (_, batches)) in missing.iter().zip(&appended) {
-            views.append(view, (start, end), batches.clone())?;
+        let mut appended = Vec::with_capacity(rows.len());
+        for (index, batches) in rows {
+            let view = &group.views[index];
+            views.append(view, range, batches.clone())?;
+            appended.push((view.node_id, batches));
         }
         Ok(Refreshed::Ran(appended))
+    }
+
+    /// Which windows may be computed at once.
+    pub fn tasks(&self) -> &RefreshTaskGraph {
+        &self.tasks
     }
 
     /// Each refresh group's views (with their retention margin) and their

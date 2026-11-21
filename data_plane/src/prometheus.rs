@@ -2,7 +2,9 @@
 //! range-query parameters and results.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
 
 use crate::query::ResultSample;
@@ -184,34 +186,121 @@ pub fn bad_data(error: &str) -> Value {
     json!({"status": "error", "errorType": "bad_data", "error": error})
 }
 
-/// A Prometheus instant-query response for `samples` at `time_ms`.
-pub fn vector_response(time_ms: i64, samples: &[ResultSample]) -> Value {
-    let time = time_ms as f64 / 1000.0;
-    let result: Vec<Value> = samples
-        .iter()
-        .map(|s| json!({"metric": s.labels, "value": [time, format_value(s.value)]}))
-        .collect();
-    json!({"status": "success", "data": {"resultType": "vector", "result": result}})
+/// A Prometheus instant-query response for `samples` at `time_ms`,
+/// serialized straight into the response body: no JSON tree is built.
+pub struct VectorResponse {
+    pub time_ms: i64,
+    pub samples: Answer,
+}
+
+impl Serialize for VectorResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let time = self.time_ms as f64 / 1000.0;
+        Envelope::new("vector", VectorResult(&self.samples, time)).serialize(serializer)
+    }
 }
 
 /// A Prometheus range-query response: each series' value at each
-/// evaluation time it has one, series sorted by labels.
-pub fn matrix_response(steps: &[(i64, Answer)]) -> Value {
-    let mut series: BTreeMap<&BTreeMap<String, String>, Vec<Value>> = BTreeMap::new();
-    for (time_ms, samples) in steps {
-        let time = *time_ms as f64 / 1000.0;
-        for sample in samples.iter() {
-            series
-                .entry(&sample.labels)
-                .or_default()
-                .push(json!([time, format_value(sample.value)]));
+/// evaluation time it has one, series sorted by labels. Holds each series'
+/// labels once (shared with the step answers) and its points as numbers,
+/// and is serialized straight into the response body.
+pub struct MatrixResponse {
+    series: Vec<(Arc<BTreeMap<String, String>>, Vec<Point>)>,
+}
+
+impl MatrixResponse {
+    pub fn new(steps: &[(i64, Answer)]) -> Self {
+        let mut by_labels: BTreeMap<&Arc<BTreeMap<String, String>>, Vec<Point>> = BTreeMap::new();
+        for (time_ms, samples) in steps {
+            let time = *time_ms as f64 / 1000.0;
+            for sample in samples.iter() {
+                by_labels
+                    .entry(&sample.labels)
+                    .or_default()
+                    .push(Point(time, sample.value));
+            }
+        }
+        Self {
+            series: by_labels
+                .into_iter()
+                .map(|(labels, points)| (labels.clone(), points))
+                .collect(),
         }
     }
-    let result: Vec<Value> = series
-        .into_iter()
-        .map(|(labels, values)| json!({"metric": labels, "values": values}))
-        .collect();
-    json!({"status": "success", "data": {"resultType": "matrix", "result": result}})
+}
+
+impl Serialize for MatrixResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Envelope::new("matrix", MatrixResult(&self.series)).serialize(serializer)
+    }
+}
+
+/// `{"status": "success", "data": {"resultType": .., "result": ..}}`.
+#[derive(Serialize)]
+struct Envelope<R: Serialize> {
+    status: &'static str,
+    data: EnvelopeData<R>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvelopeData<R: Serialize> {
+    result_type: &'static str,
+    result: R,
+}
+
+impl<R: Serialize> Envelope<R> {
+    fn new(result_type: &'static str, result: R) -> Self {
+        Self {
+            status: "success",
+            data: EnvelopeData {
+                result_type,
+                result,
+            },
+        }
+    }
+}
+
+/// One sample: `[time, "value"]`.
+#[derive(Clone, Copy)]
+struct Point(f64, f64);
+
+impl Serialize for Point {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (self.0, format_value(self.1)).serialize(serializer)
+    }
+}
+
+struct VectorResult<'a>(&'a [ResultSample], f64);
+
+impl Serialize for VectorResult<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Sample<'a> {
+            metric: &'a BTreeMap<String, String>,
+            value: Point,
+        }
+        serializer.collect_seq(self.0.iter().map(|sample| Sample {
+            metric: &sample.labels,
+            value: Point(self.1, sample.value),
+        }))
+    }
+}
+
+struct MatrixResult<'a>(&'a [(Arc<BTreeMap<String, String>>, Vec<Point>)]);
+
+impl Serialize for MatrixResult<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Series<'a> {
+            metric: &'a BTreeMap<String, String>,
+            values: &'a [Point],
+        }
+        serializer.collect_seq(self.0.iter().map(|(labels, points)| Series {
+            metric: labels,
+            values: points,
+        }))
+    }
 }
 
 /// Prometheus' sample value format.
@@ -294,7 +383,7 @@ mod tests {
         let a = BTreeMap::from([("job".into(), "a".into())]);
         let b = BTreeMap::from([("job".into(), "b".into())]);
         let sample = |labels: &BTreeMap<String, String>, value| ResultSample {
-            labels: labels.clone(),
+            labels: Arc::new(labels.clone()),
             value,
         };
         let steps = [
@@ -302,7 +391,7 @@ mod tests {
             (2000, Arc::new(vec![sample(&a, 3.0)])),
         ];
         assert_eq!(
-            matrix_response(&steps),
+            serde_json::to_value(MatrixResponse::new(&steps)).unwrap(),
             json!({"status": "success", "data": {"resultType": "matrix", "result": [
                 {"metric": {"job": "a"}, "values": [[1.0, "2"], [2.0, "3"]]},
                 {"metric": {"job": "b"}, "values": [[1.0, "1"]]},
@@ -313,18 +402,22 @@ mod tests {
     /// Results use Prometheus' vector shape and value formatting.
     #[test]
     fn formats_vector_results() {
-        let samples = [
+        let samples = Arc::new(vec![
             ResultSample {
-                labels: BTreeMap::from([("job".into(), "a".into())]),
+                labels: Arc::new(BTreeMap::from([("job".into(), "a".into())])),
                 value: 2.0,
             },
             ResultSample {
-                labels: BTreeMap::new(),
+                labels: Arc::default(),
                 value: f64::INFINITY,
             },
-        ];
+        ]);
         assert_eq!(
-            vector_response(1500, &samples),
+            serde_json::to_value(VectorResponse {
+                time_ms: 1500,
+                samples
+            })
+            .unwrap(),
             json!({"status": "success", "data": {"resultType": "vector", "result": [
                 {"metric": {"job": "a"}, "value": [1.5, "2"]},
                 {"metric": {}, "value": [1.5, "+Inf"]},

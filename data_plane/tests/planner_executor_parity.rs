@@ -227,6 +227,11 @@ async fn data_plane_over(
         result_cache,
         ingest_threads: shards.ingest_threads,
         precompute_mode: shards.precompute_mode,
+        // `PARITY_PRECOMPUTE_THREADS=n` computes windows on `n` threads.
+        precompute_threads: std::env::var("PARITY_PRECOMPUTE_THREADS")
+            .map_or(EngineOptions::default().precompute_threads, |n| {
+                n.parse().unwrap()
+            }),
         ingestion: IngestionOptions {
             allowed_lateness_ms: 0,
             max_future_ms: 0,
@@ -814,6 +819,10 @@ async fn range_queries_answer_what_the_planner_executor_answers_at_each_step() {
             let label = format!("{name} as ranges (raw data retained: {raw_data_retained})");
             let mut inputs = DeploymentInputs::default();
             inputs.deployment_capabilities.raw_data_retained = raw_data_retained;
+            // Each range is asked once, cold, after all its data is in: the
+            // result cache holds none of its earlier steps, so the plan
+            // must keep every step's inputs (no final_query_results_cached).
+            inputs.deployment_capabilities.final_query_results_cached = false;
             let plan = match plan_workload(&workload, &inputs) {
                 Ok((plan, _)) => plan,
                 Err(error) => {

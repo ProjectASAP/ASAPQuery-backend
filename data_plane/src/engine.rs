@@ -18,10 +18,11 @@
 //! Each thread records the thread CPU and wall time of its phases in
 //! [`Metrics`], exported on `/metrics`.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
+use std::time::Instant;
 
 use asap_executor::runtime::Limits;
 use asap_planner::InstallablePlan;
@@ -29,12 +30,14 @@ use asap_planner::InstallablePlan;
 use tokio::sync::oneshot;
 
 use crate::ingestion::{
-    ClosedWindow, Ingestion, IngestionOptions, IngestionStats, Precompute, Refreshed, Routing,
+    ClosedWindow, Computed, Ingestion, IngestionOptions, IngestionStats, Precompute,
+    RefreshTaskGraph, Refreshed, Routing,
 };
 use crate::metrics::{Gauges, Metrics, Timer};
 use crate::persist::{plan_hash, ViewFiles};
 use crate::query::{QueryEngine, Snapshot, Unanswered};
 use crate::result_cache::{Answer, ResultCache};
+use crate::store::SeriesPartition;
 use crate::store::{
     PublishedStore, QueryTimeResults, RawData, RawSample, RawShards, RunStore, ViewStore,
 };
@@ -69,6 +72,19 @@ pub struct EngineOptions {
     /// Ingest shard threads: each routes and appends the samples of the
     /// series hashed to it, into its own raw data.
     pub ingest_threads: usize,
+    /// Threads computing closed refresh windows at once. With 1 the
+    /// committer computes each window itself, one at a time, in the order
+    /// they closed.
+    pub precompute_threads: usize,
+    /// For tests: refresh windows whose computation waits this long first,
+    /// as a slow run would.
+    #[doc(hidden)]
+    pub slow_refreshes: Vec<SlowRefresh>,
+    /// For tests: fail a window whose run reads views of another group
+    /// not yet committed through its end, or whose inputs change while it
+    /// runs.
+    #[doc(hidden)]
+    pub check_task_inputs: bool,
     /// For tests: how long every ingest shard but the first waits before
     /// running each batch, so the first runs ahead of the others.
     #[doc(hidden)]
@@ -123,10 +139,6 @@ pub struct EngineOptions {
     /// a shard reserves before folding a batch and waits while older
     /// windows are open. `None`: no limit.
     pub precompute_memory_budget_bytes: Option<u64>,
-    /// For tests: refresh windows whose computation waits this long first,
-    /// as a slow run would (in push mode, the window's combine).
-    #[doc(hidden)]
-    pub slow_refreshes: Vec<SlowRefresh>,
     /// For tests, push mode: the combine of the window ending at this time
     /// (ms) panics.
     #[doc(hidden)]
@@ -143,6 +155,10 @@ impl Default for EngineOptions {
             ingest_threads: std::thread::available_parallelism()
                 .map_or(1, |cores| (usize::from(cores) / 4).max(1)),
             shard_delay_ms: 0,
+            precompute_threads: std::thread::available_parallelism()
+                .map_or(1, |cores| (usize::from(cores) / 4).clamp(1, 4)),
+            slow_refreshes: Vec::new(),
+            check_task_inputs: false,
             persist_threads: std::thread::available_parallelism()
                 .map_or(1, |cores| (usize::from(cores) / 4).clamp(1, 4)),
             max_persist_backlog_bytes: 256 << 20,
@@ -160,7 +176,6 @@ impl Default for EngineOptions {
             view_sync_interval_ms: 5_000,
             precompute_mode: PrecomputeMode::Window,
             precompute_memory_budget_bytes: None,
-            slow_refreshes: Vec::new(),
             panic_in_combine_of_window_end_ms: None,
         }
     }
@@ -168,13 +183,18 @@ impl Default for EngineOptions {
 
 /// For tests: the windows of refresh group `group` (any group if
 /// `None`) ending at `end_ms` (any end if `None`) wait `delay_ms` before
-/// they are computed.
+/// they are computed; of a window split by series, only part `part` (every
+/// part if `None`). With `per_series`, the delay is a run's over every
+/// series, and a run over a part of the series waits that share of it, as
+/// work proportional to the samples read would.
 #[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SlowRefresh {
     pub group: Option<usize>,
     pub end_ms: Option<i64>,
+    pub part: Option<u32>,
     pub delay_ms: u64,
+    pub per_series: bool,
 }
 
 type Reply<T> = oneshot::Sender<Result<T, Unanswered>>;
@@ -183,7 +203,6 @@ type Reply<T> = oneshot::Sender<Result<T, Unanswered>>;
 enum Command {
     /// A shard routed and appended a batch, or sealed and evicted.
     Report(ShardReport),
-    /// A shard has run every message sent to it before a flush.
     /// The shard numbered here has run every message sent to it before a
     /// flush.
     Flushed(usize),
@@ -202,6 +221,9 @@ struct ShardReport {
     newest_ms: Option<i64>,
     /// Each metric's first sample, while a group waits for one.
     first_seen: Vec<(Arc<str>, i64)>,
+    /// Samples of the batch reported, counted out of the queues when the
+    /// coordinator applies the report.
+    samples: u64,
 }
 
 /// What an ingest shard does next.
@@ -217,11 +239,13 @@ enum ShardMessage {
     Flush,
 }
 
-/// What the precompute thread does next.
+/// What the precompute committer does next, in the order the windows
+/// closed.
 enum PrecomputeJob {
     Refresh {
         window: ClosedWindow,
         raw_data: RawShards,
+        closed_at: Instant,
     },
     /// Answers `barrier_ms` once every window queued before is refreshed.
     Barrier {
@@ -415,14 +439,19 @@ impl EngineHandle {
             }
             None => None,
         };
-        let precompute_guard = RunningGuard(running);
-        let precompute_shared = shared.clone();
-        std::thread::Builder::new()
-            .name("precompute".into())
-            .spawn(move || {
-                let _guard = precompute_guard;
-                serve_precompute(precompute, views, persist, job_receiver, &precompute_shared);
-            })?;
+        spawn_precompute(
+            Arc::new(precompute),
+            views,
+            persist,
+            job_receiver,
+            PoolOptions {
+                threads: options.precompute_threads.max(1),
+                slow_refreshes: options.slow_refreshes.clone(),
+                check_task_inputs: options.check_task_inputs,
+            },
+            RunningGuard(running),
+            &shared,
+        )?;
         let query = Arc::new(query);
         spawn_query_workers(
             query.clone(),
@@ -477,8 +506,12 @@ impl EngineHandle {
                 .send(ShardMessage::Samples(samples))
                 .is_err()
             {
+                // This shard and the ones not sent to yet were admitted
+                // but get nothing.
                 shared.queued_samples.fetch_sub(count, Ordering::SeqCst);
-                shared.shard_queued[shard].fetch_sub(count, Ordering::SeqCst);
+                for (queued, &later) in shared.shard_queued[shard..].iter().zip(&counts[shard..]) {
+                    queued.fetch_sub(later, Ordering::SeqCst);
+                }
                 return Err(IngestError::Stopped);
             }
         }
@@ -710,7 +743,7 @@ const _: fn() = || {
     assert_send_sync::<RunStore>();
     assert_send_sync::<RawData>();
     assert_send_sync::<ViewStore>();
-    assert_send::<Precompute>();
+    assert_send_sync::<Precompute>();
     assert_send::<Ingestion>();
 };
 
@@ -894,13 +927,13 @@ fn serve_shard(
             raw_data: raw_data.clone(),
             newest_ms,
             first_seen,
+            samples: count,
         };
-        let sent = coordinator.send(Command::Report(report));
-        // Counted out after the report, so the coordinator never takes the
-        // shard for caught up before it knows the samples' times.
-        shared.shard_queued[index].fetch_sub(count, Ordering::SeqCst);
-        shared.queued_samples.fetch_sub(count, Ordering::SeqCst);
-        if sent.is_err() {
+        // The coordinator counts the samples out of the queues when it
+        // applies the report, so samples stay counted while it cannot keep
+        // up (waiting for the precompute workers): the queues fill and
+        // Remote Write gets 503, and reports waiting for it stay bounded.
+        if coordinator.send(Command::Report(report)).is_err() {
             break;
         }
     }
@@ -934,6 +967,10 @@ fn serve_ingest(
                  raw_shards: &mut Vec<Arc<RawData>>,
                  newest: &mut Vec<Option<i64>>| {
         ingestion.observe(&report.first_seen);
+        shared.shard_queued[report.shard].fetch_sub(report.samples, Ordering::SeqCst);
+        shared
+            .queued_samples
+            .fetch_sub(report.samples, Ordering::SeqCst);
         raw_shards[report.shard] = report.raw_data;
         newest[report.shard] = report.newest_ms;
     };
@@ -1094,6 +1131,7 @@ fn queue_refreshes(
         let job = PrecomputeJob::Refresh {
             window,
             raw_data: raw_data.clone(),
+            closed_at: Instant::now(),
         };
         if jobs.send(job).is_err() {
             return false;
@@ -1102,72 +1140,694 @@ fn queue_refreshes(
     true
 }
 
-/// The precompute thread: refreshes each queued window in order over its
-/// copy of the views, publishing them after each.
-fn serve_precompute(
-    precompute: Precompute,
-    mut views: Arc<ViewStore>,
+/// How the precompute task pool runs.
+struct PoolOptions {
+    threads: usize,
+    slow_refreshes: Vec<SlowRefresh>,
+    check_task_inputs: bool,
+}
+
+/// What the precompute committer waits for.
+enum PoolEvent {
+    /// The next job, in the order the windows closed.
+    Job(PrecomputeJob),
+    /// A worker computed window `seq`, or its part `part` of a window split
+    /// by series.
+    Computed {
+        seq: u64,
+        part: u32,
+        result: Result<Computed, String>,
+        times: TaskTimes,
+    },
+    /// No job will come any more.
+    Closed,
+}
+
+/// When a window's computation started and ended.
+#[derive(Debug, Clone, Copy)]
+struct TaskTimes {
+    started: Instant,
+    computed: Instant,
+}
+
+/// A window for a worker to compute.
+struct WindowRun {
+    seq: u64,
+    window: ClosedWindow,
+    raw_data: RawShards,
+    /// The views as committed when the run was started: every window of
+    /// the groups it reads that closed before it.
+    views: Arc<ViewStore>,
+    /// The series the run reads, when the window is split by series.
+    partition: Option<SeriesPartition>,
+}
+
+/// Starts the precompute task pool: the committer (`precompute`, today's
+/// precompute thread), which takes the closed windows in order, starts
+/// them, and stores and publishes their rows in window order, so the view
+/// store keeps one writer; and, with more than one thread, the workers
+/// `precompute-N` that compute the windows, and `precompute-queue`, which
+/// takes jobs from the bounded backlog for the committer as room frees.
+#[allow(clippy::too_many_arguments)]
+fn spawn_precompute(
+    precompute: Arc<Precompute>,
+    views: Arc<ViewStore>,
     persist: Option<PersistPool>,
     jobs: Receiver<PrecomputeJob>,
-    shared: &Shared,
-) {
-    for job in jobs {
-        match job {
-            PrecomputeJob::Refresh { window, raw_data } => {
-                let result = {
-                    let _gate = shared
-                        .precompute_gate
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let timer = Timer::start();
-                    let result = precompute.refresh(window, raw_data, &mut views);
-                    if !matches!(result, Ok(Refreshed::AlreadyStored)) {
-                        shared.metrics.precompute[window.group].1.record(timer);
+    options: PoolOptions,
+    guard: RunningGuard,
+    shared: &Arc<Shared>,
+) -> std::io::Result<()> {
+    shared
+        .metrics
+        .precompute_threads
+        .store(options.threads as u64, Ordering::Relaxed);
+    for (group, &split) in precompute.tasks().split_by_series.iter().enumerate() {
+        let parts = if split { options.threads } else { 1 };
+        shared.metrics.precompute_windows[group]
+            .parts
+            .store(parts as u64, Ordering::Relaxed);
+    }
+    let (events, inbox) = channel();
+    // Windows taken from the backlog and not yet committed: one at a time
+    // when the committer computes them itself; with workers, two per
+    // worker, so a slow window does not leave the others idle while the
+    // windows after it wait to be committed.
+    let slots = Arc::new(Slots::new(if options.threads == 1 {
+        1
+    } else {
+        2 * options.threads
+    }));
+    let workers = if options.threads == 1 {
+        None
+    } else {
+        let (runs, run_receiver) = channel::<WindowRun>();
+        let run_receiver = Arc::new(Mutex::new(run_receiver));
+        for index in 0..options.threads {
+            let (precompute, shared, runs, events) = (
+                precompute.clone(),
+                shared.clone(),
+                run_receiver.clone(),
+                events.clone(),
+            );
+            let checks = PoolOptions {
+                threads: options.threads,
+                slow_refreshes: options.slow_refreshes.clone(),
+                check_task_inputs: options.check_task_inputs,
+            };
+            std::thread::Builder::new()
+                .name(format!("precompute-{index}"))
+                .spawn(move || loop {
+                    let run = match runs.lock().unwrap_or_else(|e| e.into_inner()).recv() {
+                        Ok(run) => run,
+                        Err(_) => break,
+                    };
+                    let (result, times) = compute_window(
+                        &precompute,
+                        run.window,
+                        run.raw_data,
+                        run.views,
+                        run.partition,
+                        &checks,
+                        &shared,
+                    );
+                    let event = PoolEvent::Computed {
+                        seq: run.seq,
+                        part: run.partition.map_or(0, |p| p.index),
+                        result,
+                        times,
+                    };
+                    if events.send(event).is_err() {
+                        break;
                     }
-                    result
-                };
-                shared.published.publish_views(views.clone());
-                shared
-                    .metrics
-                    .view_bytes
-                    .store(views.bytes() as u64, Ordering::Relaxed);
-                {
-                    let mut stats = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
-                    match result {
-                        Ok(Refreshed::Ran(appended)) => {
-                            stats.windows_refreshed += 1;
-                            drop(stats);
-                            if let Some(persist) = &persist {
-                                let start_ms = window.end_ms - precompute.width_ms(window.group);
-                                persist.queue(
-                                    window.group,
-                                    (start_ms, window.end_ms),
-                                    appended,
-                                    shared,
-                                );
-                            }
-                        }
-                        Ok(Refreshed::AlreadyStored) => stats.windows_already_stored += 1,
-                        Err(error) => {
-                            tracing::error!(group = window.group, end = window.end_ms, %error, "ingestion run failed");
-                            stats.windows_failed += 1;
-                        }
+                })?;
+        }
+        Some(runs)
+    };
+    {
+        let (slots, shared) = (slots.clone(), shared.clone());
+        std::thread::Builder::new()
+            .name("precompute-queue".into())
+            .spawn(move || {
+                for job in jobs {
+                    if matches!(job, PrecomputeJob::Refresh { .. })
+                        && !slots.acquire(&shared.running)
+                    {
+                        break;
+                    }
+                    if events.send(PoolEvent::Job(job)).is_err() {
+                        break;
                     }
                 }
-                shared.precompute_backlog.fetch_sub(1, Ordering::SeqCst);
+                let _ = events.send(PoolEvent::Closed);
+            })?;
+    }
+    let shared = shared.clone();
+    std::thread::Builder::new()
+        .name("precompute".into())
+        .spawn(move || {
+            let _guard = guard;
+            serve_precompute(
+                &precompute,
+                views,
+                persist,
+                inbox,
+                workers,
+                &slots,
+                &options,
+                &shared,
+            );
+        })?;
+    Ok(())
+}
+
+/// A counting semaphore: the windows taken from the backlog and not yet
+/// committed.
+struct Slots {
+    free: Mutex<usize>,
+    freed: Condvar,
+}
+
+impl Slots {
+    fn new(count: usize) -> Self {
+        Self {
+            free: Mutex::new(count),
+            freed: Condvar::new(),
+        }
+    }
+
+    /// Takes a slot, waiting for one; `false` once the engine has stopped.
+    fn acquire(&self, running: &AtomicBool) -> bool {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        while *free == 0 {
+            if !running.load(Ordering::SeqCst) {
+                return false;
             }
-            PrecomputeJob::Barrier { barrier_ms, reply } => match &persist {
+            free = self
+                .freed
+                .wait_timeout(free, std::time::Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        *free -= 1;
+        true
+    }
+
+    fn release(&self) {
+        *self.free.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.freed.notify_one();
+    }
+}
+
+/// Computes `window` on this thread, after its test delay; a panic in the
+/// run fails the window, not the thread.
+fn compute_window(
+    precompute: &Precompute,
+    window: ClosedWindow,
+    raw_data: RawShards,
+    views: Arc<ViewStore>,
+    partition: Option<SeriesPartition>,
+    options: &PoolOptions,
+    shared: &Shared,
+) -> (Result<Computed, String>, TaskTimes) {
+    let started = Instant::now();
+    let inputs = options
+        .check_task_inputs
+        .then(|| TaskInputs::read(precompute, window, &raw_data, &views));
+    let delay_ms: u64 = options
+        .slow_refreshes
+        .iter()
+        .filter(|s| s.group.is_none_or(|g| g == window.group))
+        .filter(|s| s.end_ms.is_none_or(|e| e == window.end_ms))
+        .filter(|s| {
+            s.part
+                .is_none_or(|part| partition.is_none_or(|p| p.index == part))
+        })
+        .map(|s| match (s.per_series, partition) {
+            (true, Some(partition)) => s.delay_ms / u64::from(partition.count),
+            _ => s.delay_ms,
+        })
+        .sum();
+    if delay_ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    }
+    let timer = Timer::start();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        precompute
+            .compute(window, raw_data, views, partition)
+            .map_err(|e| e.to_string())
+    }))
+    .unwrap_or_else(|panic| {
+        let reason = panic
+            .downcast_ref::<&str>()
+            .map(ToString::to_string)
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        Err(format!("the ingestion run panicked: {reason}"))
+    });
+    if !matches!(result, Ok(Computed::AlreadyStored)) {
+        shared.metrics.precompute[window.group].1.record(timer);
+    }
+    let result = match inputs {
+        Some((before, raw_data, views)) => result.and_then(|computed| {
+            before.check(window)?;
+            if TaskInputs::read(precompute, window, &raw_data, &views).0 != before {
+                return Err("a run's inputs changed while it ran".into());
+            }
+            Ok(computed)
+        }),
+        None => result,
+    };
+    let computed = Instant::now();
+    shared
+        .metrics
+        .precompute_busy_ns
+        .fetch_add((computed - started).as_nanos() as u64, Ordering::Relaxed);
+    (result, TaskTimes { started, computed })
+}
+
+/// What a window's run reads, for tests: each raw shard's identity,
+/// samples and panes, the view store's identity, and how far each view of the groups
+/// it reads is stored.
+#[derive(Debug, PartialEq, Eq)]
+struct TaskInputs {
+    raw_shards: Vec<(usize, usize, usize)>,
+    views: usize,
+    read_views_stored_through: Vec<Option<i64>>,
+}
+
+impl TaskInputs {
+    /// The inputs as of now, and the snapshots to read them again from.
+    fn read(
+        precompute: &Precompute,
+        window: ClosedWindow,
+        raw_data: &RawShards,
+        views: &Arc<ViewStore>,
+    ) -> (Self, RawShards, Arc<ViewStore>) {
+        let groups = precompute.groups();
+        let inputs = Self {
+            raw_shards: raw_data
+                .iter()
+                // Samples and panes, not bytes: a chunk builds its series
+                // identity column once, on first read, and counts it.
+                .map(|shard| (Arc::as_ptr(shard) as usize, shard.len(), shard.panes()))
+                .collect(),
+            views: Arc::as_ptr(views) as usize,
+            read_views_stored_through: precompute.tasks().reads[window.group]
+                .iter()
+                .flat_map(|&group| &groups[group].1)
+                .map(|&view| views.stored_through(view))
+                .collect(),
+        };
+        (inputs, raw_data.clone(), views.clone())
+    }
+
+    /// Every view of the groups the window reads is committed through the
+    /// window's end.
+    fn check(&self, window: ClosedWindow) -> Result<(), String> {
+        if self
+            .read_views_stored_through
+            .iter()
+            .all(|stored| stored.is_some_and(|end| end >= window.end_ms))
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "window {window:?} ran before the views it reads were committed: {:?}",
+                self.read_views_stored_through
+            ))
+        }
+    }
+}
+
+/// The precompute committer: takes the jobs in the order the windows
+/// closed, starts each window once the windows it reads are committed,
+/// commits computed windows in window order per group, publishes the views
+/// once per pass and then queues the windows for the persist threads, and
+/// answers a barrier once every window before it is committed. Without
+/// `workers` it computes each window itself.
+#[allow(clippy::too_many_arguments)]
+fn serve_precompute(
+    precompute: &Precompute,
+    mut views: Arc<ViewStore>,
+    persist: Option<PersistPool>,
+    inbox: Receiver<PoolEvent>,
+    workers: Option<Sender<WindowRun>>,
+    slots: &Slots,
+    options: &PoolOptions,
+    shared: &Shared,
+) {
+    // A window of a group split by series runs as one part per worker.
+    let parts = if workers.is_some() {
+        options.threads
+    } else {
+        1
+    };
+    let mut tasks = WindowTasks::new(precompute.tasks().clone(), parts as u32);
+    let mut closed = false;
+    while !(closed && tasks.is_empty()) {
+        let Ok(event) = inbox.recv() else {
+            break;
+        };
+        // Take every event already sent, so one pass commits and publishes
+        // them together (as an ASAPQuery worker emits the windows one
+        // flush closed as one batch: `precompute_engine/worker.rs`,
+        // `flush_all`).
+        let mut next = Some(event);
+        while let Some(event) = next.take().or_else(|| inbox.try_recv().ok()) {
+            match event {
+                PoolEvent::Job(PrecomputeJob::Refresh {
+                    window,
+                    raw_data,
+                    closed_at,
+                }) => tasks.push(window, raw_data, closed_at),
+                PoolEvent::Job(PrecomputeJob::Barrier { barrier_ms, reply }) => {
+                    tasks.barrier(barrier_ms, reply)
+                }
+                PoolEvent::Computed {
+                    seq,
+                    part,
+                    result,
+                    times,
+                } => tasks.computed(seq, part, result, times),
+                PoolEvent::Closed => closed = true,
+            }
+        }
+        let mut to_persist = Vec::new();
+        let mut committed = false;
+        loop {
+            // Started after every commit, so a window that reads another
+            // group's views sees exactly the windows that closed before it.
+            for (seq, window, raw_data, partition) in tasks.start() {
+                match &workers {
+                    Some(workers) => {
+                        let run = WindowRun {
+                            seq,
+                            window,
+                            raw_data,
+                            views: views.clone(),
+                            partition,
+                        };
+                        if workers.send(run).is_err() {
+                            tracing::error!("the precompute workers have stopped");
+                            return;
+                        }
+                    }
+                    None => {
+                        let (result, times) = compute_window(
+                            precompute,
+                            window,
+                            raw_data,
+                            views.clone(),
+                            partition,
+                            options,
+                            shared,
+                        );
+                        tasks.computed(seq, 0, result, times);
+                    }
+                }
+            }
+            let Some(task) = tasks.next_commit() else {
+                break;
+            };
+            commit_window(precompute, task, &mut views, &mut to_persist, shared);
+            committed = true;
+            slots.release();
+        }
+        if committed {
+            shared.published.publish_views(views.clone());
+            shared
+                .metrics
+                .view_bytes
+                .store(views.bytes() as u64, Ordering::Relaxed);
+        }
+        if let Some(persist) = &persist {
+            for (group, range_ms, appended) in to_persist {
+                persist.queue(group, range_ms, appended, shared);
+            }
+        }
+        for (barrier_ms, reply) in tasks.passed_barriers() {
+            match &persist {
                 // The barrier answers once the windows before it are also
-                // written (not necessarily synced), without the precompute
-                // thread waiting for that.
+                // written (not necessarily synced), without the committer
+                // waiting for that.
                 Some(persist) => persist.barrier(barrier_ms, reply),
                 None => {
                     let _ = reply.send(barrier_ms);
                 }
-            },
+            }
         }
     }
     tracing::warn!("precompute stopped");
+}
+
+/// A window persisted after the views are published: its group, range
+/// and each view's rows.
+type ToPersist = (usize, (i64, i64), Vec<(PhysicalASAPNodeId, Vec<Batch>)>);
+
+/// Stores a computed window's rows in `views` and counts it.
+fn commit_window(
+    precompute: &Precompute,
+    task: CommitTask,
+    views: &mut Arc<ViewStore>,
+    to_persist: &mut Vec<ToPersist>,
+    shared: &Shared,
+) {
+    let window = task.window;
+    let result = {
+        let _gate = shared
+            .precompute_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        task.result
+            .and_then(|mut parts| match parts.len() {
+                1 => Ok(parts.remove(0)),
+                _ => precompute.merge(parts).map_err(|e| e.to_string()),
+            })
+            .and_then(|computed| {
+                precompute
+                    .commit(window, computed, views)
+                    .map_err(|e| e.to_string())
+            })
+    };
+    let now = Instant::now();
+    let latency = &shared.metrics.precompute_windows[window.group];
+    latency.record(
+        task.times.started.saturating_duration_since(task.closed_at),
+        now.saturating_duration_since(task.times.computed),
+        (crate::ingestion::wall_clock_ms() - window.end_ms).max(0),
+    );
+    {
+        let mut stats = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
+        match result {
+            Ok(Refreshed::Ran(appended)) => {
+                stats.windows_refreshed += 1;
+                let start_ms = window.end_ms - precompute.width_ms(window.group);
+                to_persist.push((window.group, (start_ms, window.end_ms), appended));
+            }
+            Ok(Refreshed::AlreadyStored) => stats.windows_already_stored += 1,
+            Err(error) => {
+                tracing::error!(group = window.group, end = window.end_ms, %error, "ingestion run failed");
+                stats.windows_failed += 1;
+            }
+        }
+    }
+    shared.precompute_backlog.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// A computed window ready to commit: its run, or its parts' runs by
+/// part.
+struct CommitTask {
+    window: ClosedWindow,
+    result: Result<Vec<Computed>, String>,
+    closed_at: Instant,
+    times: TaskTimes,
+}
+
+/// Where a window taken from the backlog is.
+enum TaskState {
+    /// Waiting for the windows it reads to be committed.
+    Waiting(RawShards),
+    /// Computing: `parts` runs, those done so far by part, and when the
+    /// first started and the last ended.
+    Running {
+        parts: u32,
+        done: BTreeMap<u32, Result<Computed, String>>,
+        times: Option<TaskTimes>,
+    },
+    Computed {
+        result: Result<Vec<Computed>, String>,
+        times: TaskTimes,
+    },
+}
+
+struct WindowTask {
+    window: ClosedWindow,
+    closed_at: Instant,
+    state: TaskState,
+}
+
+/// The windows taken from the backlog and not yet committed, by the order
+/// they closed (`seq`), and the barriers between them, scheduled by the
+/// plan's [`RefreshTaskGraph`]. A window starts once every earlier window
+/// of the groups it reads is committed (a superset of the windows covering
+/// it, since a group is listed after the groups it reads and its windows
+/// close no earlier than theirs), and, in a serial group, once the group's
+/// earlier windows are committed; otherwise windows of different groups,
+/// and of one group, compute at once. A group's windows commit in window
+/// order (a reorder buffer per group).
+struct WindowTasks {
+    graph: RefreshTaskGraph,
+    /// The parts a window of a group split by series runs as.
+    parts: u32,
+    tasks: BTreeMap<u64, WindowTask>,
+    next_seq: u64,
+    /// Each barrier, after the windows before `seq`.
+    barriers: VecDeque<(u64, i64, oneshot::Sender<i64>)>,
+}
+
+impl WindowTasks {
+    fn new(graph: RefreshTaskGraph, parts: u32) -> Self {
+        Self {
+            graph,
+            parts,
+            tasks: BTreeMap::new(),
+            next_seq: 0,
+            barriers: VecDeque::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tasks.is_empty() && self.barriers.is_empty()
+    }
+
+    fn push(&mut self, window: ClosedWindow, raw_data: RawShards, closed_at: Instant) {
+        self.tasks.insert(
+            self.next_seq,
+            WindowTask {
+                window,
+                closed_at,
+                state: TaskState::Waiting(raw_data),
+            },
+        );
+        self.next_seq += 1;
+    }
+
+    fn barrier(&mut self, barrier_ms: i64, reply: oneshot::Sender<i64>) {
+        self.barriers.push_back((self.next_seq, barrier_ms, reply));
+    }
+
+    /// The waiting windows that may start now: no earlier window of a
+    /// group they read is still uncommitted. They are marked running; a
+    /// window of a group split by series starts as one run per part.
+    fn start(&mut self) -> Vec<(u64, ClosedWindow, RawShards, Option<SeriesPartition>)> {
+        let mut uncommitted = BTreeSet::new();
+        let mut started = Vec::new();
+        for (&seq, task) in &mut self.tasks {
+            let group = task.window.group;
+            let waits_for = |g: &usize| uncommitted.contains(g);
+            if matches!(task.state, TaskState::Waiting(_))
+                && !self.graph.reads[group].iter().any(waits_for)
+                && !(self.graph.serial[group] && waits_for(&group))
+            {
+                let parts = if self.graph.split_by_series[group] {
+                    self.parts
+                } else {
+                    1
+                };
+                let running = TaskState::Running {
+                    parts,
+                    done: BTreeMap::new(),
+                    times: None,
+                };
+                let TaskState::Waiting(raw_data) = std::mem::replace(&mut task.state, running)
+                else {
+                    unreachable!()
+                };
+                if parts == 1 {
+                    started.push((seq, task.window, raw_data, None));
+                } else {
+                    for index in 0..parts {
+                        let partition = SeriesPartition {
+                            index,
+                            count: parts,
+                        };
+                        started.push((seq, task.window, raw_data.clone(), Some(partition)));
+                    }
+                }
+            }
+            uncommitted.insert(group);
+        }
+        started
+    }
+
+    /// Part `part` of window `seq` is computed; the window is, once every
+    /// part is.
+    fn computed(
+        &mut self,
+        seq: u64,
+        part: u32,
+        result: Result<Computed, String>,
+        times: TaskTimes,
+    ) {
+        let Some(task) = self.tasks.get_mut(&seq) else {
+            return;
+        };
+        let TaskState::Running {
+            parts,
+            done,
+            times: all,
+        } = &mut task.state
+        else {
+            return;
+        };
+        done.insert(part, result);
+        let all = all.get_or_insert(times);
+        all.started = all.started.min(times.started);
+        all.computed = all.computed.max(times.computed);
+        if done.len() as u32 == *parts {
+            let times = *all;
+            let result = std::mem::take(done).into_values().collect();
+            task.state = TaskState::Computed { result, times };
+        }
+    }
+
+    /// The earliest computed window with no earlier window of its group
+    /// still uncommitted, removed.
+    fn next_commit(&mut self) -> Option<CommitTask> {
+        let mut uncommitted = BTreeSet::new();
+        let seq = self.tasks.iter().find_map(|(&seq, task)| {
+            let ready = matches!(task.state, TaskState::Computed { .. })
+                && !uncommitted.contains(&task.window.group);
+            uncommitted.insert(task.window.group);
+            ready.then_some(seq)
+        })?;
+        let task = self.tasks.remove(&seq)?;
+        let TaskState::Computed { result, times } = task.state else {
+            unreachable!()
+        };
+        Some(CommitTask {
+            window: task.window,
+            result,
+            closed_at: task.closed_at,
+            times,
+        })
+    }
+
+    /// The barriers every window before which is committed, removed.
+    fn passed_barriers(&mut self) -> Vec<(i64, oneshot::Sender<i64>)> {
+        let first_uncommitted = self.tasks.keys().next().copied().unwrap_or(self.next_seq);
+        let mut passed = Vec::new();
+        while self
+            .barriers
+            .front()
+            .is_some_and(|(seq, _, _)| *seq <= first_uncommitted)
+        {
+            let (_, barrier_ms, reply) = self.barriers.pop_front().unwrap();
+            passed.push((barrier_ms, reply));
+        }
+        passed
+    }
 }
 
 /// What a persist thread does next.
@@ -1389,6 +2049,136 @@ mod tests {
         assert_eq!(admit_shards(&queued, &[2, 1, 1], 6), Ok(()));
         let now: Vec<u64> = queued.iter().map(|q| q.load(Ordering::SeqCst)).collect();
         assert_eq!(now, [2, 6, 1]);
+    }
+
+    fn window(group: usize, end_ms: i64) -> ClosedWindow {
+        ClosedWindow { group, end_ms }
+    }
+
+    fn times() -> TaskTimes {
+        TaskTimes {
+            started: Instant::now(),
+            computed: Instant::now(),
+        }
+    }
+
+    /// The tasks of `graph` with `windows` pushed in order.
+    fn tasks(graph: RefreshTaskGraph, windows: &[ClosedWindow]) -> WindowTasks {
+        let mut tasks = WindowTasks::new(graph, 1);
+        for &w in windows {
+            tasks.push(w, Arc::new(Vec::new()), Instant::now());
+        }
+        tasks
+    }
+
+    fn started(tasks: &mut WindowTasks) -> Vec<u64> {
+        tasks
+            .start()
+            .into_iter()
+            .map(|(seq, _, _, _)| seq)
+            .collect()
+    }
+
+    /// A group's windows all start at once; one finishing before an
+    /// earlier one waits for it and the two commit in window order.
+    #[test]
+    fn windows_commit_in_window_order_when_computed_out_of_order() {
+        let graph = RefreshTaskGraph {
+            reads: vec![vec![]],
+            serial: vec![false],
+            split_by_series: vec![false],
+        };
+        let mut tasks = tasks(graph, &[window(0, 10), window(0, 20)]);
+        assert_eq!(started(&mut tasks), [0, 1]);
+        tasks.computed(1, 0, Ok(Computed::AlreadyStored), times());
+        assert!(tasks.next_commit().is_none());
+        tasks.computed(0, 0, Ok(Computed::AlreadyStored), times());
+        let ends: Vec<i64> = std::iter::from_fn(|| tasks.next_commit())
+            .map(|t| t.window.end_ms)
+            .collect();
+        assert_eq!(ends, [10, 20]);
+    }
+
+    /// A window of a group reading another group's views starts once the
+    /// earlier windows of that group are committed; an unrelated group's
+    /// window starts at once.
+    #[test]
+    fn a_window_waits_for_the_groups_it_reads() {
+        let graph = RefreshTaskGraph {
+            reads: vec![vec![], vec![0], vec![]],
+            serial: vec![false; 3],
+            split_by_series: vec![false; 3],
+        };
+        let mut tasks = tasks(graph, &[window(0, 10), window(1, 10), window(2, 10)]);
+        assert_eq!(started(&mut tasks), [0, 2]);
+        tasks.computed(0, 0, Ok(Computed::AlreadyStored), times());
+        assert!(started(&mut tasks).is_empty());
+        assert_eq!(tasks.next_commit().unwrap().window, window(0, 10));
+        assert_eq!(started(&mut tasks), [1]);
+    }
+
+    /// A serial group's windows start one at a time.
+    #[test]
+    fn a_serial_group_computes_one_window_at_a_time() {
+        let graph = RefreshTaskGraph {
+            reads: vec![vec![]],
+            serial: vec![true],
+            split_by_series: vec![false],
+        };
+        let mut tasks = tasks(graph, &[window(0, 10), window(0, 20)]);
+        assert_eq!(started(&mut tasks), [0]);
+        tasks.computed(0, 0, Ok(Computed::AlreadyStored), times());
+        assert!(started(&mut tasks).is_empty());
+        tasks.next_commit().unwrap();
+        assert_eq!(started(&mut tasks), [1]);
+    }
+
+    /// A barrier passes once every window queued before it is committed,
+    /// not waiting for windows queued after it.
+    #[test]
+    fn a_barrier_passes_once_the_windows_before_it_are_committed() {
+        let graph = RefreshTaskGraph {
+            reads: vec![vec![], vec![]],
+            serial: vec![false; 2],
+            split_by_series: vec![false; 2],
+        };
+        let mut tasks = tasks(graph, &[window(0, 10)]);
+        let (reply, _answer) = oneshot::channel();
+        tasks.barrier(10, reply);
+        tasks.push(window(1, 20), Arc::new(Vec::new()), Instant::now());
+        assert_eq!(started(&mut tasks), [0, 1]);
+        assert!(tasks.passed_barriers().is_empty());
+        tasks.computed(0, 0, Ok(Computed::AlreadyStored), times());
+        tasks.next_commit().unwrap();
+        assert_eq!(tasks.passed_barriers().len(), 1);
+        assert!(!tasks.is_empty());
+    }
+
+    /// A window of a group split by series starts as one run per part and
+    /// is committed once every part is computed, with the parts in order.
+    #[test]
+    fn a_split_window_commits_once_every_part_is_computed() {
+        let graph = RefreshTaskGraph {
+            reads: vec![vec![]],
+            serial: vec![false],
+            split_by_series: vec![true],
+        };
+        let mut tasks = WindowTasks::new(graph, 3);
+        tasks.push(window(0, 10), Arc::new(Vec::new()), Instant::now());
+        let parts: Vec<Option<SeriesPartition>> =
+            tasks.start().into_iter().map(|(_, _, _, p)| p).collect();
+        assert_eq!(
+            parts,
+            (0..3)
+                .map(|index| Some(SeriesPartition { index, count: 3 }))
+                .collect::<Vec<_>>()
+        );
+        for part in [2, 0] {
+            tasks.computed(0, part, Ok(Computed::AlreadyStored), times());
+            assert!(tasks.next_commit().is_none());
+        }
+        tasks.computed(0, 1, Ok(Computed::AlreadyStored), times());
+        assert_eq!(tasks.next_commit().unwrap().result.unwrap().len(), 3);
     }
 
     /// The running flag clears when an engine thread panics.

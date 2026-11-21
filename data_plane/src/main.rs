@@ -8,6 +8,17 @@ use clap::Parser;
 /// short-lived objects across threads.
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// jemalloc's options, read when it starts (`_RJEM_MALLOC_CONF` in the
+/// environment still overrides them): background threads return freed
+/// pages within about a second (`dirty_decay_ms`) and skip the muzzy
+/// stage, and at most 8 arenas hold them. With the defaults (4 arenas per
+/// core, 10 s decay) a data plane answering a dashboard kept 300–450 MiB
+/// of freed pages resident at 10k series per metric.
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: &[u8] =
+    b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0,narenas:8\0";
 use data_plane::engine::{EngineOptions, PrecomputeMode};
 use data_plane::ingestion::IngestionOptions;
 use data_plane::{router, DataPlane, DEFAULT_FORWARD_TIMEOUT};
@@ -62,6 +73,12 @@ struct Args {
     /// Push mode: bytes of open-window state all shards may hold together.
     #[arg(long)]
     precompute_memory_budget_bytes: Option<u64>,
+    /// Threads computing closed refresh windows at once: windows of
+    /// different refresh groups, and of one group, run in parallel and are
+    /// stored in window order. 1 computes one window at a time. Default: a
+    /// quarter of the cores, from 1 to 4.
+    #[arg(long, default_value_t = EngineOptions::default().precompute_threads)]
+    precompute_threads: usize,
     /// Threads that write the view files (each the files of every n-th
     /// refresh group). Default: a quarter of the cores, from 1 to 4.
     #[arg(long, default_value_t = EngineOptions::default().persist_threads)]
@@ -134,9 +151,12 @@ async fn main() -> anyhow::Result<()> {
                 max_queued_samples: args.max_queued_samples,
                 max_precompute_backlog: args.max_precompute_backlog,
                 ingest_threads: args.ingest_threads,
+                precompute_threads: args.precompute_threads,
                 persist_threads: args.persist_threads,
                 max_persist_backlog_bytes: args.max_persist_backlog_bytes,
                 persist_delay_ms: 0,
+                slow_refreshes: Vec::new(),
+                check_task_inputs: false,
                 shard_delay_ms: 0,
                 no_forward: args.no_forward,
                 run_memory_limit_bytes: args.run_memory_limit_bytes,
@@ -153,7 +173,6 @@ async fn main() -> anyhow::Result<()> {
                     _ => PrecomputeMode::Window,
                 },
                 precompute_memory_budget_bytes: args.precompute_memory_budget_bytes,
-                slow_refreshes: Vec::new(),
                 panic_in_combine_of_window_end_ms: None,
             },
         )?

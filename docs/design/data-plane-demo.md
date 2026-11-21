@@ -122,9 +122,11 @@ Remote Write ─► HTTP threads: decode, intern series
                 ingest coordinator: watermark over the shards, closes
                 windows over the union of the shards' raw data
                      ▼
-                precompute thread: one ingestion run per closed refresh
-                window over the panes it covers; publishes a new snapshot of
-                the ingestion-time views (Arc swap)
+                precompute task pool: one ingestion run per closed refresh
+                window over the panes it covers, on --precompute-threads
+                workers; the committer stores each group's windows in
+                window order and publishes a new snapshot of the
+                ingestion-time views (Arc swap)
                      ▼
         materialized view store
           ├─ ingestion-time views: immutable snapshots, kept for each view's
@@ -196,7 +198,7 @@ HTTP queries ─► query workers: one query run per worker thread over
   queue), behind its own flush. It closes each
   refresh window the watermark passes and hands it, with every shard's raw
   data as it was then (shared `Arc` chunk lists, no copy), to the
-  precompute thread,
+  precompute task pool (below),
   which runs `execute_ingestion` and publishes the views' rows as a new
   immutable snapshot. A refresh therefore reads exactly the samples the
   serial engine read. Inside a run, a node feeding several views runs once
@@ -216,13 +218,81 @@ HTTP queries ─► query workers: one query run per worker thread over
   coordinator closes a window over every shard's raw data, so the
   minimum is reached by a flush: every shard runs what was admitted
   before it, and an idle shard answers at once.
-- One precompute thread refreshes the windows in this design; computing
-  windows in parallel is the next step (a separate, stacked change).
+- Precompute task pool (`--precompute-threads`, default a quarter of the
+  cores, 1 to 4). Each closed refresh window is a task. Windows of
+  different refresh groups compute in parallel, and so do consecutive
+  windows of one group; a group's windows are committed in window order
+  through a per-group reorder buffer (a window computed early waits for
+  the group's earlier ones). One committer (`precompute`, the former
+  precompute thread) takes the windows in the order they closed, starts
+  them, stores their rows, publishes the views once per pass and then
+  queues the windows for the persist threads, so the view store keeps one
+  writer. A group that reads another group's views (the plan's
+  `ingestion_refresh_groups` lists a group after the groups it reads)
+  starts a window only once every window of those groups that closed
+  before it is committed, and reads the views as of then: exactly the
+  windows the serial engine had stored. Each task is one
+  `execute_ingestion` on its worker (`precompute-N`); runs are not `Send`,
+  so only the output batches cross threads. An event-time barrier answers
+  once every window queued before it is committed. With 1 the committer
+  computes each window itself, one at a time, in the order they closed,
+  as before the pool. A panic in a run fails that window, not the thread.
+  ASAPQuery parallelizes precompute by series (each worker closes its own
+  partial windows). Borrowed from it: committing all the windows one pass
+  finished as one batch (`precompute_engine/worker.rs`, `flush_all` emits
+  a flush's closed windows together).
+- A window split by series. One group's window can be most of the work
+  (a 60 s dashboard at 10 Hz, 10k series: twelve per-series views over
+  12M samples, 14 s on one thread), so windows in parallel do not help.
+  When every node of a group computes each series alone (time-series
+  `Scan`s that keep the series identity, row filters, and summaries whose
+  reduction is `PerEntity`) and the group reads no other group's views,
+  each window runs as one task per precompute thread: part `i` of `n`
+  reads the raw samples of the series whose id is `i` modulo `n` (a chunk
+  is filtered by its series list; one whose series all fall in the part
+  is read as is). Each part's rows are those series' rows of the whole
+  run, since no node combines series. The committer merges the parts into
+  the order the executor emits groups in (their group values' key order)
+  as one batch per view, so the stored views are byte-identical to one
+  run's, and commits the window once every part is in. Any other group
+  (a node that combines series, such as a `by (job)` reduction, or a view
+  read) runs whole; the install log says which, and `/metrics` reports
+  `asap_precompute_window_parts` per group. Merging partial states of a
+  combining node would change floating-point sums in the last bits, so it
+  is not done.
+- Why a window's task can run on its own. A task (group `G`, window
+  `(e - W, e]`) is a pure function of immutable inputs: the raw data as it
+  was when the window closed, after every ingest shard flushed up to `e`
+  (panes shared by `Arc` and never changed in place, the earlier panes a
+  `Scan`'s lookback reads included), and the committed views of the
+  groups `G` reads. Its output, `G`'s views for that one window, is
+  disjoint from every other task's and invisible until committed. Each
+  `execute_ingestion` run starts with fresh state, so nothing passes from
+  one window to the next inside the executor. The plan is turned into a
+  task graph at install (`RefreshTaskGraph`): `(H, windows covering w)`
+  before `(G, w)` when `G` reads `H`'s views, and a group's windows commit
+  in window order. A group whose ingestion sub-DAG holds an operator that
+  may carry state across windows runs its windows one at a time, in
+  order, while other groups stay parallel. The check is conservative: an
+  operator counts as window-local only if it is known to be
+  (`MaintainPopulation`, the reserved ASAP operators and any operator
+  added later run serially until classified). A test
+  (`data_plane/tests/precompute_pool.rs`) fails any window whose run
+  starts before the views it reads are committed through its end, or
+  whose raw shards or views change while it runs. No public workload's
+  plan has a group reading another group's views at ingestion today, so
+  that order is covered by the scheduler's unit tests.
 - At most `--max-precompute-backlog` (default 256) windows wait for their
-  refresh; when the backlog is full the coordinator waits, the shards'
-  queues fill up to `--max-queued-samples`, and Remote Write gets 503 so
-  senders retry. The backlog is exported: a growing backlog means the data plane
-  cannot keep up with the input rate.
+  refresh, plus at most two per precompute thread taken by the committer
+  (one with a single thread) and one held by the thread that hands them
+  over (`precompute-queue`); when the backlog is full the coordinator
+  waits, the shards' queues fill up to `--max-queued-samples`, and Remote
+  Write gets 503 so senders retry. A shard's samples count as queued until
+  the coordinator applies the shard's report, not only until the shard has
+  run them, so the queues fill while the coordinator waits even though the
+  shards keep running, and the reports waiting for it stay bounded. The
+  backlog is exported: a growing backlog means the data plane cannot keep
+  up with the input rate.
 
 ### Queries
 
@@ -575,16 +645,16 @@ per refreshed window, a length and a MessagePack payload holding
 `(start, end]` and the rows of each view appended. A text (a label value or
 a series identity) is stored once per file: a record carries the texts it
 adds to the file's dictionary, and rows hold indices. Persisting runs in
-the background: the precompute thread publishes a refreshed window first
+the background: the precompute committer publishes a refreshed window first
 and then queues its rows for a pool of `--persist-threads` threads
 (`persist-N`; default a quarter of the cores, 1 to 4), which encode, write
 and sync. Refresh group `g` goes to thread `g % n`, so each file has
 exactly one writer and its records stay in window order. The queue is
 bounded by bytes (`--max-persist-backlog-bytes`, default 256 MiB;
 `asap_persist_backlog_bytes`, `asap_persist_backlog_windows`); only when
-it is full does the precompute thread wait, and the wait is exported
+it is full does the committer wait, and the wait is exported
 (`asap_view_persist_wait_seconds_total`). An event-time barrier answers
-once the windows before it are written, without the precompute thread
+once the windows before it are written, without the committer
 waiting. Each persist thread syncs its files (`fdatasync`) every
 `--view-sync-interval-ms` on its own timer, also when no window arrives,
 and writes and syncs everything queued when the engine stops;
@@ -623,7 +693,8 @@ retention are skipped at load.
 ### Measurements
 
 - Threads are named by role: `ingest-N` (shards), `ingest` (coordinator),
-  `precompute`, `persist-N`,
+  `precompute` (committer), `precompute-N` and `precompute-queue` (task
+  pool), `persist-N`,
   `query-N`; Remote Write is decoded on the HTTP runtime's threads.
 - `GET /metrics` exports, in the Prometheus text format:
   - `asap_phase_cpu_seconds_total`, `asap_phase_wall_seconds_total` and
@@ -647,6 +718,15 @@ retention are skipped at load.
     `asap_result_cache_{entries,bytes}`, and per query
     `asap_range_query_steps_total` and
     `asap_range_query_steps_cached_total`.
+  - Precompute task pool, per refresh group: `asap_precompute_windows_total`,
+    `asap_precompute_queue_wait_seconds_total` (window closed → its
+    computation starts), `asap_precompute_commit_wait_seconds_total`
+    (computed → committed), `asap_window_ready_seconds_total` and
+    `asap_window_ready_seconds_max` (window end in event time → committed,
+    wall clock); compute time is the `precompute` phase (summed over a
+    split window's parts), and `asap_precompute_window_parts` is the
+    runs each window is split into. Utilisation:
+    `asap_precompute_busy_seconds_total` over `asap_precompute_threads`.
   - Persistence: `asap_view_persisted_bytes_total`,
     `asap_view_sync_seconds_total`, and (view, window) pairs not persisted
     (`asap_view_windows_not_persisted_total`) or loaded at startup
@@ -655,6 +735,27 @@ retention are skipped at load.
     removed), from `/proc`, for the threads the phases do not cover.
 - `scripts/profile.sh` records a CPU profile (`perf record`) of a running
   data plane and writes a flame graph.
+
+Ingest threads, measured with `ingest_bench` (one in-process client
+sending Remote Write as fast as it is accepted, views persisted, 16 cores),
+one run each. "Acknowledged" is samples/s until every write is accepted;
+"refreshed" until every window's views are refreshed; the CPU is the sum
+over the `ingest-N` shards.
+
+| Plan | Series × seconds | Ingest threads | Acknowledged (samples/s) | Refreshed (samples/s) | `ingest-N` CPU |
+|---|---|---|---|---|---|
+| raw | 10k × 300 | 1 / 2 / 4 / 8 | 2.32M / 2.28M / 2.25M / 2.24M | 943k / 928k / 900k / 911k | 0.83 / 1.45 / 1.64 / 1.72 s |
+| raw | 100k × 120 | 1 / 2 / 4 / 8 | 1.84M / 1.76M / 1.78M / 1.80M | 659k / 574k / 528k / 618k | 3.86 / 5.47 / 7.04 / 7.30 s |
+| views | 10k × 300 | 1 / 2 / 4 / 8 | 2.34M / 2.25M / 2.21M / 2.20M | 46k / 44k / 44k / 45k | 0.86 / 1.13 / 1.27 / 1.37 s |
+| views | 100k × 120 | 1 / 2 / 4 / 8 | 1.87M / 1.76M / 1.65M / 1.67M | 38k / 38k / 38k / 42k | 3.34 / 4.74 / 5.65 / 6.25 s |
+
+More ingest threads do not raise throughput here: the single bench client,
+which decodes and sends every request itself, is the limit (about 2.3M
+samples/s at 10k series, 1.8M at 100k). The shards' CPU grows with their
+count (per-batch and flush overhead) while one shard is far from busy.
+View-heavy plans are limited by precompute and persistence (refreshed),
+not by ingestion. Measuring the shards' own limit needs several concurrent
+senders.
 
 ## Evaluation
 

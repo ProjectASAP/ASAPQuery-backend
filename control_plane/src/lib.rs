@@ -17,7 +17,7 @@ use asap_planner::{
 
 /// What the backend gives the Planner about its deployment. The Planner
 /// selects; these only say what can run and what it costs.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeploymentInputs {
     /// What the data plane can execute and keep (Stages 1–3).
     pub deployment_capabilities: DeploymentCapabilities,
@@ -27,6 +27,18 @@ pub struct DeploymentInputs {
     /// Accept every query output regardless of its accuracy guarantee:
     /// candidates are compared on cost alone.
     pub ignore_accuracy_guarantees: bool,
+}
+
+impl Default for DeploymentInputs {
+    /// This backend's capabilities ([`backend_capabilities`]), the
+    /// Planner's default cost inputs, accuracy guarantees enforced.
+    fn default() -> Self {
+        Self {
+            deployment_capabilities: backend_capabilities(),
+            cost_inputs: CostInputs::default(),
+            ignore_accuracy_guarantees: false,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -96,12 +108,16 @@ pub fn load_plan(path: &Path) -> Result<InstallablePlan, PlanError> {
 /// Planner's executor builds (the Planner's default when left `None`) and
 /// raw samples, kept in its store for query-time `Scan`s. It refreshes no
 /// view on first read yet, so no query-time result is kept across
-/// evaluations.
+/// evaluations. It keeps each planned query's final answer per evaluation
+/// time (the data plane's result cache), so a range request's earlier
+/// steps are read from the cache and their inputs need not be kept for
+/// the whole span (`final_query_results_cached`).
 pub fn backend_capabilities() -> DeploymentCapabilities {
     DeploymentCapabilities {
         supported_summaries: None,
         raw_data_retained: true,
         query_time_results_retained: false,
+        final_query_results_cached: true,
         ..DeploymentCapabilities::default()
     }
 }

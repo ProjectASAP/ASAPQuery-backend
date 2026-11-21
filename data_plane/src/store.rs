@@ -36,6 +36,7 @@ use asap_executor::arrow::array::{
     Array, ArrayRef, DictionaryArray, Float64Array, StringArray, TimestampMillisecondArray,
     UInt32Array,
 };
+use asap_executor::arrow::datatypes::UInt32Type;
 use asap_executor::planner::ir::operator::Source;
 use asap_executor::planner::ir::schema::{DataType, FieldDataType, PROMQL_SERIES_IDENTITY};
 use asap_executor::planner::plan::materialized_view::MaterializedView;
@@ -146,6 +147,51 @@ impl Chunk {
             return None;
         }
         Self::new(self.rows().filter(|(_, t, _)| start < *t && *t <= end)).map(Arc::new)
+    }
+
+    /// The rows of the series in `partition`, in order: the chunk itself
+    /// when every series is, `None` when none is. One pass over the rows,
+    /// with no lookup per row: each series' new code is found once.
+    fn in_partition(self: &Arc<Self>, partition: SeriesPartition) -> Option<Arc<Self>> {
+        const DROPPED: u32 = u32::MAX;
+        let mut new_code = vec![DROPPED; self.series.len()];
+        let mut series = Vec::new();
+        for (code, one) in self.series.iter().enumerate() {
+            if partition.holds(one.id) {
+                new_code[code] = series.len() as u32;
+                series.push(one.clone());
+            }
+        }
+        if series.len() == self.series.len() {
+            return Some(self.clone());
+        }
+        if series.is_empty() {
+            return None;
+        }
+        let (mut times, mut values, mut codes) = (Vec::new(), Vec::new(), Vec::new());
+        let rows = self
+            .codes
+            .values()
+            .iter()
+            .zip(self.time.values().iter())
+            .zip(self.value.values().iter());
+        for ((&code, &time), &value) in rows {
+            let code = new_code[code as usize];
+            if code != DROPPED {
+                times.push(time);
+                values.push(value);
+                codes.push(code);
+            }
+        }
+        let time_bounds_ms = (*times.iter().min()?, *times.iter().max()?);
+        Some(Arc::new(Self {
+            time: TimestampMillisecondArray::from(times),
+            value: Float64Array::from(values),
+            codes: UInt32Array::from(codes),
+            series,
+            identities: std::sync::OnceLock::new(),
+            time_bounds_ms,
+        }))
     }
 
     fn column(&self, kind: &ColumnKind) -> Result<ArrayRef, Error> {
@@ -309,6 +355,7 @@ impl RawData {
         metric: &str,
         request: &RawDataRequest,
         reads: Option<&RawReads>,
+        partition: Option<&PartitionReads>,
     ) -> Result<Vec<Batch>, Error> {
         let columns = column_kinds(metric, request)?;
         let Some(metric) = self.by_metric.get(metric) else {
@@ -331,6 +378,13 @@ impl RawData {
             let Some(chunk) = stored.in_range((start, end)) else {
                 continue;
             };
+            let Some(chunk) = (match partition {
+                Some(partition) if Arc::ptr_eq(stored, &chunk) => partition.chunk(stored),
+                Some(partition) => chunk.in_partition(partition.partition),
+                None => Some(chunk),
+            }) else {
+                continue;
+            };
             let convert = || -> Result<Batch, Error> {
                 let columns = columns
                     .iter()
@@ -347,6 +401,52 @@ impl RawData {
             batches.push(batch);
         }
         Ok(batches)
+    }
+}
+
+/// One of `count` disjoint parts of the series, by series id: a window's
+/// ingestion run split by series reads one part per run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeriesPartition {
+    pub index: u32,
+    pub count: u32,
+}
+
+impl SeriesPartition {
+    fn holds(&self, series_id: u32) -> bool {
+        series_id % self.count == self.index
+    }
+}
+
+/// One run's part of the series and the stored chunks it has cut to that
+/// part, so the run's scans filter each chunk (and build its series
+/// identities) once, as a whole run reads each chunk's cached ones.
+pub struct PartitionReads {
+    partition: SeriesPartition,
+    /// By chunk address; each entry holds the chunk, so its address is not
+    /// reused while it is kept.
+    chunks: Mutex<HashMap<usize, CutChunk>>,
+}
+
+/// A stored chunk and its rows of one part of the series (`None`: none).
+type CutChunk = (Arc<Chunk>, Option<Arc<Chunk>>);
+
+impl PartitionReads {
+    pub fn new(partition: SeriesPartition) -> Self {
+        Self {
+            partition,
+            chunks: Mutex::default(),
+        }
+    }
+
+    fn chunk(&self, stored: &Arc<Chunk>) -> Option<Arc<Chunk>> {
+        let key = Arc::as_ptr(stored) as usize;
+        let mut chunks = self.chunks.lock().unwrap_or_else(|e| e.into_inner());
+        chunks
+            .entry(key)
+            .or_insert_with(|| (stored.clone(), stored.in_partition(self.partition)))
+            .1
+            .clone()
     }
 }
 
@@ -448,6 +548,8 @@ pub struct RunStore {
     views: Arc<ViewStore>,
     /// Chunks converted by the other evaluations of the same range request.
     raw_reads: Option<Arc<RawReads>>,
+    /// The series the run reads raw samples of; `None`: every series.
+    partition: Option<PartitionReads>,
     /// The query-time results the run reads, by node: each computed for
     /// the run's evaluation time before the run starts and held by the run.
     query_time_results: HashMap<PhysicalASAPNodeId, Arc<Vec<Batch>>>,
@@ -471,8 +573,21 @@ impl RunStore {
             raw_data,
             views,
             raw_reads,
+            partition: None,
             query_time_results,
             missing_view_rows: Mutex::new(None),
+        }
+    }
+
+    /// A run reading the raw samples of `partition`'s series only.
+    pub fn for_partition(
+        raw_data: RawShards,
+        views: Arc<ViewStore>,
+        partition: Option<SeriesPartition>,
+    ) -> Self {
+        Self {
+            partition: partition.map(PartitionReads::new),
+            ..Self::new(raw_data, views)
         }
     }
 
@@ -499,7 +614,12 @@ impl DataStore for RunStore {
         };
         let mut batches = Vec::new();
         for shard in self.raw_data.iter() {
-            batches.extend(shard.read(metric, request, self.raw_reads.as_deref())?);
+            batches.extend(shard.read(
+                metric,
+                request,
+                self.raw_reads.as_deref(),
+                self.partition.as_ref(),
+            )?);
         }
         Ok(stream::iter(batches)
             .map(move |batch| {
@@ -541,19 +661,117 @@ impl DataStore for RunStore {
     }
 }
 
-/// Rows stored for one view: the `(start, end]` they cover and their
-/// batches, oldest first.
+/// Rows stored for one view: one entry per appended window, oldest first.
 type ViewRows = Vec<ViewWindow>;
 
-/// One window of a view's rows: the `(start, end]` they cover and their
-/// batches.
-type ViewWindow = ((i64, i64), Arc<Vec<Batch>>);
+/// One window of a view's rows: the `(start, end]` they cover, their
+/// batches, and the bytes they hold apart from the view's shared texts.
+#[derive(Clone)]
+struct ViewWindow {
+    time_range_ms: (i64, i64),
+    batches: Arc<Vec<Batch>>,
+    /// Counted when the window is appended: a run that later reads its
+    /// states marks them held outside the run, after which
+    /// [`Batch::memory_bytes`] no longer counts them.
+    bytes: usize,
+}
+
+/// The texts of one text column of one view, each stored once: every
+/// window's dictionary column of that view has this one values array, and
+/// a window holds only its rows' keys into it. Append-only: a text stays
+/// for as long as the data plane runs, as the series interner keeps its
+/// series.
+#[derive(Default)]
+struct SharedTexts {
+    code_of: HashMap<Arc<str>, u32>,
+    texts: Vec<Arc<str>>,
+    /// The values array the windows share, rebuilt when a text is added.
+    values: Option<ArrayRef>,
+}
+
+impl SharedTexts {
+    /// `column` re-keyed into the shared values; `None` when it is not a
+    /// dictionary of texts.
+    fn share(&mut self, column: &ArrayRef) -> Result<Option<ArrayRef>, Error> {
+        let Some(dictionary) = column
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
+        else {
+            return Ok(None);
+        };
+        let Some(own_values) = dictionary.values().as_any().downcast_ref::<StringArray>() else {
+            return Ok(None);
+        };
+        if self
+            .values
+            .as_ref()
+            .is_some_and(|values| Arc::ptr_eq(values, dictionary.values()))
+        {
+            return Ok(Some(column.clone()));
+        }
+        // The window's own entries, mapped to shared codes once each.
+        let mut added = false;
+        let mut code_of_entry: Vec<Option<u32>> = vec![None; own_values.len()];
+        let keys = dictionary.keys();
+        let mut shared_keys = Vec::with_capacity(keys.len());
+        for row in 0..keys.len() {
+            if keys.is_null(row) {
+                shared_keys.push(None);
+                continue;
+            }
+            let entry = keys.value(row) as usize;
+            let code = match code_of_entry[entry] {
+                Some(code) => code,
+                None => {
+                    let text = own_values.value(entry);
+                    let code = match self.code_of.get(text) {
+                        Some(&code) => code,
+                        None => {
+                            let code = u32::try_from(self.texts.len()).map_err(|_| {
+                                Error::Invalid("more than u32::MAX texts in one view".into())
+                            })?;
+                            let text: Arc<str> = text.into();
+                            self.texts.push(text.clone());
+                            self.code_of.insert(text, code);
+                            added = true;
+                            code
+                        }
+                    };
+                    code_of_entry[entry] = Some(code);
+                    code
+                }
+            };
+            shared_keys.push(Some(code));
+        }
+        if added || self.values.is_none() {
+            self.values = Some(Arc::new(StringArray::from_iter_values(
+                self.texts.iter().map(|text| &**text),
+            )));
+        }
+        let values = self.values.clone().expect("set above");
+        Ok(Some(Arc::new(
+            DictionaryArray::<UInt32Type>::try_new(UInt32Array::from(shared_keys), values)
+                .map_err(|e| Error::Invalid(e.to_string()))?,
+        )))
+    }
+
+    /// Bytes of the shared values (counted once per view column).
+    fn bytes(&self) -> usize {
+        self.values
+            .as_ref()
+            .map_or(0, |values| values.get_array_memory_size())
+    }
+}
 
 /// Each materialized view's stored rows. Cloning shares every batch, so a
-/// writer copies only the per-view lists when a run still reads them.
+/// writer copies only the per-view lists when a run still reads them; the
+/// shared texts are shared by every clone (only the precompute thread
+/// appends).
 #[derive(Default, Clone)]
 pub struct ViewStore {
     by_view: BTreeMap<PhysicalASAPNodeId, ViewRows>,
+    /// Per view and text column index, the texts its windows share.
+    texts: BTreeMap<(PhysicalASAPNodeId, usize), Arc<Mutex<SharedTexts>>>,
 }
 
 impl ViewStore {
@@ -565,7 +783,7 @@ impl ViewStore {
             .map(|(view, rows)| {
                 let windows = rows
                     .iter()
-                    .map(|(range, batches)| (*range, batches.as_ref().clone()))
+                    .map(|w| (w.time_range_ms, w.batches.as_ref().clone()))
                     .collect();
                 (*view, windows)
             })
@@ -576,7 +794,9 @@ impl ViewStore {
     /// (`(start, end]`), then drops its rows ending `view.retention_ms()`
     /// or more before `end` (the newest are always kept). Bad input when
     /// the range is empty or starts before the end of the rows appended
-    /// last (the store is append-only).
+    /// last (the store is append-only). Each text column (a series
+    /// identity or a label) is stored with the view's shared texts, so a
+    /// text is held once per view however many windows it is in.
     pub fn append(
         &mut self,
         view: &MaterializedView,
@@ -584,37 +804,103 @@ impl ViewStore {
         batches: Vec<Batch>,
     ) -> Result<(), Error> {
         let (start, end) = time_range_ms;
-        let rows = self.by_view.entry(view.node_id).or_default();
         if start >= end
-            || rows
-                .last()
-                .is_some_and(|((_, last_end), _)| start < *last_end)
+            || self
+                .by_view
+                .get(&view.node_id)
+                .and_then(|rows| rows.last())
+                .is_some_and(|window| start < window.time_range_ms.1)
         {
             return Err(Error::Invalid(format!(
                 "materialized view {}: appended rows ({start}, {end}] are empty or not after the stored ones",
                 view.node_id
             )));
         }
-        rows.push((time_range_ms, Arc::new(batches)));
+        let batches = batches
+            .into_iter()
+            .map(|batch| self.share_texts(view.node_id, batch))
+            .collect::<Result<Vec<_>, Error>>()?;
+        let bytes = batches.iter().map(window_batch_bytes).sum();
+        let rows = self.by_view.entry(view.node_id).or_default();
+        rows.push(ViewWindow {
+            time_range_ms,
+            batches: Arc::new(batches),
+            bytes,
+        });
         let retention_ms = i64::try_from(view.retention_ms()).unwrap_or(i64::MAX);
         let oldest_kept_end = end.saturating_sub(retention_ms);
-        rows.retain(|((_, row_end), _)| *row_end > oldest_kept_end || *row_end == end);
+        rows.retain(|window| {
+            let row_end = window.time_range_ms.1;
+            row_end > oldest_kept_end || row_end == end
+        });
         Ok(())
+    }
+
+    /// `batch` with each text column keyed into `view`'s shared texts.
+    fn share_texts(&mut self, view: PhysicalASAPNodeId, batch: Batch) -> Result<Batch, Error> {
+        let schema = batch.schema().clone();
+        let mut changed = false;
+        let mut columns = Vec::with_capacity(schema.fields.len());
+        for (index, field) in schema.fields.iter().enumerate() {
+            if let Some(states) = batch.state_column(index) {
+                let indices = batch
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .ok_or_else(|| Error::Invalid("state indices are not u32".into()))?
+                    .clone();
+                columns.push(BatchColumn::States {
+                    indices,
+                    states: states.clone(),
+                });
+                continue;
+            }
+            let column = batch.column(index);
+            let shared = if field.dtype == FieldDataType::Plain(DataType::Utf8) {
+                let texts = self.texts.entry((view, index)).or_default().clone();
+                let mut texts = texts.lock().unwrap_or_else(|e| e.into_inner());
+                texts.share(column)?
+            } else {
+                None
+            };
+            match shared {
+                Some(array) => {
+                    changed |= !Arc::ptr_eq(&array, column);
+                    columns.push(BatchColumn::Plain(array));
+                }
+                None => columns.push(BatchColumn::Plain(column.clone())),
+            }
+        }
+        if !changed {
+            return Ok(batch);
+        }
+        Batch::try_from_columns(schema, columns)
     }
 
     /// The end of `view`'s newest stored rows.
     pub fn stored_through(&self, view: PhysicalASAPNodeId) -> Option<i64> {
-        self.by_view.get(&view)?.last().map(|((_, end), _)| *end)
+        self.by_view
+            .get(&view)?
+            .last()
+            .map(|window| window.time_range_ms.1)
     }
 
-    /// Bytes of the stored rows.
+    /// Bytes of the stored rows: each window as counted when it was
+    /// appended (states included, whether or not a run has read them
+    /// since), plus each view's shared texts once.
     pub fn bytes(&self) -> usize {
-        self.by_view
+        let windows: usize = self
+            .by_view
             .values()
             .flatten()
-            .flat_map(|(_, batches)| batches.iter())
-            .map(Batch::memory_bytes)
-            .sum()
+            .map(|window| window.bytes)
+            .sum();
+        let texts: usize = self
+            .texts
+            .values()
+            .map(|texts| texts.lock().unwrap_or_else(|e| e.into_inner()).bytes())
+            .sum();
+        windows + texts
     }
 
     /// `view`'s rows whose ranges tile `request.time_range_ms` exactly;
@@ -636,31 +922,51 @@ impl ViewStore {
         // Rows are disjoint and oldest first, so the rows inside the range
         // are one slice: from the first starting at or after `start` to
         // the last ending at or before `end`.
-        let first = rows.partition_point(|((row_start, _), _)| *row_start < start);
-        let past_last = rows.partition_point(|((_, row_end), _)| *row_end <= end);
+        let first = rows.partition_point(|window| window.time_range_ms.0 < start);
+        let past_last = rows.partition_point(|window| window.time_range_ms.1 <= end);
         let selected: &[ViewWindow] = rows.get(first..past_last).unwrap_or_default();
         // The selected ranges, oldest first, must tile `(start, end]`.
         let mut covered_to = start;
-        for ((row_start, row_end), _) in selected {
-            if *row_start != covered_to {
+        for window in selected {
+            let (row_start, row_end) = window.time_range_ms;
+            if row_start != covered_to {
                 return Err(missing());
             }
-            covered_to = *row_end;
+            covered_to = row_end;
         }
         if covered_to != end {
             return Err(missing());
         }
-        Ok(
-            stream::iter(selected.iter().flat_map(|(_, b)| b.iter().cloned()))
-                .map(move |batch| {
-                    if context.is_cancelled() {
-                        return Err(Error::Cancelled);
-                    }
-                    Ok(batch)
-                })
-                .boxed_local(),
+        Ok(stream::iter(
+            selected
+                .iter()
+                .flat_map(|window| window.batches.iter().cloned()),
         )
+        .map(move |batch| {
+            if context.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            Ok(batch)
+        })
+        .boxed_local())
     }
+}
+
+/// A stored window batch's bytes apart from its shared texts: its own
+/// buffers and states ([`Batch::memory_bytes`]) less each text column's
+/// values array, which the view's [`SharedTexts`] counts once.
+fn window_batch_bytes(batch: &Batch) -> usize {
+    let shared: usize = (0..batch.schema().fields.len())
+        .filter(|&index| batch.state_column(index).is_none())
+        .filter_map(|index| {
+            batch
+                .column(index)
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+                .map(|dictionary| dictionary.values().get_array_memory_size())
+        })
+        .sum();
+    batch.memory_bytes().saturating_sub(shared)
 }
 
 /// The newest published snapshot of the store, which every query run reads.
@@ -1008,7 +1314,7 @@ mod tests {
             schema,
             predicates: &[],
         };
-        raw.read("m_store_test", &request, reads)
+        raw.read("m_store_test", &request, reads, None)
             .unwrap()
             .iter()
             .flat_map(Batch::to_rows)
@@ -1134,6 +1440,96 @@ mod tests {
                 "{range:?}"
             );
         }
+    }
+
+    /// Every window of a view keys its text columns into one shared values
+    /// array: a series identity is stored once per view, the rows read back
+    /// unchanged, and a series first seen in a later window is added
+    /// without changing the earlier windows' rows.
+    #[test]
+    fn view_windows_share_one_copy_of_each_text() {
+        let view: MaterializedView = serde_json::from_value(serde_json::json!({
+            "node_id": 1,
+            "refresh": "on_first_read",
+            "coverage": {"definition_id": "test-view", "selection": []},
+            "inputs": {"materialized_views": []},
+            "retention_ms": 1_000_000,
+        }))
+        .unwrap();
+        let schema = schema();
+        // Identities of 200 bytes: one copy of 101 of them is 20 KB.
+        let identity = |s: usize| {
+            format!(
+                r#"{{"__name__":"data","instance":"host-{s:04}","pad":"{}"}}"#,
+                "x".repeat(155)
+            )
+        };
+        let window = |end: i64, series: usize| -> Vec<Vec<Value>> {
+            (0..series)
+                .map(|s| {
+                    vec![
+                        Value::Timestamp(end),
+                        Value::Float64(s as f64),
+                        Value::Utf8(identity(s).into()),
+                        Value::Utf8(format!("job-{}", s % 3).into()),
+                    ]
+                })
+                .collect()
+        };
+        let mut views = ViewStore::default();
+        let mut appended = Vec::new();
+        for (end, series) in [(10, 100), (20, 100), (30, 101)] {
+            let rows = window(end, series);
+            views
+                .append(
+                    &view,
+                    (end - 10, end),
+                    vec![Batch::try_new(schema.clone(), rows.clone()).unwrap()],
+                )
+                .unwrap();
+            appended.push(rows);
+        }
+        let stored = &views.by_view[&1];
+        for (window, rows) in stored.iter().zip(&appended) {
+            assert_eq!(
+                format!("{:?}", window.batches[0].to_rows()),
+                format!("{rows:?}")
+            );
+        }
+        let values = |window: &ViewWindow, column: usize| {
+            window.batches[0]
+                .column(column)
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+                .unwrap()
+                .values()
+                .clone()
+        };
+        // The first two windows share one values array per text column;
+        // the third, with a new series, holds the grown one.
+        for column in [2, 3] {
+            assert!(Arc::ptr_eq(
+                &values(&stored[0], column),
+                &values(&stored[1], column)
+            ));
+        }
+        assert_eq!(values(&stored[2], 2).len(), 101);
+        // A window adds its rows' columns and keys, not a copy of the
+        // identities.
+        let identities: usize = (0..101).map(|s| identity(s).len()).sum();
+        let one_window = views.bytes();
+        views
+            .append(
+                &view,
+                (30, 40),
+                vec![Batch::try_new(schema.clone(), window(40, 101)).unwrap()],
+            )
+            .unwrap();
+        let added = views.bytes() - one_window;
+        assert!(
+            added < identities / 2,
+            "a window added {added} bytes; identities are {identities}"
+        );
     }
 
     /// A query-time result at a time the watermark has passed is computed
