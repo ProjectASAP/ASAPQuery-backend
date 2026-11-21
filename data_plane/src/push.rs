@@ -37,7 +37,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use asap_executor::planner::ir::operator::Source;
-use asap_executor::planner::ir::ScalarExpr;
 use asap_executor::planner::plan::materialized_view::MaterializedView;
 use asap_executor::runtime::{Limits, OutputStream, RunContext, Scope};
 use asap_executor::sources::{DataStore, MaterializedViewRequest, RawDataRequest};
@@ -52,31 +51,61 @@ use crate::ingestion::{window_end, ClosedWindow, Computed, Precompute};
 use crate::metrics::{Metrics, Timer};
 use crate::store::{RawData, RawSample};
 
-/// One `Scan`'s stream in an instance: what it asked for and where its
+/// The samples of one Remote Write request routed to a shard, and their
+/// batches converted once per metric and slot schema: every `Scan` of
+/// every open window reading that metric in that schema gets the same
+/// batches (the executor re-applies each slot's time range and
+/// predicates, so the conversion ignores them).
+pub struct Morsel {
+    raw: RawData,
+    converted: RefCell<HashMap<(String, String), Vec<Batch>>>,
+}
+
+impl Morsel {
+    fn batches(
+        &self,
+        metric: &str,
+        schema_key: &str,
+        schema: &SchemaRef,
+    ) -> Result<Vec<Batch>, Error> {
+        let key = (metric.to_string(), schema_key.to_string());
+        if let Some(batches) = self.converted.borrow().get(&key) {
+            return Ok(batches.clone());
+        }
+        let request = RawDataRequest {
+            time_range_ms: None,
+            schema,
+            predicates: &[],
+        };
+        let batches: Vec<Batch> = self
+            .raw
+            .read(metric, &request, None, None)?
+            .into_iter()
+            .filter(|b| b.num_rows() > 0)
+            .collect();
+        self.converted.borrow_mut().insert(key, batches.clone());
+        Ok(batches)
+    }
+}
+
+/// One `Scan`'s stream in an instance: what it reads and where its
 /// batches go.
 struct Reader {
     metric: String,
-    time_range_ms: Option<(i64, i64)>,
     schema: SchemaRef,
-    predicates: Vec<ScalarExpr<()>>,
+    /// The schema, printed: readers with equal schemas share conversions.
+    schema_key: String,
     sender: Option<UnboundedSender<Batch>>,
 }
 
 impl Reader {
     /// `morsel`'s rows of this reader's metric, in its schema.
-    fn feed(&self, morsel: &RawData) -> Result<(), Error> {
+    fn feed(&self, morsel: &Morsel) -> Result<(), Error> {
         let Some(sender) = &self.sender else {
             return Ok(());
         };
-        let request = RawDataRequest {
-            time_range_ms: self.time_range_ms,
-            schema: &self.schema,
-            predicates: &self.predicates,
-        };
-        for batch in morsel.read(&self.metric, &request, None, None)? {
-            if batch.num_rows() > 0 {
-                let _ = sender.unbounded_send(batch);
-            }
+        for batch in morsel.batches(&self.metric, &self.schema_key, &self.schema)? {
+            let _ = sender.unbounded_send(batch);
         }
         Ok(())
     }
@@ -89,7 +118,9 @@ pub struct Feed {
     /// `Scan`s per metric the run opens (from the install probe); while
     /// fewer are open, morsels are kept to replay to the late ones.
     expected: HashMap<String, usize>,
-    pending: RefCell<Vec<Arc<RawData>>>,
+    /// Each `Scan`'s requested time range (for the install probe).
+    ranges: RefCell<Vec<Option<(i64, i64)>>>,
+    pending: RefCell<Vec<Arc<Morsel>>>,
 }
 
 impl Feed {
@@ -100,7 +131,7 @@ impl Feed {
             .all(|(metric, count)| readers.iter().filter(|r| &r.metric == metric).count() >= *count)
     }
 
-    fn feed(&self, morsel: &Arc<RawData>) -> Result<(), Error> {
+    fn feed(&self, morsel: &Arc<Morsel>) -> Result<(), Error> {
         for reader in self.readers.borrow().iter() {
             reader.feed(morsel)?;
         }
@@ -140,11 +171,11 @@ impl DataStore for PushStore {
         let (sender, receiver) = unbounded();
         let reader = Reader {
             metric: metric.clone(),
-            time_range_ms: request.time_range_ms,
             schema: request.schema.clone(),
-            predicates: request.predicates.to_vec(),
+            schema_key: format!("{:?}", request.schema),
             sender: Some(sender),
         };
+        self.feed.ranges.borrow_mut().push(request.time_range_ms);
         for morsel in self.feed.pending.borrow().iter() {
             reader.feed(morsel)?;
         }
@@ -236,7 +267,9 @@ pub fn probe(
             let mut exact = true;
             for reader in feed.readers.borrow().iter() {
                 *reads.entry(reader.metric.clone()).or_default() += 1;
-                exact &= reader.time_range_ms == Some((end - width_ms, end));
+            }
+            for range in feed.ranges.borrow().iter() {
+                exact &= *range == Some((end - width_ms, end));
             }
             feed.seal();
             pool.run_until_stalled();
@@ -351,9 +384,12 @@ impl PushShard {
         if samples.is_empty() || self.metrics.is_empty() {
             return 0;
         }
-        let mut morsel = RawData::for_metrics(self.metrics.iter(), self.pane_width_ms);
-        morsel.append(samples);
-        let morsel = Arc::new(morsel);
+        let mut raw = RawData::for_metrics(self.metrics.iter(), self.pane_width_ms);
+        raw.append(samples);
+        let morsel = Arc::new(Morsel {
+            raw,
+            converted: RefCell::default(),
+        });
         let mut late = 0;
         let mut ends: Vec<BTreeSet<i64>> = vec![BTreeSet::new(); self.groups.len()];
         for sample in samples {
