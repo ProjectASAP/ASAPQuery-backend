@@ -125,6 +125,41 @@ impl Latency {
     }
 }
 
+/// One refresh group's windows on their way through the precompute task
+/// pool.
+#[derive(Default)]
+pub struct WindowLatency {
+    /// Windows committed (refreshed, already stored or failed).
+    pub windows: AtomicU64,
+    /// From the window closing to its computation starting: the backlog,
+    /// waiting for the windows it reads and for a free worker.
+    pub queue_wait_ns: AtomicU64,
+    /// From its computation ending to its commit: waiting for the group's
+    /// earlier windows.
+    pub commit_wait_ns: AtomicU64,
+    /// From the window's end (event time) to its commit (wall clock).
+    pub ready_ms: AtomicU64,
+    pub ready_max_ms: AtomicU64,
+}
+
+impl WindowLatency {
+    pub fn record(
+        &self,
+        queue_wait: std::time::Duration,
+        commit_wait: std::time::Duration,
+        ready_ms: i64,
+    ) {
+        self.windows.fetch_add(1, Ordering::Relaxed);
+        self.queue_wait_ns
+            .fetch_add(queue_wait.as_nanos() as u64, Ordering::Relaxed);
+        self.commit_wait_ns
+            .fetch_add(commit_wait.as_nanos() as u64, Ordering::Relaxed);
+        self.ready_ms.fetch_add(ready_ms as u64, Ordering::Relaxed);
+        self.ready_max_ms
+            .fetch_max(ready_ms as u64, Ordering::Relaxed);
+    }
+}
+
 /// One planned query's measurements.
 #[derive(Default)]
 pub struct QueryMetrics {
@@ -152,6 +187,12 @@ pub struct Metrics {
     pub append: PhaseStats,
     /// Each refresh group's ingestion runs, with its labels.
     pub precompute: Vec<(String, PhaseStats)>,
+    /// Each refresh group's waits around its ingestion runs.
+    pub precompute_windows: Vec<WindowLatency>,
+    /// Wall time the precompute threads spent computing windows.
+    pub precompute_busy_ns: AtomicU64,
+    /// Threads computing windows (`--precompute-threads`).
+    pub precompute_threads: AtomicU64,
     /// Each planned query's runs, by query text.
     pub queries: BTreeMap<String, QueryMetrics>,
     /// The watermark, `i64::MIN` before the first.
@@ -190,6 +231,9 @@ impl Metrics {
                     (labels, PhaseStats::default())
                 })
                 .collect(),
+            precompute_windows: groups.iter().map(|_| WindowLatency::default()).collect(),
+            precompute_busy_ns: AtomicU64::new(0),
+            precompute_threads: AtomicU64::new(1),
             queries: queries
                 .iter()
                 .map(|query| (query.trim().to_string(), QueryMetrics::default()))
@@ -437,6 +481,65 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
         family(&mut out, name, "counter", help);
         let _ = writeln!(out, "{name} {value}");
     }
+    let seconds = |ns: &AtomicU64| ns.load(Ordering::Relaxed) as f64 / 1e9;
+    for (name, help, value) in [
+        (
+            "asap_precompute_windows_total",
+            "Refresh windows committed, by refresh group.",
+            (|w: &WindowLatency| w.windows.load(Ordering::Relaxed) as f64)
+                as fn(&WindowLatency) -> f64,
+        ),
+        (
+            "asap_precompute_queue_wait_seconds_total",
+            "Time from a window closing to its computation starting, by refresh group.",
+            |w| w.queue_wait_ns.load(Ordering::Relaxed) as f64 / 1e9,
+        ),
+        (
+            "asap_precompute_commit_wait_seconds_total",
+            "Time from a window computed to its commit, waiting for the group's earlier windows.",
+            |w| w.commit_wait_ns.load(Ordering::Relaxed) as f64 / 1e9,
+        ),
+        (
+            "asap_window_ready_seconds_total",
+            "Time from a window's end (event time) to its commit (wall clock), by refresh group.",
+            |w| w.ready_ms.load(Ordering::Relaxed) as f64 / 1e3,
+        ),
+    ] {
+        family(&mut out, name, "counter", help);
+        for (group, windows) in metrics.precompute_windows.iter().enumerate() {
+            let _ = writeln!(out, "{name}{{group=\"{group}\"}} {}", value(windows));
+        }
+    }
+    family(
+        &mut out,
+        "asap_window_ready_seconds_max",
+        "gauge",
+        "The longest time from a window's end to its commit, by refresh group.",
+    );
+    for (group, windows) in metrics.precompute_windows.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "asap_window_ready_seconds_max{{group=\"{group}\"}} {}",
+            windows.ready_max_ms.load(Ordering::Relaxed) as f64 / 1e3
+        );
+    }
+    family(
+        &mut out,
+        "asap_precompute_busy_seconds_total",
+        "counter",
+        "Wall time the precompute threads spent computing windows; divided by asap_precompute_threads, the task pool's utilisation.",
+    );
+    let _ = writeln!(
+        out,
+        "asap_precompute_busy_seconds_total {}",
+        seconds(&metrics.precompute_busy_ns)
+    );
+    gauge(
+        &mut out,
+        "asap_precompute_threads",
+        "Threads computing refresh windows.",
+        load(&metrics.precompute_threads),
+    );
     let results = gauges.query_time_results;
     gauge(
         &mut out,

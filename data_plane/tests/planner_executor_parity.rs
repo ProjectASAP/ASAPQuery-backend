@@ -194,6 +194,11 @@ async fn data_plane(
             .map_or(EngineOptions::default().ingest_threads, |n| {
                 n.parse().unwrap()
             }),
+        // `PARITY_PRECOMPUTE_THREADS=n` computes windows on `n` threads.
+        precompute_threads: std::env::var("PARITY_PRECOMPUTE_THREADS")
+            .map_or(EngineOptions::default().precompute_threads, |n| {
+                n.parse().unwrap()
+            }),
         ingestion: IngestionOptions {
             allowed_lateness_ms: 0,
             max_future_ms: 0,

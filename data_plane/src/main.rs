@@ -65,6 +65,12 @@ struct Args {
     /// series hashed to it. Default: a quarter of the cores, at least 1.
     #[arg(long, default_value_t = EngineOptions::default().ingest_threads)]
     ingest_threads: usize,
+    /// Threads computing closed refresh windows at once: windows of
+    /// different refresh groups, and of one group, run in parallel and are
+    /// stored in window order. 1 computes one window at a time. Default: a
+    /// quarter of the cores, from 1 to 4.
+    #[arg(long, default_value_t = EngineOptions::default().precompute_threads)]
+    precompute_threads: usize,
     /// Threads that write the view files (each the files of every n-th
     /// refresh group). Default: a quarter of the cores, from 1 to 4.
     #[arg(long, default_value_t = EngineOptions::default().persist_threads)]
@@ -137,9 +143,12 @@ async fn main() -> anyhow::Result<()> {
                 max_queued_samples: args.max_queued_samples,
                 max_precompute_backlog: args.max_precompute_backlog,
                 ingest_threads: args.ingest_threads,
+                precompute_threads: args.precompute_threads,
                 persist_threads: args.persist_threads,
                 max_persist_backlog_bytes: args.max_persist_backlog_bytes,
                 persist_delay_ms: 0,
+                slow_refreshes: Vec::new(),
+                check_task_inputs: false,
                 shard_delay_ms: 0,
                 no_forward: args.no_forward,
                 run_memory_limit_bytes: args.run_memory_limit_bytes,
