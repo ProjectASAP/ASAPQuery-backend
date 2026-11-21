@@ -48,7 +48,10 @@ use asap_executor::Error;
 use futures::{stream, StreamExt};
 
 use crate::ingestion::window_end;
+use crate::metrics::{PhaseStats, Timer};
+use crate::persist::{ViewRead, WindowLocation};
 use crate::series_ids::Series;
+use crate::window_cache::{WindowCache, WindowKey};
 
 /// One raw sample: its series (interned: its id and full label set,
 /// `__name__` included), time and value.
@@ -664,16 +667,179 @@ impl DataStore for RunStore {
 /// Rows stored for one view: one entry per appended window, oldest first.
 type ViewRows = Vec<ViewWindow>;
 
-/// One window of a view's rows: the `(start, end]` they cover, their
-/// batches, and the bytes they hold apart from the view's shared texts.
+/// One window of a view's rows: the `(start, end]` they cover and where
+/// the rows are.
 #[derive(Clone)]
 struct ViewWindow {
     time_range_ms: (i64, i64),
-    batches: Arc<Vec<Batch>>,
-    /// Counted when the window is appended: a run that later reads its
-    /// states marks them held outside the run, after which
-    /// [`Batch::memory_bytes`] no longer counts them.
-    bytes: usize,
+    slot: Arc<WindowSlot>,
+}
+
+#[cfg(test)]
+impl ViewWindow {
+    /// The window's batches, for tests: it must be in memory.
+    fn batches(&self) -> Arc<Vec<Batch>> {
+        self.slot.batches().unwrap()
+    }
+}
+
+/// The cold tier's shared parts (docs/design/tiered-view-storage.md): the
+/// window cache, how cold windows are read, and what the tier counts.
+pub struct ViewTier {
+    pub cache: WindowCache,
+    pub read: ViewRead,
+    /// For tests: each cold decode waits this long first.
+    pub decode_delay: std::time::Duration,
+    /// Bytes of windows committed and not yet written to a file.
+    pub pending_bytes: AtomicU64,
+    /// Bytes of windows that cannot be written, kept in memory.
+    pub pinned_bytes: AtomicU64,
+    /// Cold windows decoded, and the file bytes they read.
+    pub cold_reads: AtomicU64,
+    pub cold_read_bytes: AtomicU64,
+    /// Decoding cold windows (`phase="view_decode"`).
+    pub decode: PhaseStats,
+}
+
+impl ViewTier {
+    pub fn new(cache: WindowCache, read: ViewRead, decode_delay: std::time::Duration) -> Self {
+        Self {
+            cache,
+            read,
+            decode_delay,
+            pending_bytes: AtomicU64::new(0),
+            pinned_bytes: AtomicU64::new(0),
+            cold_reads: AtomicU64::new(0),
+            cold_read_bytes: AtomicU64::new(0),
+            decode: PhaseStats::default(),
+        }
+    }
+}
+
+/// Where a committed window's rows are.
+enum SlotState {
+    /// Committed, not yet written to a file: in memory.
+    Pending(Arc<Vec<Batch>>),
+    /// Written: its fragment in a segment, decoded on read unless cached.
+    Stored(WindowLocation),
+    /// Cannot be written (no encoding, a write error, or persistence off):
+    /// in memory for as long as the window is kept.
+    Pinned(Arc<Vec<Batch>>),
+}
+
+/// One view's stored window, shared by every snapshot holding it. Its
+/// state moves from `Pending` to `Stored` (or `Pinned`) once its persist
+/// thread has written it, without the view store changing.
+pub struct WindowSlot {
+    key: WindowKey,
+    schema: SchemaRef,
+    /// Its rows' bytes when decoded, counted when appended (a run that
+    /// later reads its states marks them held outside the run, after which
+    /// [`Batch::memory_bytes`] no longer counts them).
+    bytes: u64,
+    /// Its state, and whether the window left the store (past retention).
+    state: Mutex<(SlotState, bool)>,
+    tier: Option<Arc<ViewTier>>,
+}
+
+impl WindowSlot {
+    fn lock(&self) -> std::sync::MutexGuard<'_, (SlotState, bool)> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The window was written at `location`: it leaves memory unless the
+    /// cache keeps it.
+    pub fn stored(&self, location: WindowLocation) {
+        let mut state = self.lock();
+        let SlotState::Pending(batches) = &state.0 else {
+            return;
+        };
+        let batches = batches.clone();
+        let dropped = state.1;
+        state.0 = SlotState::Stored(location);
+        drop(state);
+        if let Some(tier) = &self.tier {
+            if !dropped {
+                tier.pending_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+                tier.cache
+                    .insert(self.key, batches, self.bytes, std::time::Instant::now());
+            }
+        }
+    }
+
+    /// The window cannot be written: it stays in memory.
+    pub fn pin(&self) {
+        let mut state = self.lock();
+        let SlotState::Pending(batches) = &state.0 else {
+            return;
+        };
+        state.0 = SlotState::Pinned(batches.clone());
+        if let (Some(tier), false) = (&self.tier, state.1) {
+            tier.pending_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+            tier.pinned_bytes.fetch_add(self.bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// The window left the store (past retention): it is no longer counted
+    /// or cached; snapshots holding it still read it.
+    fn left_store(&self) {
+        let mut state = self.lock();
+        if state.1 {
+            return;
+        }
+        state.1 = true;
+        let Some(tier) = &self.tier else {
+            return;
+        };
+        match &state.0 {
+            SlotState::Pending(_) => {
+                tier.pending_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+            }
+            SlotState::Pinned(_) => {
+                tier.pinned_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+            }
+            SlotState::Stored(_) => tier.cache.remove(self.key),
+        }
+    }
+
+    /// Bytes held in memory outside the cache: `Pending` and `Pinned`.
+    fn heap_bytes(&self) -> u64 {
+        match self.lock().0 {
+            SlotState::Pending(_) | SlotState::Pinned(_) => self.bytes,
+            SlotState::Stored(_) => 0,
+        }
+    }
+
+    /// The window's batches: from memory, the cache, or its fragment.
+    fn batches(&self) -> Result<Arc<Vec<Batch>>, Error> {
+        let location = match &self.lock().0 {
+            SlotState::Pending(batches) | SlotState::Pinned(batches) => return Ok(batches.clone()),
+            SlotState::Stored(location) => location.clone(),
+        };
+        let tier = self
+            .tier
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("a stored view window without a tier".into()))?;
+        tier.cache
+            .get_or_load(self.key, std::time::Instant::now(), || {
+                if !tier.decode_delay.is_zero() {
+                    std::thread::sleep(tier.decode_delay);
+                }
+                let timer = Timer::start();
+                let batch = location.read(&self.schema, tier.read).map_err(|error| {
+                    Error::Invalid(format!(
+                        "materialized view {} window ending {}: {error}",
+                        self.key.view, self.key.end_ms
+                    ))
+                })?;
+                tier.decode.record(timer);
+                tier.cold_reads.fetch_add(1, Ordering::Relaxed);
+                tier.cold_read_bytes
+                    .fetch_add(location.read_bytes(), Ordering::Relaxed);
+                let bytes = batch.memory_bytes() as u64;
+                Ok((Arc::new(vec![batch]), bytes))
+            })
+    }
 }
 
 /// The texts of one text column of one view, each stored once: every
@@ -770,6 +936,9 @@ impl SharedTexts {
 #[derive(Default, Clone)]
 pub struct ViewStore {
     by_view: BTreeMap<PhysicalASAPNodeId, ViewRows>,
+    /// The cold tier, when the views are persisted; without it every
+    /// window stays in memory.
+    tier: Option<Arc<ViewTier>>,
     /// Per view, window part and text column index, the texts its windows
     /// share. A window split by series keeps one batch per part (the
     /// parts' series are stable across windows), and each part has its own
@@ -780,6 +949,86 @@ pub struct ViewStore {
 }
 
 impl ViewStore {
+    /// An empty store whose windows, once written, are read through `tier`.
+    pub fn tiered(tier: Arc<ViewTier>) -> Self {
+        Self {
+            tier: Some(tier),
+            ..Self::default()
+        }
+    }
+
+    /// The window of `view` ending at `end_ms`, to tell it where it was
+    /// written.
+    pub fn slot(&self, view: PhysicalASAPNodeId, end_ms: i64) -> Option<Arc<WindowSlot>> {
+        let rows = self.by_view.get(&view)?;
+        let at = rows.partition_point(|window| window.time_range_ms.1 < end_ms);
+        rows.get(at)
+            .filter(|window| window.time_range_ms.1 == end_ms)
+            .map(|window| window.slot.clone())
+    }
+
+    /// Checks that `(start, end]` is after `view`'s stored rows.
+    fn check_after(&self, view: PhysicalASAPNodeId, (start, end): (i64, i64)) -> Result<(), Error> {
+        if start >= end
+            || self
+                .by_view
+                .get(&view)
+                .and_then(|rows| rows.last())
+                .is_some_and(|window| start < window.time_range_ms.1)
+        {
+            return Err(Error::Invalid(format!(
+                "materialized view {view}: appended rows ({start}, {end}] are empty or not after the stored ones"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Adds `slot` covering `time_range_ms` to `view`'s rows, then drops its
+    /// rows ending `view.retention_ms()` or more before it (the newest are
+    /// always kept).
+    fn push(&mut self, view: &MaterializedView, time_range_ms: (i64, i64), slot: WindowSlot) {
+        let end = time_range_ms.1;
+        let rows = self.by_view.entry(view.node_id).or_default();
+        rows.push(ViewWindow {
+            time_range_ms,
+            slot: Arc::new(slot),
+        });
+        let retention_ms = i64::try_from(view.retention_ms()).unwrap_or(i64::MAX);
+        let oldest_kept_end = end.saturating_sub(retention_ms);
+        rows.retain(|window| {
+            let row_end = window.time_range_ms.1;
+            let kept = row_end > oldest_kept_end || row_end == end;
+            if !kept {
+                window.slot.left_store();
+            }
+            kept
+        });
+    }
+
+    /// Adds `view`'s window covering `time_range_ms` already written at
+    /// `location` (indexed at startup), read back as `schema`.
+    pub fn append_stored(
+        &mut self,
+        view: &MaterializedView,
+        time_range_ms: (i64, i64),
+        location: WindowLocation,
+        schema: SchemaRef,
+    ) -> Result<(), Error> {
+        self.check_after(view.node_id, time_range_ms)?;
+        let slot = WindowSlot {
+            key: WindowKey {
+                view: view.node_id,
+                end_ms: time_range_ms.1,
+            },
+            schema,
+            bytes: 0,
+            state: Mutex::new((SlotState::Stored(location), false)),
+            tier: self.tier.clone(),
+        };
+        self.push(view, time_range_ms, slot);
+        Ok(())
+    }
+
     /// Appends `batches` as `view`'s rows covering `time_range_ms`
     /// (`(start, end]`), then drops its rows ending `view.retention_ms()`
     /// or more before `end` (the newest are always kept). Bad input when
@@ -793,37 +1042,38 @@ impl ViewStore {
         time_range_ms: (i64, i64),
         batches: Vec<Batch>,
     ) -> Result<(), Error> {
-        let (start, end) = time_range_ms;
-        if start >= end
-            || self
-                .by_view
-                .get(&view.node_id)
-                .and_then(|rows| rows.last())
-                .is_some_and(|window| start < window.time_range_ms.1)
-        {
-            return Err(Error::Invalid(format!(
-                "materialized view {}: appended rows ({start}, {end}] are empty or not after the stored ones",
-                view.node_id
-            )));
-        }
+        self.check_after(view.node_id, time_range_ms)?;
+        let schema = batches
+            .first()
+            .map(|batch| batch.schema().clone())
+            .unwrap_or_else(|| {
+                Arc::new(asap_executor::planner::ir::schema::Schema::new(Vec::new()))
+            });
         let batches = batches
             .into_iter()
             .enumerate()
             .map(|(part, batch)| self.share_texts(view.node_id, part, batch))
             .collect::<Result<Vec<_>, Error>>()?;
-        let bytes = batches.iter().map(window_batch_bytes).sum();
-        let rows = self.by_view.entry(view.node_id).or_default();
-        rows.push(ViewWindow {
-            time_range_ms,
-            batches: Arc::new(batches),
+        let bytes = batches.iter().map(window_batch_bytes).sum::<usize>() as u64;
+        let batches = Arc::new(batches);
+        let state = match &self.tier {
+            Some(tier) => {
+                tier.pending_bytes.fetch_add(bytes, Ordering::Relaxed);
+                SlotState::Pending(batches)
+            }
+            None => SlotState::Pinned(batches),
+        };
+        let slot = WindowSlot {
+            key: WindowKey {
+                view: view.node_id,
+                end_ms: time_range_ms.1,
+            },
+            schema,
             bytes,
-        });
-        let retention_ms = i64::try_from(view.retention_ms()).unwrap_or(i64::MAX);
-        let oldest_kept_end = end.saturating_sub(retention_ms);
-        rows.retain(|window| {
-            let row_end = window.time_range_ms.1;
-            row_end > oldest_kept_end || row_end == end
-        });
+            state: Mutex::new((state, false)),
+            tier: self.tier.clone(),
+        };
+        self.push(view, time_range_ms, slot);
         Ok(())
     }
 
@@ -886,12 +1136,23 @@ impl ViewStore {
     /// appended (states included, whether or not a run has read them
     /// since), plus each view's shared texts once.
     pub fn bytes(&self) -> usize {
-        let windows: usize = self
-            .by_view
-            .values()
-            .flatten()
-            .map(|window| window.bytes)
-            .sum();
+        let windows: usize = match &self.tier {
+            None => self
+                .by_view
+                .values()
+                .flatten()
+                .map(|window| window.slot.bytes as usize)
+                .sum(),
+            Some(tier) => {
+                let heap: u64 = self
+                    .by_view
+                    .values()
+                    .flatten()
+                    .map(|window| window.slot.heap_bytes())
+                    .sum();
+                (heap + tier.cache.stats().bytes) as usize
+            }
+        };
         let texts: usize = self
             .texts
             .values()
@@ -934,18 +1195,23 @@ impl ViewStore {
         if covered_to != end {
             return Err(missing());
         }
-        Ok(stream::iter(
-            selected
-                .iter()
-                .flat_map(|window| window.batches.iter().cloned()),
+        // Cold windows are decoded as the stream is pulled, so a run holds
+        // one decoded window at a time beyond what the cache keeps.
+        Ok(
+            stream::iter(selected.iter().map(|window| window.slot.clone()))
+                .flat_map(move |slot| {
+                    let batches: Vec<Result<Batch, Error>> = if context.is_cancelled() {
+                        vec![Err(Error::Cancelled)]
+                    } else {
+                        match slot.batches() {
+                            Ok(batches) => batches.iter().cloned().map(Ok).collect(),
+                            Err(error) => vec![Err(error)],
+                        }
+                    };
+                    stream::iter(batches)
+                })
+                .boxed_local(),
         )
-        .map(move |batch| {
-            if context.is_cancelled() {
-                return Err(Error::Cancelled);
-            }
-            Ok(batch)
-        })
-        .boxed_local())
     }
 }
 
@@ -1489,12 +1755,12 @@ mod tests {
         let stored = &views.by_view[&1];
         for (window, rows) in stored.iter().zip(&appended) {
             assert_eq!(
-                format!("{:?}", window.batches[0].to_rows()),
+                format!("{:?}", window.batches()[0].to_rows()),
                 format!("{rows:?}")
             );
         }
         let values = |window: &ViewWindow, column: usize| {
-            window.batches[0]
+            window.batches()[0]
                 .column(column)
                 .as_any()
                 .downcast_ref::<DictionaryArray<UInt32Type>>()
@@ -1568,7 +1834,7 @@ mod tests {
                 .unwrap();
         }
         let identities = |window: &ViewWindow, part: usize| {
-            window.batches[part]
+            window.batches()[part]
                 .column(2)
                 .as_any()
                 .downcast_ref::<DictionaryArray<UInt32Type>>()

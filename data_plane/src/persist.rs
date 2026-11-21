@@ -1,29 +1,29 @@
-//! Materialized views on disk: one append-only file per refresh group,
-//! `group-<index>.log`, one record per refreshed window holding its
-//! `(start, end]` and the rows of each view the window was appended to,
-//! synced to disk (one `fdatasync`) before the next window is refreshed.
-//! At startup the records still within each view's retention are loaded
-//! back into the view store; open windows and raw samples are not
-//! persisted.
+//! Materialized views on disk (docs/design/tiered-view-storage.md): per
+//! refresh group, a directory `group-<index>/` of time segments
+//! (`<first window end ms>.seg`, see [`crate::segment`]), one record per
+//! refreshed window holding its `(start, end]` and one columnar fragment
+//! per view appended. The files are both the views' recovery and their cold
+//! tier: a window evicted from memory is read back from its fragment.
+//! Segments are synced every sync interval, roll every `segment_ms` of
+//! windows, and are deleted once every window in them is past retention.
+//! At startup the segments are indexed from their record heads, without
+//! decoding any fragment.
 //!
-//! A file starts with a header naming the plan (a hash of the plan file)
-//! and the group; a file written for another plan or group is renamed to
-//! `*.stale` and never loaded. A record is a little-endian `u32` length
-//! and a MessagePack payload; a torn or oversized record at the end (a
-//! crash while writing) is cut off at load, so later records stay aligned.
+//! A segment starts with a header naming the plan (a hash of the plan
+//! file), the group and the format version; a segment of another plan,
+//! group or version, and a version 1 file (`group-<index>.log`), is renamed
+//! `*.stale` and never read. A torn record at a segment's end (a crash
+//! while writing) is cut off at startup, before the segment is mapped.
 //!
-//! A row's plain values are stored as the executor's `Value`s, an exact
-//! state (sum, count, min, max, rate, increase) by its serde form, and a
-//! sketch state by `asap_sketchlib`'s ASAPv1 bytes with the kernel it
-//! rebuilds, through each kernel's `sketch()` and `restore_from_disk`. A
-//! Hydra-Count-Min grid, shared by every group of a build, is stored once
-//! per record. A UnivMon whose heaps mix key types has no ASAPv1 encoding,
-//! so a view holding one is not persisted (counted in
-//! `asap_view_windows_not_persisted_total`).
+//! A state is stored by its existing form: an exact state by its serde
+//! form, and a sketch state by `asap_sketchlib`'s ASAPv1 bytes with the
+//! kernel it rebuilds, through each kernel's `sketch()` and
+//! `restore_from_disk`. A Hydra-Count-Min grid, shared by every group of a
+//! build, is stored once per record. A UnivMon whose heaps mix key types
+//! has no ASAPv1 encoding, so a view holding one is not persisted (counted
+//! in `asap_view_windows_not_persisted_total`) and stays in memory.
 
-use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -47,19 +47,8 @@ use asap_sketchlib::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::store::ViewStore;
-
-/// A record longer than this is taken as torn: no window's rows are this
-/// large, and a garbage length must not size an allocation.
-const MAX_RECORD_BYTES: usize = 1 << 30;
-
-/// The first record of a group file.
-#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
-struct Header {
-    /// A hash of the plan file the views were computed for.
-    plan_hash: u64,
-    group: usize,
-}
+use crate::segment::{encode_fragment, RecordHead, Segment, SegmentHeader, SegmentTexts};
+pub use crate::segment::{ViewRead, WindowLocation, FORMAT_VERSION};
 
 /// The kernels whose sketch state is stored as ASAPv1 bytes, with what
 /// rebuilding one needs beyond the bytes.
@@ -88,9 +77,9 @@ pub enum FrequencyKind {
     CountSketchHeap,
 }
 
-/// One stored value of a view row.
+/// One stored state (or, in version 1 files, value) of a view row.
 #[derive(Serialize, Deserialize)]
-enum StoredValue {
+pub(crate) enum StoredValue {
     Plain(Value),
     /// A text value, by its index in the file's dictionary.
     Text(u32),
@@ -109,130 +98,52 @@ enum StoredValue {
     },
 }
 
-/// One refreshed window of a group: the rows of each view appended.
-#[derive(Serialize, Deserialize)]
-struct Record {
-    start_ms: i64,
-    end_ms: i64,
-    /// Texts this record adds to the file's dictionary, in index order:
-    /// label values and series identities are written once per file.
-    #[serde(default)]
-    new_texts: Vec<String>,
-    /// The Hydra-Count-Min grids its rows read, as ASAPv1 bytes, each once.
-    #[serde(default)]
-    hydra_cms_grids: Vec<serde_bytes::ByteBuf>,
-    views: Vec<(PhysicalASAPNodeId, Vec<Vec<StoredValue>>)>,
-}
-
-/// One view's stored rows of one window: `(start, end, rows)`.
-type StoredWindow = (
-    i64,
-    i64,
-    Vec<Vec<StoredValue>>,
-    Arc<Vec<Option<Arc<HydraCms>>>>,
-);
-
 /// What persisting one window wrote.
 #[derive(Debug, Default, Clone)]
 pub struct Written {
+    /// Bytes added to the files.
     pub bytes: u64,
     pub sync_ns: u64,
     /// Views whose window could not be encoded.
     pub not_persisted: u64,
     /// Where each persisted view's fragment of the window is, for reading
-    /// it back cold (docs/design/tiered-view-storage.md). Empty until the
-    /// segment format is implemented.
+    /// it back cold.
     pub locations: Vec<(PhysicalASAPNodeId, WindowLocation)>,
-}
-
-/// The view file format version: 2 is per-group directories of time
-/// segments with columnar fragments (docs/design/tiered-view-storage.md).
-/// Not written yet: the files are still version 1.
-pub const FORMAT_VERSION: u32 = 2;
-
-/// How a cold window's fragment is read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ViewRead {
-    /// Sealed segments mapped and decoded in place; the active segment
-    /// read with `pread`.
-    #[default]
-    Mmap,
-    /// Every fragment read with `pread` into a buffer.
-    Pread,
-}
-
-/// Where one view's rows of one window are on disk: its fragment in a
-/// segment. Not implemented yet: no write returns one.
-#[derive(Debug, Clone)]
-pub struct WindowLocation {
-    segment: PathBuf,
-    offset: u64,
-    len: u32,
-}
-
-impl WindowLocation {
-    /// The segment file holding the fragment.
-    pub fn segment_path(&self) -> &Path {
-        &self.segment
-    }
-
-    /// The fragment's byte offset in its segment.
-    pub fn offset(&self) -> u64 {
-        self.offset
-    }
-
-    /// The fragment's length in bytes.
-    pub fn len(&self) -> u32 {
-        self.len
-    }
-
-    /// Whether the fragment is empty (never, for a written window).
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Whether its segment is sealed (and so read through a mapping).
-    pub fn is_sealed(&self) -> bool {
-        false
-    }
-
-    /// Whether `address` lies inside its segment's mapping.
-    pub fn maps(&self, _address: usize) -> bool {
-        false
-    }
-
-    /// The fragment's rows as one batch of `schema`.
-    pub fn read(&self, _schema: &SchemaRef, _how: ViewRead) -> Result<Batch, asap_executor::Error> {
-        Err(asap_executor::Error::Invalid(
-            "reading a view window from its segment is not implemented".into(),
-        ))
-    }
 }
 
 /// The windows indexed at startup, by view: each window's range and
 /// location, oldest first.
 pub type ViewIndex = BTreeMap<PhysicalASAPNodeId, Vec<((i64, i64), WindowLocation)>>;
 
-/// A group file's text dictionary: each text's index, in the order the
-/// records added them.
-#[derive(Default)]
-struct Dictionary {
-    index: std::collections::HashMap<Arc<str>, u32>,
-    len: u32,
+/// The segment being appended to, with its texts by text.
+struct ActiveSegment {
+    segment: Arc<Segment>,
+    texts: HashMap<Arc<str>, u32>,
+    /// The start of its first window: it rolls once a window starts
+    /// `segment_ms` or more after it.
+    first_start_ms: i64,
 }
 
-/// The group files in one directory, for one plan.
+/// One refresh group's segments.
+#[derive(Default)]
+struct GroupFiles {
+    active: Option<ActiveSegment>,
+    /// Sealed segments, oldest first.
+    sealed: Vec<Arc<Segment>>,
+}
+
+/// The view files of some refresh groups in one directory, for one plan.
 pub struct ViewFiles {
     dir: PathBuf,
     plan_hash: u64,
-    files: BTreeMap<usize, File>,
-    dictionaries: BTreeMap<usize, Dictionary>,
+    segment_ms: i64,
+    groups: BTreeMap<usize, GroupFiles>,
     /// Files are synced at most this often; a window's record is durable
     /// within this long after it is written.
     sync_interval: Duration,
     last_sync: Instant,
     /// Groups written since the last sync.
-    unsynced: std::collections::BTreeSet<usize>,
+    unsynced: BTreeSet<usize>,
 }
 
 /// A stable 64-bit FNV-1a hash of `bytes`.
@@ -240,6 +151,17 @@ pub fn plan_hash(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
     })
+}
+
+/// The default `segment_ms`: 15 minutes.
+pub const DEFAULT_SEGMENT_MS: i64 = 900_000;
+
+/// Renames `path` to `<path>.stale`, so it is never read again.
+fn set_aside(path: &Path, why: &str) -> std::io::Result<()> {
+    let mut stale = path.as_os_str().to_owned();
+    stale.push(".stale");
+    tracing::warn!(path = %path.display(), why, "view file set aside, not loaded");
+    std::fs::rename(path, stale)
 }
 
 impl ViewFiles {
@@ -250,74 +172,54 @@ impl ViewFiles {
         Ok(Self {
             dir: dir.to_path_buf(),
             plan_hash,
-            files: BTreeMap::new(),
-            dictionaries: BTreeMap::new(),
+            segment_ms: DEFAULT_SEGMENT_MS,
+            groups: BTreeMap::new(),
             sync_interval,
             last_sync: Instant::now(),
-            unsynced: Default::default(),
+            unsynced: BTreeSet::new(),
         })
     }
 
+    /// Rolls each group to a new segment once a window starts `segment_ms`
+    /// or more after its active segment's first window.
+    pub fn with_segment_ms(mut self, segment_ms: i64) -> Self {
+        self.segment_ms = segment_ms.max(1);
+        self
+    }
+
     /// Splits the files into `shards` sets, refresh group `g` going to set
-    /// `g % shards`, each with the dictionaries loaded for its groups: one
-    /// writer per file, so records stay in window order.
+    /// `g % shards`: one writer per group, so records stay in window order.
     pub fn split(self, shards: usize) -> Vec<ViewFiles> {
         let shards = shards.max(1);
         let mut out: Vec<ViewFiles> = (0..shards)
             .map(|_| ViewFiles {
                 dir: self.dir.clone(),
                 plan_hash: self.plan_hash,
-                files: BTreeMap::new(),
-                dictionaries: BTreeMap::new(),
+                segment_ms: self.segment_ms,
+                groups: BTreeMap::new(),
                 sync_interval: self.sync_interval,
                 last_sync: Instant::now(),
-                unsynced: Default::default(),
+                unsynced: BTreeSet::new(),
             })
             .collect();
-        for (group, file) in self.files {
-            out[group % shards].files.insert(group, file);
-        }
-        for (group, dictionary) in self.dictionaries {
-            out[group % shards].dictionaries.insert(group, dictionary);
+        for (group, files) in self.groups {
+            out[group % shards].groups.insert(group, files);
         }
         out
-    }
-
-    /// Rolls each group to a new segment once its active one spans
-    /// `segment_ms` of windows. Not implemented yet: ignored.
-    pub fn with_segment_ms(self, _segment_ms: i64) -> Self {
-        self
-    }
-
-    /// Seals `group`'s active segment now; its next window starts a new
-    /// one. Not implemented yet.
-    pub fn seal(&mut self, _group: usize) -> std::io::Result<()> {
-        Err(std::io::Error::other("view segments are not implemented"))
-    }
-
-    /// Deletes `group`'s sealed segments whose every record ends at or
-    /// before `oldest_kept_end_ms`; returns how many. Not implemented yet.
-    pub fn delete_expired(
-        &mut self,
-        _group: usize,
-        _oldest_kept_end_ms: i64,
-    ) -> std::io::Result<usize> {
-        Err(std::io::Error::other("view segments are not implemented"))
-    }
-
-    /// The windows of `groups` within each view's retention, with their
-    /// locations, read from record heads only (no fragment decoded). Not
-    /// implemented yet.
-    pub fn index(
-        &mut self,
-        _groups: &[Vec<(MaterializedView, SchemaRef)>],
-    ) -> std::io::Result<ViewIndex> {
-        Err(std::io::Error::other("view segments are not implemented"))
     }
 
     /// How often the files are synced.
     pub fn sync_interval(&self) -> Duration {
         self.sync_interval
+    }
+
+    /// Bytes of the segments held, over every group.
+    pub fn bytes(&self) -> u64 {
+        self.groups
+            .values()
+            .flat_map(|g| g.sealed.iter().chain(g.active.iter().map(|a| &a.segment)))
+            .map(|segment| segment.len())
+            .sum()
     }
 
     /// Syncs every file written since the last sync when the sync interval
@@ -334,22 +236,66 @@ impl ViewFiles {
     pub fn sync(&mut self) -> std::io::Result<u64> {
         let started = Instant::now();
         for group in std::mem::take(&mut self.unsynced) {
-            if let Some(file) = self.files.get(&group) {
-                file.sync_data()?;
+            if let Some(active) = self.groups.get(&group).and_then(|g| g.active.as_ref()) {
+                active.segment.sync()?;
             }
         }
         self.last_sync = Instant::now();
         Ok(started.elapsed().as_nanos() as u64)
     }
 
-    fn path(&self, group: usize) -> PathBuf {
-        self.dir.join(format!("group-{group}.log"))
+    fn group_dir(&self, group: usize) -> PathBuf {
+        self.dir.join(format!("group-{group}"))
+    }
+
+    /// Seals `group`'s active segment now; its next window starts a new
+    /// one.
+    pub fn seal(&mut self, group: usize) -> std::io::Result<()> {
+        let files = self.groups.entry(group).or_default();
+        if let Some(active) = files.active.take() {
+            active.segment.seal()?;
+            files.sealed.push(active.segment);
+        }
+        self.unsynced.remove(&group);
+        Ok(())
+    }
+
+    /// Deletes `group`'s sealed segments whose every record ends at or
+    /// before `oldest_kept_end_ms`; returns how many. A reader still
+    /// holding one keeps reading it (the file stays open until it is done).
+    pub fn delete_expired(
+        &mut self,
+        group: usize,
+        oldest_kept_end_ms: i64,
+    ) -> std::io::Result<usize> {
+        let Some(files) = self.groups.get_mut(&group) else {
+            return Ok(0);
+        };
+        let mut deleted = 0;
+        let mut kept = Vec::with_capacity(files.sealed.len());
+        for segment in files.sealed.drain(..) {
+            if segment.max_end_ms() <= oldest_kept_end_ms {
+                match std::fs::remove_file(segment.path()) {
+                    Ok(()) => deleted += 1,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => deleted += 1,
+                    Err(error) => {
+                        kept.push(segment);
+                        return Err(error);
+                    }
+                }
+            } else {
+                kept.push(segment);
+            }
+        }
+        files.sealed = kept;
+        Ok(deleted)
     }
 
     /// Appends the rows each of `views` got for `(start, end]` as one record
-    /// of `group`'s file, synced with the other files once the sync
-    /// interval has passed. A view holding a state with no byte encoding is
-    /// left out of the record and counted.
+    /// of `group`'s active segment (rolling to a new one when due), synced
+    /// with the other files once the sync interval has passed. A view
+    /// holding a state with no byte encoding is left out of the record and
+    /// counted.
     pub fn append(
         &mut self,
         group: usize,
@@ -357,221 +303,234 @@ impl ViewFiles {
         views: &[(PhysicalASAPNodeId, &[Batch])],
     ) -> std::io::Result<Written> {
         let mut written = Written::default();
-        let mut stored = Vec::new();
-        let dictionary = self.dictionaries.entry(group).or_default();
-        // Texts new to the file; added to its dictionary once written.
-        let mut texts = Texts {
-            dictionary,
-            new: Vec::new(),
-            new_index: std::collections::HashMap::new(),
-            grids: Grids::default(),
+        let segment_ms = self.segment_ms;
+        let header = SegmentHeader {
+            plan_hash: self.plan_hash,
+            group,
+            version: FORMAT_VERSION,
         };
+        let path = self.group_dir(group).join(format!("{end_ms}.seg"));
+        let files = self.groups.entry(group).or_default();
+        if files
+            .active
+            .as_ref()
+            .is_some_and(|active| start_ms >= active.first_start_ms.saturating_add(segment_ms))
+        {
+            let active = files.active.take().expect("checked");
+            active.segment.seal()?;
+            files.sealed.push(active.segment);
+        }
+        if files.active.is_none() {
+            files.active = Some(ActiveSegment {
+                segment: Segment::create(&path, &header)?,
+                texts: HashMap::new(),
+                first_start_ms: start_ms,
+            });
+            written.bytes += files.active.as_ref().expect("set").segment.len();
+        }
+        let active = files.active.as_mut().expect("set");
+        let mut texts = SegmentTexts {
+            known: &active.texts,
+            base: active.segment.text_count() as u32,
+            new: Vec::new(),
+            new_index: HashMap::new(),
+        };
+        let mut grids = Grids::default();
+        let mut fragments: Vec<(PhysicalASAPNodeId, Vec<u8>)> = Vec::new();
         for (view, batches) in views {
-            let mark = texts.new.len();
-            let grids_mark = texts.grids.bytes.len();
-            match encode_rows(batches, &mut texts) {
-                Some(rows) => stored.push((*view, rows)),
+            let (mark, grids_mark) = (texts.new.len(), grids.bytes.len());
+            let encoded = batches.first().and_then(|first| {
+                let rows = window_rows(batches)?;
+                encode_fragment(first.schema(), &rows, &mut texts, &mut grids)
+            });
+            match encoded {
+                Some(fragment) => fragments.push((*view, fragment)),
+                None if batches.is_empty() => {}
                 None => {
                     texts.forget_after(mark);
-                    texts.grids.forget_after(grids_mark);
+                    grids.forget_after(grids_mark);
                     written.not_persisted += 1;
                 }
             }
         }
-        if stored.is_empty() {
+        if fragments.is_empty() {
             return Ok(written);
         }
-        let new_texts: Vec<Arc<str>> = texts.new;
-        let record = Record {
-            start_ms,
-            end_ms,
-            new_texts: new_texts.iter().map(|t| t.to_string()).collect(),
-            hydra_cms_grids: texts
-                .grids
-                .bytes
-                .into_iter()
-                .map(serde_bytes::ByteBuf::from)
-                .collect(),
-            views: stored,
+        let new_texts = texts.new;
+        let texts_part =
+            rmp_serde::to_vec(&new_texts.iter().map(|t| t.as_ref()).collect::<Vec<&str>>())
+                .map_err(std::io::Error::other)?;
+        let grids_part = if grids.bytes.is_empty() {
+            Vec::new()
+        } else {
+            rmp_serde::to_vec(
+                &grids
+                    .bytes
+                    .iter()
+                    .map(|b| serde_bytes::ByteBuf::from(b.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(std::io::Error::other)?
         };
-        let file = match self.files.entry(group) {
-            std::collections::btree_map::Entry::Occupied(file) => file.into_mut(),
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                let path = self.dir.join(format!("group-{group}.log"));
-                let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-                if file.metadata()?.len() == 0 {
-                    let header = Header {
-                        plan_hash: self.plan_hash,
-                        group,
-                    };
-                    file.write_all(&framed(&header)?)?;
-                }
-                entry.insert(file)
-            }
-        };
-        let bytes = framed(&record)?;
-        file.write_all(&bytes)?;
-        let dictionary = self.dictionaries.entry(group).or_default();
-        for text in new_texts {
-            dictionary.index.insert(text, dictionary.len);
-            dictionary.len += 1;
+        let mut parts: Vec<&[u8]> = vec![&texts_part, &grids_part];
+        parts.extend(fragments.iter().map(|(_, fragment)| fragment.as_slice()));
+        let base = active.segment.text_count() as u32;
+        let (head, frame_bytes) =
+            active
+                .segment
+                .append_record(&parts, new_texts.clone(), end_ms, |placed| RecordHead {
+                    start_ms,
+                    end_ms,
+                    texts: placed[0],
+                    grids: placed[1],
+                    views: fragments
+                        .iter()
+                        .zip(&placed[2..])
+                        .map(|((view, _), (offset, len))| (*view, *offset, *len))
+                        .collect(),
+                })?;
+        for (i, text) in new_texts.into_iter().enumerate() {
+            active.texts.insert(text, base + i as u32);
         }
+        written.locations = head
+            .views
+            .iter()
+            .map(|&(view, offset, len)| {
+                (
+                    view,
+                    WindowLocation::new(active.segment.clone(), (offset, len), head.grids),
+                )
+            })
+            .collect();
         self.unsynced.insert(group);
-        written.bytes = bytes.len() as u64;
+        written.bytes += frame_bytes;
         written.sync_ns = self.sync_if_due()?;
         Ok(written)
     }
 
-    /// Loads into `views` the records of each group in `groups` (its views
-    /// with their output schemas) that end within each view's retention of
-    /// its newest record, oldest first; returns the (view, window) pairs
-    /// loaded. A file of another plan or group is renamed `*.stale`; a torn
-    /// record at a file's end is cut off; a record that does not decode, or
-    /// is not after the rows already loaded, is skipped.
-    pub fn load(
+    /// The windows of `groups` (each refresh group's views with their
+    /// output schemas) within each view's retention of its newest window,
+    /// with their locations, oldest first, read from record heads only:
+    /// no fragment is decoded. Every segment found is sealed; appends start
+    /// a new one. A version 1 file, and a segment of another plan, group
+    /// or version, is renamed `*.stale`; a torn record at a segment's end is
+    /// cut off.
+    pub fn index(
         &mut self,
         groups: &[Vec<(MaterializedView, SchemaRef)>],
-        views: &mut ViewStore,
-    ) -> std::io::Result<u64> {
-        let mut loaded = 0;
+    ) -> std::io::Result<ViewIndex> {
+        let mut index = ViewIndex::new();
         for (group, group_views) in groups.iter().enumerate() {
-            let path = self.path(group);
-            let Some(records) = self.read_group(&path, group)? else {
-                continue;
+            let v1 = self.dir.join(format!("group-{group}.log"));
+            if v1.exists() {
+                set_aside(&v1, "a version 1 view file")?;
+            }
+            let dir = self.group_dir(group);
+            let mut paths: Vec<(i64, PathBuf)> = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries
+                    .filter_map(|entry| entry.ok().map(|e| e.path()))
+                    .filter(|path| path.extension().is_some_and(|x| x == "seg"))
+                    .filter_map(|path| {
+                        let end = path.file_stem()?.to_str()?.parse::<i64>().ok()?;
+                        Some((end, path))
+                    })
+                    .collect(),
+                Err(_) => continue,
             };
-            // The file's dictionary, replayed in record order; appends
-            // after the restart continue it.
-            let mut texts: Vec<Arc<str>> = Vec::new();
-            let mut by_view: BTreeMap<PhysicalASAPNodeId, Vec<StoredWindow>> = BTreeMap::new();
-            for record in records {
-                texts.extend(record.new_texts.iter().map(|t| Arc::from(t.as_str())));
-                // A record's grids are rebuilt once and shared by its rows.
-                let grids: Arc<Vec<Option<Arc<HydraCms>>>> = Arc::new(
-                    record
-                        .hydra_cms_grids
-                        .iter()
-                        .map(|bytes| {
-                            let grid = Hydra::from_asapv1(bytes).ok()?;
-                            HydraCms::restore_from_disk(grid).ok().map(Arc::new)
-                        })
-                        .collect(),
-                );
-                for (view, rows) in record.views {
-                    by_view.entry(view).or_default().push((
-                        record.start_ms,
-                        record.end_ms,
-                        rows,
-                        grids.clone(),
-                    ));
-                }
-            }
-            let dictionary = self.dictionaries.entry(group).or_default();
-            for text in &texts {
-                dictionary.index.insert(text.clone(), dictionary.len);
-                dictionary.len += 1;
-            }
-            for (view, schema) in group_views {
-                let Some(own) = by_view.remove(&view.node_id) else {
+            paths.sort();
+            let expected = SegmentHeader {
+                plan_hash: self.plan_hash,
+                group,
+                version: FORMAT_VERSION,
+            };
+            let mut by_view = ViewIndex::new();
+            let files = self.groups.entry(group).or_default();
+            for (_, path) in paths {
+                let Some((segment, heads)) = Segment::open(&path, &expected)? else {
+                    set_aside(&path, "a segment of another plan, group or version")?;
                     continue;
                 };
-                let Some(newest_end) = own.iter().map(|r| r.1).max() else {
+                for head in heads {
+                    for &(view, offset, len) in &head.views {
+                        by_view.entry(view).or_default().push((
+                            (head.start_ms, head.end_ms),
+                            WindowLocation::new(segment.clone(), (offset, len), head.grids),
+                        ));
+                    }
+                }
+                files.sealed.push(segment);
+            }
+            for (view, _) in group_views {
+                let Some(mut windows) = by_view.remove(&view.node_id) else {
+                    continue;
+                };
+                windows.sort_by_key(|(range, _)| *range);
+                let Some(newest_end) = windows.last().map(|(range, _)| range.1) else {
                     continue;
                 };
                 let retention_ms = i64::try_from(view.retention_ms()).unwrap_or(i64::MAX);
                 let oldest_kept_end = newest_end.saturating_sub(retention_ms);
-                for (start, end, rows, grids) in own {
-                    if end <= oldest_kept_end && end != newest_end {
-                        continue;
-                    }
-                    let Some(batch) = decode_rows(schema, rows, &texts, &grids) else {
-                        tracing::warn!(
-                            view = view.node_id,
-                            start,
-                            end,
-                            "skipping a view record that does not decode"
-                        );
-                        continue;
-                    };
-                    if views.append(view, (start, end), vec![batch]).is_ok() {
-                        loaded += 1;
-                    }
-                }
+                windows.retain(|((_, end), _)| *end > oldest_kept_end || *end == newest_end);
+                index.insert(view.node_id, windows);
             }
         }
-        Ok(loaded)
+        Ok(index)
     }
+}
 
-    /// The records of `group`'s file, after cutting off a torn tail; `None`
-    /// when there is no file or it belongs to another plan or group (it is
-    /// then renamed `*.stale`).
-    fn read_group(&self, path: &Path, group: usize) -> std::io::Result<Option<Vec<Record>>> {
-        let Ok(file) = File::open(path) else {
-            return Ok(None);
-        };
-        let (frames, good_len) = read_frames(file)?;
-        let mut frames = frames.into_iter();
-        let header: Option<Header> = frames.next().and_then(|f| rmp_serde::from_slice(&f).ok());
-        let expected = Header {
-            plan_hash: self.plan_hash,
+/// The rows of a window's `batches`. A window split by series is kept as
+/// one batch per part; its rows are written in the order one run over
+/// every series emits them (by their plain columns' values), so a window's
+/// fragment is the same whichever way its run was split. `None` when a
+/// plain value has no order.
+fn window_rows(batches: &[Batch]) -> Option<Vec<Vec<Value>>> {
+    let mut rows: Vec<Vec<Value>> = batches.iter().flat_map(Batch::to_rows).collect();
+    if batches.len() > 1 {
+        let plain: Vec<usize> = batches[0]
+            .schema()
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| {
+                matches!(
+                    field.dtype,
+                    asap_executor::planner::ir::schema::FieldDataType::Plain(_)
+                )
+            })
+            .map(|(column, _)| column)
+            .collect();
+        let mut keyed = rows
+            .into_iter()
+            .map(|row| {
+                let key = plain
+                    .iter()
+                    .map(|&column| row[column].key())
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()?;
+                Some((key, row))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        rows = keyed.into_iter().map(|(_, row)| row).collect();
+    }
+    Some(rows)
+}
+
+/// The state `value` stores, with the record's rebuilt `grids`.
+pub(crate) fn decode_stored_state(
+    value: StoredValue,
+    grids: &[Option<Arc<HydraCms>>],
+) -> Option<Arc<dyn AggregateCore>> {
+    Some(match value {
+        StoredValue::Plain(_) | StoredValue::Text(_) => return None,
+        StoredValue::Exact(state) => Arc::new(state),
+        StoredValue::Increase(state) => Arc::new(state),
+        StoredValue::Sketch { kernel, asapv1 } => decode_sketch(kernel, &asapv1)?,
+        StoredValue::HydraCmsGroup { grid, group } => Arc::new(HydraCmsGroup {
+            grid: grids.get(grid as usize)?.clone()?,
             group,
-        };
-        if header.as_ref() != Some(&expected) {
-            let stale = path.with_extension("log.stale");
-            tracing::warn!(path = %path.display(), ?header, ?expected, "view file of another plan or group; renamed, not loaded");
-            std::fs::rename(path, stale)?;
-            return Ok(None);
-        }
-        let file = OpenOptions::new().write(true).open(path)?;
-        if file.metadata()?.len() != good_len {
-            tracing::warn!(path = %path.display(), good_len, "cutting off a torn record");
-            file.set_len(good_len)?;
-            file.sync_data()?;
-        }
-        Ok(Some(
-            frames
-                .filter_map(|frame| rmp_serde::from_slice(&frame).ok())
-                .collect(),
-        ))
-    }
-}
-
-/// `value` as one record: its MessagePack length and bytes.
-fn framed<T: Serialize>(value: &T) -> std::io::Result<Vec<u8>> {
-    let payload = rmp_serde::to_vec(value).map_err(std::io::Error::other)?;
-    let length = u32::try_from(payload.len())
-        .ok()
-        .filter(|&len| (len as usize) <= MAX_RECORD_BYTES)
-        .ok_or_else(|| std::io::Error::other("view record too large"))?;
-    let mut bytes = Vec::with_capacity(4 + payload.len());
-    bytes.extend_from_slice(&length.to_le_bytes());
-    bytes.extend_from_slice(&payload);
-    Ok(bytes)
-}
-
-/// Every whole record of `file`'s, and the length up to the last one.
-fn read_frames(file: File) -> std::io::Result<(Vec<Vec<u8>>, u64)> {
-    let mut reader = BufReader::new(file);
-    let end = reader.seek(SeekFrom::End(0))?;
-    reader.seek(SeekFrom::Start(0))?;
-    let mut frames = Vec::new();
-    let mut good_len = 0u64;
-    loop {
-        let mut length = [0u8; 4];
-        if reader.read_exact(&mut length).is_err() {
-            break;
-        }
-        let length = u32::from_le_bytes(length) as u64;
-        if length as usize > MAX_RECORD_BYTES || good_len + 4 + length > end {
-            break;
-        }
-        let mut payload = vec![0u8; length as usize];
-        if reader.read_exact(&mut payload).is_err() {
-            break;
-        }
-        frames.push(payload);
-        good_len += 4 + length;
-    }
-    Ok((frames, good_len))
+        }),
+    })
 }
 
 /// Each HyperLogLog precision's sketch type, from the executor's
@@ -618,8 +577,8 @@ hll_precisions!(
 
 /// The Hydra-Count-Min grids of one record, each stored once.
 #[derive(Default)]
-struct Grids {
-    bytes: Vec<Vec<u8>>,
+pub(crate) struct Grids {
+    pub(crate) bytes: Vec<Vec<u8>>,
     /// Each grid's index, by its address.
     index: std::collections::HashMap<usize, u32>,
 }
@@ -640,7 +599,7 @@ impl Grids {
     }
 
     /// Drops the grids after the first `mark` (a view left out).
-    fn forget_after(&mut self, mark: usize) {
+    pub(crate) fn forget_after(&mut self, mark: usize) {
         self.bytes.truncate(mark);
         self.index.retain(|_, index| (*index as usize) < mark);
     }
@@ -648,7 +607,7 @@ impl Grids {
 
 /// `state` as stored bytes, when its kernel can be rebuilt from them; a
 /// Hydra-Count-Min group's grid goes to `grids`.
-fn encode_state(state: &dyn AggregateCore, grids: &mut Grids) -> Option<StoredValue> {
+pub(crate) fn encode_state(state: &dyn AggregateCore, grids: &mut Grids) -> Option<StoredValue> {
     let any = state.as_any();
     let sketch = |kernel, bytes: Option<Vec<u8>>| {
         Some(StoredValue::Sketch {
@@ -764,128 +723,13 @@ pub fn encode_sketch(state: &dyn AggregateCore) -> Option<(SketchKernel, Vec<u8>
     }
 }
 
-/// Texts being encoded into one record: the file's dictionary, and the
-/// texts this record adds to it.
-struct Texts<'a> {
-    dictionary: &'a Dictionary,
-    new: Vec<Arc<str>>,
-    new_index: std::collections::HashMap<Arc<str>, u32>,
-    grids: Grids,
-}
-
-impl Texts<'_> {
-    /// `text`'s index, added to the record's new texts if the file has none.
-    fn index(&mut self, text: &Arc<str>) -> u32 {
-        if let Some(&index) = self.dictionary.index.get(text) {
-            return index;
-        }
-        if let Some(&index) = self.new_index.get(text) {
-            return index;
-        }
-        let index = self.dictionary.len + self.new.len() as u32;
-        self.new.push(text.clone());
-        self.new_index.insert(text.clone(), index);
-        index
-    }
-
-    /// Drops the new texts after the first `mark` (a view left out).
-    fn forget_after(&mut self, mark: usize) {
-        for text in self.new.drain(mark..) {
-            self.new_index.remove(&text);
-        }
-    }
-}
-
-/// The rows of `batches`, texts as dictionary indices; `None` when one
-/// holds a state with no byte encoding. A window split by series is kept
-/// as one batch per part; its rows are written in the order one run over
-/// every series emits them (by their plain columns' values), so a window's
-/// record is the same whichever way its run was split.
-fn encode_rows(batches: &[Batch], texts: &mut Texts) -> Option<Vec<Vec<StoredValue>>> {
-    let mut rows: Vec<Vec<Value>> = batches.iter().flat_map(Batch::to_rows).collect();
-    if batches.len() > 1 {
-        let plain: Vec<usize> = batches[0]
-            .schema()
-            .fields
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| {
-                matches!(
-                    field.dtype,
-                    asap_executor::planner::ir::schema::FieldDataType::Plain(_)
-                )
-            })
-            .map(|(column, _)| column)
-            .collect();
-        let mut keyed = rows
-            .into_iter()
-            .map(|row| {
-                let key = plain
-                    .iter()
-                    .map(|&column| row[column].key())
-                    .collect::<Result<Vec<_>, _>>()
-                    .ok()?;
-                Some((key, row))
-            })
-            .collect::<Option<Vec<_>>>()?;
-        keyed.sort_by(|a, b| a.0.cmp(&b.0));
-        rows = keyed.into_iter().map(|(_, row)| row).collect();
-    }
-    rows.into_iter()
-        .map(|row| {
-            row.into_iter()
-                .map(|value| match value {
-                    Value::Summary { state, .. } => encode_state(state.as_ref(), &mut texts.grids),
-                    Value::Utf8(text) => Some(StoredValue::Text(texts.index(&text))),
-                    plain => Some(StoredValue::Plain(plain)),
-                })
-                .collect()
-        })
-        .collect()
-}
-
-/// `rows` as one batch of `schema`, each state of its field's family.
-fn decode_rows(
-    schema: &SchemaRef,
-    rows: Vec<Vec<StoredValue>>,
-    texts: &[Arc<str>],
-    grids: &[Option<Arc<HydraCms>>],
-) -> Option<Batch> {
-    let rows = rows
-        .into_iter()
-        .map(|row| {
-            row.into_iter()
-                .zip(&schema.fields)
-                .map(|(value, field)| {
-                    let state: Arc<dyn AggregateCore> = match value {
-                        StoredValue::Plain(value) => return Some(value),
-                        StoredValue::Text(index) => {
-                            return texts.get(index as usize).cloned().map(Value::Utf8)
-                        }
-                        StoredValue::Exact(state) => Arc::new(state),
-                        StoredValue::Increase(state) => Arc::new(state),
-                        StoredValue::Sketch { kernel, asapv1 } => decode_sketch(kernel, &asapv1)?,
-                        StoredValue::HydraCmsGroup { grid, group } => Arc::new(HydraCmsGroup {
-                            grid: grids.get(grid as usize)?.clone()?,
-                            group,
-                        }),
-                    };
-                    Some(Value::Summary {
-                        family: field.dtype.clone(),
-                        state,
-                    })
-                })
-                .collect::<Option<Vec<_>>>()
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Batch::try_new(schema.clone(), rows).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use asap_executor::planner::summary_type::SketchStatistic;
     use asap_executor::values::Value;
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
 
     /// Two states of each persisted sketch kernel, built from different
     /// samples.
@@ -1113,45 +957,6 @@ mod tests {
         }
     }
 
-    /// A torn last record is cut off, so a record appended after it is
-    /// read back; a file of another plan is renamed and not loaded.
-    #[test]
-    fn torn_tails_are_cut_and_other_plans_are_not_loaded() {
-        let dir = std::env::temp_dir().join(format!("asap-persist-unit-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
-        let empty: &[Batch] = &[];
-        files.append(0, (0, 10), &[(1, empty)]).unwrap();
-        drop(files);
-        let path = dir.join("group-0.log");
-        // A crash mid-record: a length announcing 100 bytes, 3 written.
-        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(&[100, 0, 0, 0, 1, 2, 3]).unwrap();
-        drop(file);
-        let files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
-        assert_eq!(files.read_group(&path, 0).unwrap().unwrap().len(), 1);
-        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
-        files.append(0, (10, 20), &[(1, empty)]).unwrap();
-        let records = files.read_group(&path, 0).unwrap().unwrap();
-        assert_eq!(
-            records
-                .iter()
-                .map(|r| (r.start_ms, r.end_ms))
-                .collect::<Vec<_>>(),
-            [(0, 10), (10, 20)]
-        );
-        // A garbage length past the end is a torn record, not an allocation.
-        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(&u32::MAX.to_le_bytes()).unwrap();
-        drop(file);
-        assert_eq!(files.read_group(&path, 0).unwrap().unwrap().len(), 2);
-        // Another plan's file is set aside.
-        let other = ViewFiles::open(&dir, 8, Duration::ZERO).unwrap();
-        assert!(other.read_group(&path, 0).unwrap().is_none());
-        assert!(dir.join("group-0.log.stale").exists());
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
     // ── Tiered view storage: segments and columnar fragments ──────────
     // docs/design/tiered-view-storage.md, tests V2, V3, V9, V12, V13,
     // V18, V19. They fail until the segment format is implemented.
@@ -1297,7 +1102,8 @@ mod tests {
     }
 
     /// One window per state family a view column can hold, plus exact
-    /// Sum and Max and Hydra-Count-Min groups.
+    /// Sum, Max and Counter (the state `rate` and `increase` read) and
+    /// Hydra-Count-Min groups.
     fn every_family() -> Vec<(String, Batch)> {
         let mut out = Vec::new();
         for (kernel, a, b) in states() {
@@ -1314,6 +1120,7 @@ mod tests {
         for (kind, params) in [
             (ExactKind::Sum, ExactParams::Sum),
             (ExactKind::Max, ExactParams::Max),
+            (ExactKind::Counter, ExactParams::Counter),
         ] {
             let family = FieldDataType::ExactAggregate(kind, params);
             let states: Vec<Arc<dyn AggregateCore>> = (0..3)
@@ -1611,14 +1418,21 @@ mod tests {
             hydra_cms_grids: Vec<serde_bytes::ByteBuf>,
             views: Vec<(PhysicalASAPNodeId, Vec<Vec<u8>>)>,
         }
+        let framed = |payload: Vec<u8>| -> Vec<u8> {
+            let mut bytes = (payload.len() as u32).to_le_bytes().to_vec();
+            bytes.extend(payload);
+            bytes
+        };
         let v1 = dir.join("group-0.log");
-        let mut bytes = framed(&V1Header {
-            plan_hash: 7,
-            group: 0,
-        })
-        .unwrap();
-        bytes.extend(
-            framed(&V1Record {
+        let mut bytes = framed(
+            rmp_serde::to_vec(&V1Header {
+                plan_hash: 7,
+                group: 0,
+            })
+            .unwrap(),
+        );
+        bytes.extend(framed(
+            rmp_serde::to_vec(&V1Record {
                 start_ms: 0,
                 end_ms: 10,
                 new_texts: vec![],
@@ -1626,7 +1440,7 @@ mod tests {
                 views: vec![],
             })
             .unwrap(),
-        );
+        ));
         std::fs::write(&v1, bytes).unwrap();
         let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
         let index = files.index(&groups).unwrap();

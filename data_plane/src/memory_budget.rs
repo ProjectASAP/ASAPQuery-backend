@@ -6,8 +6,6 @@
 //! Only anonymous memory can trigger the OOM killer; clean page cache of
 //! the view segments is reclaimed first. A tenth of `memory.max` is kept
 //! as headroom for page cache of the segments being written and read.
-//!
-//! Interface only: not implemented yet.
 
 use std::path::Path;
 
@@ -25,22 +23,63 @@ pub struct CgroupMemory {
 }
 
 /// Reads `memory.max`, `memory.current` and `memory.stat` from the cgroup
-/// directory `dir` (for the running process: its `/proc/self/cgroup` path
-/// under `/sys/fs/cgroup`).
+/// directory `dir` (for the running process: [`own_cgroup`]).
 pub fn read_cgroup(dir: &Path) -> std::io::Result<CgroupMemory> {
-    let _ = dir;
-    Err(std::io::Error::other(
-        "the cgroup memory budget is not implemented",
-    ))
+    let read = |file: &str| std::fs::read_to_string(dir.join(file));
+    let max = read("memory.max")?;
+    let max = max.trim();
+    let number = |text: &str| {
+        text.trim()
+            .parse::<u64>()
+            .map_err(|e| std::io::Error::other(format!("{}: {e}", dir.display())))
+    };
+    let stat = read("memory.stat")?;
+    let field = |name: &str| {
+        stat.lines()
+            .find_map(|line| {
+                line.strip_prefix(name)?
+                    .strip_prefix(' ')?
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
+            .unwrap_or(0)
+    };
+    Ok(CgroupMemory {
+        max_bytes: if max == "max" {
+            None
+        } else {
+            Some(number(max)?)
+        },
+        current_bytes: number(&read("memory.current")?)?,
+        anon_bytes: field("anon"),
+        file_bytes: field("file"),
+    })
+}
+
+/// The running process's cgroup v2 directory, if it has one.
+pub fn own_cgroup() -> Option<std::path::PathBuf> {
+    let line = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = line.lines().find_map(|l| l.strip_prefix("0::"))?;
+    let dir = Path::new("/sys/fs/cgroup").join(path.trim().trim_start_matches('/'));
+    dir.join("memory.max").exists().then_some(dir)
+}
+
+/// The headroom kept below `memory.max` for page cache: a tenth of it.
+fn headroom(max: u64) -> u64 {
+    max / 10
 }
 
 /// The window cache's default budget: `memory.max` less the other bounded
-/// pools (`other_pools_bytes`: query runs, query-time results, result
-/// cache, persist backlog, raw panes) less a tenth of `memory.max`, or
-/// zero if that is negative; `None` (no budget) without a limit.
+/// pools (`other_pools_bytes`: query-time results, result cache, persist
+/// backlog, raw panes) less a tenth of `memory.max`, or zero if that is
+/// negative; `None` (no budget) without a limit.
 pub fn default_view_cache_budget(cgroup: &CgroupMemory, other_pools_bytes: u64) -> Option<u64> {
-    let _ = (cgroup, other_pools_bytes);
-    unimplemented!("the cgroup memory budget is not implemented")
+    let max = cgroup.max_bytes?;
+    Some(
+        max.saturating_sub(other_pools_bytes)
+            .saturating_sub(headroom(max)),
+    )
 }
 
 /// The cache's target for the next second: `budget` while anonymous
@@ -51,8 +90,15 @@ pub fn monitored_target(
     cgroup: &CgroupMemory,
     cached_bytes: u64,
 ) -> Option<u64> {
-    let _ = (budget, cgroup, cached_bytes);
-    unimplemented!("the cgroup memory budget is not implemented")
+    let Some(max) = cgroup.max_bytes else {
+        return budget;
+    };
+    let allowed = max - headroom(max);
+    if cgroup.anon_bytes <= allowed {
+        return budget;
+    }
+    let lowered = cached_bytes.saturating_sub(cgroup.anon_bytes - allowed);
+    Some(budget.map_or(lowered, |budget| budget.min(lowered)))
 }
 
 #[cfg(test)]

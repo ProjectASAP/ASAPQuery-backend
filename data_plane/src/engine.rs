@@ -39,8 +39,10 @@ use crate::query::{QueryEngine, Snapshot, Unanswered};
 use crate::result_cache::{Answer, ResultCache};
 use crate::store::SeriesPartition;
 use crate::store::{
-    PublishedStore, QueryTimeResults, RawData, RawSample, RawShards, RunStore, ViewStore,
+    PublishedStore, QueryTimeResults, RawData, RawSample, RawShards, RunStore, ViewStore, ViewTier,
+    WindowSlot,
 };
+use crate::window_cache::WindowCache;
 use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
 use asap_executor::values::Batch;
 
@@ -122,20 +124,16 @@ pub struct EngineOptions {
     /// Bytes of decoded view windows the window cache may hold
     /// (docs/design/tiered-view-storage.md); the other windows are read
     /// from the view files. `None`: derived from the cgroup's
-    /// `memory.max`, or no budget without a limit. Not implemented yet:
-    /// install refuses a value.
+    /// `memory.max`, or no budget without a limit.
     pub view_cache_max_bytes: Option<u64>,
     /// A cached window not read for this long leaves the cache. `None`:
-    /// twice the longest evaluation interval of the plan's view readers;
-    /// `Some(0)`: never (every window stays decoded, as before tiering).
-    /// Not implemented yet: install refuses a value above 0.
+    /// [`DEFAULT_VIEW_CACHE_IDLE_MS`]; `Some(0)`: never (every window stays
+    /// decoded, as before tiering).
     pub view_cache_idle_ms: Option<u64>,
     /// Each refresh group's view file rolls to a new segment every this
-    /// many milliseconds of windows. Not implemented yet: install refuses
-    /// a value other than the default.
+    /// many milliseconds of windows.
     pub view_segment_ms: i64,
-    /// How cold windows are read: mapped sealed segments, or `pread`. Not
-    /// implemented yet: install refuses `Pread`.
+    /// How cold windows are read: mapped sealed segments, or `pread`.
     pub view_read: ViewRead,
     /// For tests: each cold view window's decode waits this long first.
     #[doc(hidden)]
@@ -149,7 +147,11 @@ pub struct EngineOptions {
 
 /// The default `view_segment_ms`: 15 minutes, about five segments per hour
 /// of retention.
-pub const DEFAULT_VIEW_SEGMENT_MS: i64 = 900_000;
+pub const DEFAULT_VIEW_SEGMENT_MS: i64 = crate::persist::DEFAULT_SEGMENT_MS;
+
+/// The default `view_cache_idle_ms`: a minute, four 15 s dashboard
+/// refreshes (the plan does not carry its queries' intervals).
+pub const DEFAULT_VIEW_CACHE_IDLE_MS: u64 = 60_000;
 
 impl Default for EngineOptions {
     fn default() -> Self {
@@ -335,26 +337,32 @@ impl EngineHandle {
     /// compiled once, and returns the plan's queries. Fails if the plan is
     /// invalid or the data plane cannot execute it.
     pub fn spawn(plan_json: String, options: EngineOptions) -> anyhow::Result<(Self, Vec<String>)> {
-        if options.view_cache_max_bytes.is_some()
-            || options.view_cache_idle_ms.is_some_and(|ms| ms > 0)
-            || options.view_segment_ms != DEFAULT_VIEW_SEGMENT_MS
-            || options.view_read != ViewRead::Mmap
-            || options.cold_decode_delay_ms > 0
-            || !options.unpersistable_views.is_empty()
-        {
-            anyhow::bail!(
-                "tiered view storage is not implemented yet (docs/design/tiered-view-storage.md)"
-            );
-        }
         let (mut ingestion, precompute, query, query_texts) = install(&plan_json, &options)?;
         let mut views = ViewStore::default();
+        let mut tier = None;
         let files = match &options.view_dir {
             Some(dir) => {
+                let new_tier = Arc::new(view_tier(&options));
+                views = ViewStore::tiered(new_tier.clone());
+                tier = Some(new_tier);
                 let sync_interval = std::time::Duration::from_millis(options.view_sync_interval_ms);
                 let mut files =
-                    ViewFiles::open(dir, plan_hash(plan_json.as_bytes()), sync_interval)?;
-                let loaded = files.load(&precompute.views(), &mut views)?;
-                tracing::info!(dir = %dir.display(), windows = loaded, "loaded persisted views");
+                    ViewFiles::open(dir, plan_hash(plan_json.as_bytes()), sync_interval)?
+                        .with_segment_ms(options.view_segment_ms);
+                // Indexed, not decoded: the first reads decode what they read.
+                let mut index = files.index(&precompute.views())?;
+                let mut loaded = 0;
+                for (view, schema) in precompute.views().into_iter().flatten() {
+                    for (range, location) in index.remove(&view.node_id).unwrap_or_default() {
+                        if views
+                            .append_stored(&view, range, location, schema.clone())
+                            .is_ok()
+                        {
+                            loaded += 1;
+                        }
+                    }
+                }
+                tracing::info!(dir = %dir.display(), windows = loaded, "indexed persisted views");
                 if loaded > 0 {
                     ingestion.restarted();
                 }
@@ -372,6 +380,9 @@ impl EngineHandle {
             .map(|(width_ms, views)| (width_ms, views.iter().map(ToString::to_string).collect()))
             .collect();
         let metrics = Metrics::new(&groups, &query_texts);
+        if let Some(tier) = &tier {
+            let _ = metrics.view_tier.set(tier.clone());
+        }
         let running = Arc::new(AtomicBool::new(true));
         let shared = Arc::new(Shared {
             queued_samples: AtomicU64::new(0),
@@ -439,14 +450,48 @@ impl EngineHandle {
                     .metrics
                     .view_windows_loaded
                     .store(loaded, Ordering::Relaxed);
+                shared
+                    .metrics
+                    .view_file_bytes
+                    .store(files.bytes(), Ordering::Relaxed);
+                // A group's segments expire with the longest retention of
+                // its views.
+                let retention_ms: Arc<Vec<i64>> = Arc::new(
+                    precompute
+                        .views()
+                        .iter()
+                        .map(|views| {
+                            views
+                                .iter()
+                                .map(|(view, _)| {
+                                    i64::try_from(view.retention_ms()).unwrap_or(i64::MAX)
+                                })
+                                .max()
+                                .unwrap_or(i64::MAX)
+                        })
+                        .collect(),
+                );
+                let unpersistable: Arc<BTreeSet<PhysicalASAPNodeId>> =
+                    Arc::new(options.unpersistable_views.iter().copied().collect());
                 let mut shards = Vec::new();
                 for (index, files) in files.split(options.persist_threads).into_iter().enumerate() {
                     let (shard, jobs) = channel();
                     let persist_shared = shared.clone();
                     let delay = std::time::Duration::from_millis(options.persist_delay_ms);
+                    let (retention_ms, unpersistable) =
+                        (retention_ms.clone(), unpersistable.clone());
                     std::thread::Builder::new()
                         .name(format!("persist-{index}"))
-                        .spawn(move || serve_persist(files, jobs, &persist_shared, delay))?;
+                        .spawn(move || {
+                            serve_persist(
+                                files,
+                                jobs,
+                                &persist_shared,
+                                delay,
+                                &retention_ms,
+                                &unpersistable,
+                            )
+                        })?;
                     shards.push(shard);
                 }
                 Some(PersistPool {
@@ -456,6 +501,13 @@ impl EngineHandle {
             }
             None => None,
         };
+        if let Some(tier) = &tier {
+            let (tier, monitor_running) = (tier.clone(), running.clone());
+            let budget = tier.cache.max_bytes();
+            std::thread::Builder::new()
+                .name("view-cache".into())
+                .spawn(move || serve_view_cache(tier, budget, monitor_running))?;
+        }
         spawn_precompute(
             Arc::new(precompute),
             views,
@@ -1580,7 +1632,11 @@ fn serve_precompute(
         }
         if let Some(persist) = &persist {
             for (group, range_ms, appended) in to_persist {
-                persist.queue(group, range_ms, appended, shared);
+                let slots = appended
+                    .iter()
+                    .map(|(view, _)| views.slot(*view, range_ms.1))
+                    .collect();
+                persist.queue(group, range_ms, appended, slots, shared);
             }
         }
         for (barrier_ms, reply) in tasks.passed_barriers() {
@@ -1855,6 +1911,8 @@ enum PersistJob {
         group: usize,
         range_ms: (i64, i64),
         views: Vec<(PhysicalASAPNodeId, Vec<Batch>)>,
+        /// Each view's stored window, told where it was written.
+        slots: Vec<Option<Arc<WindowSlot>>>,
         bytes: u64,
     },
     /// Done once every window queued to this thread before is written.
@@ -1897,6 +1955,7 @@ impl PersistPool {
         group: usize,
         range_ms: (i64, i64),
         views: Vec<(PhysicalASAPNodeId, Vec<Batch>)>,
+        slots: Vec<Option<Arc<WindowSlot>>>,
         shared: &Shared,
     ) {
         let bytes: u64 = views
@@ -1929,6 +1988,7 @@ impl PersistPool {
             group,
             range_ms,
             views,
+            slots,
             bytes,
         };
         if self.shards[group % self.shards.len()].send(job).is_err() {
@@ -1972,6 +2032,8 @@ fn serve_persist(
     jobs: Receiver<PersistJob>,
     shared: &Shared,
     delay: std::time::Duration,
+    retention_ms: &[i64],
+    unpersistable: &BTreeSet<PhysicalASAPNodeId>,
 ) {
     let metrics = &shared.metrics;
     let wait = files.sync_interval().clamp(
@@ -1998,6 +2060,7 @@ fn serve_persist(
                 group,
                 range_ms,
                 views,
+                slots,
                 bytes,
             } => {
                 // A slow disk, for tests.
@@ -2006,9 +2069,12 @@ fn serve_persist(
                 }
                 let records: Vec<(PhysicalASAPNodeId, &[Batch])> = views
                     .iter()
+                    .filter(|(view, _)| !unpersistable.contains(view))
                     .map(|(view, batches)| (*view, batches.as_slice()))
                     .collect();
-                match files.append(group, range_ms, &records) {
+                let skipped = (views.len() - records.len()) as u64;
+                let files_before = files.bytes();
+                let locations = match files.append(group, range_ms, &records) {
                     Ok(written) => {
                         metrics
                             .view_persisted_bytes
@@ -2018,14 +2084,41 @@ fn serve_persist(
                             .fetch_add(written.sync_ns, Ordering::Relaxed);
                         metrics
                             .view_windows_not_persisted
-                            .fetch_add(written.not_persisted, Ordering::Relaxed);
+                            .fetch_add(written.not_persisted + skipped, Ordering::Relaxed);
+                        written.locations
                     }
                     Err(error) => {
                         tracing::error!(group, ?range_ms, %error, "persisting a window failed");
                         metrics
                             .view_windows_not_persisted
-                            .fetch_add(records.len() as u64, Ordering::Relaxed);
+                            .fetch_add(views.len() as u64, Ordering::Relaxed);
+                        Vec::new()
                     }
+                };
+                // Each written window leaves memory (unless the cache keeps
+                // it); one that was not written stays.
+                for ((view, _), slot) in views.iter().zip(&slots) {
+                    let Some(slot) = slot else { continue };
+                    match locations.iter().find(|(v, _)| v == view) {
+                        Some((_, location)) => slot.stored(location.clone()),
+                        None => slot.pin(),
+                    }
+                }
+                let cutoff = range_ms
+                    .1
+                    .saturating_sub(retention_ms.get(group).copied().unwrap_or(i64::MAX));
+                if let Err(error) = files.delete_expired(group, cutoff) {
+                    tracing::error!(group, %error, "deleting expired view segments failed");
+                }
+                let files_after = files.bytes();
+                if files_after >= files_before {
+                    metrics
+                        .view_file_bytes
+                        .fetch_add(files_after - files_before, Ordering::Relaxed);
+                } else {
+                    metrics
+                        .view_file_bytes
+                        .fetch_sub(files_before - files_after, Ordering::Relaxed);
                 }
                 release_persist_queue(shared, bytes);
             }
@@ -2039,6 +2132,55 @@ fn serve_persist(
         Err(error) => tracing::error!(%error, "syncing the view files failed"),
     }
     tracing::info!("persist stopped");
+}
+
+/// The cold tier of a data plane persisting its views: the window cache
+/// with its budget (the option, else from the cgroup's `memory.max`, else
+/// none) and idle time.
+fn view_tier(options: &EngineOptions) -> ViewTier {
+    let cgroup = crate::memory_budget::own_cgroup()
+        .and_then(|dir| crate::memory_budget::read_cgroup(&dir).ok());
+    let other_pools = (options.result_cache_max_bytes + options.query_time_results_max_bytes)
+        as u64
+        + options.max_persist_backlog_bytes;
+    let budget = options.view_cache_max_bytes.or_else(|| {
+        cgroup
+            .as_ref()
+            .and_then(|cgroup| crate::memory_budget::default_view_cache_budget(cgroup, other_pools))
+    });
+    let idle_ms = options
+        .view_cache_idle_ms
+        .unwrap_or(DEFAULT_VIEW_CACHE_IDLE_MS);
+    tracing::info!(?budget, idle_ms, "view window cache");
+    ViewTier::new(
+        WindowCache::new(
+            budget,
+            (idle_ms > 0).then(|| std::time::Duration::from_millis(idle_ms)),
+        ),
+        options.view_read,
+        std::time::Duration::from_millis(options.cold_decode_delay_ms),
+    )
+}
+
+/// The view cache's monitor: once a second, drops idle windows and, under
+/// a cgroup memory limit, lowers the cache's target while anonymous memory
+/// runs higher than its budget assumed.
+fn serve_view_cache(tier: Arc<ViewTier>, budget: Option<u64>, running: Arc<AtomicBool>) {
+    let cgroup = crate::memory_budget::own_cgroup();
+    while running.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        tier.cache.evict_idle(std::time::Instant::now());
+        if let Some(memory) = cgroup
+            .as_ref()
+            .and_then(|dir| crate::memory_budget::read_cgroup(dir).ok())
+        {
+            let cached = tier.cache.stats().bytes;
+            tier.cache
+                .set_target_bytes(crate::memory_budget::monitored_target(
+                    budget, &memory, cached,
+                ));
+        }
+    }
 }
 
 #[cfg(test)]

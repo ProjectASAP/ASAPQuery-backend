@@ -280,6 +280,8 @@ async fn a_window_leaves_memory_only_after_it_is_written() {
         EngineOptions {
             persist_delay_ms: 300,
             persist_threads: 1,
+            // Each query reads its views (a kept answer reads none).
+            result_cache: false,
             ..options(&dir, Some(0), None)
         },
     );
@@ -389,7 +391,7 @@ async fn a_segment_deleted_during_a_read_stays_readable() {
         &plan,
         EngineOptions {
             view_segment_ms: 10_000,
-            cold_decode_delay_ms: 300,
+            cold_decode_delay_ms: 1_000,
             ..options(&dir, Some(0), None)
         },
     );
@@ -399,7 +401,7 @@ async fn a_segment_deleted_during_a_read_stays_readable() {
         let app = app.clone();
         tokio::spawn(async move { answer(&app, SUM, 300).await })
     };
-    // While the query decodes its windows (300 ms each), later windows
+    // While the query decodes its windows (a second each), later windows
     // push those it reads past retention and their segments are deleted.
     write(&app, 300, 600).await;
     let started = std::time::Instant::now();

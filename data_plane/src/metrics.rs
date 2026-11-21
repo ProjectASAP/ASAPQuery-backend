@@ -213,6 +213,10 @@ pub struct Metrics {
     pub view_windows_loaded: AtomicU64,
     /// Time the precompute thread waited for room in the persist backlog.
     pub view_persist_wait_ns: AtomicU64,
+    /// Bytes of the view files (segments) held.
+    pub view_file_bytes: AtomicU64,
+    /// The views' cold tier, when they are persisted.
+    pub view_tier: std::sync::OnceLock<std::sync::Arc<crate::store::ViewTier>>,
 }
 
 impl Metrics {
@@ -250,6 +254,8 @@ impl Metrics {
             view_windows_not_persisted: AtomicU64::new(0),
             view_windows_loaded: AtomicU64::new(0),
             view_persist_wait_ns: AtomicU64::new(0),
+            view_file_bytes: AtomicU64::new(0),
+            view_tier: std::sync::OnceLock::new(),
         }
     }
 
@@ -301,6 +307,9 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
         .remote_write_decode
         .render(&mut out, "phase=\"remote_write_decode\"");
     metrics.append.render(&mut out, "phase=\"append\"");
+    if let Some(tier) = metrics.view_tier.get() {
+        tier.decode.render(&mut out, "phase=\"view_decode\"");
+    }
     for (labels, stats) in &metrics.precompute {
         stats.render(&mut out, labels);
     }
@@ -453,6 +462,68 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
         "Bytes of materialized view rows held.",
         load(&metrics.view_bytes),
     );
+    if let Some(tier) = metrics.view_tier.get() {
+        let cache = tier.cache.stats();
+        for (name, help, value) in [
+            (
+                "asap_view_cache_bytes",
+                "Bytes of decoded view windows in the window cache.",
+                cache.bytes as f64,
+            ),
+            (
+                "asap_view_cache_entries",
+                "View windows in the window cache.",
+                cache.entries as f64,
+            ),
+            (
+                "asap_view_pending_bytes",
+                "Bytes of view windows committed and not yet written to the view files.",
+                load(&tier.pending_bytes),
+            ),
+            (
+                "asap_view_pinned_bytes",
+                "Bytes of view windows that cannot be written, kept in memory.",
+                load(&tier.pinned_bytes),
+            ),
+            (
+                "asap_view_file_bytes",
+                "Bytes of the view files (segments) held.",
+                load(&metrics.view_file_bytes),
+            ),
+        ] {
+            gauge(&mut out, name, help, value);
+        }
+        for (name, help, value) in [
+            (
+                "asap_view_cache_hits_total",
+                "View window reads the window cache answered.",
+                cache.hits,
+            ),
+            (
+                "asap_view_cache_misses_total",
+                "View window reads the window cache did not answer.",
+                cache.misses,
+            ),
+            (
+                "asap_view_cache_evictions_total",
+                "View windows evicted from the window cache.",
+                cache.evictions,
+            ),
+            (
+                "asap_view_cold_reads_total",
+                "View windows decoded from the view files.",
+                load(&tier.cold_reads) as u64,
+            ),
+            (
+                "asap_view_cold_read_bytes_total",
+                "Bytes of the view files decoded.",
+                load(&tier.cold_read_bytes) as u64,
+            ),
+        ] {
+            family(&mut out, name, "counter", help);
+            let _ = writeln!(out, "{name} {value}");
+        }
+    }
     for (name, help, value) in [
         (
             "asap_view_persisted_bytes_total",

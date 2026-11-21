@@ -149,11 +149,13 @@ Each `ViewWindow` in the store keeps its `(start, end]` and one of:
   mix key types, an encoding error, or a write error), or persistence is
   off. Always in the heap and counted in `asap_view_pinned_bytes`.
 
-The committer is still the only writer of `ViewStore`. A persist thread,
-once its `write_all` returns, sends `Written { group, window, segment,
-offsets }` back to the committer, which turns the window's views from
-`Pending` to `Stored` at its next pass and publishes the snapshot. A run
-holding an older snapshot keeps reading `Pending` batches it already has.
+The committer is still the only writer of `ViewStore`. Each window is a
+`WindowSlot` shared by every snapshot holding it, and its state is the one
+thing that changes after commit: once a persist thread's write returns, it
+moves the window's slot from `Pending` to `Stored` with its location (and
+inserts the decoded batches into the cache), or to `Pinned` when the view
+was not written. No snapshot needs republishing, and an event-time barrier
+answered after the write sees the window `Stored`.
 
 ### Tiering policy
 
@@ -166,8 +168,8 @@ The window cache decides which `Stored` windows stay decoded:
 2. **Recency.** Each read sets the entry's reference bit. A CLOCK hand
    (second chance) evicts entries whose bit is clear. An entry not read
    for `--view-cache-idle-ms` is evicted even when the budget has room;
-   the default is twice the longest evaluation interval among the plan's
-   readers of views (30 s for the dashboard), so a window read by every
+   the default is 60 s, four 15 s dashboard refreshes (the installed plan
+   does not carry its queries' intervals), so a window read by every
    evaluation never goes idle.
 3. **Budget.** When the cache holds more than `--view-cache-max-bytes`
    (counted with the bytes `ViewStore::append` already records per window,
@@ -436,12 +438,12 @@ gauges count bytes recorded at append, which the budget also uses.
   touch the store or the files. Per-shard partial states are never
   persisted.
 - **Committer**: still the only writer of `ViewStore`; it appends
-  `Pending` windows, applies persist acks, drops windows past retention,
+  `Pending` windows, drops windows past retention,
   and publishes snapshots, as today. It also inserts committed windows into
   the cache.
 - **Persist threads**: one writer per group directory (group `g` on
   thread `g % n`, as today). They encode, append, sync, roll and delete
-  segments, and send acks. Encoding is done once; the bytes written are
+  segments, and move written windows' slots to `Stored`. Encoding is done once; the bytes written are
   the bytes later read.
 - **Query workers**: read snapshots without locks. The cache is a sharded
   map (64 shards, as `RawReads`) with one `OnceLock` per entry for single
@@ -558,12 +560,12 @@ same build with tiering off (`--view-cache-max-bytes` unbounded and
 | # | Behavior verified | Inputs | Expected | Today |
 | --- | --- | --- | --- | --- |
 | V1 | Answers are identical with tiering on and off. | All parity workloads (`tests/workloads/`), raw data kept and not kept, ingest shards 1, 4 and 8 (`PARITY_INGEST_THREADS`), instant and range queries; tiering with a budget of zero (every read cold). | Equal to the Planner executor and to tiering off. KLL plans within the existing 5 %, as today. | Fails: no tiering options. |
-| V2 | A cold window decodes, from its columnar fragment, to the rows that were committed. | One window per state family a view column can hold (DDSketch, KLL, Count-Min, KMV, HLL, Count-Min and Count Sketch with heap, UnivMon, Hydra-Count-Min groups, exact Sum/Max/Rate, increase), with a text column, a timestamp column and nulls; written, then read back through its location from a sealed (mapped) and from the active segment. | Same rows: texts equal, states equal by `sketch()` bytes or exact value. (Hydra-KLL and heapless weighted frequency cannot be a view column today.) | Fails: no fragment format, no locations. |
+| V2 | A cold window decodes, from its columnar fragment, to the rows that were committed. | One window per state family a view column can hold (DDSketch, KLL, Count-Min, KMV, HLL, Count-Min and Count Sketch with heap, UnivMon, Hydra-Count-Min groups, exact Sum, Max and Counter), with a text column, a timestamp column and nulls; written, then read back through its location from a sealed (mapped) and from the active segment. | Same rows: texts equal, states equal by `sketch()` bytes or exact value. (Hydra-KLL and heapless weighted frequency cannot be a view column today.) | Fails: no fragment format, no locations. |
 | V3 | A view's fragment decodes without the record's other views. | A record with four views; the bytes of view 2's fragment overwritten. | Views 1, 3 and 4 read correctly; view 2's read returns an error naming the view and window. | Fails: as V2. |
 | V4 | The cache keeps windows recent reads touched and evicts idle ones. | Unit test on the cache: idle time 30 s, budget unbounded; windows read every 15 s and windows never read. | Read windows stay; unread ones leave after 30 s; eviction never touches `Pending` or `Pinned`. | Fails: no cache. |
 | V5 | The byte budget holds. | Budget = 3 windows' bytes; 10 windows committed; reads of every window in turn. | Cached bytes ≤ budget after every insert; reads all answered; misses counted. | Fails: no cache. |
 | V6 | Concurrent reads of one cold window decode it once. | 8 query workers reading the same cold window at once (a hook slows the decode). | One decode (`asap_view_cold_reads_total` +1), 8 equal answers. | Fails: no cache. |
-| V7 | A window leaves the heap only after its record is written. | Persist delay hook (`persist_delay_ms`); budget zero. | Until the write, the window is `Pending` and read from the heap; after the ack it is `Stored`; answers unchanged throughout. | Fails: no window states. |
+| V7 | A window leaves the heap only after its record is written. | Persist delay hook (`persist_delay_ms`); budget zero; result cache off. | Until the write, the window is `Pending` and read from the heap; after the write it is `Stored`; answers unchanged throughout. | Fails: no window states. |
 | V8 | Windows that cannot be persisted stay hot. | A UnivMon view whose heaps mix key types; persistence on, budget zero. | Answered from the heap; `asap_view_pinned_bytes` > 0; never evicted. | Fails: no pinned state. |
 | V9 | Segments roll and are deleted past retention; disk is bounded. | 1 min retention, `--view-segment-ms` 15 s, 5 min of samples. | At most ⌈(retention + margin) / segment⌉ + 1 segments per group; `asap_view_file_bytes` flat after the first minute; answers unchanged. | Fails: one file per group grows without bound. |
 | V10 | A segment deleted while a run reads it stays readable. | A hook holds a run after it took its snapshot; the segment it reads passes retention and is unlinked. | The run's answer is complete; the file is gone after it finishes. | Fails: no segments. |

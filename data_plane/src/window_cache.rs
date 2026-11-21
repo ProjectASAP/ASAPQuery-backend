@@ -2,11 +2,14 @@
 //! (docs/design/tiered-view-storage.md): decoded view windows shared by
 //! every query, bounded by a byte budget and an idle time, evicted by
 //! CLOCK (second chance). A window read cold is decoded once (single
-//! flight) and inserted; the committer inserts each window it commits.
+//! flight) and inserted; a window is inserted when it is written.
 //!
-//! Interface only: not implemented yet, so every method panics.
+//! One lock guards the map; it is held only for lookups and bookkeeping,
+//! never while a window is decoded.
 
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
@@ -32,34 +35,161 @@ pub struct CacheStats {
     pub loads: u64,
 }
 
-/// Decoded view windows, shared by every query.
-pub struct WindowCache {
-    _max_bytes: Option<u64>,
-    _idle: Option<Duration>,
+struct Entry {
+    batches: Arc<Vec<Batch>>,
+    bytes: u64,
+    /// Read since the CLOCK hand last passed it.
+    referenced: bool,
+    last_read: Instant,
 }
 
-const NOT_IMPLEMENTED: &str =
-    "the window cache is not implemented (docs/design/tiered-view-storage.md)";
+/// A decode in flight: its result once done (an error as text).
+type Loading = Arc<(Mutex<Option<Result<Arc<Vec<Batch>>, String>>>, Condvar)>;
+
+#[derive(Default)]
+struct Inner {
+    entries: HashMap<WindowKey, Entry>,
+    /// The CLOCK ring: keys in insertion order, the hand at the front.
+    ring: VecDeque<WindowKey>,
+    bytes: u64,
+    /// The bytes the cache may hold now (`None`: unbounded).
+    target: Option<u64>,
+    loading: HashMap<WindowKey, Loading>,
+}
+
+/// Decoded view windows, shared by every query.
+pub struct WindowCache {
+    max_bytes: Option<u64>,
+    idle: Option<Duration>,
+    inner: Mutex<Inner>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
+    loads: AtomicU64,
+}
+
+impl Inner {
+    /// Evicts by CLOCK until the cache holds at most `target` bytes.
+    fn evict_to(&mut self, target: u64, evictions: &AtomicU64) {
+        let mut passes = 2 * self.ring.len() + 1;
+        while self.bytes > target && passes > 0 {
+            passes -= 1;
+            let Some(key) = self.ring.pop_front() else {
+                break;
+            };
+            let Some(entry) = self.entries.get_mut(&key) else {
+                continue;
+            };
+            if entry.referenced {
+                entry.referenced = false;
+                self.ring.push_back(key);
+                continue;
+            }
+            let entry = self.entries.remove(&key).expect("present");
+            self.bytes -= entry.bytes;
+            evictions.fetch_add(1, Ordering::Relaxed);
+        }
+        // Every entry was referenced twice over: drop from the front.
+        while self.bytes > target {
+            let Some(key) = self.ring.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&key) {
+                self.bytes -= entry.bytes;
+                evictions.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn insert(
+        &mut self,
+        key: WindowKey,
+        batches: Arc<Vec<Batch>>,
+        bytes: u64,
+        now: Instant,
+        evictions: &AtomicU64,
+    ) {
+        let target = self.target.unwrap_or(u64::MAX);
+        if bytes > target {
+            return;
+        }
+        if let Some(old) = self.entries.remove(&key) {
+            self.bytes -= old.bytes;
+        } else {
+            self.ring.push_back(key);
+        }
+        self.entries.insert(
+            key,
+            Entry {
+                batches,
+                bytes,
+                referenced: false,
+                last_read: now,
+            },
+        );
+        self.bytes += bytes;
+        if self.bytes > target {
+            // The new entry is passed over once: it was just read.
+            if let Some(entry) = self.entries.get_mut(&key) {
+                entry.referenced = true;
+            }
+            self.evict_to(target, evictions);
+            if let Some(entry) = self.entries.get_mut(&key) {
+                entry.referenced = false;
+            }
+        }
+    }
+}
 
 impl WindowCache {
     /// A cache holding at most `max_bytes` (`None`: no budget) and
     /// dropping an entry not read for `idle` (`None`: never).
     pub fn new(max_bytes: Option<u64>, idle: Option<Duration>) -> Self {
-        let _ = (max_bytes, idle);
-        unimplemented!("{NOT_IMPLEMENTED}")
+        Self {
+            max_bytes,
+            idle: idle.filter(|idle| !idle.is_zero()),
+            inner: Mutex::new(Inner {
+                target: max_bytes,
+                ..Inner::default()
+            }),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+            loads: AtomicU64::new(0),
+        }
+    }
+
+    /// The budget (`None`: none).
+    pub fn max_bytes(&self) -> Option<u64> {
+        self.max_bytes
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Inserts `key`'s decoded `batches` of `bytes`, read at `now`, evicting
     /// to stay within the target; not kept if the window alone exceeds it.
     pub fn insert(&self, key: WindowKey, batches: Arc<Vec<Batch>>, bytes: u64, now: Instant) {
-        let _ = (key, batches, bytes, now);
-        unimplemented!("{NOT_IMPLEMENTED}")
+        self.lock()
+            .insert(key, batches, bytes, now, &self.evictions);
     }
 
     /// `key`'s batches if cached, marking them read at `now`.
     pub fn get(&self, key: WindowKey, now: Instant) -> Option<Arc<Vec<Batch>>> {
-        let _ = (key, now);
-        unimplemented!("{NOT_IMPLEMENTED}")
+        let mut inner = self.lock();
+        match inner.entries.get_mut(&key) {
+            Some(entry) => {
+                entry.referenced = true;
+                entry.last_read = now;
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(entry.batches.clone())
+            }
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
     }
 
     /// `key`'s batches: cached, or decoded by `load` (its batches and
@@ -71,31 +201,111 @@ impl WindowCache {
         now: Instant,
         load: impl FnOnce() -> Result<(Arc<Vec<Batch>>, u64), Error>,
     ) -> Result<Arc<Vec<Batch>>, Error> {
-        let _ = (key, now, load);
-        unimplemented!("{NOT_IMPLEMENTED}")
+        let (loading, loader) = {
+            let mut inner = self.lock();
+            if let Some(entry) = inner.entries.get_mut(&key) {
+                entry.referenced = true;
+                entry.last_read = now;
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(entry.batches.clone());
+            }
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            match inner.loading.get(&key) {
+                Some(loading) => (loading.clone(), false),
+                None => {
+                    let loading: Loading = Arc::default();
+                    inner.loading.insert(key, loading.clone());
+                    (loading, true)
+                }
+            }
+        };
+        if !loader {
+            let (result, done) = &*loading;
+            let mut result = result.lock().unwrap_or_else(|e| e.into_inner());
+            while result.is_none() {
+                result = done.wait(result).unwrap_or_else(|e| e.into_inner());
+            }
+            return result.clone().expect("set").map_err(Error::Invalid);
+        }
+        self.loads.fetch_add(1, Ordering::Relaxed);
+        // A panic in `load` must not leave waiters waiting.
+        let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(load))
+            .unwrap_or_else(|_| Err(Error::Invalid("decoding a view window panicked".into())));
+        let shared = loaded
+            .as_ref()
+            .map(|(batches, _)| batches.clone())
+            .map_err(|e| e.to_string());
+        {
+            let mut inner = self.lock();
+            inner.loading.remove(&key);
+            if let Ok((batches, bytes)) = &loaded {
+                inner.insert(key, batches.clone(), *bytes, now, &self.evictions);
+                if let Some(entry) = inner.entries.get_mut(&key) {
+                    entry.referenced = true;
+                }
+            }
+        }
+        let (result, done) = &*loading;
+        *result.lock().unwrap_or_else(|e| e.into_inner()) = Some(shared);
+        done.notify_all();
+        loaded.map(|(batches, _)| batches)
     }
 
     /// Drops the entries not read since `now - idle`.
     pub fn evict_idle(&self, now: Instant) {
-        let _ = now;
-        unimplemented!("{NOT_IMPLEMENTED}")
+        let Some(idle) = self.idle else {
+            return;
+        };
+        let mut inner = self.lock();
+        let idle_keys: Vec<WindowKey> = inner
+            .entries
+            .iter()
+            .filter(|(_, entry)| now.saturating_duration_since(entry.last_read) > idle)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in idle_keys {
+            if let Some(entry) = inner.entries.remove(&key) {
+                inner.bytes -= entry.bytes;
+                self.evictions.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let Inner { ring, entries, .. } = &mut *inner;
+        ring.retain(|key| entries.contains_key(key));
     }
 
     /// Sets the bytes the cache may hold now (`None`: the budget) and
     /// evicts down to it; the memory monitor lowers it under pressure.
     pub fn set_target_bytes(&self, target: Option<u64>) {
-        let _ = target;
-        unimplemented!("{NOT_IMPLEMENTED}")
+        let target = match (target, self.max_bytes) {
+            (Some(target), Some(max)) => Some(target.min(max)),
+            (Some(target), None) => Some(target),
+            (None, max) => max,
+        };
+        let mut inner = self.lock();
+        inner.target = target;
+        if let Some(target) = target {
+            inner.evict_to(target, &self.evictions);
+        }
     }
 
     /// Drops `key` (its window left the store: past retention).
     pub fn remove(&self, key: WindowKey) {
-        let _ = key;
-        unimplemented!("{NOT_IMPLEMENTED}")
+        let mut inner = self.lock();
+        if let Some(entry) = inner.entries.remove(&key) {
+            inner.bytes -= entry.bytes;
+        }
     }
 
     pub fn stats(&self) -> CacheStats {
-        unimplemented!("{NOT_IMPLEMENTED}")
+        let inner = self.lock();
+        CacheStats {
+            bytes: inner.bytes,
+            entries: inner.entries.len() as u64,
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+            loads: self.loads.load(Ordering::Relaxed),
+        }
     }
 }
 
