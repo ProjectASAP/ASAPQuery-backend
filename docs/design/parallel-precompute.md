@@ -821,28 +821,30 @@ overturns it.
 ### B1/B2 measurements (typical 60 s / 10 Hz dashboard, 12 views)
 
 **Setup.** Push compared with the window path on the precompute task pool, with K
-ingest shards and K precompute threads, one Remote Write request per scrape. Window
-ready is the time from when the scrape at a window's end was sent to that window's
-commit, including the 15 s allowed lateness.
+ingest shards and K precompute threads, one Remote Write request per scrape, paced at
+10 scrapes/s. Window ready is the time from when the scrape at a window's end was sent
+to that window's commit, including the 15 s allowed lateness. Push coalesces each
+shard's samples into morsels of up to 32,768 samples or 1 s before folding (the
+default).
 
-| series, K | window ready, window path (mean s) | window ready, push (mean s) | samples/s unpaced, window path / push | fold CPU paced, window path / push (s) |
+| series, K | window ready, window path / push (mean s) | M samples/s, window path / push | fold CPU, window path / push (s) | total CPU, window path / push (s) |
 | --- | --- | --- | --- | --- |
-| 10k, 1 | 37.2 | 12.2 | – | 126 / 140 |
-| 10k, 4 | 18.7 | 12.3 | 1.46M / 1.59M | 124 / 223 |
-| 10k, 12 | 14.7 | 12.3 | 1.98M / 2.07M | 127 / 219 |
-| 100k, 12 (2M/s offered) | 87.2 | 43.7 | 1.37M / 1.64M | 1,464 / 1,611 |
+| 10k, 4 | 18.5 / 12.3 | 0.20 / 0.20 (offered) | 121 / 135 | 234 / 235 |
+| 10k, 12 | 14.7 / 12.3 | 0.20 / 0.20 (offered) | 126 / 140 | 254 / 259 |
+| 100k, 4 (2M/s offered) | 224 / 193 | 0.78 / 0.86 | 1,436 / 1,523 | 1,870 / 2,028 |
+| 100k, 12 (2M/s offered) | 88.6 / 44.7 | 1.33 / 1.59 | 1,422 / 1,312 | 1,926 / 1,693 |
 
 **Findings.**
 
-- **Latency.** Push commits each window at the lateness bound, whatever K is.
-- **Throughput.** Push takes 4–21% more samples per second.
-- **CPU.** Unpaced, push costs the same CPU as the window path (10k series, K = 4:
-  124 s against 130 s). Paced with K ≥ 4, it costs about 1.75× as much: each shard
-  folds a roughly 5k-row morsel through every view every 100 ms. Coalescing morsels
-  before folding is the next step.
-
-The D9 rule for making push the default is therefore met on latency and
-throughput, but not yet on CPU under paced load.
+- **Latency.** Push commits each window at the lateness bound at 10k series,
+  whatever K is. At 100k series and K = 12 it halves the window path's latency.
+- **CPU, total.** With morsel batching, push's total CPU matches the window path's
+  at 10k series and is 12% lower at 100k series with K = 12.
+- **CPU, fold only.** Push's folding costs 6–12% more than the window path's,
+  except at 100k series with K = 12, where it costs 8% less.
+- **Without batching.** When every 10 Hz scrape was folded at once, push used about
+  1.75× the window path's fold CPU at K ≥ 4. With morsels of 8,192 samples it still
+  used 1.6×.
 
 ## Minimal complexity
 
