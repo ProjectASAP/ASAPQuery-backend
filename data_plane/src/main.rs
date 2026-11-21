@@ -73,6 +73,13 @@ struct Args {
     /// Push mode: bytes of open-window state all shards may hold together.
     #[arg(long)]
     precompute_memory_budget_bytes: Option<u64>,
+    /// Push mode: a shard folds its pending samples once this many are
+    /// pending (0: fold every request's samples at once).
+    #[arg(long, default_value_t = data_plane::push::MorselBatching::default().max_samples)]
+    push_batch_samples: usize,
+    /// Push mode: ... or once the oldest pending sample is this old.
+    #[arg(long, default_value_t = data_plane::push::MorselBatching::default().max_age_ms)]
+    push_batch_max_ms: u64,
     /// Threads computing closed refresh windows at once: windows of
     /// different refresh groups, and of one group, run in parallel and are
     /// stored in window order. 1 computes one window at a time. Default: a
@@ -173,6 +180,10 @@ async fn main() -> anyhow::Result<()> {
                     _ => PrecomputeMode::Window,
                 },
                 precompute_memory_budget_bytes: args.precompute_memory_budget_bytes,
+                push_batching: data_plane::push::MorselBatching {
+                    max_samples: args.push_batch_samples,
+                    max_age_ms: args.push_batch_max_ms,
+                },
                 panic_in_combine_of_window_end_ms: None,
             },
         )?

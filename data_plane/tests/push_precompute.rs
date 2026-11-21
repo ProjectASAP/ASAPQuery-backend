@@ -1068,6 +1068,15 @@ async fn peak_state_bytes(app: &Router, requests: Vec<Vec<u8>>) -> f64 {
     peak
 }
 
+/// Push folding every request's samples as they come, so open state grows
+/// request by request (the default batches them into larger morsels).
+fn per_request() -> data_plane::push::MorselBatching {
+    data_plane::push::MorselBatching {
+        max_samples: 0,
+        max_age_ms: 0,
+    }
+}
+
 /// T15. A memory reservation waits while older windows are open and fails
 /// the window only when nothing else is open. With a budget for one open
 /// window and two windows open at once (lateness), ingest slows (queue,
@@ -1089,7 +1098,13 @@ async fn memory_reservations_wait_then_fail_only_a_lone_window() {
         .map(|s| body(&["data"], 0..2000, &[s * 1000]))
         .collect();
     // Calibration: the open state of one window of 200 and of 2000 series.
-    let (app, _) = install(&plan, options(PUSH, 4));
+    let (app, _) = install(
+        &plan,
+        EngineOptions {
+            push_batching: per_request(),
+            ..options(PUSH, 4)
+        },
+    );
     let one_small = peak_state_bytes(&app, small.clone()).await;
     let one_large = peak_state_bytes(&app, large.clone()).await;
     assert!(one_large > one_small * 2.0, "{one_small} then {one_large}");
@@ -1099,6 +1114,7 @@ async fn memory_reservations_wait_then_fail_only_a_lone_window() {
         &plan,
         EngineOptions {
             precompute_memory_budget_bytes: Some((one_small * 1.5) as u64),
+            push_batching: per_request(),
             ingestion: IngestionOptions {
                 allowed_lateness_ms: 5_000,
                 stream_start_ms: Some(0),
@@ -1126,6 +1142,7 @@ async fn memory_reservations_wait_then_fail_only_a_lone_window() {
         &plan,
         EngineOptions {
             precompute_memory_budget_bytes: Some(((one_small + one_large) / 2.0) as u64),
+            push_batching: per_request(),
             ..options(PUSH, 4)
         },
     );

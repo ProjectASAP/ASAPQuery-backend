@@ -137,6 +137,9 @@ pub struct EngineOptions {
     pub view_sync_interval_ms: u64,
     /// How the views of a closed window are built.
     pub precompute_mode: PrecomputeMode,
+    /// Push mode: how each shard coalesces samples into morsels before
+    /// folding them.
+    pub push_batching: crate::push::MorselBatching,
     /// Push mode: bytes of open-window state all shards may hold together;
     /// a shard reserves before folding a batch and waits while older
     /// windows are open. `None`: no limit.
@@ -178,6 +181,7 @@ impl Default for EngineOptions {
             view_sync_interval_ms: 5_000,
             precompute_mode: PrecomputeMode::Window,
             precompute_memory_budget_bytes: None,
+            push_batching: crate::push::MorselBatching::default(),
             panic_in_combine_of_window_end_ms: None,
         }
     }
@@ -444,15 +448,19 @@ impl EngineHandle {
                     ingestion.pane_width_ms(),
                     options.precompute_memory_budget_bytes,
                     partials.clone(),
+                    options.push_batching,
                 )
             });
             std::thread::Builder::new()
                 .name(format!("ingest-{index}"))
                 .spawn(move || {
                     let _guard = guard;
-                    let push = push_init.map(|(precompute, groups, pane, budget, partials)| {
-                        PushShard::new(index, precompute, groups, pane, budget, partials)
-                    });
+                    let push =
+                        push_init.map(|(precompute, groups, pane, budget, partials, batching)| {
+                            PushShard::new(
+                                index, precompute, groups, pane, budget, partials, batching,
+                            )
+                        });
                     serve_shard(
                         index,
                         raw_data,

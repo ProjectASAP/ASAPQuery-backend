@@ -23,7 +23,8 @@
 //! prints the time from a window's end to its commit (for a paced run,
 //! counted from when the scrape at the window's end was sent), split into
 //! the precompute queue wait, compute and commit wait.
-//! `PRECOMPUTE_MODE=push` builds views by push pipelines instead of one
+//! `PUSH_BATCH_SAMPLES` / `PUSH_BATCH_MAX_MS` set push mode's morsel
+//! batching. `PRECOMPUTE_MODE=push` builds views by push pipelines instead of one
 //! ingestion run per closed window (B1: dashboard and seed-862-01, raw data
 //! not kept, 1k/10k/100k series, K = 1, 2, 4, 8, paced then unpaced). With
 //! `PACED=1` it also samples the newest window's commit lag every second
@@ -124,6 +125,16 @@ async fn main() {
             .map_or(EngineOptions::default().ingest_threads, |n| {
                 n.parse().unwrap()
             }),
+        push_batching: data_plane::push::MorselBatching {
+            max_samples: std::env::var("PUSH_BATCH_SAMPLES").map_or(
+                data_plane::push::MorselBatching::default().max_samples,
+                |n| n.parse().unwrap(),
+            ),
+            max_age_ms: std::env::var("PUSH_BATCH_MAX_MS").map_or(
+                data_plane::push::MorselBatching::default().max_age_ms,
+                |n| n.parse().unwrap(),
+            ),
+        },
         precompute_mode: match std::env::var("PRECOMPUTE_MODE").as_deref() {
             Ok("push") => PrecomputeMode::Push,
             _ => PrecomputeMode::Window,

@@ -312,6 +312,30 @@ pub struct PushShard {
     sealed_through: Vec<Option<i64>>,
     pool: LocalPool,
     partials: Sender<Partial>,
+    batching: MorselBatching,
+    /// Accepted samples not folded yet, and when the oldest came.
+    pending: Vec<RawSample>,
+    pending_since: Option<Instant>,
+}
+
+/// How a shard coalesces its routed samples into morsels before folding:
+/// each fold runs every view of the group, so small morsels (one 10 Hz
+/// scrape's share of a shard) cost more per sample than large ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MorselBatching {
+    /// Fold once this many samples are pending (0 or 1: fold every batch).
+    pub max_samples: usize,
+    /// ... or once the oldest pending sample came this long ago.
+    pub max_age_ms: u64,
+}
+
+impl Default for MorselBatching {
+    fn default() -> Self {
+        Self {
+            max_samples: 32_768,
+            max_age_ms: 1_000,
+        }
+    }
 }
 
 impl PushShard {
@@ -322,6 +346,7 @@ impl PushShard {
         pane_width_ms: i64,
         budget_bytes: Option<u64>,
         partials: Sender<Partial>,
+        batching: MorselBatching,
     ) -> Self {
         let metrics: BTreeSet<String> = groups
             .iter()
@@ -341,7 +366,46 @@ impl PushShard {
             instances: BTreeMap::new(),
             pool: LocalPool::new(),
             partials,
+            batching,
+            pending: Vec::new(),
+            pending_since: None,
         }
+    }
+
+    /// Takes `samples` (accepted, of this shard's series): buffers them
+    /// into the shard's pending morsel and folds it once it holds
+    /// `max_samples` or its oldest sample is `max_age_ms` old. A seal
+    /// folds what is pending first, so batching never delays a window.
+    pub fn push(&mut self, samples: &[RawSample], metrics: &Metrics) {
+        if self.metrics.is_empty() {
+            return;
+        }
+        if self.batching.max_samples <= 1 {
+            self.fold(samples, metrics);
+            return;
+        }
+        self.pending.extend(
+            samples
+                .iter()
+                .filter(|s| self.metrics.iter().any(|m| **m == *s.labels.metric))
+                .cloned(),
+        );
+        if self.pending.is_empty() {
+            return;
+        }
+        let since = *self.pending_since.get_or_insert_with(Instant::now);
+        if self.pending.len() >= self.batching.max_samples
+            || since.elapsed().as_millis() as u64 >= self.batching.max_age_ms
+        {
+            self.flush(metrics);
+        }
+    }
+
+    /// Folds the pending morsel.
+    fn flush(&mut self, metrics: &Metrics) {
+        let pending = std::mem::take(&mut self.pending);
+        self.pending_since = None;
+        self.fold(&pending, metrics);
     }
 
     fn open(&mut self, group: usize, end_ms: i64) -> Result<Instance, Error> {
@@ -380,18 +444,16 @@ impl PushShard {
     /// Folds `samples` (accepted, of this shard's series) into the open
     /// windows they fall in; returns the samples late for every push
     /// group's views (their window already sealed), which are not folded.
-    pub fn push(&mut self, samples: &[RawSample], metrics: &Metrics) -> u64 {
+    fn fold(&mut self, samples: &[RawSample], metrics: &Metrics) -> u64 {
         if samples.is_empty() || self.metrics.is_empty() {
             return 0;
         }
-        let mut raw = RawData::for_metrics(self.metrics.iter(), self.pane_width_ms);
-        raw.append(samples);
-        let morsel = Arc::new(Morsel {
-            raw,
-            converted: RefCell::default(),
-        });
+        // Each group's samples by the window they fall in: a window's
+        // instance gets a morsel of its own samples only, so a large
+        // window does not cost a small one's run.
         let mut late = 0;
-        let mut ends: Vec<BTreeSet<i64>> = vec![BTreeSet::new(); self.groups.len()];
+        let mut by_window: Vec<BTreeMap<i64, Vec<RawSample>>> =
+            vec![BTreeMap::new(); self.groups.len()];
         for sample in samples {
             let mut late_for_all = true;
             let mut any = false;
@@ -406,18 +468,21 @@ impl PushShard {
                     continue;
                 }
                 late_for_all = false;
-                ends[group].insert(end);
+                by_window[group]
+                    .entry(end)
+                    .or_default()
+                    .push(sample.clone());
             }
             if any && late_for_all {
                 late += 1;
             }
         }
-        for (group, ends) in ends.into_iter().enumerate() {
-            if ends.is_empty() {
+        for (group, windows) in by_window.into_iter().enumerate() {
+            if windows.is_empty() {
                 continue;
             }
             let timer = Timer::start();
-            for end in ends {
+            for (end, rows) in windows {
                 if !self.instances.contains_key(&(group, end)) {
                     match self.open(group, end) {
                         Ok(instance) => {
@@ -433,6 +498,12 @@ impl PushShard {
                 if instance.failed.is_some() {
                     continue;
                 }
+                let mut raw = RawData::for_metrics(self.metrics.iter(), self.pane_width_ms);
+                raw.append(&rows);
+                let morsel = Arc::new(Morsel {
+                    raw,
+                    converted: RefCell::default(),
+                });
                 if let Err(error) = instance.feed.feed(&morsel) {
                     instance.failed = Some(error.to_string());
                 }
@@ -492,6 +563,9 @@ impl PushShard {
     /// shard with an empty run) and sends their partials; drops instances
     /// of windows the coordinator skipped (`through`, by group).
     pub fn seal(&mut self, windows: &[ClosedWindow], through: &[Option<i64>], metrics: &Metrics) {
+        if !self.pending.is_empty() {
+            self.flush(metrics);
+        }
         for window in windows {
             let Some(Some(_)) = self.groups.get(window.group) else {
                 continue;
