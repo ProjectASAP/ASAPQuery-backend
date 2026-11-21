@@ -175,17 +175,47 @@ fn points(plan: &InstallablePlan, start_ms: i64) -> Vec<Point> {
 
 // ── The data plane ─────────────────────────────────────────────────────
 
+/// Where the data plane under test keeps its view windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Views {
+    /// Decoded in memory, as without tiered view storage.
+    InMemory,
+    /// In the view files, with a window cache of zero bytes, so every view
+    /// read decodes its windows from the files
+    /// (docs/design/tiered-view-storage.md).
+    EveryReadCold,
+}
+
+/// A fresh directory for the view files of one data plane under test.
+fn fresh_view_dir() -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "asap-parity-views-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
 /// The data plane running `plan` with `--no-forward`, fed `points` by
 /// Remote Write (one request per minute of event time) from `start_ms`,
-/// with the barrier at the evaluation time, and its result cache on or
-/// off.
+/// with the barrier at the evaluation time, its result cache on or off,
+/// and its view windows kept as `views` says.
 async fn data_plane(
     plan: &InstallablePlan,
     points: &[Point],
     start_ms: i64,
     result_cache: bool,
+    views: Views,
 ) -> Router {
+    let (view_dir, view_cache_max_bytes) = match views {
+        Views::InMemory => (None, None),
+        Views::EveryReadCold => (Some(fresh_view_dir()), Some(0)),
+    };
     let options = EngineOptions {
+        view_dir,
+        view_cache_max_bytes,
         no_forward: true,
         result_cache,
         // `PARITY_INGEST_THREADS=n` runs the data plane over `n` ingest
@@ -670,6 +700,17 @@ fn tolerance(plan: &InstallablePlan) -> f64 {
 /// either. At least ten workload plans are compared query by query.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_data_plane_answers_what_the_planner_executor_answers() {
+    compare_instant_answers(Views::InMemory).await;
+}
+
+/// V1 (docs/design/tiered-view-storage.md): the same comparison with every
+/// view window read cold from the view files.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_every_view_read_cold_the_data_plane_answers_what_the_planner_executor_answers() {
+    compare_instant_answers(Views::EveryReadCold).await;
+}
+
+async fn compare_instant_answers(views: Views) {
     let mut compared_plans = 0;
     let mut compared_queries = 0;
     let mut compared_non_empty = 0;
@@ -690,8 +731,8 @@ async fn the_data_plane_answers_what_the_planner_executor_answers() {
             let start_ms = EVALUATION_MS - reach_back_ms(&plan);
             let points = points(&plan, start_ms);
             let expected = reference_answers(&plan, &points, start_ms);
-            let app = data_plane(&plan, &points, start_ms, true).await;
-            let uncached = data_plane(&plan, &points, start_ms, false).await;
+            let app = data_plane(&plan, &points, start_ms, true, views).await;
+            let uncached = data_plane(&plan, &points, start_ms, false, views).await;
             let mut answered = 0;
             let mut non_empty = 0;
             let tolerance = tolerance(&plan);
@@ -774,6 +815,18 @@ fn with_range_evaluation(workload: &PlanningWorkload) -> (PlanningWorkload, Vec<
 /// that time answers, or neither answers.
 #[tokio::test(flavor = "multi_thread")]
 async fn range_queries_answer_what_the_planner_executor_answers_at_each_step() {
+    compare_range_answers(Views::InMemory).await;
+}
+
+/// V1 (docs/design/tiered-view-storage.md): the same comparison with every
+/// view window read cold from the view files, steps sharing the windows
+/// they decode through the window cache.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_every_view_read_cold_range_queries_answer_what_the_planner_executor_answers() {
+    compare_range_answers(Views::EveryReadCold).await;
+}
+
+async fn compare_range_answers(views: Views) {
     let mut compared_steps = 0;
     let mut non_empty_steps = 0;
     let mut report = Vec::new();
@@ -805,8 +858,8 @@ async fn range_queries_answer_what_the_planner_executor_answers_at_each_step() {
                 })
                 .collect();
             let expected = reference_answers_at(&plan, &points, start_ms, &times);
-            let uncached = data_plane(&plan, &points, start_ms, false).await;
-            let app = data_plane(&plan, &points, start_ms, true).await;
+            let uncached = data_plane(&plan, &points, start_ms, false, views).await;
+            let app = data_plane(&plan, &points, start_ms, true, views).await;
             let mut equal = 0;
             for ((query, expected), (step, times)) in plan
                 .query_texts

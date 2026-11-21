@@ -34,7 +34,7 @@ use crate::ingestion::{
     RefreshTaskGraph, Refreshed, Routing,
 };
 use crate::metrics::{Gauges, Metrics, Timer};
-use crate::persist::{plan_hash, ViewFiles};
+use crate::persist::{plan_hash, ViewFiles, ViewRead};
 use crate::query::{QueryEngine, Snapshot, Unanswered};
 use crate::result_cache::{Answer, ResultCache};
 use crate::store::SeriesPartition;
@@ -119,7 +119,37 @@ pub struct EngineOptions {
     /// How often the view files are synced to disk: a refreshed window is
     /// durable within this long. 0 syncs after every window.
     pub view_sync_interval_ms: u64,
+    /// Bytes of decoded view windows the window cache may hold
+    /// (docs/design/tiered-view-storage.md); the other windows are read
+    /// from the view files. `None`: derived from the cgroup's
+    /// `memory.max`, or no budget without a limit. Not implemented yet:
+    /// install refuses a value.
+    pub view_cache_max_bytes: Option<u64>,
+    /// A cached window not read for this long leaves the cache. `None`:
+    /// twice the longest evaluation interval of the plan's view readers;
+    /// `Some(0)`: never (every window stays decoded, as before tiering).
+    /// Not implemented yet: install refuses a value above 0.
+    pub view_cache_idle_ms: Option<u64>,
+    /// Each refresh group's view file rolls to a new segment every this
+    /// many milliseconds of windows. Not implemented yet: install refuses
+    /// a value other than the default.
+    pub view_segment_ms: i64,
+    /// How cold windows are read: mapped sealed segments, or `pread`. Not
+    /// implemented yet: install refuses `Pread`.
+    pub view_read: ViewRead,
+    /// For tests: each cold view window's decode waits this long first.
+    #[doc(hidden)]
+    pub cold_decode_delay_ms: u64,
+    /// For tests: these views' windows are never written to the view files
+    /// (as a state with no byte encoding or a write error), so they stay
+    /// in the heap.
+    #[doc(hidden)]
+    pub unpersistable_views: Vec<PhysicalASAPNodeId>,
 }
+
+/// The default `view_segment_ms`: 15 minutes, about five segments per hour
+/// of retention.
+pub const DEFAULT_VIEW_SEGMENT_MS: i64 = 900_000;
 
 impl Default for EngineOptions {
     fn default() -> Self {
@@ -150,6 +180,12 @@ impl Default for EngineOptions {
             view_dir: None,
             // VictoriaMetrics' default -inmemoryDataFlushInterval (v1.155.0).
             view_sync_interval_ms: 5_000,
+            view_cache_max_bytes: None,
+            view_cache_idle_ms: None,
+            view_segment_ms: DEFAULT_VIEW_SEGMENT_MS,
+            view_read: ViewRead::Mmap,
+            cold_decode_delay_ms: 0,
+            unpersistable_views: Vec::new(),
         }
     }
 }
@@ -299,6 +335,17 @@ impl EngineHandle {
     /// compiled once, and returns the plan's queries. Fails if the plan is
     /// invalid or the data plane cannot execute it.
     pub fn spawn(plan_json: String, options: EngineOptions) -> anyhow::Result<(Self, Vec<String>)> {
+        if options.view_cache_max_bytes.is_some()
+            || options.view_cache_idle_ms.is_some_and(|ms| ms > 0)
+            || options.view_segment_ms != DEFAULT_VIEW_SEGMENT_MS
+            || options.view_read != ViewRead::Mmap
+            || options.cold_decode_delay_ms > 0
+            || !options.unpersistable_views.is_empty()
+        {
+            anyhow::bail!(
+                "tiered view storage is not implemented yet (docs/design/tiered-view-storage.md)"
+            );
+        }
         let (mut ingestion, precompute, query, query_texts) = install(&plan_json, &options)?;
         let mut views = ViewStore::default();
         let files = match &options.view_dir {
