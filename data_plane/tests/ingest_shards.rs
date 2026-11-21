@@ -582,3 +582,44 @@ async fn a_precompute_that_cannot_keep_up_reaches_remote_write() {
     drop(state);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The status of a barrier at `time_ms`.
+async fn barrier_status(app: Router, time_ms: i64) -> StatusCode {
+    app.oneshot(
+        Request::post(format!("/api/v1/precompute/watermark?time_ms={time_ms}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+    .status()
+}
+
+/// A barrier that comes while the coordinator waits for another
+/// barrier's flush covers the writes acknowledged before it: it takes the
+/// next pass, behind its own flush. Here three slow shards hold the first
+/// barrier's flush while a write and a second barrier come.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_barrier_during_another_barriers_flush_covers_writes_before_it() {
+    let (app, _state) = data_plane_with(4, 300);
+    write_seconds(&app, 0..64, 1..=60).await;
+    let first = tokio::spawn(barrier_status(app.clone(), 60_000));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    write_seconds(&app, 0..64, 61..=70).await;
+    assert_eq!(barrier_status(app.clone(), 70_000).await, StatusCode::OK);
+    assert_eq!(first.await.unwrap(), StatusCode::OK);
+    assert_eq!(per_job(&answer(&app, 70).await), expected(70));
+}
+
+/// Two barriers that come while one flush is waited for both answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn barriers_during_one_flush_all_answer() {
+    let (app, _state) = data_plane_with(4, 300);
+    write_seconds(&app, 0..64, 1..=60).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let first = tokio::spawn(barrier_status(app.clone(), 50_000));
+    let second = tokio::spawn(barrier_status(app.clone(), 60_000));
+    assert_eq!(first.await.unwrap(), StatusCode::OK);
+    assert_eq!(second.await.unwrap(), StatusCode::OK);
+    assert_eq!(per_job(&answer(&app, 60).await), expected(60));
+}

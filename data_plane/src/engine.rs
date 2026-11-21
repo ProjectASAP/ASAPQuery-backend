@@ -140,7 +140,6 @@ type Reply<T> = oneshot::Sender<Result<T, Unanswered>>;
 enum Command {
     /// A shard routed and appended a batch, or sealed and evicted.
     Report(ShardReport),
-    /// A shard has run every message sent to it before a flush.
     /// The shard numbered here has run every message sent to it before a
     /// flush.
     Flushed(usize),
