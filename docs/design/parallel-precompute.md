@@ -507,7 +507,18 @@ overturns it.
     core.
 - **Experiment:** E1 (fold throughput per core and scaling, push against
   the window path and against DuckDB, ClickHouse and DataFusion arms).
-  Result: *pending*.
+  Result (100k series, W = 60 s, 10 samples/s, 1 to 16 cores):
+  - **Single-thread fold rate.** It is on par across engines: the data
+    plane 11–15M samples/s per core for sum, max and rate, and about 4M
+    for a quantile sketch. DuckDB, ClickHouse and DataFusion fold sum at
+    10–17M samples/s per core and a quantile at 3–6M.
+  - **Scaling.** Series-hash push into per-thread view states with no
+    combine scaled best: 13–17× on 16 cores (ClickHouse insert-time views
+    fed by series-sharded senders). Whole-window GROUP BY with partial
+    states and a combine scaled worse, and worst for sketches:
+    ClickHouse 1.9–3.8× for a quantile, DuckDB 10–11×, DataFusion about 6×.
+  - **The window path on one thread.** It needs 27–29 s of each 60 s
+    window for four views.
 - **Conclusion:** (b). The window-task pool stays, both as the slow path
   for groups that cannot be pushed (D4, D7) and as the pool that runs
   combine tasks.
@@ -539,7 +550,16 @@ overturns it.
   - The executor's ingestion runtime already gives each batch to every
     consumer with no copy.
 - **Experiment:** E2 (one insert feeding 1 to 13 views; same-thread
-  against cross-thread). Result: *pending*.
+  against cross-thread). Result (K = 1, 4, 16 views over one 15 s batch,
+  10k and 100k series):
+  - **CPU per view.** CPU grows close to linearly with views in every
+    engine. Reading the batch once instead of K times saves nothing
+    measurable. DuckDB's broadcast CTE uses 15–35% more CPU and 7–9× more
+    memory than K separate scans at 16 threads.
+  - **Cross-thread fan-out.** ClickHouse's parallel view processing cuts
+    one stream's wall time by 2.5–4.3×, at 27–60% more CPU, and the
+    slowest view bounds it. With 16 series-hash senders, it makes wall
+    time and CPU worse.
 - **Conclusion:** (a). The earlier draft said pipelines of different views
   would run on different threads. That is withdrawn: the pipeline DAG
   orders dependent work (seal, combine, dependent group, commit) and does
@@ -729,7 +749,11 @@ overturns it.
     total as one thread. For `Reduce` breakers it is up to
     min(K, series per group) times larger.
 - **Experiment:** E2 records state bytes per view as fan-out grows.
-  Result: *pending*.
+  Result:
+  - Views run one after another add state linearly (ClickHouse 128 MB
+    at K = 16 on one stream).
+  - Views run concurrently multiply it (DuckDB's broadcast CTE 12.5 GB
+    against 1.4 GB for separate scans; ClickHouse parallel views 8.4 GB).
 - **Conclusion:** (c), with no spill. Shrinking allowed lateness to close
   windows sooner is an opt-in last resort, not automatic.
   `asap_precompute_state_bytes` reports what is held.
@@ -754,7 +778,12 @@ overturns it.
   - Shards now do the view work, so a quarter of the cores leaves
     precompute capacity unused.
 - **Experiment:** E1 (fold rate per thread for each view class; scaling
-  at 1, 2, 4 and 8 shards). Result: *pending*.
+  at 1, 2, 4 and 8 shards). Result:
+  - **Fold rate per thread.** About 4.5M samples/s with sum, max, rate
+    and a sketch on one source, and 11–15M with cheap folds only.
+  - **Scaling.** Per-thread rates held to 16 cores in the series-hash arm.
+  - **Short windows.** A source with 1 s windows needs more than one
+    thread at 100k series: 5 views take 1.34 s per 1 s window.
 - **Conclusion:** *provisional* (b). Combine runs on the window-task pool,
   so no new pool and no `--precompute-threads` flag. (c) only if E1 shows
   per-source rates differ widely within one deployment. Push becomes the
@@ -788,6 +817,32 @@ overturns it.
   partials × shards × open windows, and single-partition breakers × 1
   plus their buffered rows. This keeps the Planner deployment-agnostic
   and is separate Planner work, after E3 and E4.
+
+### B1/B2 measurements (typical 60 s / 10 Hz dashboard, 12 views)
+
+**Setup.** Push compared with the window path on the precompute task pool, with K
+ingest shards and K precompute threads, one Remote Write request per scrape. Window
+ready is the time from when the scrape at a window's end was sent to that window's
+commit, including the 15 s allowed lateness.
+
+| series, K | window ready, window path (mean s) | window ready, push (mean s) | samples/s unpaced, window path / push | fold CPU paced, window path / push (s) |
+| --- | --- | --- | --- | --- |
+| 10k, 1 | 37.2 | 12.2 | – | 126 / 140 |
+| 10k, 4 | 18.7 | 12.3 | 1.46M / 1.59M | 124 / 223 |
+| 10k, 12 | 14.7 | 12.3 | 1.98M / 2.07M | 127 / 219 |
+| 100k, 12 (2M/s offered) | 87.2 | 43.7 | 1.37M / 1.64M | 1,464 / 1,611 |
+
+**Findings.**
+
+- **Latency.** Push commits each window at the lateness bound, whatever K is.
+- **Throughput.** Push takes 4–21% more samples per second.
+- **CPU.** Unpaced, push costs the same CPU as the window path (10k series, K = 4:
+  124 s against 130 s). Paced with K ≥ 4, it costs about 1.75× as much: each shard
+  folds a roughly 5k-row morsel through every view every 100 ms. Coalescing morsels
+  before folding is the next step.
+
+The D9 rule for making push the default is therefore met on latency and
+throughput, but not yet on CPU under paced load.
 
 ## Minimal complexity
 
