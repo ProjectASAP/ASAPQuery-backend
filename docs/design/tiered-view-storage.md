@@ -290,8 +290,9 @@ the mapped bytes:
   `DictionaryArray<UInt32>` of borrowed keys over it: no copy and no
   per-row allocation;
 - states are rebuilt from their bytes in place (`from_asapv1(&[u8])` on
-  the mapped slice) into owned sketch structures; this is the remaining
-  copy, inherent to the executor's in-memory state types.
+  the mapped slice) into owned sketch structures. This is what is
+  implemented now; the revision below replaces it with read-only views of
+  the mapped states, so nothing is rebuilt.
 
 `SIGBUS` comes only from accessing a mapped page past the end of the file.
 That cannot happen here: only sealed segments are mapped, a sealed
@@ -338,6 +339,100 @@ they are still hot) and by queries whose edges fall on them. They go idle
 and leave the cache, so the hot set shrinks by about the same factor as
 the merges, and cold reads stay rare. Nothing in this design depends on
 levels: each level is its own view, tiered the same way.
+
+### Zero-copy state views (revision, for approval)
+
+**Why.** Decoding a cold window rebuilds every state on the heap. The
+implementation measured so far (sketch states rebuilt from their mapped
+ASAPv1 bytes) bounds the *steady* heap, but not a query's: the executor's
+`SummaryMerge` collects every input batch before merging
+(`merge_summary` in the executor's summary operators), so a 1 h quantile
+over cold windows decodes all 240 windows at once. Dashboard plan, 10k
+series, 1 sample/s, a cgroup of 3 GiB, window cache budget 0: anonymous
+memory is about 0.2 GB between queries and peaks at **2.54 GB** during
+`quantile_over_time(0.99, lat[1h])` (10–14 s), above the 1.7 GB that
+keeping every window decoded takes. Decoding also costs about 1.9 µs per
+KLL state with the page cache warm (B3).
+
+**Goal.** A state stored on disk is *used* where it is mapped: the query
+reads a read-only view of the mapped bytes and folds it into one heap
+accumulator per group. The only heap allocation a query makes for cold
+windows is its accumulators (and its output).
+
+**Fragment layout.** The columnar v2 fragment's state column stores each
+family in a zero-copy-readable layout: little-endian, every array 8-byte
+aligned, per row an offset into the column's data section.
+
+| Family | Layout of one state (fixed header, then arrays) | View operations |
+| --- | --- | --- |
+| DDSketch | `alpha`, `count`, `sum`, `min`, `max`, `zero_count`; per sign: `offset: i32`, `len: u32`, `counts: [u64; len]` | `merge_into(&mut DdSketch)` (add bucket counts at index + offset), `quantile`, `count`, `sum`, `min`, `max` |
+| KLL (f64) | `k`, `m`, `num_levels`; `levels: [u32; num_levels + 1]`; `items: [f64; levels[num_levels]]` | `merge_into(&mut Kll)` (each level's items into the accumulator's level, then its compaction), `quantile`, `cdf`, `count` |
+| Count-Min (f64), Count Sketch | `rows`, `cols`; `grid: [f64 or i64; rows × cols]` | `merge_into` (element-wise add), `point(key)` |
+| HyperLogLog | `precision`; `registers: [u8; 2^p]` (padded to 8) | `merge_into` (element-wise max), `cardinality` |
+| KMV | `k`; `hashes: [u64; n]` sorted | `merge_into` (merge of sorted hashes into the accumulator), `cardinality` |
+| Exact Sum / Count / Min / Max | one fixed record: `sum: f64, compensation: f64, seen: u8` / `count: u64` / `present: u8, value: f64` | `merge_into(&mut ScalarState)`, `finalize` |
+| Counter (`rate`/`increase`) | its fields as one record: first and last sample `(ts: i64, value: f64)`, `increase: f64`, `resets: u64`, `samples: u64` (the executor's `IncreaseAccumulator` fields, in a fixed order) | `merge_into` in time order (windows arrive oldest first), `finalize(readout)` |
+| IRate | two `(ts: i64, value: f64)` slots with presence flags | `merge_into`, `finalize` |
+| Compressed samples (Planner design "compressed sample windows") | one blob: the block as the codec wrote it | decoded at query time (below) |
+
+**Read-only view types live in `asap_sketchlib`** (one sketchlib PR):
+per family a `…View<'a>` over `&'a [u8]` (or typed slices of it) with
+`from_bytes(&[u8]) -> Result<Self>` (validates lengths and alignment, never
+panics on bad bytes), `to_view_bytes(&self) -> Vec<u8>` on the owned type
+(the writer), `merge_into(&self, &mut Owned)`, and the family's estimates.
+The executor (one ASAPPlanner PR pinning that sketchlib commit) adds a
+state storage variant `Mapped { family, bytes: Arc<dyn Allocation>,
+offsets }` to its state columns; `SummaryMerge`, `SummaryEstimate` and
+`FinalizeExactAccumulator` accept owned or mapped states, and
+`SummaryMerge` folds its input batch by batch into its accumulators
+instead of collecting every batch first. The backend pins both and builds
+a cold window's state column as `Mapped` over the segment's mapping: no
+state is rebuilt, and the batch holds only the mapping's `Arc`.
+
+**Fallback: decode to owned** for the families where a zero-copy view is
+impractical:
+
+| Family | Why |
+| --- | --- |
+| Count-Min / Count Sketch with heap (top-k) | the heap holds variable-length keys; the grid could be a view, but `merge_into` must rebuild the heap from both sides anyway |
+| UnivMon | layers of Count Sketches with L2 norms plus a heap per layer with keys of several types; no fixed layout covers the heaps |
+| Hydra-KLL, Hydra-Count-Min | a grid of per-cell sketches shared by many groups, with a key schema; rare at ingestion time, decoded once per record's grid |
+
+These keep today's path (state bytes rebuilt into owned states, cached by
+the window cache). Each family can move to a view later without a format
+change, since the state column records its family.
+
+**Memory accounting.** Mapped pages are page cache: clean, reclaimable,
+counted by the cgroup as `file` (and in RSS as `RssFile` once touched),
+never as `anon`. A query's `anon` for cold windows is its accumulators: for
+the 1 h quantile at 10k series, 10k KLL accumulators (about 10 MB) instead
+of 240 decoded windows (2.3 GB). Hot owned windows (the window cache,
+`Pending` and `Pinned`) stay `anon`. With views, the window cache matters
+mainly for the fallback families and the open segment; for view families
+it can stay small.
+
+**Compressed-sample windows in the data plane** (the Planner's
+compressed-sample-windows design; approved):
+
+- *Write path.* A `CompressedSamples` chain's window state is one block
+  per series, encoded by the executor's codec when the window seals. The
+  data plane commits it like any state and the persist thread writes the
+  block bytes unchanged into the fragment's state column as a blob (no
+  re-encode). The hot window holds the blocks, which are already compact.
+- *Unsealed-window reads.* `DecodeSamplesInRange` with
+  `reads_unsealed_window` also reads the open window. The data plane keeps
+  the raw panes of a metric scanned by an open window until that window
+  closes (the window path already does), and serves the open window's
+  samples from them through the same read, so it declares
+  `unsealed_window_reads: true`. Push mode (parallel precompute) holds no
+  raw panes for views; there it declares `false` until a shard can hand
+  out its open block.
+- *Storage.* A blob column: `u32` offsets and the blocks back to back, in
+  the segment, mapped like any fragment; the blob is read in place.
+- *Decode at query time.* `DecodeSamplesInRange` decodes each overlapping
+  window's block from the mapped bytes into raw rows, one window at a
+  time, streamed to the exact operators above it; the decoded rows are run
+  memory (charged to the run's limit), never kept.
 
 ### Memory accounting under a cgroup
 
@@ -547,6 +642,9 @@ here changes the Planner.
 - **Fragment encoding:** columnar, with format version 2.
 - **No cgroup limit:** no budget, plus idle eviction.
 - **Old view files:** renamed `*.stale`.
+- **Revision (pending approval):** states are used from the mapping
+  through read-only views (section "Zero-copy state views"), with
+  decode-to-owned only for the families listed there.
 
 ## Acceptance and test design (for approval)
 
@@ -560,7 +658,8 @@ same build with tiering off (`--view-cache-max-bytes` unbounded and
 | # | Behavior verified | Inputs | Expected | Today |
 | --- | --- | --- | --- | --- |
 | V1 | Answers are identical with tiering on and off. | All parity workloads (`tests/workloads/`), raw data kept and not kept, ingest shards 1, 4 and 8 (`PARITY_INGEST_THREADS`), instant and range queries; tiering with a budget of zero (every read cold). | Equal to the Planner executor and to tiering off. KLL plans within the existing 5 %, as today. | Fails: no tiering options. |
-| V2 | A cold window decodes, from its columnar fragment, to the rows that were committed. | One window per state family a view column can hold (DDSketch, KLL, Count-Min, KMV, HLL, Count-Min and Count Sketch with heap, UnivMon, Hydra-Count-Min groups, exact Sum, Max and Counter), with a text column, a timestamp column and nulls; written, then read back through its location from a sealed (mapped) and from the active segment. | Same rows: texts equal, states equal by `sketch()` bytes or exact value. (Hydra-KLL and heapless weighted frequency cannot be a view column today.) | Fails: no fragment format, no locations. |
+| V2 (revised) | Every family answers identically from a mapped view and from an owned state. | Per view family (DDSketch, KLL, Count-Min, Count Sketch, HLL, KMV, exact Sum/Count/Min/Max, Counter, IRate): states written to a fragment, sealed, then read as views: each estimate or finalize, and `merge_into` of 1, 2 and 240 views into one accumulator, against the same on owned states. Fallback families (heap variants, UnivMon, Hydra) through decode-to-owned. | Equal answers (KLL: equal, since the same items merge in the same order into the same seeded accumulator); accumulators equal by bytes. | Fails: no view types. |
+| V2 (implemented, kept) | A cold window decodes, from its columnar fragment, to the rows that were committed. | One window per state family a view column can hold (DDSketch, KLL, Count-Min, KMV, HLL, Count-Min and Count Sketch with heap, UnivMon, Hydra-Count-Min groups, exact Sum, Max and Counter), with a text column, a timestamp column and nulls; written, then read back through its location from a sealed (mapped) and from the active segment. | Same rows: texts equal, states equal by `sketch()` bytes or exact value. (Hydra-KLL and heapless weighted frequency cannot be a view column today.) | Fails: no fragment format, no locations. |
 | V3 | A view's fragment decodes without the record's other views. | A record with four views; the bytes of view 2's fragment overwritten. | Views 1, 3 and 4 read correctly; view 2's read returns an error naming the view and window. | Fails: as V2. |
 | V4 | The cache keeps windows recent reads touched and evicts idle ones. | Unit test on the cache: idle time 30 s, budget unbounded; windows read every 15 s and windows never read. | Read windows stay; unread ones leave after 30 s; eviction never touches `Pending` or `Pinned`. | Fails: no cache. |
 | V5 | The byte budget holds. | Budget = 3 windows' bytes; 10 windows committed; reads of every window in turn. | Cached bytes ≤ budget after every insert; reads all answered; misses counted. | Fails: no cache. |
@@ -578,8 +677,12 @@ same build with tiering off (`--view-cache-max-bytes` unbounded and
 | V17 | Metrics. | Any plan, a few windows, budget zero. | `asap_view_cache_{bytes,entries}`, `asap_view_{pending,pinned,file}_bytes`, `asap_view_cache_{hits,misses,evictions}_total`, `asap_view_cold_reads_total`, `asap_view_cold_read_bytes_total`, `phase="view_decode"` CPU. | Fails: new series. |
 | B1 | Bench at 10k (reported, not CI). | Dashboard-heavy and typical-dashboard at 10k series, 1 sample/s, in the harness's cgroups with the same `memory.max` for both engines; tiering off, on with the default budget, on with a budget of zero. | RSS, `memory.current` split into anon and file, peak and steady; query latency per query; CPU per phase incl. `view_decode`; disk bytes. | Tiering-off numbers come from today's code. |
 | B2 | Cold versus warm page cache (reported). | As B1, budget zero; before a round of queries, drop the segments' pages (`POSIX_FADV_DONTNEED` on each file) for the cold case. | Query latency and read bytes cold vs warm; cache hit ratio over a run (checks the recency policy). | — |
-| V18 | Fixed-width columns and texts are borrowed from the mapping, not copied. | A window of 1,000 rows read cold from a sealed segment. | The text keys' and timestamps' buffer addresses lie inside the segment's mapping; the dictionary values array is shared by every window of the segment. With `--view-read=pread` they lie outside it, and the rows are equal. | Fails: as V2. |
+| V18 (revised) | States and fixed-width columns are used from the mapping. | A window of 1,000 KLL and 1,000 DDSketch rows read cold from a sealed segment. | Each view's item and bucket slices lie inside the segment's mapping; text keys and plain columns too; the dictionary is shared by every window of the segment. With `--view-read=pread` they lie outside it, and the answers are equal. | Fails: no view types. |
+| V18 (implemented, kept) | Fixed-width columns and texts are borrowed from the mapping, not copied. | A window of 1,000 rows read cold from a sealed segment. | The text keys' and timestamps' buffer addresses lie inside the segment's mapping; the dictionary values array is shared by every window of the segment. With `--view-read=pread` they lie outside it, and the rows are equal. | Fails: as V2. |
 | V19 | No `SIGBUS`: only sealed segments are mapped, and a sealed segment is never shortened. | Read a window of the active segment (by `pread`), seal it, read again (mapped); unlink a mapped segment and read through a held location; restart over a segment with a torn tail. | All reads equal; the torn tail is cut before any mapping; no crash. | Fails: as V2. |
+| V20 | A query over cold windows allocates only its accumulators. | Dashboard plan, 1k series, 1 h of windows, window cache budget 0, all segments sealed; a counting global allocator in the test binary; `quantile_over_time(0.99, lat[1h])` and `max_over_time(lat[30m])`. | Bytes allocated during the run ≤ accumulators (series × one accumulator state) + output + a fixed bound, and at least 10× below the decoded windows' bytes; same answers as tiering off. | Fails: windows are decoded, and `SummaryMerge` collects them. |
+| V21 | Executor: `SummaryMerge` folds batch by batch and accepts mapped states. | Executor test (ASAPPlanner): a stream of 240 batches whose state columns are `Mapped`; a stream mixing owned and mapped batches; Counter windows out of order in the stream. | Same output as over owned states; at most one input batch held at a time; Counter merged in time order. | Fails: no `Mapped` storage; merge collects. |
+| V22 | Compressed-sample windows through the data plane. | A plan with a `CompressedSamples` chain (Planner fixture): commit, persist, read sealed and active, restart; a query reading the open window. | Blob bytes on disk equal the block the executor sealed; decoded rows equal the raw samples; the open window's samples are included when `reads_unsealed_window`; decoded rows are not kept after the run. | Fails: no compressed-sample chains in the pinned Planner. |
 | B3 | `pread` versus `mmap` (reported). | `examples/view_read_bench.rs` over one 10k-series segment of the dashboard plan: decode each window with `--view-read=mmap` and `pread`, page cache warm and cold. | ns per window and per state by family, bytes copied, `RssAnon`/`RssFile`. | — |
 
 Parity, crash recovery and eviction are V1, V12 and V15. The test design is
@@ -596,6 +699,9 @@ PR.
 | 3 | Window cache: CLOCK, idle time, budget, single flight; lazy cold reads in `read_materialized_view` (V4–V6, V10) |
 | 4 | cgroup budget and monitor, jemalloc defaults, metrics (V14, V17) |
 | 5 | Parity and stress (V1, V16); B1–B3 and the cgroup run (V15) |
+| 6 (revision) | `asap_sketchlib` PR: view layouts, `…View` types, `to_view_bytes`, `merge_into`, estimates, with view-vs-owned tests per family |
+| 7 (revision) | ASAPPlanner executor PR: `Mapped` state storage; streaming `SummaryMerge`; estimates and finalize over views (V21); pins the sketchlib commit |
+| 8 (revision) | Backend: v2 state columns in view layout; cold reads build `Mapped` columns; fallback families unchanged; compressed-sample blobs (V2 revised, V18 revised, V20, V22); pins both |
 
 ## Risks, rollout, and exit criteria
 
