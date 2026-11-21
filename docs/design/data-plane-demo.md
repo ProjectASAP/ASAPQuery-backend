@@ -237,11 +237,29 @@ HTTP queries ─► query workers: one query run per worker thread over
   once every window queued before it is committed. With 1 the committer
   computes each window itself, one at a time, in the order they closed,
   as before the pool. A panic in a run fails that window, not the thread.
-  ASAPQuery parallelizes precompute by series instead (each worker closes
-  its own partial windows); here a window run reads every series, so the
-  window is the task. Borrowed from it: committing all the windows one
-  pass finished as one batch (`precompute_engine/worker.rs`, `flush_all`
-  emits a flush's closed windows together).
+  ASAPQuery parallelizes precompute by series (each worker closes its own
+  partial windows). Borrowed from it: committing all the windows one pass
+  finished as one batch (`precompute_engine/worker.rs`, `flush_all` emits
+  a flush's closed windows together).
+- A window split by series. One group's window can be most of the work
+  (a 60 s dashboard at 10 Hz, 10k series: twelve per-series views over
+  12M samples, 14 s on one thread), so windows in parallel do not help.
+  When every node of a group computes each series alone (time-series
+  `Scan`s that keep the series identity, row filters, and summaries whose
+  reduction is `PerEntity`) and the group reads no other group's views,
+  each window runs as one task per precompute thread: part `i` of `n`
+  reads the raw samples of the series whose id is `i` modulo `n` (a chunk
+  is filtered by its series list; one whose series all fall in the part
+  is read as is). Each part's rows are those series' rows of the whole
+  run, since no node combines series. The committer merges the parts into
+  the order the executor emits groups in (their group values' key order)
+  as one batch per view, so the stored views are byte-identical to one
+  run's, and commits the window once every part is in. Any other group
+  (a node that combines series, such as a `by (job)` reduction, or a view
+  read) runs whole; the install log says which, and `/metrics` reports
+  `asap_precompute_window_parts` per group. Merging partial states of a
+  combining node would change floating-point sums in the last bits, so it
+  is not done.
 - Why a window's task can run on its own. A task (group `G`, window
   `(e - W, e]`) is a pure function of immutable inputs: the raw data as it
   was when the window closed, after every ingest shard flushed up to `e`
@@ -705,7 +723,9 @@ retention are skipped at load.
     computation starts), `asap_precompute_commit_wait_seconds_total`
     (computed → committed), `asap_window_ready_seconds_total` and
     `asap_window_ready_seconds_max` (window end in event time → committed,
-    wall clock); compute time is the `precompute` phase. Utilisation:
+    wall clock); compute time is the `precompute` phase (summed over a
+    split window's parts), and `asap_precompute_window_parts` is the
+    runs each window is split into. Utilisation:
     `asap_precompute_busy_seconds_total` over `asap_precompute_threads`.
   - Persistence: `asap_view_persisted_bytes_total`,
     `asap_view_sync_seconds_total`, and (view, window) pairs not persisted
