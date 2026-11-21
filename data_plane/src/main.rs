@@ -8,7 +8,7 @@ use clap::Parser;
 /// short-lived objects across threads.
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-use data_plane::engine::EngineOptions;
+use data_plane::engine::{EngineOptions, PrecomputeMode};
 use data_plane::ingestion::IngestionOptions;
 use data_plane::{router, DataPlane, DEFAULT_FORWARD_TIMEOUT};
 
@@ -54,6 +54,14 @@ struct Args {
     /// series hashed to it. Default: a quarter of the cores, at least 1.
     #[arg(long, default_value_t = EngineOptions::default().ingest_threads)]
     ingest_threads: usize,
+    /// How the views of a closed window are built: `window` (one ingestion
+    /// run per closed window) or `push` (shards fold samples as they
+    /// arrive; not implemented yet, so install refuses it).
+    #[arg(long, default_value = "window", value_parser = ["window", "push"])]
+    precompute_mode: String,
+    /// Push mode: bytes of open-window state all shards may hold together.
+    #[arg(long)]
+    precompute_memory_budget_bytes: Option<u64>,
     /// Threads that write the view files (each the files of every n-th
     /// refresh group). Default: a quarter of the cores, from 1 to 4.
     #[arg(long, default_value_t = EngineOptions::default().persist_threads)]
@@ -140,6 +148,13 @@ async fn main() -> anyhow::Result<()> {
                 result_cache_max_bytes: args.result_cache_bytes,
                 view_dir: (!args.no_view_persistence).then_some(args.view_dir),
                 view_sync_interval_ms: args.view_sync_interval_ms,
+                precompute_mode: match args.precompute_mode.as_str() {
+                    "push" => PrecomputeMode::Push,
+                    _ => PrecomputeMode::Window,
+                },
+                precompute_memory_budget_bytes: args.precompute_memory_budget_bytes,
+                slow_refreshes: Vec::new(),
+                panic_in_combine_of_window_end_ms: None,
             },
         )?
         .with_forward_timeout(Duration::from_secs(args.forward_timeout_seconds)),

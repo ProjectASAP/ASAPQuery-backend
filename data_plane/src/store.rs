@@ -557,6 +557,21 @@ pub struct ViewStore {
 }
 
 impl ViewStore {
+    /// Every view's rows: per view, each window's `(start, end]` and
+    /// batches, oldest first.
+    pub fn rows(&self) -> BTreeMap<PhysicalASAPNodeId, Vec<((i64, i64), Vec<Batch>)>> {
+        self.by_view
+            .iter()
+            .map(|(view, rows)| {
+                let windows = rows
+                    .iter()
+                    .map(|(range, batches)| (*range, batches.as_ref().clone()))
+                    .collect();
+                (*view, windows)
+            })
+            .collect()
+    }
+
     /// Appends `batches` as `view`'s rows covering `time_range_ms`
     /// (`(start, end]`), then drops its rows ending `view.retention_ms()`
     /// or more before `end` (the newest are always kept). Bad input when

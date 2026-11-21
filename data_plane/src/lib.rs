@@ -13,6 +13,7 @@ pub mod engine;
 pub mod ingestion;
 pub mod metrics;
 pub mod persist;
+pub mod pipelines;
 pub mod prometheus;
 pub mod query;
 pub mod remote_write;

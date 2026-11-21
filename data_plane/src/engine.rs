@@ -41,6 +41,20 @@ use crate::store::{
 use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
 use asap_executor::values::Batch;
 
+/// How the views of a closed refresh window are built
+/// (docs/design/parallel-precompute.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PrecomputeMode {
+    /// One ingestion run per closed window, over the raw samples the
+    /// shards buffered for it (`--precompute-mode=window`).
+    #[default]
+    Window,
+    /// Each ingest shard folds its samples into its own instance of each
+    /// window's pipelines as they arrive; at close the shards' partials are
+    /// combined and committed. Not implemented yet: install refuses it.
+    Push,
+}
+
 /// How the engine ingests samples and runs queries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineOptions {
@@ -103,6 +117,20 @@ pub struct EngineOptions {
     /// How often the view files are synced to disk: a refreshed window is
     /// durable within this long. 0 syncs after every window.
     pub view_sync_interval_ms: u64,
+    /// How the views of a closed window are built.
+    pub precompute_mode: PrecomputeMode,
+    /// Push mode: bytes of open-window state all shards may hold together;
+    /// a shard reserves before folding a batch and waits while older
+    /// windows are open. `None`: no limit.
+    pub precompute_memory_budget_bytes: Option<u64>,
+    /// For tests: refresh windows whose computation waits this long first,
+    /// as a slow run would (in push mode, the window's combine).
+    #[doc(hidden)]
+    pub slow_refreshes: Vec<SlowRefresh>,
+    /// For tests, push mode: the combine of the window ending at this time
+    /// (ms) panics.
+    #[doc(hidden)]
+    pub panic_in_combine_of_window_end_ms: Option<i64>,
 }
 
 impl Default for EngineOptions {
@@ -130,8 +158,23 @@ impl Default for EngineOptions {
             view_dir: None,
             // VictoriaMetrics' default -inmemoryDataFlushInterval (v1.155.0).
             view_sync_interval_ms: 5_000,
+            precompute_mode: PrecomputeMode::Window,
+            precompute_memory_budget_bytes: None,
+            slow_refreshes: Vec::new(),
+            panic_in_combine_of_window_end_ms: None,
         }
     }
+}
+
+/// For tests: the windows of refresh group `group` (any group if
+/// `None`) ending at `end_ms` (any end if `None`) wait `delay_ms` before
+/// they are computed.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlowRefresh {
+    pub group: Option<usize>,
+    pub end_ms: Option<i64>,
+    pub delay_ms: u64,
 }
 
 type Reply<T> = oneshot::Sender<Result<T, Unanswered>>;
@@ -259,6 +302,9 @@ impl EngineHandle {
     /// compiled once, and returns the plan's queries. Fails if the plan is
     /// invalid or the data plane cannot execute it.
     pub fn spawn(plan_json: String, options: EngineOptions) -> anyhow::Result<(Self, Vec<String>)> {
+        if options.precompute_mode == PrecomputeMode::Push {
+            anyhow::bail!("precompute mode push is not implemented yet");
+        }
         let (mut ingestion, precompute, query, query_texts) = install(&plan_json, &options)?;
         let mut views = ViewStore::default();
         let files = match &options.view_dir {
