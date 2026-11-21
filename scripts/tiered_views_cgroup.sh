@@ -6,6 +6,7 @@
 #   tiered    the default window cache budget (derived from memory.max)
 # Expected: the control is OOM-killed (memory.events oom_kill > 0) and the tiered
 # run answers every query with oom_kill 0. Needs sudo -n to create the cgroup.
+# WORKLOAD, COLD and VIEW_READ are passed to the bench (see examples/tier_bench.rs).
 #
 #   scripts/tiered_views_cgroup.sh [MEMORY_MAX_BYTES] [SERIES] [MINUTES] [WORK_DIR]
 set -uo pipefail
@@ -27,7 +28,7 @@ for arm in control tiered; do
   budget=$([ "$arm" = control ] && echo off || echo "")
   log=$WORK/$arm.log
   # The shell moves itself into the cgroup, then runs the bench there.
-  sudo -n -E bash -c "echo \$\$ > $cg/cgroup.procs && exec sudo -n -u $(id -un) env VIEW_CACHE_MAX_BYTES=$budget \
+  sudo -n -E bash -c "echo \$\$ > $cg/cgroup.procs && exec sudo -n -u $(id -un) env VIEW_CACHE_MAX_BYTES=$budget WORKLOAD=${WORKLOAD:-} COLD=${COLD:-0} VIEW_READ=${VIEW_READ:-mmap} \
     $BENCH $SERIES $MINUTES $WORK/$arm-views 3" >"$log" 2>&1
   code=$?
   kills=$(awk '/^oom_kill /{print $2}' "$cg/memory.events")

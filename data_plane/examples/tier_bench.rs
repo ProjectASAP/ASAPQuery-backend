@@ -12,6 +12,8 @@
 //!   default; `off` keeps every window in memory, as before tiering, with
 //!   no idle eviction).
 //! - `VIEW_READ=pread` reads cold windows with `pread`.
+//! - `WORKLOAD=path` plans another workload file (a planning workload,
+//!   as in `tests/workloads/`) instead, at 1 sample/s.
 //! - `COLD=1` drops the segments' pages from the page cache
 //!   (`POSIX_FADV_DONTNEED`) before each round (B2).
 //!
@@ -52,10 +54,10 @@ async fn main() {
     let cold = std::env::var("COLD").is_ok_and(|v| v == "1");
     let _ = std::fs::remove_dir_all(&dir);
 
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/workloads/dashboard.json"
-    );
+    let path = std::env::var("WORKLOAD")
+        .ok()
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/tests/workloads/dashboard.json").into());
     let mut workload: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let metrics: Vec<String> = workload["data_workload"]["sources"]
@@ -251,12 +253,18 @@ fn memory() -> String {
                 .find_map(|line| line.strip_prefix(name)?.trim().parse::<f64>().ok())
                 .map_or(0.0, |bytes| bytes / 1048576.0)
         };
+        let current = read("memory.current").trim().parse::<f64>().unwrap_or(0.0) / 1048576.0;
+        // The working set as container monitors define it: memory.current
+        // less the inactive file pages the kernel reclaims first.
         out += &format!(
-            "; cgroup memory.max {}, current {:.0} MiB, anon {:.0} MiB, file {:.0} MiB, oom_kill {}",
+            "; cgroup memory.max {}, working set {:.0} MiB, current {:.0} MiB, anon {:.0} MiB, file {:.0} MiB (active {:.0}, inactive {:.0}), oom_kill {}",
             read("memory.max").trim(),
-            read("memory.current").trim().parse::<f64>().unwrap_or(0.0) / 1048576.0,
+            current - stat_field("inactive_file "),
+            current,
             stat_field("anon "),
             stat_field("file "),
+            stat_field("active_file "),
+            stat_field("inactive_file "),
             read("memory.events").lines().find_map(|l| l.strip_prefix("oom_kill ")).unwrap_or("?"),
         );
     }

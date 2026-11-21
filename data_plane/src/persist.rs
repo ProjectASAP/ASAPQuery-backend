@@ -1075,11 +1075,22 @@ mod tests {
                         },
                     ) => {
                         assert_eq!(fx, fy, "{what}: row {row} column {column} family");
-                        assert_eq!(
-                            state_bytes(sx.as_ref()),
-                            state_bytes(sy.as_ref()),
-                            "{what}: row {row} column {column} state"
-                        );
+                        // A DDSketch read back is shrunk (sealed), so its
+                        // bytes may be shorter than the written state's;
+                        // its answers are the same.
+                        match encode_sketch(sx.as_ref()) {
+                            Some((kernel @ SketchKernel::DDSketch, _)) => assert_same_readout(
+                                kernel,
+                                readout(kernel, sx.as_ref()),
+                                readout(kernel, sy.as_ref()),
+                                &format!("{what}: row {row} column {column} state"),
+                            ),
+                            _ => assert_eq!(
+                                state_bytes(sx.as_ref()),
+                                state_bytes(sy.as_ref()),
+                                "{what}: row {row} column {column} state"
+                            ),
+                        }
                     }
                     (x, y) => assert_eq!(
                         format!("{x:?}"),

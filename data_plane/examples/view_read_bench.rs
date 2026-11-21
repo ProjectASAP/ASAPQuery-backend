@@ -87,7 +87,8 @@ fn main() {
         "{windows} windows x {series} rows, {samples} samples per KLL: {:.1} MiB of fragments",
         bytes as f64 / 1048576.0
     );
-    for how in [ViewRead::Mmap, ViewRead::Pread] {
+    // pread first: a mapped page cannot be dropped from the page cache.
+    for how in [ViewRead::Pread, ViewRead::Mmap] {
         for cold in [true, false] {
             if cold {
                 drop_page_cache(locations[0].segment_path());

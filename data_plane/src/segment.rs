@@ -503,6 +503,19 @@ impl WindowLocation {
         }
         if how == ViewRead::Mmap && self.segment.is_sealed() {
             let mapping = self.segment.mapping()?;
+            // The fragment is read whole: fault it in at once rather than
+            // page by page (the mapping is MADV_RANDOM).
+            let page = 4096;
+            let start = offset as usize / page * page;
+            let end = (offset as usize + len).min(mapping.len);
+            // SAFETY: a range inside the mapping; advice only.
+            unsafe {
+                libc::madvise(
+                    mapping.ptr.as_ptr().add(start).cast(),
+                    end - start,
+                    libc::MADV_WILLNEED,
+                )
+            };
             return Ok(Bytes::Mapped(mapping, offset as usize, len));
         }
         let mut words = vec![0u64; len.div_ceil(8)];
