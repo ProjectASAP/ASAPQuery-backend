@@ -31,7 +31,7 @@ axum = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 control_plane = { path = "control_plane" }
 
-# asap_sketchlib#271's head, ahead of the Planner's pin (896d414): DDSketch
+# asap_sketchlib#271's head, ahead of the Planner's pin (389530c): DDSketch
 # view merges in place, with width-specialized loops (a 1 h quantile over
 # cold windows 3x faster). Drop when the Planner's pin moves past it. The
 # `www.` URL is a distinct source, so it may patch the one the Planner names.
