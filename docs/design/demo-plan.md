@@ -352,8 +352,12 @@ is the store for every query the plan does not cover.
   and counted.
 - The order between concurrent deliveries is not kept. VictoriaMetrics accepts
   samples out of order.
-- The queue is in memory. A crash loses at most the queued bytes. Making it
-  durable would need a disk spool, which the demo does not need.
+- The queue is in memory, and there is no disk spool, by decision. This is a
+  known limit: a crash of the data plane loses up to `--raw-forward-queue-bytes`
+  of samples it has already acknowledged, on the raw-store side only. ASAP
+  still holds those samples; VictoriaMetrics, which answers the unplanned
+  queries, does not. A smaller bound limits the loss, at the cost of more 503s
+  when the raw store slows down.
 
 **Queries.** Each query is answered by whichever store can answer it:
 
