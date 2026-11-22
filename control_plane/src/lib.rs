@@ -111,13 +111,17 @@ pub fn load_plan(path: &Path) -> Result<InstallablePlan, PlanError> {
 /// evaluations. It keeps each planned query's final answer per evaluation
 /// time (the data plane's result cache), so a range request's earlier
 /// steps are read from the cache and their inputs need not be kept for
-/// the whole span (`final_query_results_cached`).
+/// the whole span (`final_query_results_cached`). A view read returns
+/// sealed windows only, so a compressed-samples chain is read at widths
+/// that tile each reader's range (`unsealed_window_reads: false`) until the
+/// data plane serves a chain's open window.
 pub fn backend_capabilities() -> DeploymentCapabilities {
     DeploymentCapabilities {
         supported_summaries: None,
         raw_data_retained: true,
         query_time_results_retained: false,
         final_query_results_cached: true,
+        unsealed_window_reads: false,
         ..DeploymentCapabilities::default()
     }
 }

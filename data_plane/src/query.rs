@@ -443,7 +443,8 @@ fn run_compiled(
             evaluation_time_ms: time_ms,
         },
         limits.clone(),
-    )?;
+    )?
+    .with_sample_block_codec(crate::sample_blocks::codec());
     block_on(async {
         let mut output = instance.execute(compiled.roots(), context)?.remove(0);
         let mut batches = Vec::new();

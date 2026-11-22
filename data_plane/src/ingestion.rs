@@ -853,7 +853,8 @@ impl Precompute {
                     window_end_ms: end,
                 },
                 self.limits.clone(),
-            )?;
+            )?
+            .with_sample_block_codec(crate::sample_blocks::codec());
             let outputs = block_on(instance.execute_ingestion(group.compiled.roots(), context)?)?;
             outputs
         };
