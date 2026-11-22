@@ -553,3 +553,45 @@ async fn tiering_metrics_are_exported() {
     assert!(metric(&state, "asap_phase_runs_total{phase=\"view_decode\"}") > 0.0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A slow disk never holds ingest or refreshes: with every window's write
+/// taking 2 s and a persist queue bounded at one byte, Remote Write is
+/// never refused, every window is refreshed at once (the unwritten ones
+/// stay in memory, `Pending`), the queue past its bound is counted, and
+/// once written they answer as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_disk_never_holds_ingest_or_refreshes() {
+    let plan = plan(&[SUM]);
+    let expected = control_answers(&plan, "slow-disk", &[SUM], 120).await;
+    let dir = view_dir("slow-disk");
+    let (app, state) = data_plane(
+        &plan,
+        EngineOptions {
+            persist_threads: 1,
+            persist_delay_ms: 2_000,
+            max_persist_backlog_bytes: 1,
+            ..options(&dir, Some(0), None)
+        },
+    );
+    let started = std::time::Instant::now();
+    for minute in 0..2 {
+        // send() asserts 204: no request is refused.
+        send(&app, minute * 60, minute * 60 + 60).await;
+    }
+    send(&app, 120, 121).await;
+    while state.engine.stats().windows_refreshed < 12 {
+        assert!(
+            started.elapsed().as_secs() < 5,
+            "refreshes waited for the disk"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(metric(&state, "asap_view_pending_bytes") > 0.0);
+    assert!(metric(&state, "asap_view_persist_over_bound_total") > 0.0);
+    assert_same_answer(SUM, &answer(&app, SUM, 120).await, &expected[0]);
+    // The barrier answers once every window is written.
+    barrier(&app, 120).await;
+    assert_eq!(metric(&state, "asap_view_pending_bytes"), 0.0);
+    assert_same_answer(SUM, &answer(&app, SUM, 120).await, &expected[0]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

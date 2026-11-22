@@ -505,9 +505,12 @@ gauges count bytes recorded at append, which the budget also uses.
 - Page cache of cold segments is reclaimed by the kernel; a read after
   that goes to disk. That is the "slows down rather than OOM" behavior
   VictoriaMetrics has under the same limit.
-- `Pending` windows are bounded by the persist backlog: when the disk
-  cannot keep up, the committer waits (`asap_view_persist_wait_seconds_total`)
-  and Remote Write gets 503, as today.
+- Ingest and precompute never wait for the disk: when it cannot keep up,
+  more windows stay `Pending` (in memory, as without tiering) until they
+  are written, and the windows queued past `--max-persist-backlog-bytes`
+  are counted (`asap_view_persist_over_bound_total`). Waiting instead let
+  a slow disk under reclaim hold refreshes and the watermark (a harness run
+  at 10 Hz under a 3 GiB limit lagged 43–89 s).
 
 ### Recovery
 

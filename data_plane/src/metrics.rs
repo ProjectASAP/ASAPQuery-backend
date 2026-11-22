@@ -212,7 +212,7 @@ pub struct Metrics {
     /// View windows loaded from the files at startup.
     pub view_windows_loaded: AtomicU64,
     /// Time the precompute thread waited for room in the persist backlog.
-    pub view_persist_wait_ns: AtomicU64,
+    pub view_persist_over_bound: AtomicU64,
     /// Bytes of the view files (segments) held.
     pub view_file_bytes: AtomicU64,
     /// The views' cold tier, when they are persisted.
@@ -253,7 +253,7 @@ impl Metrics {
             view_sync_ns: AtomicU64::new(0),
             view_windows_not_persisted: AtomicU64::new(0),
             view_windows_loaded: AtomicU64::new(0),
-            view_persist_wait_ns: AtomicU64::new(0),
+            view_persist_over_bound: AtomicU64::new(0),
             view_file_bytes: AtomicU64::new(0),
             view_tier: std::sync::OnceLock::new(),
         }
@@ -541,9 +541,9 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
             load(&metrics.view_windows_not_persisted),
         ),
         (
-            "asap_view_persist_wait_seconds_total",
-            "Time the precompute thread waited for room in the persist queue.",
-            load(&metrics.view_persist_wait_ns) / 1e9,
+            "asap_view_persist_over_bound_total",
+            "Windows queued for the view files while the queue held more than --max-persist-backlog-bytes (the data plane does not wait for its disk).",
+            load(&metrics.view_persist_over_bound),
         ),
         (
             "asap_view_windows_loaded_total",

@@ -81,7 +81,8 @@ pub struct EngineOptions {
     /// `persist_threads`-th refresh group.
     pub persist_threads: usize,
     /// Bytes of refreshed windows queued for the persist threads beyond
-    /// which the precompute thread waits (the wait is exported).
+    /// which further windows are counted (`asap_view_persist_over_bound_total`);
+    /// the precompute thread never waits for the disk.
     pub max_persist_backlog_bytes: u64,
     /// For tests: how long a persist thread waits before writing each
     /// window, as a slow disk would.
@@ -308,7 +309,7 @@ struct Shared {
     /// Bytes of the refreshed windows queued for the persist threads.
     persist_queue: Mutex<u64>,
     /// Signalled when the persist threads release queued bytes.
-    persist_room: Condvar,
+
     /// False once the ingest or precompute thread has exited, for any
     /// reason.
     running: Arc<AtomicBool>,
@@ -392,7 +393,7 @@ impl EngineHandle {
             precompute_backlog: AtomicU64::new(0),
             persist_backlog: AtomicU64::new(0),
             persist_queue: Mutex::new(0),
-            persist_room: Condvar::new(),
+
             running: running.clone(),
             stats: Mutex::new(IngestionStats::default()),
             published: PublishedStore::new(Arc::new(raw_shards.clone())),
@@ -1963,23 +1964,20 @@ impl PersistPool {
             .flat_map(|(_, batches)| batches)
             .map(|batch| batch.memory_bytes() as u64)
             .sum();
+        // The committer never waits for the disk: a slow disk leaves more
+        // windows `Pending` (in memory, as without tiering) instead of
+        // holding refreshes, the watermark and ingest. Windows queued past
+        // the bound are counted.
         {
             let mut queued = shared
                 .persist_queue
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if *queued > 0 && *queued + bytes > self.max_bytes {
-                let waited = std::time::Instant::now();
-                while *queued > 0 && *queued + bytes > self.max_bytes {
-                    queued = shared
-                        .persist_room
-                        .wait(queued)
-                        .unwrap_or_else(|e| e.into_inner());
-                }
                 shared
                     .metrics
-                    .view_persist_wait_ns
-                    .fetch_add(waited.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    .view_persist_over_bound
+                    .fetch_add(1, Ordering::Relaxed);
             }
             *queued += bytes;
         }
@@ -2021,7 +2019,6 @@ fn release_persist_queue(shared: &Shared, bytes: u64) {
         .unwrap_or_else(|e| e.into_inner());
     *queued = queued.saturating_sub(bytes);
     shared.persist_backlog.fetch_sub(1, Ordering::SeqCst);
-    shared.persist_room.notify_all();
 }
 
 /// The persist thread: writes each refreshed window's records to the view

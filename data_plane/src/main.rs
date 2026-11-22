@@ -77,7 +77,7 @@ struct Args {
     #[arg(long, default_value_t = EngineOptions::default().persist_threads)]
     persist_threads: usize,
     /// Bytes of refreshed windows queued for the persist threads beyond
-    /// which refreshes wait.
+    /// which further windows are counted; refreshes never wait for the disk.
     #[arg(long, default_value_t = EngineOptions::default().max_persist_backlog_bytes)]
     max_persist_backlog_bytes: u64,
     /// Never forward a query to Prometheus: refuse a plan with a query the

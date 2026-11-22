@@ -649,11 +649,11 @@ the background: the precompute committer publishes a refreshed window first
 and then queues its rows for a pool of `--persist-threads` threads
 (`persist-N`; default a quarter of the cores, 1 to 4), which encode, write
 and sync. Refresh group `g` goes to thread `g % n`, so each file has
-exactly one writer and its records stay in window order. The queue is
-bounded by bytes (`--max-persist-backlog-bytes`, default 256 MiB;
-`asap_persist_backlog_bytes`, `asap_persist_backlog_windows`); only when
-it is full does the committer wait, and the wait is exported
-(`asap_view_persist_wait_seconds_total`). An event-time barrier answers
+exactly one writer and its records stay in window order. The committer
+never waits for the disk (see [tiered view storage](tiered-view-storage.md));
+windows queued past `--max-persist-backlog-bytes` (default 256 MiB) are
+counted (`asap_view_persist_over_bound_total`; the queue is
+`asap_persist_backlog_bytes`, `asap_persist_backlog_windows`). An event-time barrier answers
 once the windows before it are written, without the committer
 waiting. Each persist thread syncs its files (`fdatasync`) every
 `--view-sync-interval-ms` on its own timer, also when no window arrives,
