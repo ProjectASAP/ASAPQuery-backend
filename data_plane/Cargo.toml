@@ -25,6 +25,8 @@ reqwest.workspace = true
 prost = "0.13"
 rmp-serde = "1"
 snap = "1.1"
+# Codec 1 of the sample blocks (`sample_blocks`): written at level 1.
+zstd = "0.13"
 futures = "0.3"
 form_urlencoded = "1"
 

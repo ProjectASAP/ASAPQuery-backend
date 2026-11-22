@@ -17,6 +17,7 @@ pub mod prometheus;
 pub mod query;
 pub mod remote_write;
 pub mod result_cache;
+pub mod sample_blocks;
 pub mod series_ids;
 pub mod store;
 
