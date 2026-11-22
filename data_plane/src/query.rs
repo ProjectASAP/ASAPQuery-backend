@@ -490,25 +490,36 @@ fn slots_read(
         .collect()
 }
 
+/// The column holding a result row's value: the one `Float64` column, or,
+/// with none, the one `Int64` column (a `count` answers in integers, e.g.
+/// `count by (region) (... > 1000)`).
+fn value_column(schema: &Schema) -> Result<usize, Unanswered> {
+    use asap_executor::planner::ir::schema::{DataType, FieldDataType};
+    let columns = |dtype: DataType| -> Vec<usize> {
+        schema
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.dtype == FieldDataType::Plain(dtype.clone()))
+            .map(|(index, _)| index)
+            .collect()
+    };
+    match (
+        columns(DataType::Float64).as_slice(),
+        columns(DataType::Int64).as_slice(),
+    ) {
+        ([value], _) | ([], [value]) => Ok(*value),
+        _ => Err(Unanswered::Unsupported(
+            "result rows: expected one Float64 or, with none, one Int64 value column".into(),
+        )),
+    }
+}
+
 /// PromQL vector samples from a root's result batches: labels from the
 /// series identity and every other non-empty text column, the value from
-/// the one `Float64` column.
+/// the value column ([`value_column`]).
 fn result_samples(schema: &Schema, batches: &[Batch]) -> Result<Vec<ResultSample>, Unanswered> {
-    let floats = schema
-        .fields
-        .iter()
-        .filter(|f| {
-            f.dtype
-                == asap_executor::planner::ir::schema::FieldDataType::Plain(
-                    asap_executor::planner::ir::schema::DataType::Float64,
-                )
-        })
-        .count();
-    if floats != 1 {
-        return Err(Unanswered::Unsupported(
-            "result rows: expected one Float64 value column".into(),
-        ));
-    }
+    let value_index = value_column(schema)?;
     let mut samples = Vec::new();
     for row in batches.iter().flat_map(Batch::to_rows) {
         // An interned input series' shared labels, until another label
@@ -516,7 +527,7 @@ fn result_samples(schema: &Schema, batches: &[Batch]) -> Result<Vec<ResultSample
         let mut shared: Option<Arc<BTreeMap<String, String>>> = None;
         let mut own: Option<BTreeMap<String, String>> = None;
         let mut value = None;
-        for (field, cell) in schema.fields.iter().zip(&row) {
+        for (index, (field, cell)) in schema.fields.iter().zip(&row).enumerate() {
             match cell {
                 Value::Utf8(text) if field.name == PROMQL_SERIES_IDENTITY => {
                     // An input series' identity is interned; parse only a
@@ -551,7 +562,8 @@ fn result_samples(schema: &Schema, batches: &[Batch]) -> Result<Vec<ResultSample
                     })
                     .insert(field.name.clone(), text.to_string());
                 }
-                Value::Float64(v) => value = Some(*v),
+                Value::Float64(v) if index == value_index => value = Some(*v),
+                Value::Int64(v) if index == value_index => value = Some(*v as f64),
                 _ => {}
             }
         }

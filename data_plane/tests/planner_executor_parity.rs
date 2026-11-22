@@ -141,7 +141,7 @@ fn points(plan: &InstallablePlan, start_ms: i64) -> Vec<Point> {
     for metric in scanned_schemas(plan).keys() {
         let counter = metric.ends_with("_total");
         for series in 0..SERIES {
-            let labels: Labels = [
+            let mut labels: Labels = [
                 ("__name__", metric.clone()),
                 ("job", format!("job{}", series % 3)),
                 ("instance", format!("i{series}")),
@@ -151,6 +151,10 @@ fn points(plan: &InstallablePlan, start_ms: i64) -> Vec<Point> {
             .into_iter()
             .map(|(n, v)| (n.to_string(), v))
             .collect();
+            // A histogram's buckets: each job gets two bucket bounds.
+            if metric.ends_with("_bucket") {
+                labels.insert("le".into(), ["0.1", "1", "+Inf"][series / 2 % 3].into());
+            }
             let mut total = 0.0;
             let mut t = start_ms + 10_000;
             while t <= EVALUATION_MS {
@@ -576,7 +580,7 @@ fn reaches_without_passing_a_view(
 }
 
 /// Answer rows: the series identity's labels and other non-empty text
-/// columns, the Float64 value; sorted by labels.
+/// columns, the Float64 value (Int64 for a `count`); sorted by labels.
 fn answers(schema: &Schema, batches: &[Batch]) -> Vec<Answer> {
     let mut answers: Vec<Answer> = batches
         .iter()
@@ -594,6 +598,8 @@ fn answers(schema: &Schema, batches: &[Batch]) -> Vec<Answer> {
                         labels.insert(field.name.clone(), text.to_string());
                     }
                     Value::Float64(v) => value = *v,
+                    // A `count` answers in integers (no Float64 column then).
+                    Value::Int64(v) => value = *v as f64,
                     _ => {}
                 }
             }

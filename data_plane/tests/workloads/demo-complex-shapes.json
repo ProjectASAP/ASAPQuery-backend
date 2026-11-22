@@ -1,0 +1,149 @@
+{
+  "query_workload": {
+    "language": "promql",
+    "repeating_queries": [
+      {
+        "query": "count by (region) (sum by (region, service) (increase(http_requests_total[5m])) > 100)",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 15000,
+            "evaluation_phase": 0
+          }
+        },
+        "requirements": {},
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "(sum by (job) (increase(http_errors_total[1h])) / on(job) group_left() sum by (job) (increase(http_requests_total[1h]))) > 0.01",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 15000,
+            "evaluation_phase": 0
+          }
+        },
+        "requirements": {},
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "(sum by (job, region) (rate(http_requests_total[1m])) * 100 / on(job) group_left() max by (job) (max_over_time(capacity_rps[1h]))) >= 0",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 15000,
+            "evaluation_phase": 0
+          }
+        },
+        "requirements": {},
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "topk(3, increase(http_requests_total[10m]))",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 15000,
+            "evaluation_phase": 0
+          }
+        },
+        "requirements": {},
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "histogram_quantile(0.99, sum by (le, job) (rate(http_request_duration_seconds_bucket[10m])))",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 15000,
+            "evaluation_phase": 0
+          }
+        },
+        "requirements": {},
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "max by (job) (max_over_time(queue_depth[10m])) > max by (job) (max_over_time(queue_depth[10m] offset 10m))",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 15000,
+            "evaluation_phase": 0
+          }
+        },
+        "requirements": {},
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "sum(increase(http_errors_total[10m])) / sum(increase(http_requests_total[10m]))",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 15000,
+            "evaluation_phase": 0
+          }
+        },
+        "requirements": {},
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      }
+    ]
+  },
+  "data_workload": {
+    "arrival": {
+      "ingesting": {
+        "rows_per_second": 3.6
+      }
+    },
+    "sources": {
+      "http_requests_total": {
+        "series_count": 6,
+        "sample_interval": 10000,
+        "metric_type": "counter"
+      },
+      "http_errors_total": {
+        "series_count": 6,
+        "sample_interval": 10000,
+        "metric_type": "counter"
+      },
+      "http_request_duration_seconds_bucket": {
+        "series_count": 6,
+        "sample_interval": 10000,
+        "metric_type": "counter"
+      },
+      "capacity_rps": {
+        "series_count": 6,
+        "sample_interval": 10000,
+        "metric_type": "gauge",
+        "column_signs": {
+          "value": "non_negative"
+        }
+      },
+      "queue_depth": {
+        "series_count": 6,
+        "sample_interval": 10000,
+        "metric_type": "gauge"
+      }
+    }
+  }
+}
