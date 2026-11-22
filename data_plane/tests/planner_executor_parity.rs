@@ -72,8 +72,11 @@ fn workloads() -> Vec<(String, PlanningWorkload)> {
         .filter(|path| path.extension().is_some_and(|e| e == "json"))
         .collect();
     files.sort();
+    // `PARITY_WORKLOAD=name` runs only the workloads whose name contains it.
+    let only = std::env::var("PARITY_WORKLOAD").unwrap_or_default();
     files
         .into_iter()
+        .filter(|path| path.file_stem().unwrap().to_string_lossy().contains(&only))
         .map(|path| {
             let name = path.file_stem().unwrap().to_string_lossy().to_string();
             let text = std::fs::read_to_string(&path).unwrap();
@@ -443,7 +446,15 @@ fn reference_answers_at(
     let views = plan.materialized_views().unwrap();
     let limits = Limits { max_bytes: 4 << 30 };
     let mut store = Arc::new(raw_tables(plan, points));
-    for group in plan.ingestion_refresh_groups().unwrap() {
+    let groups = plan.ingestion_refresh_groups().unwrap();
+    // Each group's compiled refresh and window width, and every window
+    // `(end - width, end]` of every group, run in end order (groups in plan
+    // order at one end), as the data plane closes them: a view read by a
+    // later group keeps only its retention, so a group cannot run all its
+    // windows before the group reading it.
+    let mut runs = Vec::new();
+    let mut windows = Vec::new();
+    for (index, group) in groups.iter().enumerate() {
         let window = group.refresh_window.unwrap();
         let (width, phase) = (window.width_ms as i64, window.phase_ms as i64);
         let ids: Vec<u64> = group.views.iter().map(|v| v.node_id as u64).collect();
@@ -459,40 +470,45 @@ fn reference_answers_at(
             })
             .cloned()
             .collect();
-        let compiled = compile(dag, &read, &ids).unwrap();
+        runs.push((compile(dag, &read, &ids).unwrap(), width));
         // The first window starting at or after `start_ms`.
         let mut end = start_ms + width + (phase - start_ms - width).rem_euclid(width);
         while end <= EVALUATION_MS {
-            let outputs = {
-                let instance = compiled.instantiate(store.clone()).unwrap();
-                let context = RunContext::new(
-                    Scope::Ingestion {
-                        window_start_ms: end - width,
-                        window_end_ms: end,
-                    },
-                    limits.clone(),
-                )
-                .unwrap();
-                block_on(
-                    instance
-                        .execute_ingestion(compiled.roots(), context)
-                        .unwrap(),
-                )
-                .unwrap()
-            };
-            let store = Arc::get_mut(&mut store).unwrap();
-            for (root, batches) in compiled.roots().iter().zip(outputs) {
-                let view = group
-                    .views
-                    .iter()
-                    .find(|v| v.node_id as u64 == *root)
-                    .unwrap();
-                let batches = batches.iter().map(|b| (**b).clone()).collect();
-                store
-                    .append_materialized_view(view, (end - width, end), batches)
-                    .unwrap();
-            }
+            windows.push((end, index));
             end += width;
+        }
+    }
+    windows.sort_unstable();
+    for (end, index) in windows {
+        let (compiled, width) = &runs[index];
+        let outputs = {
+            let instance = compiled.instantiate(store.clone()).unwrap();
+            let context = RunContext::new(
+                Scope::Ingestion {
+                    window_start_ms: end - width,
+                    window_end_ms: end,
+                },
+                limits.clone(),
+            )
+            .unwrap();
+            block_on(
+                instance
+                    .execute_ingestion(compiled.roots(), context)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let store = Arc::get_mut(&mut store).unwrap();
+        for (root, batches) in compiled.roots().iter().zip(outputs) {
+            let view = groups[index]
+                .views
+                .iter()
+                .find(|v| v.node_id as u64 == *root)
+                .unwrap();
+            let batches = batches.iter().map(|b| (**b).clone()).collect();
+            store
+                .append_materialized_view(view, (end - width, end), batches)
+                .unwrap();
         }
     }
     dag.roots
@@ -748,7 +764,7 @@ async fn the_data_plane_answers_what_the_planner_executor_answers() {
         "only {compared_non_empty} of {compared_queries} equal answers have rows"
     );
     assert!(
-        compared_plans >= 10,
+        compared_plans >= 10 || std::env::var("PARITY_WORKLOAD").is_ok(),
         "only {compared_plans} plans compared ({compared_queries} queries)"
     );
 }
@@ -870,7 +886,7 @@ async fn range_queries_answer_what_the_planner_executor_answers_at_each_step() {
     println!("{}", report.join("\n"));
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     assert!(
-        compared_steps >= 100,
+        compared_steps >= 100 || std::env::var("PARITY_WORKLOAD").is_ok(),
         "only {compared_steps} steps compared"
     );
     assert!(

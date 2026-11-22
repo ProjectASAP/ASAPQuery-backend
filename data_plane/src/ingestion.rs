@@ -133,14 +133,25 @@ struct RefreshGroupRun {
     views: Vec<MaterializedView>,
     compiled: CompiledPhysicalDAG,
     width_ms: i64,
+    /// The views of other groups its runs read.
+    reads: Vec<PhysicalASAPNodeId>,
+    /// For each of its views, the groups that read it.
+    readers: Vec<Vec<usize>>,
 }
 
 /// One refresh group's windows.
 struct RefreshGroup {
     width_ms: i64,
     phase_ms: i64,
-    /// The metrics its runs scan.
+    /// The metrics its runs scan: their raw samples it needs kept.
     metrics: BTreeSet<String>,
+    /// The groups whose views its runs read.
+    reads: Vec<usize>,
+    /// The metrics whose first sample starts it: those its runs scan and
+    /// those scanned below the views it reads. A wider level of a window
+    /// chain (`SummaryMergeWindows`) scans nothing; it starts with the
+    /// chain it is built from.
+    started_by: BTreeSet<String>,
     /// The longest retention of its views.
     retention_ms: i64,
     /// End of the newest window closed or skipped; `None` before the
@@ -260,6 +271,7 @@ impl Ingestion {
                     error,
                 })?;
             let metrics = index.metrics_below(&ids, &read);
+            let started_by = index.metrics_below(&ids, &BTreeSet::new());
             let margin_ms = options.view_retention_margin_ms;
             let views = group
                 .views
@@ -275,11 +287,15 @@ impl Ingestion {
                 views,
                 compiled,
                 width_ms: millis(window.width_ms),
+                reads: read.iter().copied().collect(),
+                readers: Vec::new(),
             });
             clocks.push(RefreshGroup {
                 width_ms: millis(window.width_ms),
                 phase_ms: millis(window.phase_ms),
                 metrics,
+                reads: tasks.reads.last().cloned().unwrap_or_default(),
+                started_by,
                 retention_ms,
                 refreshed_through: None,
             });
@@ -322,6 +338,20 @@ impl Ingestion {
             barrier_ms: None,
             stats: IngestionStats::default(),
         };
+        // Each view's readers: the groups whose runs read it.
+        let mut readers: HashMap<PhysicalASAPNodeId, Vec<usize>> = HashMap::new();
+        for (reader, run) in runs.iter().enumerate() {
+            for &view in &run.reads {
+                readers.entry(view).or_default().push(reader);
+            }
+        }
+        for run in &mut runs {
+            run.readers = run
+                .views
+                .iter()
+                .map(|view| readers.get(&view.node_id).cloned().unwrap_or_default())
+                .collect();
+        }
         Ok((
             ingestion,
             Precompute {
@@ -450,7 +480,7 @@ impl Ingestion {
     /// start.
     fn start_groups(&mut self, metric: &str, timestamp_ms: i64) {
         for group in &mut self.groups {
-            if group.refreshed_through.is_some() || !group.metrics.contains(metric) {
+            if group.refreshed_through.is_some() || !group.started_by.contains(metric) {
                 continue;
             }
             let first_end = group.window_end(timestamp_ms);
@@ -503,15 +533,46 @@ impl Ingestion {
         let Some(watermark) = self.watermark_ms() else {
             return Vec::new();
         };
+        // Per group, the windows ending at or before this would already be
+        // dropped (they are past its retention). A group whose views
+        // another group reads (a narrower level of a window chain) keeps
+        // building the windows its readers still need: it skips at most to
+        // the latest of its window boundaries at or before where each
+        // reader skips to. Readers come after the groups they read, so in
+        // reverse plan order every reader's bound is known first.
+        let mut expired: Vec<i64> = self
+            .groups
+            .iter()
+            .map(|group| {
+                group.window_end(watermark.saturating_sub(group.retention_ms)) - group.width_ms
+            })
+            .collect();
+        for reader in (0..self.groups.len()).rev() {
+            for &read in &self.groups[reader].reads {
+                let group = &self.groups[read];
+                // The latest boundary of `group` at or before the reader's.
+                let needed = group.window_end(expired[reader] - group.width_ms + 1);
+                expired[read] = expired[read].min(needed);
+            }
+        }
         let mut closed = Vec::new();
+        // Per group, how far this pass skipped its expired windows.
+        let mut skipped_to: Vec<Option<i64>> = vec![None; self.groups.len()];
         for (index, group) in self.groups.iter_mut().enumerate() {
             let Some(mut through) = group.refreshed_through else {
                 continue;
             };
-            // A window ending at or before this would already be dropped.
-            let expired_through =
-                group.window_end(watermark.saturating_sub(group.retention_ms)) - group.width_ms;
+            let mut expired_through = expired[index];
+            // A group reading the views of groups that skipped further
+            // skips at least as far, to its next window boundary: its
+            // windows before that would read windows never built.
+            for read in &group.reads {
+                if let Some(skipped) = skipped_to[*read] {
+                    expired_through = expired_through.max(group.window_end(skipped));
+                }
+            }
             if through < expired_through {
+                skipped_to[index] = Some(expired_through);
                 self.stats.windows_skipped_expired +=
                     ((expired_through - through) / group.width_ms) as u64;
                 through = expired_through;
@@ -873,8 +934,13 @@ impl Precompute {
         let mut appended = Vec::with_capacity(rows.len());
         for (index, batches) in rows {
             let view = &group.views[index];
+            views.hold_for_readers(view.node_id, &group.readers[index]);
             views.append(view, range, batches.clone())?;
             appended.push((view.node_id, batches));
+        }
+        // The narrower windows this window read may now go.
+        for &read in &group.reads {
+            views.reader_committed(read, window.group, window.end_ms);
         }
         Ok(Refreshed::Ran(appended))
     }

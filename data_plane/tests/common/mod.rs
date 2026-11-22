@@ -10,6 +10,18 @@ pub fn inputs(raw_data_retained: bool) -> DeploymentInputs {
     inputs
 }
 
+/// [`inputs`] for a deployment without multi-level window chains: plans
+/// keep one level per chain, for tests about refresh groups' timing.
+#[allow(dead_code)]
+pub fn inputs_without_levels(raw_data_retained: bool) -> DeploymentInputs {
+    let mut inputs = inputs(raw_data_retained);
+    inputs.deployment_capabilities.excluded_candidates = serde_json::from_value(
+        serde_json::json!([{"operator": "SummaryMergeWindows"}, {"operator": "TimeRangeCover"}]),
+    )
+    .unwrap();
+    inputs
+}
+
 /// A #509 example workload in `examples/`.
 #[allow(dead_code)]
 pub fn workload(example: &str) -> PlanningWorkload {

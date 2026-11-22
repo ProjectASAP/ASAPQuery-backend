@@ -218,6 +218,31 @@ HTTP queries ─► query workers: one query run per worker thread over
   coordinator closes a window over every shard's raw data, so the
   minimum is reached by a flush: every shard runs what was admitted
   before it, and an idle shard answers at once.
+- Multi-level window chains. For a long range read the plan adds wider
+  levels of a tumbling-window chain (for example 10 s, 1 min, 5 min,
+  15 min): each wider level is a view in its own refresh group, built by
+  `SummaryMergeWindows` from the next narrower level's stored windows, and
+  a query reads the range through `TimeRangeCover`, the union of the
+  widest whole windows of each level. The executor runs both operators; the
+  data plane only has to have the windows. Three rules make that hold:
+  - A level starts with the chain it is built from: a group starts at the
+    first sample of a metric scanned below the views it reads, not only of
+    a metric it scans itself (a wider level scans nothing, so it never
+    started and its view stayed empty).
+  - A view read by another group keeps the windows that group has yet to
+    read, whatever its retention. The plan sizes the retention for a
+    reader running right behind it; here a pass that closes many windows
+    queues them group by group, so the narrower group commits far ahead
+    (back to the group's longest retention, which may exceed the view's).
+  - When the watermark jumps, each group skips the windows past its
+    retention, but a group whose views another group reads keeps building
+    the windows that reader still needs (back to the reader's retention,
+    rounded down to its own window boundary). One run builds all of a
+    level's views and reads every chain below it, so a level holding a
+    view kept 21 min over chains kept 10 min (one group of the narrow
+    level) needs those chains' windows back 21 min. A reader of a group
+    that still skipped further skips as far, to its own next boundary, so
+    it never builds a window from windows never built.
 - Precompute task pool (`--precompute-threads`, default a quarter of the
   cores, 1 to 4). Each closed refresh window is a task. Windows of
   different refresh groups compute in parallel, and so do consecutive

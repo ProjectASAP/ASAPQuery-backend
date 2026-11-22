@@ -777,12 +777,41 @@ pub struct ViewStore {
     /// values included, so one view-wide array in every part's batch would
     /// be charged once per part per window.
     texts: BTreeMap<(PhysicalASAPNodeId, usize, usize), Arc<Mutex<SharedTexts>>>,
+    /// For a view another refresh group reads (a narrower level of a window
+    /// chain, read by `SummaryMergeWindows`): per reader group, the end of
+    /// its newest committed window. The view keeps its rows ending after
+    /// the oldest of these whatever its retention: the plan sizes the
+    /// retention for a reader that runs right behind it, and the precompute
+    /// pool lets a group run ahead of its readers.
+    readers: BTreeMap<PhysicalASAPNodeId, BTreeMap<usize, i64>>,
 }
 
 impl ViewStore {
+    /// Registers `readers`, the refresh groups that read `view`, as having
+    /// committed nothing yet: until each commits, `view` keeps every row.
+    pub fn hold_for_readers(&mut self, view: PhysicalASAPNodeId, readers: &[usize]) {
+        let held = self.readers.entry(view).or_default();
+        for &reader in readers {
+            held.entry(reader).or_insert(i64::MIN);
+        }
+    }
+
+    /// Reader group `reader` committed its window ending `end_ms`, reading
+    /// `view`: rows of `view` ending at or before it are no longer held.
+    pub fn reader_committed(&mut self, view: PhysicalASAPNodeId, reader: usize, end_ms: i64) {
+        let through = self
+            .readers
+            .entry(view)
+            .or_default()
+            .entry(reader)
+            .or_insert(end_ms);
+        *through = (*through).max(end_ms);
+    }
+
     /// Appends `batches` as `view`'s rows covering `time_range_ms`
     /// (`(start, end]`), then drops its rows ending `view.retention_ms()`
-    /// or more before `end` (the newest are always kept). Bad input when
+    /// or more before `end` (the newest are always kept), except those a
+    /// reader group has yet to read ([`Self::hold_for_readers`]). Bad input when
     /// the range is empty or starts before the end of the rows appended
     /// last (the store is append-only). Each text column (a series
     /// identity or a label) is stored with the view's shared texts, so a
@@ -812,14 +841,21 @@ impl ViewStore {
             .map(|(part, batch)| self.share_texts(view.node_id, part, batch))
             .collect::<Result<Vec<_>, Error>>()?;
         let bytes = batches.iter().map(window_batch_bytes).sum();
+        let retention_ms = i64::try_from(view.retention_ms()).unwrap_or(i64::MAX);
+        let mut oldest_kept_end = end.saturating_sub(retention_ms);
+        if let Some(&held) = self
+            .readers
+            .get(&view.node_id)
+            .and_then(|r| r.values().min())
+        {
+            oldest_kept_end = oldest_kept_end.min(held);
+        }
         let rows = self.by_view.entry(view.node_id).or_default();
         rows.push(ViewWindow {
             time_range_ms,
             batches: Arc::new(batches),
             bytes,
         });
-        let retention_ms = i64::try_from(view.retention_ms()).unwrap_or(i64::MAX);
-        let oldest_kept_end = end.saturating_sub(retention_ms);
         rows.retain(|window| {
             let row_end = window.time_range_ms.1;
             row_end > oldest_kept_end || row_end == end
