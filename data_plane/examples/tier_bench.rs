@@ -16,6 +16,7 @@
 //!   as in `tests/workloads/`) instead, at 1 sample/s.
 //! - `RESULT_CACHE=0` turns the result cache off, so every round reads
 //!   its views.
+//! - `SCRAPE_MS=n`: one sample per series every `n` ms (default 1,000).
 //! - `COLD=1` drops the segments' pages from the page cache
 //!   (`POSIX_FADV_DONTNEED`) before each round (B2).
 //!
@@ -54,6 +55,11 @@ async fn main() {
         .ok()
         .filter(|v| !v.is_empty());
     let cold = std::env::var("COLD").is_ok_and(|v| v == "1");
+    // `SCRAPE_MS`: one sample per series every this many milliseconds.
+    let scrape_ms: i64 = std::env::var("SCRAPE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000);
     let _ = std::fs::remove_dir_all(&dir);
 
     let path = std::env::var("WORKLOAD")
@@ -80,14 +86,20 @@ async fn main() {
         .values_mut()
     {
         source["series_count"] = series.into();
-        source["sample_interval"] = 1000.into();
+        source["sample_interval"] = scrape_ms.into();
     }
     workload["data_workload"]["arrival"]["ingesting"]["rows_per_second"] =
-        (series * metrics.len()).into();
+        (series * metrics.len() * 1000 / scrape_ms as usize).into();
     let workload = serde_json::from_value(workload).unwrap();
     let mut inputs = DeploymentInputs::default();
     inputs.deployment_capabilities.raw_data_retained = false;
     let (plan, _) = plan_workload(&workload, &inputs).unwrap();
+    let plan_text = serde_json::to_string(&plan).unwrap();
+    println!(
+        "plan states (mentions): {:?}",
+        ["DDSketch", "\"Kll\"", "Hll", "Cms", "Counter", "Max"]
+            .map(|k| (k, plan_text.matches(k).count()))
+    );
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -148,7 +160,7 @@ async fn main() {
         })
         .collect();
     let fed = Instant::now();
-    let mut t = start_ms + 1000;
+    let mut t = start_ms + scrape_ms;
     while t <= end_ms {
         let timeseries = labels
             .iter()
@@ -157,7 +169,14 @@ async fn main() {
                 labels: labels.clone(),
                 samples: vec![Sample {
                     timestamp: t,
-                    value: ((i as i64 * 7 + t / 1000) % 100) as f64 + (t % 7) as f64 * 0.13,
+                    // A long-tailed value per sample: Pareto (shape 2) of a
+                    // per-series scale (rank-scaled), as the harness feeds.
+                    value: {
+                        let h = (i as u64 ^ (t as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+                            .wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                        let u = ((h >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+                        (1.0 + (i % 100) as f64) * (1.0 - u).powf(-0.5)
+                    },
                 }],
             })
             .collect();
@@ -188,7 +207,7 @@ async fn main() {
                 memory()
             );
         }
-        t += 1000;
+        t += scrape_ms;
     }
     let response = app
         .clone()

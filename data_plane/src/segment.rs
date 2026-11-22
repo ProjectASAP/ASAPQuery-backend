@@ -374,6 +374,23 @@ impl Segment {
         payload.extend_from_slice(&(head_bytes.len() as u32).to_le_bytes());
         let bytes = frame(RECORD_FRAME, &payload)?;
         self.file.write_all_at(&bytes, frame_start)?;
+        // Start writing the record back now, without waiting: its pages
+        // become clean (reclaimable) within moments instead of piling up as
+        // dirty page cache until the next sync, which under a memory limit
+        // stalls every allocating thread in reclaim.
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: a valid open descriptor and a written range; advice
+            // to the kernel only (an error leaves the pages to the next sync).
+            unsafe {
+                libc::sync_file_range(
+                    self.file.as_raw_fd(),
+                    frame_start as libc::off64_t,
+                    bytes.len() as libc::off64_t,
+                    libc::SYNC_FILE_RANGE_WRITE,
+                )
+            };
+        }
         self.texts
             .write()
             .unwrap_or_else(|e| e.into_inner())
