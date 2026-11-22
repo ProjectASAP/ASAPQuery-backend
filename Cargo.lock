@@ -333,7 +333,7 @@ dependencies = [
 [[package]]
 name = "asap-accuracy"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=846a70ab202b5b205137db258dd5223df2ba81e4#846a70ab202b5b205137db258dd5223df2ba81e4"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=8c4dec479574fcb2933888be6e5a634649c03482#8c4dec479574fcb2933888be6e5a634649c03482"
 dependencies = [
  "asap-types",
  "asap_sketchlib",
@@ -344,7 +344,7 @@ dependencies = [
 [[package]]
 name = "asap-cost"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=846a70ab202b5b205137db258dd5223df2ba81e4#846a70ab202b5b205137db258dd5223df2ba81e4"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=8c4dec479574fcb2933888be6e5a634649c03482#8c4dec479574fcb2933888be6e5a634649c03482"
 dependencies = [
  "asap-types",
  "asap_sketchlib",
@@ -356,7 +356,7 @@ dependencies = [
 [[package]]
 name = "asap-executor"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=846a70ab202b5b205137db258dd5223df2ba81e4#846a70ab202b5b205137db258dd5223df2ba81e4"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=8c4dec479574fcb2933888be6e5a634649c03482#8c4dec479574fcb2933888be6e5a634649c03482"
 dependencies = [
  "ahash",
  "arrow",
@@ -374,7 +374,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-common"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=846a70ab202b5b205137db258dd5223df2ba81e4#846a70ab202b5b205137db258dd5223df2ba81e4"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=8c4dec479574fcb2933888be6e5a634649c03482#8c4dec479574fcb2933888be6e5a634649c03482"
 dependencies = [
  "asap-types",
  "serde",
@@ -384,7 +384,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-metricsql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=846a70ab202b5b205137db258dd5223df2ba81e4#846a70ab202b5b205137db258dd5223df2ba81e4"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=8c4dec479574fcb2933888be6e5a634649c03482#8c4dec479574fcb2933888be6e5a634649c03482"
 dependencies = [
  "asap-frontend-common",
  "asap-types",
@@ -395,7 +395,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-promql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=846a70ab202b5b205137db258dd5223df2ba81e4#846a70ab202b5b205137db258dd5223df2ba81e4"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=8c4dec479574fcb2933888be6e5a634649c03482#8c4dec479574fcb2933888be6e5a634649c03482"
 dependencies = [
  "asap-frontend-common",
  "asap-types",
@@ -405,7 +405,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-sql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=846a70ab202b5b205137db258dd5223df2ba81e4#846a70ab202b5b205137db258dd5223df2ba81e4"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=8c4dec479574fcb2933888be6e5a634649c03482#8c4dec479574fcb2933888be6e5a634649c03482"
 dependencies = [
  "asap-frontend-common",
  "asap-sql-function-catalog",
@@ -417,7 +417,7 @@ dependencies = [
 [[package]]
 name = "asap-planner"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=846a70ab202b5b205137db258dd5223df2ba81e4#846a70ab202b5b205137db258dd5223df2ba81e4"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=8c4dec479574fcb2933888be6e5a634649c03482#8c4dec479574fcb2933888be6e5a634649c03482"
 dependencies = [
  "asap-accuracy",
  "asap-cost",
@@ -439,12 +439,12 @@ dependencies = [
 [[package]]
 name = "asap-sql-function-catalog"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=846a70ab202b5b205137db258dd5223df2ba81e4#846a70ab202b5b205137db258dd5223df2ba81e4"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=8c4dec479574fcb2933888be6e5a634649c03482#8c4dec479574fcb2933888be6e5a634649c03482"
 
 [[package]]
 name = "asap-stage0-memo"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=846a70ab202b5b205137db258dd5223df2ba81e4#846a70ab202b5b205137db258dd5223df2ba81e4"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=8c4dec479574fcb2933888be6e5a634649c03482#8c4dec479574fcb2933888be6e5a634649c03482"
 dependencies = [
  "asap-types",
 ]
@@ -452,7 +452,7 @@ dependencies = [
 [[package]]
 name = "asap-stage1-pass1-per-computation-candidates"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=846a70ab202b5b205137db258dd5223df2ba81e4#846a70ab202b5b205137db258dd5223df2ba81e4"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=8c4dec479574fcb2933888be6e5a634649c03482#8c4dec479574fcb2933888be6e5a634649c03482"
 dependencies = [
  "asap-types",
  "thiserror 2.0.20",
@@ -461,7 +461,7 @@ dependencies = [
 [[package]]
 name = "asap-stage1-pass2-reuse-candidates"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=846a70ab202b5b205137db258dd5223df2ba81e4#846a70ab202b5b205137db258dd5223df2ba81e4"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=8c4dec479574fcb2933888be6e5a634649c03482#8c4dec479574fcb2933888be6e5a634649c03482"
 dependencies = [
  "asap-accuracy",
  "asap-types",
@@ -471,7 +471,7 @@ dependencies = [
 [[package]]
 name = "asap-stage2-physical-optimization"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=846a70ab202b5b205137db258dd5223df2ba81e4#846a70ab202b5b205137db258dd5223df2ba81e4"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=8c4dec479574fcb2933888be6e5a634649c03482#8c4dec479574fcb2933888be6e5a634649c03482"
 dependencies = [
  "asap-types",
 ]
@@ -479,7 +479,7 @@ dependencies = [
 [[package]]
 name = "asap-stage3-plan-selection"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=846a70ab202b5b205137db258dd5223df2ba81e4#846a70ab202b5b205137db258dd5223df2ba81e4"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=8c4dec479574fcb2933888be6e5a634649c03482#8c4dec479574fcb2933888be6e5a634649c03482"
 dependencies = [
  "asap-accuracy",
  "asap-cost",
@@ -494,7 +494,7 @@ dependencies = [
 [[package]]
 name = "asap-types"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=846a70ab202b5b205137db258dd5223df2ba81e4#846a70ab202b5b205137db258dd5223df2ba81e4"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=8c4dec479574fcb2933888be6e5a634649c03482#8c4dec479574fcb2933888be6e5a634649c03482"
 dependencies = [
  "asap_sketchlib",
  "serde",
@@ -505,7 +505,7 @@ dependencies = [
 [[package]]
 name = "asap_sketchlib"
 version = "0.4.0"
-source = "git+https://github.com/ProjectASAP/asap_sketchlib?rev=389530ce23b121520f0218a4471e376db2c35945#389530ce23b121520f0218a4471e376db2c35945"
+source = "git+https://github.com/ProjectASAP/asap_sketchlib?rev=a404f031f3c47f14667220d3d0628053f9638e52#a404f031f3c47f14667220d3d0628053f9638e52"
 dependencies = [
  "rand 0.9.5",
  "rmp-serde",
@@ -976,6 +976,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]
@@ -2472,7 +2473,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "metricsql_common"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=846a70ab202b5b205137db258dd5223df2ba81e4#846a70ab202b5b205137db258dd5223df2ba81e4"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=8c4dec479574fcb2933888be6e5a634649c03482#8c4dec479574fcb2933888be6e5a634649c03482"
 dependencies = [
  "chrono",
 ]
@@ -2480,7 +2481,7 @@ dependencies = [
 [[package]]
 name = "metricsql_parser"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=846a70ab202b5b205137db258dd5223df2ba81e4#846a70ab202b5b205137db258dd5223df2ba81e4"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=8c4dec479574fcb2933888be6e5a634649c03482#8c4dec479574fcb2933888be6e5a634649c03482"
 dependencies = [
  "ahash",
  "chrono",
