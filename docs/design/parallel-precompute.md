@@ -846,6 +846,95 @@ default).
   1.75× the window path's fold CPU at K ≥ 4. With morsels of 8,192 samples it still
   used 1.6×.
 
+### Core scaling (engine and senders on separate hosts)
+
+**Setup.**
+
+- **Hosts.** The engine host has 2 sockets × 14 cores × 2 hardware threads: 28
+  physical cores, 56 logical CPUs. CPUs 0–27 are the physical cores, and 28–55
+  their SMT siblings. The engine (the `data_plane` server) is pinned to CPUs
+  `0..K`, so K ≤ 28 uses physical cores only and K = 32, 48 and 56 add SMT
+  siblings.
+- **Engine settings.** K ingest shards, and K precompute threads for the window
+  path.
+- **Senders.** The Remote Write senders (`examples/remote_write_load.rs`) run on a
+  second host and send over a 10 GbE link. iperf3 measured 9.42 Gbit/s (4 streams)
+  with a 0.06 ms RTT. The highest load sent, 8.7M samples/s, is below 3 Gbit/s
+  snappy-compressed, so the network is not the limit.
+- **Workload.** The typical 60 s / 10 Hz dashboard (12 views), with 100k series
+  per metric (200k series).
+- **Saturation runs.** Samples are stamped in the past and sent as fast as the
+  engine takes them, for 180 s, so windows close as event time passes.
+- **Senders' behaviour.** 48 sender threads, about 4.2k samples per request, each
+  with one request in flight. A 503 is retried with exponential backoff (10 ms to
+  1 s), as Prometheus does.
+- **Throughput.** Samples the engine accepted over a 145 s interval. Fold CPU is
+  the `precompute*` phases.
+
+| K (CPUs) | push M samples/s | push efficiency vs K = 12 | push fold / engine CPU (cores) | window path M samples/s | window engine CPU (cores) |
+| --- | --- | --- | --- | --- | --- |
+| 4 | 0.89 | 0.82 | 2.3 / 3.9 | 0.46 | 3.3 |
+| 12 | 3.25 | 1.00 | 6.6 / 11.8 | 0.21 | 3.8 |
+| 16 | 4.41 | 1.02 | 8.8 / 15.7 | 0.17 | 3.7 |
+| 28 (all physical) | 6.59 | 0.87 | 16.6 / 27.4 | 0.13 | 4.0 |
+| 32 (+4 SMT) | 6.56 | 0.76 | 19.1 / 31.0 | 0.12 | 4.4 |
+| 48 (+20 SMT) | 8.00 | 0.62 | 30.9 / 46.8 | 0.10 | 6.1 |
+| 56 (+28 SMT) | 8.59 | 0.57 | 30.6 / 48.6 | 0.09 | 6.7 |
+
+**Window-ready latency.** Measured at 1M samples/s offered (50k series per metric,
+stamped at the wall clock):
+
+- Push commits windows 16.8 s after their end at K = 12, 28 and 56 (max 17.0 s):
+  the 15 s lateness plus under 2 s.
+- The window path does not sustain 1M samples/s from 48 senders at any K
+  (0.07–0.12M accepted), so no window closed.
+
+**Request size.** With 12 sender threads (about 17k samples per request) at
+K = 28:
+
+- push takes 8.69M samples/s with no 503, using 22.6 of 28 cores, so the senders
+  are the limit;
+- the window path takes 0.51M samples/s.
+
+With 96 sender threads (about 2.1k samples per request), push takes 7.4M at K = 48
+and 7.1M at K = 56. That is less than with 48 senders, at 32–35 of the engine's
+cores.
+
+**Where it stops scaling, and why.**
+
+- **Push, physical cores.** Push scales close to linearly to the 28 physical cores:
+  0.87–1.02 of the K = 12 rate per core.
+- **Push, SMT siblings.** The 28 SMT siblings add 30% (6.6M → 8.6M samples/s).
+  Per-CPU efficiency drops to 0.57, as expected from hyperthreads sharing a core.
+- **Push, the knee is the coordinator.** Beyond the physical cores the limit is
+  the ingest coordinator, a single thread. It applies every shard's per-request
+  report and runs the flush passes. Shard queues are counted out only when the
+  coordinator applies a report. So when it falls behind, Remote Write gets 503s
+  while the engine still has idle CPU: at K = 56 the engine used 35–49 of 56
+  cores.
+  - Its CPU grows with the request rate, not the sample rate. At K = 28 it used
+    56 s with 48 senders, against 13 s with 12 senders at a higher sample rate.
+  - Halving the request size at K = 56 raised it from 130 s to 187 s and lowered
+    throughput.
+- **Push, where the CPU goes.** The perf profile at K = 28 and K = 56 puts most
+  engine CPU in Remote Write decode on the HTTP threads: series interning
+  (per-thread `cached_series` hash lookups and memcmp, about 10–17% of samples),
+  protobuf field and varint parsing, and snappy. The fold runs on the shards
+  (30–58% of engine CPU).
+- **Push, ruled out.** The committer (1–2 s of CPU per window) and persistence
+  (views in memory) are not limits.
+- **Window path.** It does not scale at all with many small requests. Throughput
+  falls from 0.46M samples/s at K = 4 to 0.09M at K = 56, using only 3–7 cores.
+  - Its coordinator is saturated: 250 s of CPU at K = 12 and 757 s at K = 56.
+    perf shows it dropping and rebuilding raw-data pane maps, 15% of all samples
+    at K = 56.
+  - Its shards clone those `BTreeMap`s on every append, because the coordinator's
+    published snapshot shares them (copy-on-write).
+  - Push keeps no raw data for these views, so none of this cost exists there.
+  - With fewer, larger requests the window path does better (0.51M at K = 28; the
+    in-process bench reaches 1.4M with one request per scrape). It stays
+    coordinator-bound.
+
 ## Minimal complexity
 
 - **No new partitioning, pool or flag for combine.** The ingest shards, the
