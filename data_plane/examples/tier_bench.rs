@@ -199,7 +199,7 @@ async fn main() {
                             // about once per 20 minutes.
                             let draw = (u.powf(-1.0 / 0.1)).floor().min(1e6);
                             if metrics[i / series].ends_with("_total") {
-                                if (h >> 3) % 12_000 == 0 {
+                                if (h >> 3).is_multiple_of(12_000) {
                                     totals[i] = 0.0;
                                 }
                                 totals[i] += draw;
