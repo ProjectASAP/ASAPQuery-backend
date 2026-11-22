@@ -8,6 +8,11 @@
 //! range queries with query runs, all through the Planner's executor
 //! ([`engine`]); every other query, and any planned query it cannot
 //! answer, is forwarded to Prometheus (or refused with `--no-forward`).
+//!
+//! Forward mode (`--raw-store-url`, [`raw_forward`]): every accepted Remote
+//! Write request is also delivered to a raw store (VictoriaMetrics), which
+//! then answers every query the plan does not and every other API path
+//! (labels, series, metadata), proxied with `x-asap-execution: forwarded`.
 
 pub mod engine;
 pub mod ingestion;
@@ -17,6 +22,7 @@ pub mod persist;
 pub mod prometheus;
 pub mod push;
 pub mod query;
+pub mod raw_forward;
 pub mod remote_write;
 pub mod result_cache;
 pub mod segment;
@@ -29,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, RawQuery, State};
+use axum::extract::{DefaultBodyLimit, OriginalUri, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -59,6 +65,9 @@ pub struct DataPlane {
     /// gets an error with the reason ([`EngineOptions::no_forward`]).
     pub no_forward: bool,
     client: reqwest::Client,
+    /// Forward mode: delivers accepted Remote Write bodies to the raw store,
+    /// which also answers what the plan does not. `None`: off.
+    pub raw_forward: Option<raw_forward::RawForwarder>,
 }
 
 impl DataPlane {
@@ -90,7 +99,24 @@ impl DataPlane {
             prometheus_url: prometheus_url.trim_end_matches('/').to_string(),
             limits: remote_write::Limits::default(),
             client: forward_client(DEFAULT_FORWARD_TIMEOUT),
+            raw_forward: None,
         })
+    }
+
+    /// Turns forward mode on: accepted Remote Write bodies are delivered to
+    /// the raw store at `options.url`, and queries the plan does not answer,
+    /// as well as any other path, are proxied to it (in place of
+    /// `prometheus_url`). Refused with `--no-forward`, which forbids proxying.
+    pub fn with_raw_forward(
+        mut self,
+        options: raw_forward::RawForwardOptions,
+    ) -> anyhow::Result<Self> {
+        if self.no_forward {
+            anyhow::bail!("--raw-store-url proxies unplanned queries, which --no-forward refuses");
+        }
+        self.prometheus_url = options.url.clone();
+        self.raw_forward = Some(raw_forward::RawForwarder::start(options)?);
+        Ok(self)
     }
 
     /// Bounds each forwarded query by `timeout`, from sending the request to
@@ -112,15 +138,43 @@ pub fn router(state: Arc<DataPlane>) -> Router {
     // axum refuses bodies over 2 MB by default; Remote Write allows up to
     // `max_compressed_bytes` and answers larger bodies with 413.
     let write_body_limit = DefaultBodyLimit::max(state.limits.max_compressed_bytes);
-    Router::new()
+    let forward_mode = state.raw_forward.is_some();
+    let router = Router::new()
         .route("/api/v1/write", post(write).layer(write_body_limit))
         .route("/api/v1/query", get(query).post(query))
         .route("/api/v1/query_range", get(query_range).post(query_range))
         .route("/api/v1/status/asap", get(status))
         .route("/metrics", get(metrics))
         .route("/api/v1/precompute/watermark", post(watermark))
-        .route("/-/ready", get(ready))
-        .with_state(state)
+        .route("/-/ready", get(ready));
+    // Forward mode: any other path (labels, series, metadata, the raw
+    // store's UI) is proxied to the raw store. Off: those paths are 404.
+    let router = if forward_mode {
+        router.fallback(proxy)
+    } else {
+        router
+    };
+    router.with_state(state)
+}
+
+/// Forward mode: proxies a request the data plane does not serve to the raw
+/// store, with `x-asap-execution: forwarded`.
+async fn proxy(
+    state: State<Arc<DataPlane>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    forward_path(
+        state,
+        uri.path(),
+        method,
+        RawQuery(uri.query().map(str::to_string)),
+        headers,
+        body,
+    )
+    .await
 }
 
 async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
@@ -131,8 +185,28 @@ async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
             if samples.is_empty() {
                 return StatusCode::NO_CONTENT.into_response();
             }
+            // Forward mode: room in the raw store's queue first, so a refused
+            // request reaches neither store and a retry duplicates nothing.
+            let reservation = match &state.raw_forward {
+                Some(forwarder) => match forwarder.reserve(body.len() as u64) {
+                    Some(reservation) => Some(reservation),
+                    None => {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "the raw store's forward queue is full",
+                        )
+                            .into_response()
+                    }
+                },
+                None => None,
+            };
             match state.engine.try_ingest(samples) {
-                Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                Ok(()) => {
+                    if let Some(reservation) = reservation {
+                        reservation.commit(body);
+                    }
+                    StatusCode::NO_CONTENT.into_response()
+                }
                 // Remote Write senders retry on 503.
                 Err(IngestError::Busy) => (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -220,6 +294,7 @@ async fn status(State(state): State<Arc<DataPlane>>) -> Response {
         "samples_queued": state.engine.queued_samples(),
         "precompute_backlog": state.engine.precompute_backlog(),
         "ingestion": state.engine.stats(),
+        "raw_forward": state.raw_forward.as_ref().map(|f| f.status()),
     });
     (
         [(header::CONTENT_TYPE, "application/json")],
@@ -232,11 +307,11 @@ async fn status(State(state): State<Arc<DataPlane>>) -> Response {
 /// thread CPU and wall time, query latency, counters, backlogs, watermark
 /// lag, bytes held and each thread's CPU time ([`metrics`]).
 async fn metrics(State(state): State<Arc<DataPlane>>) -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        state.engine.render_metrics(),
-    )
-        .into_response()
+    let mut text = state.engine.render_metrics();
+    if let Some(forwarder) = &state.raw_forward {
+        forwarder.render(&mut text);
+    }
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], text).into_response()
 }
 
 /// `text` as a header value: characters a header cannot carry (controls and
@@ -485,14 +560,27 @@ fn forwarded_headers(headers: &HeaderMap) -> HeaderMap {
 /// `Authorization` and tenancy headers such as `X-Scope-OrgID`) and returns
 /// Prometheus's status, body and `Content-Type`.
 async fn forward(
-    State(state): State<Arc<DataPlane>>,
+    state: State<Arc<DataPlane>>,
     endpoint: &str,
+    method: Method,
+    query: RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let path = format!("/api/v1/{endpoint}");
+    forward_path(state, &path, method, query, headers, body).await
+}
+
+/// [`forward`] for any `path` of the Prometheus (or raw store) server.
+async fn forward_path(
+    State(state): State<Arc<DataPlane>>,
+    path: &str,
     method: Method,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let mut url = format!("{}/api/v1/{endpoint}", state.prometheus_url);
+    let mut url = format!("{}{path}", state.prometheus_url);
     if let Some(query) = query {
         url = format!("{url}?{query}");
     }
