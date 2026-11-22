@@ -953,6 +953,11 @@ pub struct ViewStore {
     /// retention for a reader that runs right behind it, and the precompute
     /// pool lets a group run ahead of its readers.
     readers: BTreeMap<PhysicalASAPNodeId, BTreeMap<usize, i64>>,
+    /// Per view, the start of the first window ever stored. Before it the
+    /// view has no data at all, so a read reaching back past it answers
+    /// from the rows that exist, as PromQL does over a range that starts
+    /// before the first sample.
+    first_start: BTreeMap<PhysicalASAPNodeId, i64>,
 }
 
 impl ViewStore {
@@ -995,6 +1000,9 @@ impl ViewStore {
     /// always kept).
     fn push(&mut self, view: &MaterializedView, time_range_ms: (i64, i64), slot: WindowSlot) {
         let end = time_range_ms.1;
+        self.first_start
+            .entry(view.node_id)
+            .or_insert(time_range_ms.0);
         let rows = self.by_view.entry(view.node_id).or_default();
         rows.push(ViewWindow {
             time_range_ms,
@@ -1205,7 +1213,14 @@ impl ViewStore {
         request: &MaterializedViewRequest,
         context: RunContext,
     ) -> Result<OutputStream<'_, Batch>, Error> {
-        let (start, end) = request.time_range_ms;
+        let (requested_start, end) = request.time_range_ms;
+        // A range reaching back before the view's first window reads the
+        // rows that exist (PromQL semantics while a window is still
+        // filling); a gap after the first window is still missing data.
+        let start = match self.first_start.get(&view.node_id) {
+            Some(&first) if requested_start < first => first.min(end),
+            _ => requested_start,
+        };
         let missing = || {
             Error::Invalid(format!(
                 "materialized view {} has no rows tiling ({start}, {end}]",
@@ -1727,7 +1742,12 @@ mod tests {
             ((5, 30), false),
             ((10, 35), false),
             ((40, 50), false),
-            ((-10, 0), false),
+            // Before the first window there is no data: a range reaching
+            // back past it reads the rows that exist (PromQL semantics
+            // while a window fills), and one wholly before it is empty.
+            ((-20, 20), true),
+            ((-10, 0), true),
+            ((-5, 25), false),
         ] {
             let request = MaterializedViewRequest {
                 time_range_ms: range,
