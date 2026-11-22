@@ -339,12 +339,13 @@ impl EngineHandle {
     /// invalid or the data plane cannot execute it.
     pub fn spawn(plan_json: String, options: EngineOptions) -> anyhow::Result<(Self, Vec<String>)> {
         let (mut ingestion, precompute, query, query_texts) = install(&plan_json, &options)?;
-        let mut views = ViewStore::default();
+        let mut views = ViewStore::default().with_stream_start(options.ingestion.stream_start_ms);
         let mut tier = None;
         let files = match &options.view_dir {
             Some(dir) => {
                 let new_tier = Arc::new(view_tier(&options));
-                views = ViewStore::tiered(new_tier.clone());
+                views = ViewStore::tiered(new_tier.clone())
+                    .with_stream_start(options.ingestion.stream_start_ms);
                 tier = Some(new_tier);
                 let sync_interval = std::time::Duration::from_millis(options.view_sync_interval_ms);
                 let mut files =

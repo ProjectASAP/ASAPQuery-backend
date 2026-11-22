@@ -209,3 +209,77 @@ async fn wider_levels_and_covers_answer_after_one_pass_closes_every_window() {
         }
     }
 }
+
+/// Before a window has filled, a query answers from the samples there are,
+/// as PromQL does: the stream starts at 0, 20 minutes of samples arrive,
+/// and the 1 h sum and the 30 min max are exact at every 15 s step from the
+/// first sample on, the wider levels and covers included.
+#[tokio::test(flavor = "multi_thread")]
+async fn queries_answer_from_the_samples_there_are_before_their_window_fills() {
+    const FILLED_S: i64 = 1_200;
+    let plan = plan();
+    let options = EngineOptions {
+        no_forward: true,
+        precompute_threads: 4,
+        ingestion: IngestionOptions {
+            allowed_lateness_ms: 0,
+            stream_start_ms: Some(0),
+            ..IngestionOptions::default()
+        },
+        ..EngineOptions::default()
+    };
+    let state = Arc::new(
+        DataPlane::with_options(
+            serde_json::to_string(&plan).unwrap(),
+            "http://127.0.0.1:1".into(),
+            options,
+        )
+        .unwrap(),
+    );
+    let app = router(state.clone());
+    let timeseries = (0..SERIES)
+        .map(|i| TimeSeries {
+            labels: [
+                ("__name__", "data".to_string()),
+                ("instance", format!("i{i}")),
+                ("job", format!("job{}", i % 3)),
+            ]
+            .into_iter()
+            .map(|(name, value)| Label {
+                name: name.into(),
+                value,
+            })
+            .collect(),
+            samples: (1..=FILLED_S / 15)
+                .map(|step| Sample {
+                    timestamp: step * 15_000,
+                    value: value(i, step * 15),
+                })
+                .collect(),
+        })
+        .collect();
+    let body = encode(&WriteRequest { timeseries });
+    assert_eq!(
+        post(&app, "/api/v1/write".into(), body).await,
+        StatusCode::NO_CONTENT
+    );
+    let barrier = format!("/api/v1/precompute/watermark?time_ms={}", FILLED_S * 1000);
+    assert_eq!(post(&app, barrier, Vec::new()).await, StatusCode::OK);
+    assert_eq!(
+        state.engine.stats().windows_failed,
+        0,
+        "{:?}",
+        state.engine.stats()
+    );
+    for query in [SUM, MAX] {
+        for time_s in (15..=FILLED_S).step_by(15) {
+            let (status, body) = answer(&app, query, time_s).await;
+            assert_eq!(status, StatusCode::OK, "{query} at {time_s}: {body}");
+            assert_eq!(
+                per_job(&body),
+                expected(query, time_s),
+                "{query} at {time_s}"
+            );
+        }
+    }
+}

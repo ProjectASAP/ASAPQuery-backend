@@ -958,9 +958,18 @@ pub struct ViewStore {
     /// from the rows that exist, as PromQL does over a range that starts
     /// before the first sample.
     first_start: BTreeMap<PhysicalASAPNodeId, i64>,
+    /// Where the producer's stream starts, when declared: no view has data
+    /// before it, so a view with no window yet reads as empty there.
+    stream_start_ms: Option<i64>,
 }
 
 impl ViewStore {
+    /// Declares where the producer's stream starts (see `stream_start_ms`).
+    pub fn with_stream_start(mut self, stream_start_ms: Option<i64>) -> Self {
+        self.stream_start_ms = stream_start_ms;
+        self
+    }
+
     /// An empty store whose windows, once written, are read through `tier`.
     pub fn tiered(tier: Arc<ViewTier>) -> Self {
         Self {
@@ -1217,8 +1226,13 @@ impl ViewStore {
         // A range reaching back before the view's first window reads the
         // rows that exist (PromQL semantics while a window is still
         // filling); a gap after the first window is still missing data.
-        let start = match self.first_start.get(&view.node_id) {
-            Some(&first) if requested_start < first => first.min(end),
+        let floor = self
+            .first_start
+            .get(&view.node_id)
+            .copied()
+            .or(self.stream_start_ms);
+        let start = match floor {
+            Some(first) if requested_start < first => first.min(end),
             _ => requested_start,
         };
         let missing = || {
@@ -1227,7 +1241,12 @@ impl ViewStore {
                 view.node_id
             ))
         };
-        let rows = self.by_view.get(&view.node_id).ok_or_else(missing)?;
+        let rows: &[ViewWindow] = match self.by_view.get(&view.node_id) {
+            Some(rows) => rows,
+            // Wholly before the stream start: no data, not missing data.
+            None if start == end => &[],
+            None => return Err(missing()),
+        };
         // Rows are disjoint and oldest first, so the rows inside the range
         // are one slice: from the first starting at or after `start` to
         // the last ending at or before `end`.

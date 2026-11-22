@@ -14,7 +14,8 @@
 //! The first window a group sees may have started before the data plane
 //! did, so it is never refreshed and queries that read it are not
 //! answered, unless the producer declares where its stream starts
-//! (`stream_start_ms`): a window starting at or after it is complete.
+//! (`stream_start_ms`): nothing arrives before it, so the window holding it
+//! is complete and is the group's first.
 //! When the watermark jumps past a view's retention, the windows that would
 //! already be dropped are skipped.
 //!
@@ -485,10 +486,11 @@ impl Ingestion {
             }
             let first_end = group.window_end(timestamp_ms);
             group.refreshed_through = Some(match self.options.stream_start_ms {
-                // The first window starting at or after the stream start.
-                Some(start) => {
-                    group.window_end(start.saturating_add(group.width_ms)) - group.width_ms
-                }
+                // The window holding the stream start: nothing arrives
+                // before it, so that window is complete too, and every
+                // group (each level of a window chain included) starts at
+                // the same instant.
+                Some(start) => group.window_end(start) - group.width_ms,
                 None => {
                     self.stats.windows_skipped_first += 1;
                     first_end

@@ -339,13 +339,15 @@ async fn windows_that_cannot_be_written_stay_in_memory() {
 #[tokio::test(flavor = "multi_thread")]
 async fn view_files_stay_bounded_by_retention() {
     let plan = plan(&[SUM]);
+    // The store keeps a view's windows for its retention plus the margin.
     let retention_ms = plan
         .materialized_views()
         .unwrap()
         .iter()
         .map(|view| view.retention_ms() as i64)
         .max()
-        .unwrap();
+        .unwrap()
+        + IngestionOptions::default().view_retention_margin_ms as i64;
     let segment_ms = 15_000;
     let expected = control_answers(&plan, "bounded", &[SUM], 600).await;
     let dir = view_dir("bounded");
