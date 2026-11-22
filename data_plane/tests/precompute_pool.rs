@@ -59,7 +59,9 @@ fn workloads() -> Vec<(String, PlanningWorkload)> {
 fn plans() -> impl Iterator<Item = (String, InstallablePlan)> {
     workloads().into_iter().flat_map(|(name, workload)| {
         [true, false].into_iter().filter_map(move |raw| {
-            let (plan, _) = plan_workload(&workload, &common::inputs(raw)).ok()?;
+            // Without wider chain levels: these tests time refresh groups
+            // of the plan shapes they pick (`window_levels` tests levels).
+            let (plan, _) = plan_workload(&workload, &common::inputs_without_levels(raw)).ok()?;
             Some((format!("{name} (raw data retained: {raw})"), plan))
         })
     })
