@@ -1308,14 +1308,10 @@ mod tests {
             l1.maps(values.values().as_ptr() as usize),
             "values are copied, not borrowed"
         );
-        // The KLL states are read where they are mapped, not rebuilt.
+        // The KLL states are read in place (a mapped column, charged
+        // nothing), not rebuilt as objects.
         let states = r1.state_column(4).expect("a state column");
-        for index in [0, 999] {
-            let address = states
-                .mapped_state_address(index)
-                .expect("a mapped state column");
-            assert!(l1.maps(address), "state {index} was copied");
-        }
+        assert_eq!(states.state_memory_bytes(), 0);
         assert!(
             Arc::ptr_eq(identity(&r1).values(), identity(&r2).values()),
             "one dictionary per segment"
