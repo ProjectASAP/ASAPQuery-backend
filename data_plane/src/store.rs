@@ -1237,7 +1237,7 @@ impl ViewStore {
         };
         let missing = || {
             Error::Invalid(format!(
-                "materialized view {} has no rows tiling ({start}, {end}]",
+                "materialized view {} has no rows tiling ({requested_start}, {end}]",
                 view.node_id
             ))
         };
