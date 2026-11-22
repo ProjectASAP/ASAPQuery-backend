@@ -163,10 +163,23 @@ HTTP queries ─► query workers: one query run per worker thread over
   cutoff falls in answers as the row store did.
 - A read returns one batch per chunk of the panes overlapping its range;
   only a chunk straddling the range is filtered. A query-time `Scan` that
-  reads the open pane reads the chunks published so far, the same way:
-  every shard reports its raw data after every request (copy on write: the
-  per-pane chunk lists are copied, never the chunks), and a read takes the
-  union over the shards.
+  reads the open pane reads the chunks published as of the coordinator's
+  last flush, the same way, and takes the union over the shards.
+- The coordinator's work does not grow with the request rate. A shard
+  drains every batch already queued to it and sends one report (sample
+  times, counts, first samples), so a coordinator pass takes the batches
+  of many requests. A shard sends its raw data only with its answer to a
+  flush (copy on write: the per-pane chunk lists are copied, never the
+  chunks), and eviction sends no report, so it starts no pass. When no
+  query reads raw samples (no query-time `Scan`), the coordinator lets
+  each pass's snapshot go once the windows it closed are queued: a
+  shard's next append then owns its raw data again instead of copying
+  its pane lists; only a queued refresh still holds them, until it runs.
+  On two 40-vCPU hosts (engine and Remote Write senders, 32 shards,
+  200,000 series of the 10 Hz dashboard), the coordinator went from one
+  busy core at 0.16M samples/s to 0.45 cores at 8M samples/s offered as
+  fast as accepted; paced at 3M and 4M samples/s (samples stamped at the
+  wall clock) every sample is accepted, none late.
 - An `ingest` coordinator thread keeps the watermark over the shards: it
   follows the newest sample any shard holds, and before it moves the
   coordinator flushes every shard (each runs the samples queued to it and

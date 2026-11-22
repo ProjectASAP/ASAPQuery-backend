@@ -376,6 +376,12 @@ impl Ingestion {
         RawData::for_metrics(self.scanned_metrics.iter(), self.pane_width_ms)
     }
 
+    /// Whether a query run reads raw samples (a query-time `Scan`); if not,
+    /// only the refresh windows read them.
+    pub fn queries_read_raw_data(&self) -> bool {
+        !self.query_time_lookback_ms.is_empty()
+    }
+
     /// The raw-data pane width.
     pub fn pane_width_ms(&self) -> i64 {
         self.pane_width_ms

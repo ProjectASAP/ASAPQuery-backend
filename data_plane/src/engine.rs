@@ -217,7 +217,9 @@ enum Command {
     Report(ShardReport),
     /// The shard numbered here has run every message sent to it before a
     /// flush.
-    Flushed(usize),
+    /// With the shard's raw data as of then: what windows closing behind
+    /// the flush read.
+    Flushed(usize, Arc<RawData>),
     AdvanceWatermark {
         barrier_ms: i64,
         reply: oneshot::Sender<i64>,
@@ -228,7 +230,6 @@ enum Command {
 /// A shard's state after its last message.
 struct ShardReport {
     shard: usize,
-    raw_data: Arc<RawData>,
     /// The newest sample the shard holds.
     newest_ms: Option<i64>,
     /// Each metric's first sample, while a group waits for one.
@@ -953,49 +954,79 @@ fn serve_shard(
     delay: std::time::Duration,
 ) {
     let mut newest_ms: Option<i64> = None;
-    for message in messages {
-        let (count, first_seen) = match message {
-            ShardMessage::Samples(samples) => {
-                if !delay.is_zero() {
-                    std::thread::sleep(delay);
-                }
-                let timer = Timer::start();
-                let count = samples.len() as u64;
-                let routing = shared
-                    .routing
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
-                let routed = routing.route(samples, crate::ingestion::wall_clock_ms());
-                Arc::make_mut(&mut raw_data).append(&routed.accepted);
-                newest_ms = newest_ms.max(routed.newest_ms);
-                {
-                    let mut stats = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
-                    stats.samples_accepted += routed.stats.samples_accepted;
-                    stats.samples_dropped_late += routed.stats.samples_dropped_late;
-                    stats.samples_dropped_future += routed.stats.samples_dropped_future;
-                    stats.samples_unrouted += routed.stats.samples_unrouted;
-                }
-                shared.metrics.append.record(timer);
-                (count, routed.first_seen)
-            }
+    // A message taken while draining a batch, to run next.
+    let mut next: Option<ShardMessage> = None;
+    loop {
+        let message = match next.take() {
+            Some(message) => message,
+            None => match messages.recv() {
+                Ok(message) => message,
+                Err(_) => break,
+            },
+        };
+        let mut samples = match message {
+            ShardMessage::Samples(samples) => samples,
+            // Eviction changes no sample time: no report (each would start
+            // another coordinator pass).
             ShardMessage::Maintain {
                 routing,
                 watermark_ms,
             } => {
                 routing.maintain(Arc::make_mut(&mut raw_data), watermark_ms);
-                (0, Vec::new())
+                continue;
             }
             ShardMessage::Flush => {
-                if coordinator.send(Command::Flushed(index)).is_err() {
+                // The raw data travels only with a flush, which a window
+                // closing reads; the coordinator lets it go after its pass,
+                // so appending rarely copies the pane lists it shares.
+                if coordinator
+                    .send(Command::Flushed(index, raw_data.clone()))
+                    .is_err()
+                {
                     break;
                 }
                 continue;
             }
         };
+        // Every batch already queued, appended and reported at once: one
+        // report (and so at most one coordinator pass) per drained queue,
+        // not per request.
+        let mut count = 0;
+        let mut first_seen = Vec::new();
+        loop {
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+            let timer = Timer::start();
+            count += samples.len() as u64;
+            let routing = shared
+                .routing
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let routed = routing.route(samples, crate::ingestion::wall_clock_ms());
+            Arc::make_mut(&mut raw_data).append(&routed.accepted);
+            newest_ms = newest_ms.max(routed.newest_ms);
+            {
+                let mut stats = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
+                stats.samples_accepted += routed.stats.samples_accepted;
+                stats.samples_dropped_late += routed.stats.samples_dropped_late;
+                stats.samples_dropped_future += routed.stats.samples_dropped_future;
+                stats.samples_unrouted += routed.stats.samples_unrouted;
+            }
+            shared.metrics.append.record(timer);
+            first_seen.extend(routed.first_seen);
+            match messages.try_recv() {
+                Ok(ShardMessage::Samples(more)) => samples = more,
+                Ok(other) => {
+                    next = Some(other);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
         let report = ShardReport {
             shard: index,
-            raw_data: raw_data.clone(),
             newest_ms,
             first_seen,
             samples: count,
@@ -1033,16 +1064,12 @@ fn serve_ingest(
     const TICK: std::time::Duration = std::time::Duration::from_millis(100);
     let mut newest: Vec<Option<i64>> = vec![None; shards.len()];
     let mut sealed_through: Option<i64> = None;
-    let apply = |report: ShardReport,
-                 ingestion: &mut Ingestion,
-                 raw_shards: &mut Vec<Arc<RawData>>,
-                 newest: &mut Vec<Option<i64>>| {
+    let apply = |report: ShardReport, ingestion: &mut Ingestion, newest: &mut Vec<Option<i64>>| {
         ingestion.observe(&report.first_seen);
         shared.shard_queued[report.shard].fetch_sub(report.samples, Ordering::SeqCst);
         shared
             .queued_samples
             .fetch_sub(report.samples, Ordering::SeqCst);
-        raw_shards[report.shard] = report.raw_data;
         newest[report.shard] = report.newest_ms;
     };
     // Barriers that came while a flush was waited for: written after it,
@@ -1054,6 +1081,13 @@ fn serve_ingest(
     // would move the watermark past samples other shards have yet to
     // append, and windows would close without them.
     let mut held: Vec<ShardReport> = Vec::new();
+    let queries_read_raw_data = ingestion.queries_read_raw_data();
+    // Published in place of the raw data when no query reads it.
+    let no_raw_data: RawShards = Arc::new(
+        (0..shards.len())
+            .map(|_| Arc::new(ingestion.raw_data()))
+            .collect(),
+    );
     'serve: loop {
         let mut barriers: Vec<_> = deferred.drain(..).collect();
         // Whether anything this pass may move the watermark: a newer
@@ -1061,15 +1095,15 @@ fn serve_ingest(
         // at it), a metric's first sample, or a barrier.
         let mut moved = !barriers.is_empty() || !held.is_empty();
         for report in held.drain(..) {
-            apply(report, &mut ingestion, &mut raw_shards, &mut newest);
+            apply(report, &mut ingestion, &mut newest);
         }
         if !moved {
             match commands.recv_timeout(TICK) {
                 Ok(Command::Report(report)) => {
-                    apply(report, &mut ingestion, &mut raw_shards, &mut newest);
+                    apply(report, &mut ingestion, &mut newest);
                     moved = true;
                 }
-                Ok(Command::Flushed(_)) => {}
+                Ok(Command::Flushed(..)) => {}
                 Ok(Command::AdvanceWatermark { barrier_ms, reply }) => {
                     barriers.push((barrier_ms, reply));
                     moved = true;
@@ -1085,10 +1119,10 @@ fn serve_ingest(
         while let Ok(command) = commands.try_recv() {
             match command {
                 Command::Report(report) => {
-                    apply(report, &mut ingestion, &mut raw_shards, &mut newest);
+                    apply(report, &mut ingestion, &mut newest);
                     moved = true;
                 }
-                Command::Flushed(_) => {}
+                Command::Flushed(..) => {}
                 Command::AdvanceWatermark { barrier_ms, reply } => {
                     barriers.push((barrier_ms, reply));
                     moved = true;
@@ -1099,6 +1133,7 @@ fn serve_ingest(
         // Before the watermark moves, every shard runs the samples queued to
         // it, so the windows it closes hold every sample admitted so far
         // and the raw data they read is every shard's as of then.
+        let flushed = moved;
         if moved {
             let flushed_ms = flush(&shards, shared);
             let mut flushed = vec![false; shards.len()];
@@ -1110,10 +1145,11 @@ fn serve_ingest(
                     {
                         held.push(report)
                     }
-                    Ok(Command::Report(report)) => {
-                        apply(report, &mut ingestion, &mut raw_shards, &mut newest)
+                    Ok(Command::Report(report)) => apply(report, &mut ingestion, &mut newest),
+                    Ok(Command::Flushed(shard, raw_data)) => {
+                        flushed[shard] = true;
+                        raw_shards[shard] = raw_data;
                     }
-                    Ok(Command::Flushed(shard)) => flushed[shard] = true,
                     Ok(Command::AdvanceWatermark { barrier_ms, reply }) => {
                         deferred.push_back((barrier_ms, reply))
                     }
@@ -1155,23 +1191,40 @@ fn serve_ingest(
                 });
             }
         }
-        shared
-            .published
-            .publish_raw_data(snapshot.clone(), watermark_ms);
         let metrics = &shared.metrics;
         if let Some(watermark_ms) = watermark_ms {
             metrics.watermark_ms.store(watermark_ms, Ordering::Relaxed);
         }
-        let sum = |f: fn(&RawData) -> usize| snapshot.iter().map(|r| f(r) as u64).sum::<u64>();
-        metrics
-            .raw_data_bytes
-            .store(sum(RawData::bytes), Ordering::Relaxed);
-        metrics
-            .raw_data_samples
-            .store(sum(RawData::len), Ordering::Relaxed);
-        metrics
-            .raw_data_panes
-            .store(sum(RawData::panes), Ordering::Relaxed);
+        if flushed {
+            let sum = |f: fn(&RawData) -> usize| snapshot.iter().map(|r| f(r) as u64).sum::<u64>();
+            metrics
+                .raw_data_bytes
+                .store(sum(RawData::bytes), Ordering::Relaxed);
+            metrics
+                .raw_data_samples
+                .store(sum(RawData::len), Ordering::Relaxed);
+            metrics
+                .raw_data_panes
+                .store(sum(RawData::panes), Ordering::Relaxed);
+        }
+        if queries_read_raw_data {
+            shared
+                .published
+                .publish_raw_data(snapshot.clone(), watermark_ms);
+        } else {
+            // No query reads the raw data, and the next windows to close
+            // read it as of their own flush: let the shards' raw data go,
+            // so their next appends own it again instead of copying the
+            // pane lists this snapshot shares (only the queued refreshes
+            // still hold it, until they run).
+            shared
+                .published
+                .publish_raw_data(no_raw_data.clone(), watermark_ms);
+            drop(snapshot);
+            for raw_data in raw_shards.iter_mut() {
+                *raw_data = no_raw_data[0].clone();
+            }
+        }
         {
             let mut stats = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
             stats.windows_skipped_first = ingestion.stats.windows_skipped_first;
