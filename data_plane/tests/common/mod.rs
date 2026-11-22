@@ -22,6 +22,18 @@ pub fn inputs_without_levels(raw_data_retained: bool) -> DeploymentInputs {
     inputs
 }
 
+/// [`inputs`] without compressed-sample windows, for tests about a
+/// sketch's own state: the plan then cannot answer exactly from decoded
+/// samples instead.
+#[allow(dead_code)]
+pub fn inputs_without_compressed_samples(raw_data_retained: bool) -> DeploymentInputs {
+    let mut inputs = inputs(raw_data_retained);
+    inputs.deployment_capabilities.excluded_candidates =
+        serde_json::from_value(serde_json::json!([{"summary_family": "compressed_samples"}]))
+            .unwrap();
+    inputs
+}
+
 /// A #509 example workload in `examples/`.
 #[allow(dead_code)]
 pub fn workload(example: &str) -> PlanningWorkload {
