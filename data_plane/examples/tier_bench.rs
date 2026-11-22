@@ -17,6 +17,9 @@
 //! - `RESULT_CACHE=0` turns the result cache off, so every round reads
 //!   its views.
 //! - `SCRAPE_MS=n`: one sample per series every `n` ms (default 1,000).
+//! - `VALUES=zipf`: the harness's values (Zipf s = 1.1 integers, counters
+//!   of such increments with resets) instead of Pareto (shape 2).
+//! - `PRECOMPUTE_THREADS`, `ALLOWED_LATENESS_MS`: engine options.
 //! - `COLD=1` drops the segments' pages from the page cache
 //!   (`POSIX_FADV_DONTNEED`) before each round (B2).
 //!
@@ -117,9 +120,17 @@ async fn main() {
     let options = EngineOptions {
         ingestion: IngestionOptions {
             stream_start_ms: Some(start_ms),
+            allowed_lateness_ms: std::env::var("ALLOWED_LATENESS_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(IngestionOptions::default().allowed_lateness_ms),
             ..IngestionOptions::default()
         },
         no_forward: true,
+        precompute_threads: std::env::var("PRECOMPUTE_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(EngineOptions::default().precompute_threads),
         result_cache: std::env::var("RESULT_CACHE").map_or(true, |v| v != "0"),
         view_dir: Some(dir.clone()),
         view_cache_max_bytes,
@@ -146,10 +157,14 @@ async fn main() {
         .iter()
         .flat_map(|metric| (0..series).map(move |i| (metric, i)))
         .map(|(metric, i)| {
+            // The harness's label tree: 4 regions, 5 services each, 10 jobs
+            // each, 50 label_0 values each (10,000 leaves).
             [
                 ("__name__", metric.clone()),
-                ("instance", format!("i{i}")),
-                ("job", format!("job{}", i % 16)),
+                ("region", format!("r{}", i / 2_500)),
+                ("service", format!("s{}", i / 500)),
+                ("job", format!("j{}", i / 50)),
+                ("label_0", format!("l{i}")),
             ]
             .into_iter()
             .map(|(name, value)| Label {
@@ -159,6 +174,9 @@ async fn main() {
             .collect()
         })
         .collect();
+    let zipf = std::env::var("VALUES").is_ok_and(|v| v == "zipf");
+    // Counters' running totals, by series (metric-major, as `labels`).
+    let mut totals = vec![0.0f64; labels.len()];
     let fed = Instant::now();
     let mut t = start_ms + scrape_ms;
     while t <= end_ms {
@@ -169,13 +187,32 @@ async fn main() {
                 labels: labels.clone(),
                 samples: vec![Sample {
                     timestamp: t,
-                    // A long-tailed value per sample: Pareto (shape 2) of a
-                    // per-series scale (rank-scaled), as the harness feeds.
                     value: {
                         let h = (i as u64 ^ (t as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
                             .wrapping_mul(0xbf58_476d_1ce4_e5b9);
                         let u = ((h >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
-                        (1.0 + (i % 100) as f64) * (1.0 - u).powf(-0.5)
+                        let leaf = i % series;
+                        if zipf {
+                            // As the harness: a Zipf (s = 1.1, N = 1e6)
+                            // integer per sample, times a per-series Zipf
+                            // scale; counters add such increments and reset
+                            // about once per 20 minutes.
+                            let draw = (u.powf(-1.0 / 0.1)).floor().min(1e6);
+                            if metrics[i / series].ends_with("_total") {
+                                if (h >> 3) % 12_000 == 0 {
+                                    totals[i] = 0.0;
+                                }
+                                totals[i] += draw;
+                                totals[i]
+                            } else {
+                                let scale = (1e3 / (leaf as f64 + 1.0).powf(1.1)).round().max(1.0);
+                                draw * scale
+                            }
+                        } else {
+                            // A long-tailed value per sample: Pareto (shape
+                            // 2) of a per-series scale (rank-scaled).
+                            (1.0 + (leaf % 100) as f64) * (1.0 - u).powf(-0.5)
+                        }
                     },
                 }],
             })
