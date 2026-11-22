@@ -367,9 +367,10 @@ is the store for every query the plan does not cover.
   store instead of `--prometheus-url`.
 
 **Resources.** The forward-mode arm runs the data plane and VictoriaMetrics in
-two cgroups under the same total limits as the VictoriaMetrics-alone arm.
-CPU, working set, anon, disk and network are reported per component and as
-their sum, ASAP + VictoriaMetrics, against VictoriaMetrics alone.
+one cgroup, under the same limits as the VictoriaMetrics-alone arm. The
+cgroup's memory, disk and network are therefore their sum, ASAP +
+VictoriaMetrics. CPU and RSS are also reported per process. All of this is
+compared against VictoriaMetrics alone.
 
 The data plane also exports these metrics:
 
