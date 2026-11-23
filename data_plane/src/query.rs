@@ -313,7 +313,7 @@ pub struct Snapshot {
 impl Snapshot {
     /// Every stored view's rows: per view, each window's `(start, end]`
     /// and batches, oldest first (for comparing two engines' views).
-    pub fn view_rows(&self) -> BTreeMap<PhysicalASAPNodeId, Vec<((i64, i64), Vec<Batch>)>> {
+    pub fn view_rows(&self) -> crate::store::ViewRowsByView {
         self.views.rows()
     }
 }

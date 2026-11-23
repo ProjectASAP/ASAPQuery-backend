@@ -186,9 +186,8 @@ pub fn intern(labels: &BTreeMap<String, String>) -> Arc<Series> {
 /// result row and cached answer of that series. Never forgets a label
 /// set, as the interner never forgets a series.
 pub fn result_labels(identity: &str) -> Result<Arc<BTreeMap<String, String>>, serde_json::Error> {
-    static RESULT_LABELS: OnceLock<
-        RwLock<ahash::HashMap<Arc<str>, Arc<BTreeMap<String, String>>>>,
-    > = OnceLock::new();
+    type LabelsByIdentity = ahash::HashMap<Arc<str>, Arc<BTreeMap<String, String>>>;
+    static RESULT_LABELS: OnceLock<RwLock<LabelsByIdentity>> = OnceLock::new();
     let table = RESULT_LABELS.get_or_init(RwLock::default);
     if let Some(labels) = table.read().expect("result labels lock").get(identity) {
         return Ok(labels.clone());

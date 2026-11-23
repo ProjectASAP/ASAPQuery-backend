@@ -1009,7 +1009,15 @@ async fn push_precompute_answers_what_the_planner_executor_answers() {
                 let start_ms = EVALUATION_MS - reach_back_ms(&plan);
                 let points = points(&plan, start_ms);
                 let expected = reference_answers(&plan, &points, start_ms);
-                let (app, _state) = data_plane_over(&plan, &points, start_ms, false, shards, Views::EveryReadCold).await;
+                let (app, _state) = data_plane_over(
+                    &plan,
+                    &points,
+                    start_ms,
+                    false,
+                    shards,
+                    Views::EveryReadCold,
+                )
+                .await;
                 for (query, expected) in plan.query_texts.iter().zip(&expected) {
                     let served = served_answer(&app, query).await;
                     match (expected, &served) {
@@ -1060,11 +1068,12 @@ fn stored_views(state: &DataPlane) -> BTreeMap<String, Vec<StoredWindow>> {
         .collect()
 }
 
+/// A stored window's range and row count.
+type WindowShape = ((i64, i64), usize);
+
 /// The stored windows' ranges and row counts only, for views whose states
 /// may differ within the plan's target (KLL compacts at random).
-fn shapes(
-    views: &BTreeMap<String, Vec<StoredWindow>>,
-) -> BTreeMap<String, Vec<((i64, i64), usize)>> {
+fn shapes(views: &BTreeMap<String, Vec<StoredWindow>>) -> BTreeMap<String, Vec<WindowShape>> {
     views
         .iter()
         .map(|(view, windows)| {
@@ -1075,6 +1084,71 @@ fn shapes(
             (view.clone(), shape)
         })
         .collect()
+}
+
+/// `served`'s windows of each view from the oldest window `expected` holds
+/// of it. Windows past a view's retention leave the store lazily (at the
+/// view's next append), and a narrower level is held until its readers
+/// commit, so how many such windows linger at the end of a run depends on
+/// the order windows were committed in, which differs between push and the
+/// window path; and windows that far back are skipped when the watermark
+/// jumps past them, which depends on when each shard reports. Neither is
+/// read by a query.
+fn from_oldest_of(
+    served: BTreeMap<String, Vec<StoredWindow>>,
+    expected: &BTreeMap<String, Vec<StoredWindow>>,
+) -> BTreeMap<String, Vec<StoredWindow>> {
+    served
+        .into_iter()
+        .map(|(view, windows)| {
+            let oldest = expected
+                .get(&view)
+                .and_then(|w| w.first())
+                .map_or(i64::MIN, |w| w.0 .1);
+            let windows = windows.into_iter().filter(|w| w.0 .1 >= oldest).collect();
+            (view, windows)
+        })
+        .collect()
+}
+
+/// Where two data planes' stored views first differ, for the failure
+/// message: the view, and the window's range and rows on each side.
+fn first_difference(
+    expected: &BTreeMap<String, Vec<StoredWindow>>,
+    served: &BTreeMap<String, Vec<StoredWindow>>,
+) -> String {
+    let views: std::collections::BTreeSet<&String> = expected.keys().chain(served.keys()).collect();
+    for view in views {
+        let (left, right) = (expected.get(view), served.get(view));
+        let (Some(left), Some(right)) = (left, right) else {
+            return format!(
+                "view {view} only in one ({:?} / {:?})",
+                left.map(Vec::len),
+                right.map(Vec::len)
+            );
+        };
+        for at in 0..left.len().max(right.len()) {
+            let (l, r) = (left.get(at), right.get(at));
+            if l != r {
+                let show = |w: Option<&StoredWindow>| {
+                    w.map(|(range, rows)| {
+                        format!("{range:?} {} rows, first {:?}", rows.len(), rows.first())
+                    })
+                };
+                let span = |w: &[StoredWindow]| (w.first().map(|w| w.0), w.last().map(|w| w.0));
+                return format!(
+                    "view {view} window #{at} of {}/{}: window path {:?}, push {:?}; windows: window path {:?}, push {:?}",
+                    left.len(),
+                    right.len(),
+                    show(l),
+                    show(r),
+                    span(left),
+                    span(right)
+                );
+            }
+        }
+    }
+    "shapes differ".into()
 }
 
 /// T2. Push precompute stores the same view rows as the window path: per
@@ -1101,9 +1175,12 @@ async fn push_precompute_stores_the_window_paths_view_rows() {
             };
             let start_ms = EVALUATION_MS - reach_back_ms(&plan);
             let points = points(&plan, start_ms);
-            let (_, by_window) = data_plane_over(&plan, &points, start_ms, false, window, Views::InMemory).await;
-            let (_, by_push) = data_plane_over(&plan, &points, start_ms, false, push, Views::InMemory).await;
-            let (expected, served) = (stored_views(&by_window), stored_views(&by_push));
+            let (_, by_window) =
+                data_plane_over(&plan, &points, start_ms, false, window, Views::InMemory).await;
+            let (_, by_push) =
+                data_plane_over(&plan, &points, start_ms, false, push, Views::InMemory).await;
+            let expected = stored_views(&by_window);
+            let served = from_oldest_of(stored_views(&by_push), &expected);
             compared_views += expected.len();
             let equal = if tolerance(&plan) > 1e-9 {
                 shapes(&expected) == shapes(&served)
@@ -1111,7 +1188,12 @@ async fn push_precompute_stores_the_window_paths_view_rows() {
                 expected == served
             };
             if !equal {
-                mismatches.push(format!("{label}: stored views differ"));
+                mismatches.push(format!(
+                    "{label}: stored views differ: {}; stats: window path {:?}, push {:?}",
+                    first_difference(&expected, &served),
+                    by_window.engine.stats(),
+                    by_push.engine.stats()
+                ));
             }
         }
     }

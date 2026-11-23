@@ -263,9 +263,12 @@ async fn answers(
     out
 }
 
+/// Per view, each stored window's range and its rows printed and sorted.
+type StoredViews = BTreeMap<String, Vec<((i64, i64), Vec<String>)>>;
+
 /// Every stored view's windows: per view, each window's range and its
 /// rows printed and sorted.
-fn stored(state: &DataPlane) -> BTreeMap<String, Vec<((i64, i64), Vec<String>)>> {
+fn stored(state: &DataPlane) -> StoredViews {
     state
         .engine
         .snapshot()
@@ -437,8 +440,19 @@ async fn per_series_breakers_are_concatenated() {
 
     let (expected, served) = (stored(&window_state), stored(&push_state));
     for (view, windows) in &served {
-        assert_eq!(windows.len(), 3, "view {view}: three windows");
-        for (range, rows) in windows {
+        // The window holding the stream start, (-10 s, 0], is the first
+        // (empty: samples start at 1 s), then three full windows.
+        assert_eq!(
+            windows.len(),
+            4,
+            "view {view}: the stream start's window and three more"
+        );
+        assert_eq!(
+            windows[0].0,
+            (-10_000, 0),
+            "view {view}: the stream start's window"
+        );
+        for (range, rows) in &windows[1..] {
             assert_eq!(
                 rows.len(),
                 1000,
@@ -452,7 +466,7 @@ async fn per_series_breakers_are_concatenated() {
     if randomized {
         // KLL compacts at random: same windows and keys, answers within 5%
         // (T1); here only the shape.
-        let shape = |v: &BTreeMap<String, Vec<((i64, i64), Vec<String>)>>| {
+        let shape = |v: &StoredViews| {
             v.values()
                 .map(|w| {
                     w.iter()
@@ -686,7 +700,8 @@ fn combine_rules_follow_the_table_and_refuse_unknown_breakers() {
                             | Operator::NonASAP(NonASAPOp::SQLWindowFunc { .. }) => {
                                 Some(CombineRule::SinglePartition)
                             }
-                            Operator::NonASAP(NonASAPOp::PromqlSubquery { .. }) => {
+                            Operator::NonASAP(NonASAPOp::PromqlSubquery { .. })
+                            | Operator::ASAP(ASAPOp::SummaryMergeWindows { .. }) => {
                                 Some(CombineRule::WindowPath)
                             }
                             _ => continue,
@@ -772,7 +787,7 @@ async fn windows_commit_in_window_order() {
             let ranges: Vec<(i64, i64)> = windows.iter().map(|(r, _)| *r).collect();
             assert_eq!(
                 ranges,
-                vec![(0, 10_000), (10_000, 20_000), (20_000, 30_000)],
+                vec![(-10_000, 0), (0, 10_000), (10_000, 20_000), (20_000, 30_000)],
                 "{mode:?}: view {view}: windows in order, window 2 committed before the barrier answered"
             );
         }
@@ -849,7 +864,8 @@ async fn idle_shards_seal_empty_and_hold_nothing_back() {
         write_seconds(&app, &["data"], series, 0, 60).await;
         barrier(&app, 60_000).await;
         let windows = state.engine.stats().windows_refreshed;
-        assert_eq!(windows, 6, "{query}: every window committed");
+        // Six windows and the (empty) one holding the stream start.
+        assert_eq!(windows, 7, "{query}: every window committed");
         let text = metrics_text(&app).await;
         for shard in 0..8 {
             let seals = metric_sum(
@@ -1003,6 +1019,8 @@ async fn late_samples_count_in_the_window_paths_windows() {
 /// of 2 windows, writes are refused; once released, every window commits
 /// and the answers equal an unheld run's.
 #[tokio::test(flavor = "multi_thread")]
+// The precompute hold is a lock held on purpose while requests are sent.
+#[allow(clippy::await_holding_lock)]
 async fn backpressure_reaches_remote_write_and_loses_nothing() {
     let plan = plan(
         &[("sum_over_time(data[30s])", 10_000)],
@@ -1159,7 +1177,8 @@ async fn memory_reservations_wait_then_fail_only_a_lone_window() {
     barrier(&app, 30_000).await;
     let stats = state.engine.stats();
     assert_eq!(stats.windows_failed, 1, "{stats:?}");
-    assert_eq!(stats.windows_refreshed, 2, "{stats:?}");
+    // The windows around it and the (empty) one holding the stream start.
+    assert_eq!(stats.windows_refreshed, 3, "{stats:?}");
 }
 
 // ── T16: chunked seal ───────────────────────────────────────────────────
@@ -1310,7 +1329,8 @@ async fn a_failing_instance_or_combine_fails_only_its_window() {
         write_three_windows(app.clone()).await;
         let stats = state.engine.stats();
         assert_eq!(stats.windows_failed, 1, "{label}: {stats:?}");
-        assert_eq!(stats.windows_refreshed, 2, "{label}: {stats:?}");
+        // Windows 1 and 3, and the (empty) one holding the stream start.
+        assert_eq!(stats.windows_refreshed, 3, "{label}: {stats:?}");
         assert!(state.engine.is_running(), "{label}");
         let query = &plan.query_texts[0];
         assert_ne!(
@@ -1344,7 +1364,8 @@ async fn precompute_phases_are_exported_per_group_and_shard() {
     write_seconds(&app, &["data"], 64, 0, 40).await;
     barrier(&app, 40_000).await;
     let windows = state.engine.stats().windows_refreshed as f64;
-    assert_eq!(windows, 4.0);
+    // Four windows and the (empty) one holding the stream start.
+    assert_eq!(windows, 5.0);
     let text = metrics_text(&app).await;
     let runs = |phase: &str, extra: &[&str]| {
         let phase = format!("phase=\"{phase}\"");
@@ -1361,7 +1382,7 @@ async fn precompute_phases_are_exported_per_group_and_shard() {
         );
         let pushes = runs("precompute_push", &[&shard, "group=\"0\""]).expect("push runs");
         assert!(
-            pushes >= 1.0 && pushes <= 40.0,
+            (1.0..=40.0).contains(&pushes),
             "{shard}: {pushes} push runs for 40 requests"
         );
     }

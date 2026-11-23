@@ -64,6 +64,10 @@ pub fn combine_rule(node: &PhysicalASAPDAGNode) -> Result<Option<CombineRule>, S
             | ASAPOp::SummaryEstimate { .. }
             | ASAPOp::FinalizeExactAccumulator { .. },
         ) => None,
+        // A wider level of a window chain: merged from the narrower
+        // level's committed windows, another group's views, so its group
+        // runs on the window path after them (D7).
+        Operator::ASAP(ASAPOp::SummaryMergeWindows { .. }) => Some(CombineRule::WindowPath),
         Operator::ASAP(_) => {
             return Err(format!(
                 "node {}: no combine rule for this ingestion-time operator",

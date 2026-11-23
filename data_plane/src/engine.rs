@@ -48,7 +48,9 @@ use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
 use asap_executor::values::Batch;
 
 /// How the views of a closed refresh window are built
-/// (docs/design/parallel-precompute.md).
+/// (docs/design/parallel-precompute.md). The `data_plane` binary defaults
+/// to `Push`; the library default stays `Window`, which the window-path
+/// tests build on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PrecomputeMode {
     /// One ingestion run per closed window, over the raw samples the
@@ -1111,6 +1113,7 @@ fn serve_shard(
                 stats.samples_dropped_late += routed.stats.samples_dropped_late;
                 stats.samples_dropped_future += routed.stats.samples_dropped_future;
                 stats.samples_unrouted += routed.stats.samples_unrouted;
+                stats.samples_late_for_views += routed.stats.samples_late_for_views;
             }
             shared.metrics.append.record(timer);
             first_seen.extend(routed.first_seen);

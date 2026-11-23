@@ -664,6 +664,10 @@ impl DataStore for RunStore {
     }
 }
 
+/// Every view's stored rows: per view, each window's `(start, end]` and
+/// batches, oldest first.
+pub type ViewRowsByView = BTreeMap<PhysicalASAPNodeId, Vec<((i64, i64), Vec<Batch>)>>;
+
 /// Rows stored for one view: one entry per appended window, oldest first.
 type ViewRows = Vec<ViewWindow>;
 
@@ -1084,7 +1088,7 @@ impl ViewStore {
     /// Every view's rows: per view, each window's `(start, end]` and
     /// batches, oldest first (cold windows are decoded; a window that
     /// cannot be read is left out).
-    pub fn rows(&self) -> BTreeMap<PhysicalASAPNodeId, Vec<((i64, i64), Vec<Batch>)>> {
+    pub fn rows(&self) -> ViewRowsByView {
         self.by_view
             .iter()
             .map(|(view, rows)| {

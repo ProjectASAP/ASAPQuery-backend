@@ -120,7 +120,7 @@ pub struct Feed {
     expected: HashMap<String, usize>,
     /// Each `Scan`'s requested time range (for the install probe).
     ranges: RefCell<Vec<Option<(i64, i64)>>>,
-    pending: RefCell<Vec<Arc<Morsel>>>,
+    pending: RefCell<Vec<Rc<Morsel>>>,
 }
 
 impl Feed {
@@ -131,7 +131,7 @@ impl Feed {
             .all(|(metric, count)| readers.iter().filter(|r| &r.metric == metric).count() >= *count)
     }
 
-    fn feed(&self, morsel: &Arc<Morsel>) -> Result<(), Error> {
+    fn feed(&self, morsel: &Rc<Morsel>) -> Result<(), Error> {
         for reader in self.readers.borrow().iter() {
             reader.feed(morsel)?;
         }
@@ -253,6 +253,9 @@ pub fn probe(
                 precompute.limits().clone(),
             )
             .ok()?;
+            // The executor takes its store as an `Arc`; this one never
+            // leaves the shard thread (its run is not `Send` either).
+            #[allow(clippy::arc_with_non_send_sync)]
             let store: Arc<dyn DataStore> = Arc::new(PushStore { feed: feed.clone() });
             let slot: Rc<RefCell<Option<Result<Computed, Error>>>> = Rc::default();
             let run = precompute.push_run(group, store, context);
@@ -421,6 +424,8 @@ impl PushShard {
             },
             self.limits.clone(),
         )?;
+        // As in `probe`: an `Arc` the executor takes, kept on the shard thread.
+        #[allow(clippy::arc_with_non_send_sync)]
         let store: Arc<dyn DataStore> = Arc::new(PushStore { feed: feed.clone() });
         let run = self.precompute.push_run(group, store, context.clone());
         let result: Rc<RefCell<Option<Result<Computed, Error>>>> = Rc::default();
@@ -500,7 +505,7 @@ impl PushShard {
                 }
                 let mut raw = RawData::for_metrics(self.metrics.iter(), self.pane_width_ms);
                 raw.append(&rows);
-                let morsel = Arc::new(Morsel {
+                let morsel = Rc::new(Morsel {
                     raw,
                     converted: RefCell::default(),
                 });
