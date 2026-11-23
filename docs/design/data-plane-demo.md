@@ -82,11 +82,13 @@ Non-goals (v1):
   it replaces the executor's whole operator layer and changes edge-case
   semantics, so it is separate, multi-week work.
 - Persisting raw samples or open windows, checkpointing, and changing the
-  shard count at run time. Late samples are handled as before: a sample
-  older than every window still to be closed and than what a query-time
-  `Scan` reads back is dropped (`asap_samples_total{outcome="dropped_late"}`);
-  a later sample for a window already refreshed is kept for query-time
-  `Scan`s but does not change the stored window.
+  shard count at run time. Late samples: a sample older than every window
+  still to be closed and than what a query-time `Scan` reads back is
+  dropped (`asap_samples_total{outcome="dropped_late"}`), and so is a
+  sample of a metric a query-time `Scan` reads at or before the published
+  watermark, since answers at times the watermark has passed are final
+  (kept in the result cache). Any other later sample for a window already
+  refreshed is kept but does not change the stored window.
 
 ## Framing questions
 

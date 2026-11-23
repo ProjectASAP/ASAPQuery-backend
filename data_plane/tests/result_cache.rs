@@ -273,3 +273,25 @@ async fn a_step_reaching_evicted_samples_is_refused() {
         "nothing cached"
     );
 }
+
+/// A sample at or before the watermark already published comes too late:
+/// answers at times the watermark has passed are final (kept in the result
+/// cache), so it is dropped and counted rather than changing what a data
+/// plane without the cache would answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sample_behind_the_watermark_does_not_change_final_answers() {
+    let times: Vec<i64> = (1..=16).map(|s| s * 15_000).collect();
+    let mut answers = Vec::new();
+    for result_cache in [true, false] {
+        let (app, state) = data_plane(common::plan_json("example1", true), result_cache);
+        write(&app, "http_requests_total", &times, 240_000).await;
+        let first = get(&app, instant_uri(RAW_QUERY, 240)).await;
+        // Within the query's 1m lookback, so not yet evicted.
+        write(&app, "http_requests_total", &[230_000], 240_000).await;
+        let second = get(&app, instant_uri(RAW_QUERY, 240)).await;
+        assert_eq!(first, second, "result cache {result_cache}");
+        assert_eq!(state.engine.stats().samples_dropped_late, 2);
+        answers.push(second);
+    }
+    assert_eq!(answers[0], answers[1]);
+}

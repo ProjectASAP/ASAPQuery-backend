@@ -403,17 +403,39 @@ impl Ingestion {
     }
 
     /// What the ingest shards need to route samples now: the metrics a
-    /// `Scan` reads, each one's eviction cutoff, and whether a group still
-    /// waits for its first sample.
+    /// `Scan` reads, each one's eviction cutoff and the time at or before
+    /// which its samples are late, and whether a group still waits for its
+    /// first sample.
+    ///
+    /// A metric a query-time `Scan` reads is late at or before the
+    /// watermark: an answer at a time the watermark has passed is final
+    /// (kept in the result cache and the query-time results), so a sample
+    /// it did not see must not change what a later run answers. Any other
+    /// metric is late at or before its eviction cutoff (only windows still
+    /// to be closed read it).
     pub fn routing(&self) -> Routing {
+        let cutoffs: HashMap<String, Option<i64>> = self
+            .scanned_metrics
+            .iter()
+            .map(|metric| (metric.clone(), self.oldest_kept_ms(metric)))
+            .collect();
+        let watermark_ms = self.watermark_ms();
+        let late_through = cutoffs
+            .iter()
+            .map(|(metric, &cutoff)| {
+                let late = if self.query_time_lookback_ms.contains_key(metric) {
+                    cutoff.max(watermark_ms)
+                } else {
+                    cutoff
+                };
+                (metric.clone(), late)
+            })
+            .collect();
         Routing {
             scanned_metrics: self.scanned_metrics.clone(),
             max_future_ms: millis(self.options.max_future_ms),
-            cutoffs: self
-                .scanned_metrics
-                .iter()
-                .map(|metric| (metric.clone(), self.oldest_kept_ms(metric)))
-                .collect(),
+            cutoffs,
+            late_through,
             groups_waiting: self.groups.iter().any(|g| g.refreshed_through.is_none()),
         }
     }
@@ -601,9 +623,11 @@ impl Ingestion {
 pub struct Routing {
     scanned_metrics: Arc<BTreeSet<String>>,
     max_future_ms: i64,
-    /// Each scanned metric's eviction cutoff: samples at or before it are
-    /// late (`None`: all are kept).
+    /// Each scanned metric's eviction cutoff (`None`: all are kept).
     cutoffs: HashMap<String, Option<i64>>,
+    /// Each scanned metric's samples at or before this are late (`None`:
+    /// none are); at or after its eviction cutoff.
+    late_through: HashMap<String, Option<i64>>,
     /// Some group has not seen its first sample: report each metric's
     /// first sample.
     groups_waiting: bool,
@@ -624,8 +648,8 @@ pub struct Routed {
 impl Routing {
     /// Routes `samples` at `now_ms`: drops samples of metrics no `Scan`
     /// reads, samples more than `max_future_ms` ahead of `now_ms` or
-    /// further from the epoch than [`MAX_TIME_MS`], and samples at or
-    /// before their metric's eviction cutoff.
+    /// further from the epoch than [`MAX_TIME_MS`], and late samples (at
+    /// or before their metric's `late_through`).
     pub fn route(&self, samples: Vec<RawSample>, now_ms: i64) -> Routed {
         let latest_allowed_ms = now_ms.saturating_add(self.max_future_ms);
         let mut routed = Routed {
@@ -645,13 +669,13 @@ impl Routing {
                 Some(index) => index,
                 None => {
                     let routed = self.scanned_metrics.contains(&**metric);
-                    let cutoff = self.cutoffs.get(&**metric).copied().flatten();
-                    metrics.push((metric.clone(), routed, cutoff, false));
+                    let late_through = self.late_through.get(&**metric).copied().flatten();
+                    metrics.push((metric.clone(), routed, late_through, false));
                     metrics.len() - 1
                 }
             };
             last = Some(index);
-            let (_, is_routed, cutoff, seen) = &mut metrics[index];
+            let (_, is_routed, late_through, seen) = &mut metrics[index];
             if !*is_routed {
                 routed.stats.samples_unrouted += 1;
                 continue;
@@ -672,7 +696,7 @@ impl Routing {
                     .first_seen
                     .push((metric.clone(), sample.timestamp_ms));
             }
-            if cutoff.is_some_and(|cutoff| sample.timestamp_ms <= cutoff) {
+            if late_through.is_some_and(|late| sample.timestamp_ms <= late) {
                 routed.stats.samples_dropped_late += 1;
                 continue;
             }
