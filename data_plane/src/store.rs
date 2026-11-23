@@ -430,7 +430,7 @@ impl SeriesPartition {
 /// One run's part of the series and the stored chunks it has cut to that
 /// part, so the run's scans filter each chunk (and build its series
 /// identities) once, as a whole run reads each chunk's cached ones.
-pub struct PartitionReads {
+pub(crate) struct PartitionReads {
     partition: SeriesPartition,
     /// By chunk address; each entry holds the chunk, so its address is not
     /// reused while it is kept.
@@ -441,7 +441,7 @@ pub struct PartitionReads {
 type CutChunk = (Arc<Chunk>, Option<Arc<Chunk>>);
 
 impl PartitionReads {
-    pub fn new(partition: SeriesPartition) -> Self {
+    pub(crate) fn new(partition: SeriesPartition) -> Self {
         Self {
             partition,
             chunks: Mutex::default(),

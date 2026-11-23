@@ -67,7 +67,7 @@ struct Header {
 /// The kernels whose sketch state is stored as ASAPv1 bytes, with what
 /// rebuilding one needs beyond the bytes.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SketchKernel {
+pub(crate) enum SketchKernel {
     DDSketch,
     Kll,
     CountMin,
@@ -84,7 +84,7 @@ pub enum SketchKernel {
 
 /// Which sketch a weighted-frequency state keeps.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrequencyKind {
+pub(crate) enum FrequencyKind {
     Cms,
     CountSketch,
     CmsHeap,
@@ -611,7 +611,7 @@ fn encode_state(state: &dyn AggregateCore, grids: &mut Grids) -> Option<StoredVa
 }
 
 /// The kernel state `kernel` rebuilds from `asapv1`.
-pub fn decode_sketch(kernel: SketchKernel, asapv1: &[u8]) -> Option<Arc<dyn AggregateCore>> {
+pub(crate) fn decode_sketch(kernel: SketchKernel, asapv1: &[u8]) -> Option<Arc<dyn AggregateCore>> {
     Some(match kernel {
         SketchKernel::DDSketch => Arc::new(
             DDSketchAccumulator::restore_from_disk(DdSketch::from_asapv1(asapv1).ok()?).ok()?,
@@ -661,15 +661,6 @@ pub fn decode_sketch(kernel: SketchKernel, asapv1: &[u8]) -> Option<Arc<dyn Aggr
             .ok()?,
         ),
     })
-}
-
-/// `state` as ASAPv1 bytes with its kernel, if it is one of the sketch
-/// kernels persisted (Hydra-Count-Min groups aside, stored by grid).
-pub fn encode_sketch(state: &dyn AggregateCore) -> Option<(SketchKernel, Vec<u8>)> {
-    match encode_state(state, &mut Grids::default())? {
-        StoredValue::Sketch { kernel, asapv1 } => Some((kernel, asapv1)),
-        _ => None,
-    }
 }
 
 /// Texts being encoded into one record: the file's dictionary, and the
@@ -794,6 +785,15 @@ mod tests {
     use super::*;
     use asap_executor::planner::summary_type::SketchStatistic;
     use asap_executor::values::Value;
+
+    /// `state` as ASAPv1 bytes with its kernel, if it is one of the sketch
+    /// kernels persisted (Hydra-Count-Min groups aside, stored by grid).
+    fn encode_sketch(state: &dyn AggregateCore) -> Option<(SketchKernel, Vec<u8>)> {
+        match encode_state(state, &mut Grids::default())? {
+            StoredValue::Sketch { kernel, asapv1 } => Some((kernel, asapv1)),
+            _ => None,
+        }
+    }
 
     /// Two states of each persisted sketch kernel, built from different
     /// samples.

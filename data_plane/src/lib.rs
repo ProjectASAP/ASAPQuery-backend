@@ -38,7 +38,7 @@ use query::Unanswered;
 /// `refused` when `--no-forward` refused to forward it.
 pub const EXECUTION_HEADER: &str = "x-asap-execution";
 /// Response header of a forwarded planned query: why the plan did not answer.
-pub const FORWARD_REASON_HEADER: &str = "x-asap-forward-reason";
+pub(crate) const FORWARD_REASON_HEADER: &str = "x-asap-forward-reason";
 
 /// How long a forwarded query may take by default, matching Prometheus's
 /// default `--query.timeout` of two minutes.

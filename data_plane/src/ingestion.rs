@@ -106,7 +106,7 @@ pub struct IngestionStats {
 
 /// Why a plan cannot be ingested.
 #[derive(Debug, thiserror::Error)]
-pub enum IngestionError {
+pub(crate) enum IngestionError {
     #[error("{0}")]
     Unsupported(String),
     #[error("refresh group of views {views:?}: {error}")]
@@ -194,7 +194,7 @@ impl Ingestion {
     /// for the [`Precompute`] returned with the ingestion. Refuses views
     /// refreshed on first read, which the data plane does not refresh yet,
     /// and groups without a bounded window.
-    pub fn new(
+    pub(crate) fn new(
         dag: &PhysicalASAPDAG,
         views: &[MaterializedView],
         groups: Vec<IngestionRefreshGroup>,
@@ -635,7 +635,7 @@ pub struct Routing {
 
 /// One batch of samples routed by a shard.
 #[derive(Debug, Default)]
-pub struct Routed {
+pub(crate) struct Routed {
     pub accepted: Vec<RawSample>,
     /// The sample counters of the batch.
     pub stats: IngestionStats,
@@ -650,7 +650,7 @@ impl Routing {
     /// reads, samples more than `max_future_ms` ahead of `now_ms` or
     /// further from the epoch than [`MAX_TIME_MS`], and late samples (at
     /// or before their metric's `late_through`).
-    pub fn route(&self, samples: Vec<RawSample>, now_ms: i64) -> Routed {
+    pub(crate) fn route(&self, samples: Vec<RawSample>, now_ms: i64) -> Routed {
         let latest_allowed_ms = now_ms.saturating_add(self.max_future_ms);
         let mut routed = Routed {
             accepted: Vec::with_capacity(samples.len()),

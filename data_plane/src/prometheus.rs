@@ -20,19 +20,19 @@ pub struct InstantQuery {
 /// The largest evaluation time, in milliseconds either side of the epoch, the
 /// data plane answers; beyond it a request is refused as Prometheus refuses
 /// a time it cannot represent. Leaves room for any window offset.
-pub const MAX_TIME_MS: i64 = i64::MAX / 4;
+pub(crate) const MAX_TIME_MS: i64 = i64::MAX / 4;
 
 /// Why an instant query's parameters are refused (400, `bad_data`).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("invalid parameter \"time\": {0}")]
-pub struct BadTime(pub String);
+pub(crate) struct BadTime(String);
 
 impl InstantQuery {
     /// Reads `query` and `time` (Unix seconds). `Ok(None)` if either is
     /// missing or `time` is in another format, such as RFC 3339 (the query
     /// is then forwarded); `Err` if `time` is a number that is not finite or
     /// beyond [`MAX_TIME_MS`].
-    pub fn parse(url_query: Option<&str>, form: &[u8]) -> Result<Option<Self>, BadTime> {
+    pub(crate) fn parse(url_query: Option<&str>, form: &[u8]) -> Result<Option<Self>, BadTime> {
         let params: BTreeMap<String, String> =
             form_urlencoded::parse(url_query.unwrap_or_default().as_bytes())
                 .chain(form_urlencoded::parse(form))
@@ -60,7 +60,7 @@ impl InstantQuery {
 }
 
 /// The most steps one range query may have, as Prometheus allows.
-pub const MAX_RANGE_STEPS: i64 = 11_000;
+pub(crate) const MAX_RANGE_STEPS: i64 = 11_000;
 
 /// Parameters of a range query: evaluated at `start_ms` and every
 /// `step_ms` after, up to and including `end_ms`.
@@ -75,7 +75,7 @@ pub struct RangeQuery {
 /// Why a range query's parameters are refused (400, `bad_data`).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
-pub struct BadRange(pub String);
+pub(crate) struct BadRange(String);
 
 impl RangeQuery {
     /// Reads `query`, `start` and `end` (Unix seconds) and `step` (seconds
@@ -85,7 +85,7 @@ impl RangeQuery {
     /// beyond [`MAX_TIME_MS`], a step that is not positive or is beyond
     /// [`MAX_TIME_MS`], an end before the start, or more than
     /// [`MAX_RANGE_STEPS`] steps.
-    pub fn parse(url_query: Option<&str>, form: &[u8]) -> Result<Option<Self>, BadRange> {
+    pub(crate) fn parse(url_query: Option<&str>, form: &[u8]) -> Result<Option<Self>, BadRange> {
         let params: BTreeMap<String, String> =
             form_urlencoded::parse(url_query.unwrap_or_default().as_bytes())
                 .chain(form_urlencoded::parse(form))
