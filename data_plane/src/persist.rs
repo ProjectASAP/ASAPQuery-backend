@@ -1733,4 +1733,124 @@ mod tests {
         assert!(!segment.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Segments written before the split by retention, directly
+    /// in `group-<g>/`, are indexed and kept until the group's longest
+    /// retention.
+    #[test]
+    fn old_layout_segments_load_and_expire_at_the_longest_retention() {
+        let dir = segment_dir("old-layout");
+        let (_, batch) = every_family().remove(0);
+        let view = |id: u64, retention: u64| -> MaterializedView {
+            serde_json::from_value(serde_json::json!({
+                "node_id": id,
+                "refresh": "at_ingestion",
+                "coverage": {"definition_id": format!("v{id}"), "selection": []},
+                "inputs": {"materialized_views": []},
+                "retention_ms": retention,
+            }))
+            .unwrap()
+        };
+        let groups = vec![vec![
+            (view(1, 20), batch.schema().clone()),
+            (view(2, 1_000), batch.schema().clone()),
+        ]];
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO)
+            .unwrap()
+            .with_segment_ms(20);
+        for end in (10..=80).step_by(10) {
+            files
+                .append(
+                    0,
+                    (end - 10, end),
+                    &[
+                        (1, std::slice::from_ref(&batch)),
+                        (2, std::slice::from_ref(&batch)),
+                    ],
+                )
+                .unwrap();
+        }
+        drop(files);
+        // Move every segment up into group-0/, the old layout.
+        let group_dir = dir.join("group-0");
+        for path in segment_files(&dir) {
+            std::fs::rename(&path, group_dir.join(path.file_name().unwrap())).unwrap();
+        }
+        for entry in std::fs::read_dir(&group_dir).unwrap().flatten() {
+            if entry.path().is_dir() {
+                std::fs::remove_dir_all(entry.path()).unwrap();
+            }
+        }
+        let old: Vec<PathBuf> = segment_files(&dir);
+        assert_eq!(old.len(), 4);
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO)
+            .unwrap()
+            .with_segment_ms(20);
+        let index = files.index(&groups).unwrap();
+        assert_eq!(
+            index[&2].len(),
+            8,
+            "the long view's windows: {:?}",
+            index.keys()
+        );
+        for (_, location) in &index[&2] {
+            assert_same_rows(
+                &batch,
+                &location.read(batch.schema(), ViewRead::Mmap).unwrap(),
+                "old layout",
+            );
+        }
+        assert!(!index[&1].is_empty());
+        // New windows go to the retention directories.
+        for end in (90..=200).step_by(10) {
+            files
+                .append(
+                    0,
+                    (end - 10, end),
+                    &[
+                        (1, std::slice::from_ref(&batch)),
+                        (2, std::slice::from_ref(&batch)),
+                    ],
+                )
+                .unwrap();
+        }
+        files.delete_expired(0, 200).unwrap();
+        assert!(
+            old.iter().all(|path| path.exists()),
+            "old segments live until 1,000 ms"
+        );
+        files.delete_expired(0, 1_200).unwrap();
+        assert!(old.iter().all(|path| !path.exists()), "and go past it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unlink failure keeps the rest of the sealed list, so
+    /// a later call deletes what it could not.
+    #[test]
+    fn a_failed_unlink_keeps_the_sealed_list() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = segment_dir("unlink");
+        let (_, batch) = every_family().remove(0);
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO)
+            .unwrap()
+            .with_segment_ms(20)
+            .with_view_retention_ms(BTreeMap::from([(1, 20)]));
+        for end in (10..=100).step_by(10) {
+            files
+                .append(0, (end - 10, end), &[(1, std::slice::from_ref(&batch))])
+                .unwrap();
+        }
+        assert_eq!(segment_files(&dir).len(), 5);
+        let retention_dir = dir.join("group-0").join("retention-20");
+        std::fs::set_permissions(&retention_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(files.delete_expired(0, 100).is_err());
+        std::fs::set_permissions(&retention_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            files.delete_expired(0, 100).unwrap(),
+            4,
+            "every expired segment, after the failure"
+        );
+        assert_eq!(segment_files(&dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
