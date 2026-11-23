@@ -11,7 +11,9 @@
 //! and the group; a file written for another plan or group is renamed to
 //! `*.stale` and never loaded. A record is a little-endian `u32` length
 //! and a MessagePack payload; a torn or oversized record at the end (a
-//! crash while writing) is cut off at load, so later records stay aligned.
+//! crash while writing), or the first record that does not decode and
+//! everything after it, is cut off at load, so later records stay aligned
+//! and read the text dictionary as it was written.
 //!
 //! A row's plain values are stored as the executor's `Value`s, an exact
 //! state (sum, count, min, max, rate, increase) by its serde form, and a
@@ -405,9 +407,12 @@ impl ViewFiles {
         let Ok(file) = File::open(path) else {
             return Ok(None);
         };
-        let (frames, good_len) = read_frames(file)?;
+        let frames = read_frames(file)?;
         let mut frames = frames.into_iter();
-        let header: Option<Header> = frames.next().and_then(|f| rmp_serde::from_slice(&f).ok());
+        let header_frame = frames.next();
+        let header: Option<Header> = header_frame
+            .as_ref()
+            .and_then(|f| rmp_serde::from_slice(f).ok());
         let expected = Header {
             plan_hash: self.plan_hash,
             group,
@@ -418,17 +423,24 @@ impl ViewFiles {
             std::fs::rename(path, stale)?;
             return Ok(None);
         }
+        // The records up to the first that does not decode: a later one
+        // would read the per-file text dictionary shifted.
+        let mut good_len = header_frame.map_or(0, |f| 4 + f.len() as u64);
+        let mut records = Vec::new();
+        for frame in frames {
+            let Ok(record) = rmp_serde::from_slice(&frame) else {
+                break;
+            };
+            records.push(record);
+            good_len += 4 + frame.len() as u64;
+        }
         let file = OpenOptions::new().write(true).open(path)?;
         if file.metadata()?.len() != good_len {
             tracing::warn!(path = %path.display(), good_len, "cutting off a torn record");
             file.set_len(good_len)?;
             file.sync_data()?;
         }
-        Ok(Some(
-            frames
-                .filter_map(|frame| rmp_serde::from_slice(&frame).ok())
-                .collect(),
-        ))
+        Ok(Some(records))
     }
 }
 
@@ -445,8 +457,8 @@ fn framed<T: Serialize>(value: &T) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Every whole record of `file`'s, and the length up to the last one.
-fn read_frames(file: File) -> std::io::Result<(Vec<Vec<u8>>, u64)> {
+/// Every whole record of `file`'s, up to a torn one.
+fn read_frames(file: File) -> std::io::Result<Vec<Vec<u8>>> {
     let mut reader = BufReader::new(file);
     let end = reader.seek(SeekFrom::End(0))?;
     reader.seek(SeekFrom::Start(0))?;
@@ -468,7 +480,7 @@ fn read_frames(file: File) -> std::io::Result<(Vec<Vec<u8>>, u64)> {
         frames.push(payload);
         good_len += 4 + length;
     }
-    Ok((frames, good_len))
+    Ok(frames)
 }
 
 /// Each HyperLogLog precision's sketch type, from the executor's
@@ -1042,6 +1054,25 @@ mod tests {
         file.write_all(&u32::MAX.to_le_bytes()).unwrap();
         drop(file);
         assert_eq!(files.read_group(&path, 0).unwrap().unwrap().len(), 2);
+        let two_records = std::fs::metadata(&path).unwrap().len();
+        // A record that does not decode ends the file there: the records
+        // after it are not loaded (they would read the per-file text
+        // dictionary shifted) and are cut off.
+        drop(files);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[3, 0, 0, 0, 0xc1, 0xc1, 0xc1]).unwrap();
+        drop(file);
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
+        files.append(0, (20, 30), &[(1, empty)]).unwrap();
+        let records = files.read_group(&path, 0).unwrap().unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.start_ms, r.end_ms))
+                .collect::<Vec<_>>(),
+            [(0, 10), (10, 20)]
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), two_records);
         // Another plan's file is set aside.
         let other = ViewFiles::open(&dir, 8, Duration::ZERO).unwrap();
         assert!(other.read_group(&path, 0).unwrap().is_none());
