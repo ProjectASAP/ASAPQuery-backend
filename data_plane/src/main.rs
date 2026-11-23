@@ -17,7 +17,7 @@ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// of freed pages resident at 10k series per metric.
 #[allow(non_upper_case_globals)]
 #[export_name = "_rjem_malloc_conf"]
-pub static malloc_conf: &[u8] =
+static malloc_conf: &[u8] =
     b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0,narenas:8\0";
 use data_plane::engine::EngineOptions;
 use data_plane::ingestion::IngestionOptions;
@@ -145,10 +145,6 @@ async fn main() -> anyhow::Result<()> {
                 precompute_threads: args.precompute_threads,
                 persist_threads: args.persist_threads,
                 max_persist_backlog_bytes: args.max_persist_backlog_bytes,
-                persist_delay_ms: 0,
-                slow_refreshes: Vec::new(),
-                check_task_inputs: false,
-                shard_delay_ms: 0,
                 no_forward: args.no_forward,
                 run_memory_limit_bytes: args.run_memory_limit_bytes,
                 query_threads: args.query_threads,
@@ -159,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
                 result_cache_max_bytes: args.result_cache_bytes,
                 view_dir: (!args.no_view_persistence).then_some(args.view_dir),
                 view_sync_interval_ms: args.view_sync_interval_ms,
+                ..EngineOptions::default()
             },
         )?
         .with_forward_timeout(Duration::from_secs(args.forward_timeout_seconds)),
