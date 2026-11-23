@@ -1088,7 +1088,8 @@ fn gcd(a: i64, b: i64) -> i64 {
     }
 }
 
-fn millis(value: u64) -> i64 {
+/// A duration option in milliseconds as a time offset, saturating.
+pub(crate) fn millis(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 

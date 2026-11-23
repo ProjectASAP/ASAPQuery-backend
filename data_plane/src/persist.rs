@@ -376,8 +376,7 @@ impl ViewFiles {
                 let Some(newest_end) = own.iter().map(|r| r.1).max() else {
                     continue;
                 };
-                let retention_ms = i64::try_from(view.retention_ms()).unwrap_or(i64::MAX);
-                let oldest_kept_end = newest_end.saturating_sub(retention_ms);
+                let oldest_kept_end = crate::store::oldest_kept_end(view, newest_end);
                 for (start, end, rows, grids) in own {
                     if end <= oldest_kept_end && end != newest_end {
                         continue;

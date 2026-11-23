@@ -799,7 +799,7 @@ fn install(
         "materialized views"
     );
     let results = QueryTimeResults::new(
-        i64::try_from(options.query_time_results_retention_ms).unwrap_or(i64::MAX),
+        crate::ingestion::millis(options.query_time_results_retention_ms),
         options.query_time_results_max_bytes,
     );
     let query = QueryEngine::new(

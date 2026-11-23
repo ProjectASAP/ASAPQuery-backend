@@ -674,6 +674,12 @@ impl DataStore for RunStore {
     }
 }
 
+/// The end at or before which `view`'s windows are past its retention,
+/// counted back from the window ending at `newest_end`.
+pub(crate) fn oldest_kept_end(view: &MaterializedView, newest_end: i64) -> i64 {
+    newest_end.saturating_sub(crate::ingestion::millis(view.retention_ms()))
+}
+
 /// Rows stored for one view: one entry per appended window, oldest first.
 type ViewRows = Vec<ViewWindow>;
 
@@ -854,8 +860,7 @@ impl ViewStore {
             .map(|(part, batch)| self.share_texts(view.node_id, part, batch))
             .collect::<Result<Vec<_>, Error>>()?;
         let bytes = batches.iter().map(window_batch_bytes).sum();
-        let retention_ms = i64::try_from(view.retention_ms()).unwrap_or(i64::MAX);
-        let mut oldest_kept_end = end.saturating_sub(retention_ms);
+        let mut oldest_kept_end = oldest_kept_end(view, end);
         if let Some(&held) = self
             .readers
             .get(&view.node_id)
