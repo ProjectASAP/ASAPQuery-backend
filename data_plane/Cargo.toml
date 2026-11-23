@@ -32,4 +32,3 @@ form_urlencoded = "1"
 control_plane.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-serde_json.workspace = true
