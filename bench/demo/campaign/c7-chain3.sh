@@ -1,5 +1,5 @@
 #!/bin/bash
-source $BENCH_ENV; cd $CAMPAIGN_DIR
+{ [ -n "${BENCH_ENV:-}" ] && source "$BENCH_ENV"; }; cd $CAMPAIGN_DIR
 while pgrep -f "[i]ngest_steps_v2.py" >/dev/null; do sleep 20; done
 rm -rf $ASAPQ_BENCH/prep/ingest.*
 export BIN_DIR=$BENCH_ROOT/campaign-bin-dae1ffef

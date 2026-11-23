@@ -8,7 +8,7 @@
 # Idempotent: removes this tag's earlier (half-finished) run dirs first.
 set -u
 commit=$1 cfg=$2 round=$3 series=$4 modes=$5 range=$6; shift 6; workloads="$*"
-source $BENCH_ENV
+{ [ -n "${BENCH_ENV:-}" ] && source "$BENCH_ENV"; }
 B=$ASAPQ_BENCH
 export BIN_DIR=$BENCH_ROOT/campaign-bin-$commit
 [ -x "$BIN_DIR/data_plane" ] || { echo "missing $BIN_DIR (build it on the build host: build_backend.sh $commit)"; exit 2; }

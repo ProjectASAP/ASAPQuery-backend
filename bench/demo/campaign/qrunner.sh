@@ -1,5 +1,5 @@
 #!/bin/bash
-# qrunner.sh: host-side queue runner, independent of any agent session or ssh connection.
+# qrunner.sh: host-side queue runner, independent of any login or ssh connection.
 #
 # Queue:  $CAMPAIGN_DIR/queue/jobs.queue, one job per line:  <job-id>|<shell command>
 #         (# comments and blank lines ignored; the file may be appended to while running).
@@ -21,7 +21,7 @@ if [ "$1" = "--daemon" ]; then
 fi
 exec 9> $Q/runner.lock
 flock -n 9 || exit 0
-source $BENCH_ENV
+{ [ -n "${BENCH_ENV:-}" ] && source "$BENCH_ENV"; }
 status() {
   { echo "host=$(hostname -s) updated=$(date -u +%FT%TZ) runner_pid=$$"
     grep -v '^#' $Q/jobs.queue 2>/dev/null | grep . | while IFS='|' read -r id cmd; do

@@ -3,6 +3,7 @@
 # workload, limits and load as chain_8156.sh (both engines under the same limits, the 8-user query
 # load from second 0), screenshots of the cumulative dashboard after 2 h, 4 h and 6 h.
 # Unlike `run_live_demo.sh reset`, the previous run's data is moved aside, not deleted.
+: "${ASAPQ_BENCH:?set ASAPQ_BENCH}" "${BENCH_ROOT:?set BENCH_ROOT}"
 set -u
 cd $ASAPQ_BENCH || exit 1
 [ -x $BENCH_ROOT/bin-live-2434/data_plane ] || { echo "no $BENCH_ROOT/bin-live-2434/data_plane"; exit 1; }

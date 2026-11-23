@@ -1,7 +1,7 @@
 #!/bin/bash
 # postrun.sh <cfg>: for each finished run of <cfg> on this host, the unified harness's
 # post-run ground truth (accuracy_vs_vm.py on VM's kept data), then report.py and demo_table.py again.
-source $BENCH_ENV
+{ [ -n "${BENCH_ENV:-}" ] && source "$BENCH_ENV"; }
 cd $ASAPQ_BENCH/harness
 VMB=$BIN_DIR/victoria-metrics-v1.156.0
 for r in ../runs/camp1120-$1.*; do

@@ -1,7 +1,8 @@
 #!/bin/bash
-# Host-side chain on backend 2f428878 (no session needed): unlimited run, 2 h warm-up (the result
+# Host-side chain on backend 2f428878 (detached): unlimited run, 2 h warm-up (the result
 # cache is not persisted; a 1 h range panel needs about one span after a restart), 3 states; then
 # the same under LIMITS=1.
+: "${ASAPQ_BENCH:?set ASAPQ_BENCH}" "${BENCH_ROOT:?set BENCH_ROOT}"
 cd $ASAPQ_BENCH
 export BIN_DIR=$BENCH_ROOT/bin-live-2f42 SERIES=10000 WORKLOAD=asap-demo FINAL_QUERY_RESULTS_CACHED=1 \
        DATA_PLANE_ARGS="--precompute-threads 12"

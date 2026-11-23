@@ -6,7 +6,7 @@
 # run_vm_demo.sh runs accuracy_vs_vm.py (post-run VM ground truth), report.py, demo_table.py;
 # then host_meta.json (report_demo/collect_meta.sh) into each run directory.
 commit=$1; jobs=$2
-source $BENCH_ENV
+{ [ -n "${BENCH_ENV:-}" ] && source "$BENCH_ENV"; }
 export BIN_DIR=$BENCH_ROOT/campaign-bin-$commit
 [ "$(cut -c1-8 "$BIN_DIR/BACKEND_COMMIT")" = "${commit:0:8}" ] || { echo "BIN_DIR $BIN_DIR is not $commit" >&2; exit 2; }
 export VICTORIAMETRICS_VERSION=v1.156.0

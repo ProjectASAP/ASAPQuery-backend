@@ -2,7 +2,7 @@
 # launch.sh <cfg>: run_vm_demo.sh for one campaign config; SERIES/MODES/WORKLOADS/RANGE/BIN_DIR from the env.
 # VictoriaMetrics: VICTORIAMETRICS_VERSION (default v1.156.0) must be in BIN_DIR (copied from $BIN_DIR if missing).
 cfg=$1
-source $BENCH_ENV
+{ [ -n "${BENCH_ENV:-}" ] && source "$BENCH_ENV"; }
 export BIN_DIR=${BIN_DIR:?set BIN_DIR}
 export ARMS=${ARMS:-victoriametrics,asap}
 export QUERY_DELAY_S=${QUERY_DELAY_S:-6}

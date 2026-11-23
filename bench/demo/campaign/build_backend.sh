@@ -1,6 +1,6 @@
 #!/bin/bash
 # build_backend.sh <sha> [hosts...]: build data_plane/control_plane at <sha> on $BUILD_HOST (own dirs), run the
-# parity test, and install into $BENCH_ROOT/campaign-bin-<sha> on the given hosts (default: the c6320 pair and
+# parity test, and install into $BENCH_ROOT/campaign-bin-<sha> on the given hosts (default: $BENCH_HOSTS, the engine hosts and
 # the demo drivers). 2026-11-23: never writes into an existing directory (another job may be using it):
 # a host that already has $BENCH_ROOT/campaign-bin-<sha> is skipped and reported; a new directory is filled
 # in a temp dir and renamed into place. It no longer copies $BIN_DIR into the directory.

@@ -32,7 +32,7 @@
       }
     }
   },
-  "description": "48-core demo workload (demo plan sections 8-9): 21 queries over data/data_total and HTTP, cache, queue, power and histogram metrics, 10 Hz integer Zipf data.",
+  "description": "48-core demo workload: 21 queries over data/data_total and HTTP, cache, queue, power and histogram metrics, 10 Hz integer Zipf data.",
   "extra_metrics": {
     "cache_hits_total": {
       "labels": [
@@ -495,8 +495,8 @@
     "cache_hits_total <= cache_lookups_total (per-series ratio 0.5-0.99); http_errors_total = a 0-2% share of its job's http_requests_total increments.",
     "Other counters: Zipf(1.1, N=1e6) integer increments, 5% of series reset every 30-120 min; gauges: Zipf integers x an integer per-series multiplier.",
     "L5 uses MetricsQL's implicit subquery rate(label_replace(...)[1m]).",
-    "Decided 2026-11-22: L6's offset moved onto the selector (same meaning; the plan's form is not valid PromQL). L1 and L5 run on VictoriaMetrics only (engines field); ASAP plans and answers the other 19 queries.",
-    "Decided 2026-11-22: the run is 3 h from zero; windows longer than 3h (A, B, E, L1, L2, L3: 6h) are capped at 3h; the original query text is in promql_original."
+    "L6's offset is on the selector (the same meaning as an offset after the aggregation, which is not valid PromQL). L1 and L5 run on VictoriaMetrics only (engines field); ASAP plans and answers the other 19 queries.",
+    "The run is 3 h from zero; windows longer than 3h (A, B, E, L1, L2, L3: 6h) are capped at 3h; the original query text is in promql_original."
   ],
   "queries": [
     {

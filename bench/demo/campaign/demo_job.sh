@@ -1,6 +1,6 @@
 #!/bin/bash
 # demo_job.sh <tag> <commit> <series> <users> <run_s> [arms] [workload]
-# One 48-core demo job (demo plan sections 8-9) on the DRIVER host: feeders (FEEDER_SHARDS
+# One 48-core demo job on the DRIVER host: feeders (FEEDER_SHARDS
 # processes), harness, query client and post-run reference here; the engines on the ENGINE
 # host (ENGINE_SSH, private 10 GbE link), each in a 48 vCPU (24 cores + hyperthreads) /
 # 100 GiB cgroup with a 400 GB data filesystem, one arm after another on the same cpuset.
@@ -10,11 +10,11 @@
 # -search.maxQueryDuration=600s; client timeout 600 s. Data: integer Zipf, declared ranges.
 set -u
 tag=$1 commit=$2 series=$3 users=$4 run_s=$5 arms=${6:-victoriametrics} workload=${7:-demo/demo48}
-source $BENCH_ENV
+{ [ -n "${BENCH_ENV:-}" ] && source "$BENCH_ENV"; }
 B=$ASAPQ_BENCH
 export BIN_DIR=$BENCH_ROOT/campaign-bin-$commit
 [ -x "$BIN_DIR/data_plane" ] || { echo "missing $BIN_DIR"; exit 2; }
-export ENGINE_SSH=${ENGINE_SSH:?set ENGINE_SSH} ENGINE_ADDR=${ENGINE_ADDR:?set ENGINE_ADDR} NET_IFACE=${NET_IFACE:-eno2}
+export ENGINE_SSH=${ENGINE_SSH:?set ENGINE_SSH} ENGINE_ADDR=${ENGINE_ADDR:?set ENGINE_ADDR} NET_IFACE=${NET_IFACE:?set NET_IFACE}
 export ENGINE_SSH_OPTS=${ENGINE_SSH_OPTS:-"-o BatchMode=yes"}
 export VICTORIAMETRICS_VERSION=v1.156.0 VM_MAX_QUERY_DURATION=600s QUERY_TIMEOUT_S=600
 export FEEDER_VALUES=zipf ZIPF_S=1.1 ZIPF_N=1000000 FEEDER_BIN=$BIN_DIR/paced_feeder_realistic

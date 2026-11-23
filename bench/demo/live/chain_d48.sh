@@ -5,6 +5,7 @@
 # previous live runs (12 cores, 64 GiB with page cache, a 200 GiB filesystem per engine).
 # The previous run's data is moved aside, not deleted. Screenshots after 10 min, 1 h and 3 h
 # (the longest window, so every accuracy check has started).
+: "${ASAPQ_BENCH:?set ASAPQ_BENCH}" "${BENCH_ROOT:?set BENCH_ROOT}"
 set -u
 cd $ASAPQ_BENCH || exit 1
 [ -x $BENCH_ROOT/bin-live-2434-d48/data_plane ] || { echo "no $BENCH_ROOT/bin-live-2434-d48/data_plane"; exit 1; }

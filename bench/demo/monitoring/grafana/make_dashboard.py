@@ -283,5 +283,6 @@ dashboard = {
     "panels": panels,
 }
 out = Path(__file__).parent / "dashboards" / "asap-vs-vm.json"
+out.parent.mkdir(parents=True, exist_ok=True)
 out.write_text(json.dumps(dashboard, indent=1) + "\n")
 print(out)

@@ -10,6 +10,7 @@
 #                    containers 24-27,52-55
 # ASAP precomputes with 20 threads. The run has no fixed end. The previous run's data is moved
 # aside, not deleted. Screenshots after 10 min, 1 h, 3 h (every accuracy check has started) and 6 h.
+: "${ASAPQ_BENCH:?set ASAPQ_BENCH}" "${BENCH_ROOT:?set BENCH_ROOT}"
 set -u
 cd $ASAPQ_BENCH || exit 1
 [ -x $BENCH_ROOT/bin-live-2434-d48/data_plane ] || { echo "no $BENCH_ROOT/bin-live-2434-d48/data_plane"; exit 1; }

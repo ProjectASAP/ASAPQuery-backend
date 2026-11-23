@@ -121,8 +121,7 @@ hits/misses/computes and backlog, VictoriaMetrics' counters), which
 SERIES="1000 10000" ARM_CORES=16 QUERY_PHASE_S=600 WORKLOADS="demo/dashboard-heavy" ../run_vm_demo.sh
 ```
 
-`run_vm_demo.sh` downloads missing pinned binaries into `$BIN_DIR`
-(default `$BIN_DIR`), builds `paced_feeder`/`data_plane`/`control_plane`
+`run_vm_demo.sh` downloads missing pinned binaries into `$BIN_DIR`, builds `paced_feeder`/`data_plane`/`control_plane`
 there when missing (from `$BACKEND_DIR`), starts the monitoring stack
 (`../monitoring`: docker compose, or `run_binaries.sh` without docker), and
 for each workload runs prepare → run (`--metrics-port 19093`) → `report.py`
@@ -189,11 +188,11 @@ has no rows for, so the ASAP panels answer once span + longest window
 they show the refusal.
 
 ```sh
-SERIES=10000 ./run_live_demo.sh start   # plan, start, wire up monitoring
-./run_live_demo.sh status               # processes, ingestion, recent requests
-./run_live_demo.sh verify --since-minutes 30   # per data source and query: statuses, start/end/step seen
-./run_live_demo.sh compare              # ASAP and VM vs Prometheus on the plan's grid
-./run_live_demo.sh browse --minutes 10  # headless browser holds the dashboard open; screenshots
+SERIES=10000 ../run_live_demo.sh start  # plan, start, wire up monitoring
+../run_live_demo.sh status               # processes, ingestion, recent requests
+../run_live_demo.sh verify --since-minutes 30   # per data source and query: statuses, start/end/step seen
+EXACT=1 ../run_live_demo.sh compare      # ASAP and VM vs Prometheus on the plan's grid (needs EXACT=1 at start)
+../run_live_demo.sh browse --minutes 10  # headless browser holds the dashboard open; screenshots
 ssh -N -L 13000:127.0.0.1:13000 <run host>   # then http://127.0.0.1:13000/d/asap-vs-vm-live
 ```
 
@@ -205,34 +204,24 @@ dashboard (whole page) and each panel alone to PNG with headless Chromium
 run's time range with `SCREENSHOTS=1`. The report panels read gauges written
 after the run, so render with `to` at or after the report time.
 
-VictoriaMetrics v1.156.0 (2026-11-09) over v1.155.0, from its changelog: no
-change to Remote Write ingestion, storage, the rollup result cache or the
-MetricsQL functions these workloads use. It adds `vm_cache_mode` per cache
-(also for `promql/rollupResult`) and `process_cgroup_cpu_throttled_seconds_total`,
-fixes cgroup v1 CPU/memory limit detection via systemd slices (the harness
-pins with CPU affinity, not cgroups, so GOMAXPROCS follows the cpuset either
-way), `running_avg`/`range_avg` over NaN gaps, number literals with leading
-zeros, subquery point limits, and stream aggregation (not used: no
-`-streamAggr.config`).
-
 ## Presentation dashboard (`asap-demo`)
 
-`SERIES=1000 WORKLOAD=asap-demo ./run_live_demo.sh start` runs the live setup
+`SERIES=1000 WORKLOAD=asap-demo ../run_live_demo.sh start` runs the live setup
 on `workloads/asap-demo.json` (gauge `lat` and counter `reqs` per series;
 `http_requests_total` with 20 status codes, one 5xx, uniform increments so
 5% of requests are 5xx; gauge `queue_depth`; all 1 sample/s) and generates
 `monitoring/grafana/make_demo_dashboard.py` -> uid `asap-demo`: ASAP vs
-VictoriaMetrics only, resource usage only. Prometheus runs in the background
-as the exact reference for `live/accuracy.py` (max relative error per query
+VictoriaMetrics only, resource usage only. A reference VictoriaMetrics with its
+own feeder and no query load is the reference for `live/accuracy.py` (max relative error per query
 and the answers table, every minute, at a time on the plan's grid) and is
 never shown. The Resources and Scale rows read the final experiment from
-`REPORT_DATA` (report_demo's report_data.json; keys in
-`live/experiment_to_textfile.py`). ASAP answers a panel once window + 1 h
+`REPORT_DATA` (a final experiment's report_data.json, not in this repository; keys in
+`live/experiment_to_textfile.py`); without it those rows stay empty. ASAP answers a panel once window + 1 h
 span of data exist (2 h for the 1 h windows, 7 h for the 6 h window).
 
 ### Ingestion while querying (live)
 
-`./run_live_demo.sh load on|off` starts or stops the query load
+`../run_live_demo.sh load on|off` starts or stops the query load
 (`live/query_load.py`): the planned queries at their intervals, sent alike to
 both engines, 6 s after each evaluation time, at most one request in flight
 per engine and query. Starting and stopping it posts annotations on the

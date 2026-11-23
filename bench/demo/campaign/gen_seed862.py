@@ -1,7 +1,10 @@
 """gen_seed862.py: harness manifests (workloads/seed862-<set>-joint.json) from ASAPPlanner's dag-viewer
 PlanningWorkloads (tools/dag-viewer/workloads/random-mixed-seed-862*/, all files of a set joined, distinct
 (query, interval) pairs): metrics data (gauge) / data_total (counter), labels region/service/job/label_0
-(SERIES=10000 -> label_0 = 50), 10 Hz."""
+(SERIES=10000 -> label_0 = 50), 10 Hz.
+
+Input: $ASAPQ_BENCH/tmp/seed862/<set>/joint.json, the set's workload files joined into one
+PlanningWorkload (repeating_queries of all files)."""
 import os
 import copy, json, re, sys
 base = json.load(open(os.environ["ASAPQ_BENCH"] + "/workloads/dashboard-heavy.json"))

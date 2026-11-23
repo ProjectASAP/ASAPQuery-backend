@@ -2,6 +2,7 @@
 # Live demo sequence: ingest only -> query load on (N users) -> off, with screenshots and a per-state
 # table (feeder lag, overrun ticks, visible-sample fraction, accuracy, load outcomes) from the
 # monitoring Prometheus.   live/demo_sequence.sh <start epoch s> [users]
+: "${ASAPQ_BENCH:?set ASAPQ_BENCH}" "${BENCH_ROOT:?set BENCH_ROOT}"
 cd $ASAPQ_BENCH
 export SERIES=10000 WORKLOAD=asap-demo AUX_CPUS=48-55 BIN_DIR=$BENCH_ROOT/bin-live
 USERS=${2:-8}

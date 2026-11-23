@@ -1,6 +1,6 @@
 #!/bin/bash
 # QUERY_USERS=N arm_rerun.sh <commit> [--dry-run]: parity gate, then append the rerun jobs to each host's queue
-# and start the host runners. Run from the local machine; nothing after it needs this session.
+# and start the host runners. Run from the local machine; nothing after it needs the local machine.
 #  1. build_backend.sh <commit> on the build host (own dirs) + parity test; STOP unless "parity rc=0"
 #     and every host has $BENCH_ROOT/campaign-bin-<commit>.
 #  2. jobs from rerun_plan.txt (cfg|est_hours|SERIES|MODES|RANGE|WORKLOADS), 3 rounds each,

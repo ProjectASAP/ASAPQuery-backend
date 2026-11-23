@@ -356,6 +356,7 @@ def main():
                                            "target": {"type": "tags", "tags": ["live"], "limit": 100,
                                                       "matchAny": True}}]},
                  "panels": panels}
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(dashboard, indent=1) + "\n")
     print(args.out)
 

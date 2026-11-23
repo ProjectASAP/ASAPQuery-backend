@@ -199,6 +199,7 @@ A query planned for instant evaluation (no `range` in queries.json) shows each e
                                  "target": {"type": "tags", "tags": ["live"], "limit": 100, "matchAny": True}}]},
         "panels": panels,
     }
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(dashboard, indent=1) + "\n")
     print(args.out)
 

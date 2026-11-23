@@ -1,4 +1,8 @@
-"""Write workloads/typical-dashboard*.json (harness manifest format)."""
+"""Write workloads/typical-dashboard*.json (harness manifest format).
+
+Usage: gen_typical.py [comma-separated panel ids to keep]. The committed manifests keep
+p01-rate-job-5m,p02-increase-region-1h,p03-avg-job-5m,p04-max-job-15m,p05-topk-rate-5m,p07-quantile-ot-job-15m,p08-avg-service-30m,p09-rate-service-1h,p10-max-region-1h,p11-topk-increase-15m,p12-quantile-ot-region-1h.
+typical-dashboard-10hz.json (the same panels at 10 samples/s) has no generator here."""
 import os
 import copy, json, sys
 base = json.load(open(os.environ["ASAPQ_BENCH"] + "/workloads/dashboard-heavy.json"))

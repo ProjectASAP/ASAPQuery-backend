@@ -2,8 +2,10 @@
 # Live Grafana demo: a paced feeder (real time, continuous) sends the same
 # samples by Remote Write to the ASAP data plane (`data_plane --no-forward`,
 # installing ASAPPlanner's plan of the live dashboard workload, planned with
-# range_evaluation), VictoriaMetrics single-node (no stream aggregation) and
-# Prometheus 3.5 (the exact reference). Each runs on its own cpuset. Grafana
+# range_evaluation), VictoriaMetrics single-node (no stream aggregation), a
+# reference VictoriaMetrics with its own feeder and no query load (the accuracy
+# reference), and with EXACT=1 Prometheus 3.5 (the exact column; needed by
+# compare). Each runs on its own cpuset. Grafana
 # queries each through a logging pass-through (live/proxy.py) that records
 # every request's start/end/step and status.
 #
@@ -43,9 +45,10 @@
 # Ports: data plane 19711, VictoriaMetrics 19712, Prometheus 19713; their
 # proxies (Grafana's data sources) 19721, 19722, 19723.
 set -euo pipefail
-[ -f $BENCH_ENV ] && source $BENCH_ENV
+[ -n "${BENCH_ENV:-}" ] && [ -f "$BENCH_ENV" ] && source "$BENCH_ENV"
 export ASAPQ_BENCH=${ASAPQ_BENCH:?set ASAPQ_BENCH}
 export BIN_DIR=${BIN_DIR:?set BIN_DIR}
+mkdir -p "$ASAPQ_BENCH/monitoring/grafana/dashboards" "$ASAPQ_BENCH/monitoring/textfile"
 BASE=$ASAPQ_BENCH
 LIVE=$BASE/live
 SERIES=${SERIES:-10000}

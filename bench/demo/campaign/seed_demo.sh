@@ -31,7 +31,7 @@ for wl in "$@"; do
   ) &
   watcher=$!
   QUERY_MAX_INFLIGHT=4096 ANSWER_RESULTS_EVERY=10 KEEP_VM_DATA=1 FEEDER_SHARDS=2 \
-  ENGINE_SSH=$eip ENGINE_ADDR=$eip NET_IFACE=eno1 ENGINE_SSH_OPTS="-o BatchMode=yes" \
+  ENGINE_SSH=$eip ENGINE_ADDR=$eip NET_IFACE=${NET_IFACE:?set NET_IFACE} ENGINE_SSH_OPTS="-o BatchMode=yes" \
     ./demo_job.sh $tag $commit 10000 1 $run_s asap,victoriametrics demo/$wl > $tag.out 2>&1
   log "$tag: run and post-run ended rc=$?"
   wait $watcher

@@ -5,7 +5,7 @@
 # QUERY_USERS, ENGINE_LIMITS, DATA_PLANE_EXTRA_ARGS, PRECOMPUTE_THREADS (default 12).
 set -u
 commit=$1 tag=$2 series=$3 modes=$4; shift 4; workloads="$*"
-source $BENCH_ENV
+{ [ -n "${BENCH_ENV:-}" ] && source "$BENCH_ENV"; }
 B=$ASAPQ_BENCH
 export BIN_DIR=$BENCH_ROOT/campaign-bin-$commit
 [ -x "$BIN_DIR/data_plane" ] || { echo "missing $BIN_DIR"; exit 2; }

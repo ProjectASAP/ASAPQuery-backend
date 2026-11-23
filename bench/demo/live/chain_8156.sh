@@ -1,7 +1,8 @@
 #!/bin/bash
 # Host-side live run on backend 815640bd (tiered views, partial windows), detached: both engines
-# under the same limits, the 8-user query load from second 0 (demo plan section 8), screenshots of
+# under the same limits, the 8-user query load from second 0, screenshots of
 # the cumulative dashboard after the warm-up (2 h) and at 4 h and 6 h.
+: "${ASAPQ_BENCH:?set ASAPQ_BENCH}" "${BENCH_ROOT:?set BENCH_ROOT}"
 cd $ASAPQ_BENCH
 export BIN_DIR=$BENCH_ROOT/bin-live-8156 SERIES=10000 WORKLOAD=asap-demo FINAL_QUERY_RESULTS_CACHED=1 \
        DATA_PLANE_ARGS="--precompute-threads 12 --view-cache-max-bytes 0" LIMITS=1 START_LOAD_USERS=8 \

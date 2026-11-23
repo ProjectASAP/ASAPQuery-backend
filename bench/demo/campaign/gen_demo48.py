@@ -1,4 +1,4 @@
-"""Write workloads/demo48.json: the 48-core demo workload of the demo plan (sections 8-9),
+"""Write workloads/demo48.json: the 48-core demo workload,
 the starting scale of the VictoriaMetrics scale sweep.
 
 All metrics at 10 Hz with integer Zipf values (FEEDER_VALUES=zipf: s=1.1, N=1e6), declared
@@ -97,7 +97,7 @@ QUERIES = [  # id, promql, interval s, metrics, capability, range
     ("L5-label-replace", 'histogram_quantile(0.95, sum by (le, svc) (rate(label_replace(calc_duration_bucket{env="prod"}, '
                          '"svc", "$1", "service", "([0-9])[0-9]*")[1m]))) > 2', 15, ["calc_duration_bucket"], "quantile", None),
     # L6: the form `(...) offset 30s` after the aggregation is not valid PromQL; the offset is on
-    # the selector, which means the same (decision 2026-11-22).
+    # the selector, which means the same.
     ("L6-offset", 'histogram_quantile(0.95, sum by (le, app, instance) (rate(data_latency_bucket{app=~"1.*", '
                   'instance=~".*\\\\.1.*", env="prod"}[30s] offset 30s)))', 15, ["data_latency_bucket"], "quantile", None),
 ]
@@ -122,7 +122,7 @@ def cap_windows(promql):
 
 w = copy.deepcopy(base)
 w["id"] = "demo48"
-w["description"] = ("48-core demo workload (demo plan sections 8-9): 21 queries over data/data_total and HTTP, cache, "
+w["description"] = ("48-core demo workload: 21 queries over data/data_total and HTTP, cache, "
                     "queue, power and histogram metrics, 10 Hz integer Zipf data.")
 w.pop("metric_names", None)
 w["extra_metrics"] = EXTRA
@@ -143,7 +143,6 @@ for qid, promql_original, interval_s, metrics, cap, rng in QUERIES:
         q["range"] = rng
     # L1 (stddev_over_time: no plan without raw data) and L5 (MetricsQL-only implicit subquery
     # rate(label_replace(...)[1m])) run on VictoriaMetrics only; ASAP plans the other 19
-    # (decision 2026-11-22).
     if qid in VM_ONLY:
         q["engines"] = ["victoriametrics", "vmcluster"]
     qs.append(q)
@@ -159,9 +158,9 @@ w["notes"] = [
     "Other counters: Zipf(1.1, N=1e6) integer increments, 5% of series reset every 30-120 min; gauges: Zipf "
     "integers x an integer per-series multiplier.",
     "L5 uses MetricsQL's implicit subquery rate(label_replace(...)[1m]).",
-    "Decided 2026-11-22: L6's offset moved onto the selector (same meaning; the plan's form is not valid PromQL). "
+    "L6's offset is on the selector (the same meaning as an offset after the aggregation, which is not valid PromQL). "
     "L1 and L5 run on VictoriaMetrics only (engines field); ASAP plans and answers the other 19 queries.",
-    "Decided 2026-11-22: the run is 3 h from zero; windows longer than 3h (A, B, E, L1, L2, L3: 6h) are capped "
+    "The run is 3 h from zero; windows longer than 3h (A, B, E, L1, L2, L3: 6h) are capped "
     "at 3h; the original query text is in promql_original.",
 ]
 json.dump(w, open(os.environ["ASAPQ_BENCH"] + "/workloads/demo48.json", "w"), indent=2, sort_keys=True)

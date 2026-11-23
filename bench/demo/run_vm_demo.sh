@@ -9,8 +9,8 @@
 # and demo_table.py (the absolute-numbers table, also exported to Grafana).
 #
 # Environment (defaults in brackets):
-#   ASAPQ_BENCH    base directory [$ASAPQ_BENCH]
-#   BIN_DIR        binaries; pinned releases are downloaded here when missing [$BIN_DIR]
+#   ASAPQ_BENCH    base directory (required)
+#   BIN_DIR        binaries; pinned releases are downloaded here when missing (required)
 #   SERIES         series per metric, one run per value, each a multiple of 200
 #                  (4 regions x 5 services x 10 jobs x label_0) ["1000 10000"]
 #   WORKLOADS      set/workload list [seed-862/workload-01 seed-862/workload-02 seed-862/workload-03 demo/dashboard-heavy]
@@ -40,9 +40,10 @@
 #   ARM_CPUS       explicit cpusets 'arm=cpus;arm2=cpus' (run.py --arm-cpus) instead of ARM_CORES; with
 #                  ENGINE_SSH (engines on another host, see run.py) they are the engine host's cpus
 set -euo pipefail
-[ -f $BENCH_ENV ] && source $BENCH_ENV
+[ -n "${BENCH_ENV:-}" ] && [ -f "$BENCH_ENV" ] && source "$BENCH_ENV"
 export ASAPQ_BENCH=${ASAPQ_BENCH:?set ASAPQ_BENCH}
 export BIN_DIR=${BIN_DIR:?set BIN_DIR}
+mkdir -p "$ASAPQ_BENCH/monitoring/grafana/dashboards" "$ASAPQ_BENCH/monitoring/textfile"
 BASE=$ASAPQ_BENCH
 SERIES=${SERIES:-1000 10000}
 ARM_CORES=${ARM_CORES:-16}
@@ -91,6 +92,7 @@ if [[ ",$ARMS," == *",asap,"* ]]; then
 fi
 
 # 2. Monitoring.
+python3 "$BASE/monitoring/grafana/make_dashboard.py" >/dev/null
 MONITORING=${MONITORING:-}
 if [ -z "$MONITORING" ]; then
   if sudo -n docker info >/dev/null 2>&1; then MONITORING=docker; else MONITORING=binaries; fi

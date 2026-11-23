@@ -10,11 +10,11 @@
 # 600 s, concurrency limits at defaults; everything recorded in <tag>.meta and vm_flags.json.
 set -u
 tag=$1 commit=$2 step=$3 workload=$4 qphase=$5 arms=${6:-asap,victoriametrics,vmcluster}
-source $BENCH_ENV
+{ [ -n "${BENCH_ENV:-}" ] && source "$BENCH_ENV"; }
 B=$ASAPQ_BENCH
 export BIN_DIR=$BENCH_ROOT/campaign-bin-$commit
 [ -x "$BIN_DIR/data_plane" ] || { echo "missing $BIN_DIR"; exit 2; }
-export ENGINE_SSH=${ENGINE_SSH:?set ENGINE_SSH} ENGINE_ADDR=${ENGINE_ADDR:?set ENGINE_ADDR} NET_IFACE=${NET_IFACE:-eno2}
+export ENGINE_SSH=${ENGINE_SSH:?set ENGINE_SSH} ENGINE_ADDR=${ENGINE_ADDR:?set ENGINE_ADDR} NET_IFACE=${NET_IFACE:?set NET_IFACE}
 export ENGINE_SSH_OPTS=${ENGINE_SSH_OPTS:-"-o BatchMode=yes"}
 export VICTORIAMETRICS_VERSION=v1.156.0 VM_MAX_QUERY_DURATION=600s QUERY_TIMEOUT_S=600
 export FEEDER_VALUES=zipf ZIPF_S=1.1 ZIPF_N=1000000 FEEDER_BIN=$BIN_DIR/paced_feeder_realistic

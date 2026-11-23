@@ -1,6 +1,7 @@
 #!/bin/bash
-# Host-side chain (no session needed): the 3-state sequence on the running unlimited run (tag
+# Host-side chain (detached): the 3-state sequence on the running unlimited run (tag
 # "nolimits"), then restart with LIMITS=1 and, after the 2 h warm-up, the 3 states again ("limits").
+: "${ASAPQ_BENCH:?set ASAPQ_BENCH}" "${BENCH_ROOT:?set BENCH_ROOT}"
 cd $ASAPQ_BENCH
 export BIN_DIR=$BENCH_ROOT/bin-live SERIES=10000 WORKLOAD=asap-demo
 bash live/demo_sequence_tagged.sh "$(date +%s)" 8 nolimits > live/logs/sequence-nolimits.log 2>&1

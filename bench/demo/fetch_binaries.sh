@@ -1,6 +1,6 @@
 #!/bin/bash
 # Download the pinned third-party binaries the VictoriaMetrics demo uses into
-# $BIN_DIR (default $BIN_DIR), each checked against its pinned sha256.
+# $BIN_DIR (required), each checked against its pinned sha256.
 # Already-present binaries are kept. Linux amd64 only.
 #
 #   BIN_DIR=$BIN_DIR ./fetch_binaries.sh            # everything
