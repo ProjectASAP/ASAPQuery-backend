@@ -1,0 +1,261 @@
+{
+  "query_workload": {
+    "language": "promql",
+    "query_batch": null,
+    "repeating_queries": [
+      {
+        "query": "sum by (job) (rate(data_total[5m]))",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 0
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "max_error": 0.05,
+            "failure_probability": 0.3
+          },
+          "max_latency_ms": null
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "sum by (region) (increase(data_total[1h]))",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 0
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "max_error": 0.05,
+            "failure_probability": 0.3
+          },
+          "max_latency_ms": null
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "avg by (job) (avg_over_time(data[5m]))",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 0
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "max_error": 0.05,
+            "failure_probability": 0.3
+          },
+          "max_latency_ms": null
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "max by (job) (max_over_time(data[15m]))",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 0
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "max_error": 0.05,
+            "failure_probability": 0.3
+          },
+          "max_latency_ms": null
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "topk(5, sum by (job) (rate(data_total[5m])))",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 0
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "max_error": 0.05,
+            "failure_probability": 0.3
+          },
+          "max_latency_ms": null
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "avg by (job) (quantile_over_time(0.99, data[15m]))",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 0
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "max_error": 0.05,
+            "failure_probability": 0.3
+          },
+          "max_latency_ms": null
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "avg by (region, service) (avg_over_time(data[30m]))",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 0
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "max_error": 0.05,
+            "failure_probability": 0.3
+          },
+          "max_latency_ms": null
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "sum by (service) (rate(data_total[1h]))",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 0
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "max_error": 0.05,
+            "failure_probability": 0.3
+          },
+          "max_latency_ms": null
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "max by (region) (max_over_time(data[1h]))",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 0
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "max_error": 0.05,
+            "failure_probability": 0.3
+          },
+          "max_latency_ms": null
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "topk(10, sum by (service, job) (increase(data_total[15m])))",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 0
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "max_error": 0.05,
+            "failure_probability": 0.3
+          },
+          "max_latency_ms": null
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      },
+      {
+        "query": "avg by (region) (quantile_over_time(0.5, data[1h]))",
+        "demand": {
+          "fixed_interval_at": {
+            "interval": 60000,
+            "evaluation_phase": 0
+          }
+        },
+        "requirements": {
+          "accuracy": {
+            "max_error": 0.05,
+            "failure_probability": 0.3
+          },
+          "max_latency_ms": null
+        },
+        "predictability": {
+          "predictable": {
+            "known_at": null
+          }
+        }
+      }
+    ]
+  },
+  "data_workload": {
+    "arrival": {
+      "ingesting": {
+        "rows_per_second": 200000.0
+      }
+    },
+    "sources": {
+      "data": {
+        "series_count": 10000,
+        "metric_type": "gauge",
+        "sample_interval": 100,
+        "column_signs": {
+          "value": "non_negative"
+        }
+      },
+      "data_total": {
+        "series_count": 10000,
+        "metric_type": "counter",
+        "sample_interval": 100
+      }
+    }
+  }
+}

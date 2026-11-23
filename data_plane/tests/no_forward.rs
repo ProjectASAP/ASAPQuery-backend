@@ -8,14 +8,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use asap_executor::planner::ir::{NonASAPOp, Operator, Predicate, ScalarExpr};
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::StatusCode;
 use axum::Router;
 use data_plane::engine::EngineOptions;
-use data_plane::{router, DataPlane, EXECUTION_HEADER};
-use http_body_util::BodyExt;
-use serde_json::Value;
-use tower::ServiceExt;
+use data_plane::{router, DataPlane};
 
 const MINUTE: i64 = 60_000;
 
@@ -43,25 +39,6 @@ fn options(no_forward: bool) -> EngineOptions {
     }
 }
 
-async fn get(app: &Router, uri: &str) -> (StatusCode, Option<String>, Value) {
-    let response = app
-        .clone()
-        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let status = response.status();
-    let execution = response
-        .headers()
-        .get(EXECUTION_HEADER)
-        .map(|v| v.to_str().unwrap().to_string());
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    (
-        status,
-        execution,
-        serde_json::from_slice(&body).unwrap_or(Value::Null),
-    )
-}
-
 fn instant(query: &str, time_ms: i64) -> String {
     format!(
         "/api/v1/query?{}",
@@ -72,7 +49,7 @@ fn instant(query: &str, time_ms: i64) -> String {
     )
 }
 
-/// With the flag, an unplanned query, an evaluation whose pane is missing
+/// With the flag, an unplanned query, an evaluation whose windows are missing
 /// and a range query each get a Prometheus `execution` error with the
 /// reason, and the stand-in Prometheus receives no request.
 #[tokio::test]
@@ -82,7 +59,7 @@ async fn refuses_what_the_plan_cannot_answer_without_asking_prometheus() {
         DataPlane::with_options(common::plan_json("example4b", false), url, options(true)).unwrap();
     let app = router(Arc::new(state));
 
-    let (status, execution, body) = get(&app, &instant("up", 70 * MINUTE)).await;
+    let (status, execution, body) = common::get(&app, &instant("up", 70 * MINUTE)).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(execution.as_deref(), Some("refused"));
     assert_eq!(body["status"], "error");
@@ -92,13 +69,13 @@ async fn refuses_what_the_plan_cannot_answer_without_asking_prometheus() {
         "{body}"
     );
 
-    // Nothing was written, so the panes the query reads are not stored.
+    // Nothing was written, so the windows the query reads are not stored.
     let query = "quantile_over_time(0.99, latency_ms[60m])";
-    let (status, execution, body) = get(&app, &instant(query, 70 * MINUTE)).await;
+    let (status, execution, body) = common::get(&app, &instant(query, 70 * MINUTE)).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(execution.as_deref(), Some("refused"));
     assert!(
-        body["error"].as_str().unwrap().contains("not stored"),
+        body["error"].as_str().unwrap().contains("no rows tiling"),
         "{body}"
     );
 
@@ -106,7 +83,7 @@ async fn refuses_what_the_plan_cannot_answer_without_asking_prometheus() {
         "/api/v1/query_range?query={}&start=0&end=60&step=15",
         form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
     );
-    let (status, execution, _) = get(&app, &range).await;
+    let (status, execution, _) = common::get(&app, &range).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(execution.as_deref(), Some("refused"));
 
@@ -120,7 +97,7 @@ async fn forwards_without_the_flag() {
     let state = DataPlane::with_options(common::plan_json("example4b", false), url, options(false))
         .unwrap();
     let app = router(Arc::new(state));
-    let (status, execution, _) = get(&app, &instant("up", 70 * MINUTE)).await;
+    let (status, execution, _) = common::get(&app, &instant("up", 70 * MINUTE)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(execution.as_deref(), Some("forwarded"));
     assert_eq!(requests.load(Ordering::SeqCst), 1);
@@ -131,19 +108,16 @@ async fn forwards_without_the_flag() {
 #[test]
 fn refuses_to_install_a_plan_with_a_query_it_cannot_run() {
     let mut plan = common::plan("example1", true);
-    // A label matcher on a column the `Scan` does not have: the selector of
-    // its raw-sample window does not compile, so the queries that read it
-    // cannot run.
-    let scan = plan.query_time_raw_windows[0].scan_node_id;
+    // A predicate on a column the `Scan` does not have: the queries that
+    // read it do not compile.
     let node = plan
-        .dag
         .dag
         .nodes
         .iter_mut()
-        .find(|n| n.id == scan)
+        .find(|n| matches!(n.payload, Operator::NonASAP(NonASAPOp::Scan { .. })))
         .unwrap();
     let Operator::NonASAP(NonASAPOp::Scan { predicates, .. }) = &mut node.payload else {
-        panic!("not a Scan");
+        unreachable!();
     };
     predicates.push(Predicate(ScalarExpr::Column(99)));
     plan.validate().unwrap();

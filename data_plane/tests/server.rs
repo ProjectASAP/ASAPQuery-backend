@@ -1,6 +1,5 @@
 mod common;
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -117,7 +116,7 @@ async fn accepts_remote_write() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    assert_eq!(state.samples.load(Ordering::Relaxed), 2);
+    assert_eq!(samples_routed(&app).await, 2);
     let (status, _, _) = send(
         &app,
         Request::post("/api/v1/write")
@@ -126,7 +125,7 @@ async fn accepts_remote_write() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(state.samples.load(Ordering::Relaxed), 2);
+    assert_eq!(samples_routed(&app).await, 2);
 }
 
 /// Remote Write bodies above axum's 2 MB default but within
@@ -177,7 +176,7 @@ async fn accepts_remote_write_up_to_the_compressed_limit() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{error}");
-    assert_eq!(state.samples.load(Ordering::Relaxed), 20_000);
+    assert_eq!(samples_routed(&app).await, 20_000);
 
     let oversized = vec![0u8; state.limits.max_compressed_bytes + 1];
     let (status, _, _) = send(
@@ -188,7 +187,7 @@ async fn accepts_remote_write_up_to_the_compressed_limit() {
     )
     .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(state.samples.load(Ordering::Relaxed), 20_000);
+    assert_eq!(samples_routed(&app).await, 20_000);
 }
 
 /// Auth and tenancy headers reach Prometheus; hop-by-hop headers and `Host`
@@ -303,7 +302,7 @@ async fn admits_a_large_request_into_an_empty_queue() {
     );
     let app = router(state.clone());
     assert_eq!(write(&app, 3).await, StatusCode::NO_CONTENT);
-    assert_eq!(state.samples.load(Ordering::Relaxed), 3);
+    assert_eq!(samples_routed(&app).await, 3);
 }
 
 /// A Remote Write request without raw samples is accepted and not queued.
@@ -325,7 +324,6 @@ async fn does_not_queue_empty_requests() {
     assert!(!state.engine.is_running());
     assert_eq!(write(&app, 0).await, StatusCode::NO_CONTENT);
     assert_eq!(state.engine.queued_samples(), 0);
-    assert_eq!(state.samples.load(Ordering::Relaxed), 0);
 }
 
 /// Once the engine thread has stopped, Remote Write gets 500 instead of a
@@ -351,15 +349,12 @@ async fn stopped_engine_fails_writes_and_readiness() {
     assert_eq!(body["engine_running"], false);
 }
 
-/// The status endpoint reports what the engine did with every sample.
-#[tokio::test]
-async fn reports_sample_counters() {
-    let state = data_plane("http://unused".into());
-    let app = router(state.clone());
-    assert_eq!(write(&app, 3).await, StatusCode::NO_CONTENT);
+/// The samples the engine has routed, by `/api/v1/status/asap`: accepted,
+/// dropped or unrouted, once none is queued.
+async fn samples_routed(app: &Router) -> u64 {
     let mut body = serde_json::Value::Null;
     for _ in 0..200 {
-        let (status, json) = get_json(&app, "/api/v1/status/asap").await;
+        let (status, json) = get_json(app, "/api/v1/status/asap").await;
         assert_eq!(status, StatusCode::OK);
         body = json;
         if body["samples_queued"] == 0 {
@@ -367,18 +362,56 @@ async fn reports_sample_counters() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(body["engine_running"], true);
-    assert_eq!(body["samples_queued"], 0);
-    let counters = &body["precompute"];
-    let total: u64 = [
+    assert_eq!(body["samples_queued"], 0, "{body}");
+    let counters = &body["ingestion"];
+    [
         "samples_accepted",
         "samples_dropped_late",
-        "samples_skipped_first_pane",
         "samples_dropped_future",
         "samples_unrouted",
     ]
     .iter()
     .map(|name| counters[name].as_u64().unwrap())
-    .sum();
-    assert_eq!(total, 3, "{body}");
+    .sum()
+}
+
+/// The status endpoint reports what the engine did with every sample.
+#[tokio::test]
+async fn reports_sample_counters() {
+    let state = data_plane("http://unused".into());
+    let app = router(state.clone());
+    assert_eq!(write(&app, 3).await, StatusCode::NO_CONTENT);
+    assert_eq!(samples_routed(&app).await, 3);
+    let (_, body) = get_json(&app, "/api/v1/status/asap").await;
+    assert_eq!(body["engine_running"], true);
+}
+
+/// `/metrics` reports, in the Prometheus text format, the Remote Write
+/// decode and append phases a write ran, the samples it stored, and the
+/// engine's threads by name.
+#[tokio::test]
+async fn exports_phase_metrics() {
+    let state = data_plane("http://unused".into());
+    let app = router(state.clone());
+    assert_eq!(write(&app, 3).await, StatusCode::NO_CONTENT);
+    for _ in 0..200 {
+        if state.engine.queued_samples() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (status, _, body) = send(&app, Request::get("/metrics").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    for line in [
+        "asap_phase_runs_total{phase=\"remote_write_decode\"} 1",
+        "asap_phase_runs_total{phase=\"append\"} 1",
+        "asap_samples_total{outcome=\"accepted\"} 3",
+        "asap_raw_data_samples 3",
+        "asap_precompute_backlog_windows 0",
+        "asap_thread_cpu_seconds_total{thread=\"ingest\"}",
+        "asap_thread_cpu_seconds_total{thread=\"precompute\"}",
+        "asap_thread_cpu_seconds_total{thread=\"query-\"}",
+    ] {
+        assert!(body.contains(line), "{line} missing from\n{body}");
+    }
 }

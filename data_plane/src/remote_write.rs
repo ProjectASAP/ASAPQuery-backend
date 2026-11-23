@@ -2,6 +2,11 @@
 
 use prost::Message;
 
+use std::sync::Arc;
+
+use crate::series_ids::Series;
+use crate::store::RawSample;
+
 #[derive(Clone, PartialEq, Message)]
 pub struct WriteRequest {
     #[prost(message, repeated, tag = "1")]
@@ -68,9 +73,8 @@ pub enum RemoteWriteError {
     DuplicateLabel(String),
 }
 
-/// Decodes a snappy-compressed Remote Write v1 body. Every series must name
-/// its metric and carry each label once.
-pub fn decode(body: &[u8], limits: &Limits) -> Result<WriteRequest, RemoteWriteError> {
+/// The snappy-decompressed bytes of `body`, within the size limits.
+fn decompress(body: &[u8], limits: &Limits) -> Result<Vec<u8>, RemoteWriteError> {
     if body.len() > limits.max_compressed_bytes {
         return Err(RemoteWriteError::CompressedTooLarge(
             limits.max_compressed_bytes,
@@ -83,26 +87,259 @@ pub fn decode(body: &[u8], limits: &Limits) -> Result<WriteRequest, RemoteWriteE
             limits.max_decompressed_bytes,
         ));
     }
-    let decoded = snap::raw::Decoder::new()
+    snap::raw::Decoder::new()
         .decompress_vec(body)
-        .map_err(|e| RemoteWriteError::Snappy(e.to_string()))?;
-    let request = WriteRequest::decode(decoded.as_slice())
-        .map_err(|e| RemoteWriteError::Protobuf(e.to_string()))?;
-    let samples: usize = request.timeseries.iter().map(|s| s.samples.len()).sum();
-    if samples > limits.max_samples {
-        return Err(RemoteWriteError::TooManySamples(limits.max_samples));
-    }
-    for series in &request.timeseries {
-        let mut names: Vec<&str> = series.labels.iter().map(|l| l.name.as_str()).collect();
-        names.sort_unstable();
-        if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
-            return Err(RemoteWriteError::DuplicateLabel(pair[0].to_string()));
+        .map_err(|e| RemoteWriteError::Snappy(e.to_string()))
+}
+
+/// The samples of a snappy-compressed Remote Write v1 body, each with its
+/// interned series, in request order. Stale markers are kept: the
+/// executor's sample selector drops them from range windows and ends
+/// instant selectors.
+///
+/// The protobuf is walked in place, without building a `WriteRequest`. A
+/// series is looked up by the bytes of its encoded labels in a per-thread
+/// cache, so a known series costs a hash and a compare; only a new one is
+/// parsed, validated (UTF-8, `__name__`, no duplicate label) and interned.
+/// Errors: the body is too large, not snappy or not protobuf, has too
+/// many samples, or a series has no `__name__` or a label twice.
+pub fn decode_samples(body: &[u8], limits: &Limits) -> Result<Vec<RawSample>, RemoteWriteError> {
+    let decoded = decompress(body, limits)?;
+    // A sample takes at least 11 encoded bytes (tag, length, value,
+    // timestamp), so this rarely grows.
+    let mut samples = Vec::with_capacity(decoded.len() / 12);
+    let mut request = Reader::new(&decoded);
+    while let Some((field, value)) = request.field()? {
+        if let (1, Value::Bytes(series)) = (field, value) {
+            decode_series(series, &mut samples, limits)?;
         }
-        if !names.contains(&"__name__") {
-            return Err(RemoteWriteError::MissingMetricName);
+    }
+    Ok(samples)
+}
+
+/// Appends the samples of one encoded `TimeSeries` to `samples`.
+fn decode_series(
+    series: &[u8],
+    samples: &mut Vec<RawSample>,
+    limits: &Limits,
+) -> Result<(), RemoteWriteError> {
+    // First pass, skipping over the samples: the labels' encoded bytes, the
+    // key of the series cache; one slice of `series` when the labels are
+    // contiguous, as senders write them.
+    let mut labels_start = None;
+    let mut labels_end = 0;
+    let mut contiguous = true;
+    let mut reader = Reader::new(series);
+    while let Some((field, value)) = reader.field()? {
+        if let (1, Value::Bytes(_)) = (field, value) {
+            match labels_start {
+                None => labels_start = Some(reader.field_start),
+                Some(_) if reader.field_start != labels_end => contiguous = false,
+                Some(_) => {}
+            }
+            labels_end = reader.position;
         }
     }
-    Ok(request)
+    let labels = match (labels_start, contiguous) {
+        (Some(start), true) => cached_series(&series[start..labels_end])?,
+        (None, _) => return Err(RemoteWriteError::MissingMetricName),
+        (Some(_), false) => {
+            // Rare: labels interleaved with other fields; key by their
+            // concatenation.
+            let mut key = Vec::new();
+            let mut reader = Reader::new(series);
+            while let Some((field, value)) = reader.field()? {
+                if let (1, Value::Bytes(_)) = (field, value) {
+                    key.extend_from_slice(&series[reader.field_start..reader.position]);
+                }
+            }
+            cached_series(&key)?
+        }
+    };
+    // Second pass: the samples.
+    let mut reader = Reader::new(series);
+    while let Some((field, value)) = reader.field()? {
+        let (2, Value::Bytes(sample)) = (field, value) else {
+            continue;
+        };
+        if samples.len() >= limits.max_samples {
+            return Err(RemoteWriteError::TooManySamples(limits.max_samples));
+        }
+        let (timestamp_ms, value) = match sample_fast(sample) {
+            Some(decoded) => decoded,
+            None => sample_generic(sample)?,
+        };
+        samples.push(RawSample {
+            labels: labels.clone(),
+            timestamp_ms,
+            value,
+        });
+    }
+    Ok(())
+}
+
+/// A `Sample` in the layout senders write: `value` (tag 0x09, 8 bytes) then
+/// `timestamp` (tag 0x10, varint) and nothing else; `None` for any other
+/// layout, which [`sample_generic`] reads.
+fn sample_fast(sample: &[u8]) -> Option<(i64, f64)> {
+    if sample.len() < 11 || sample[0] != 0x09 || sample[9] != 0x10 {
+        return None;
+    }
+    let mut tail = Reader::new(&sample[10..]);
+    let raw = tail.varint().ok()?;
+    if tail.position != tail.bytes.len() {
+        return None;
+    }
+    let value = f64::from_bits(u64::from_le_bytes(sample[1..9].try_into().ok()?));
+    Some((raw as i64, value))
+}
+
+/// A `Sample` with its fields in any order, unknown fields skipped.
+fn sample_generic(sample: &[u8]) -> Result<(i64, f64), RemoteWriteError> {
+    let (mut timestamp_ms, mut value) = (0i64, 0f64);
+    let mut fields = Reader::new(sample);
+    while let Some((field, field_value)) = fields.field()? {
+        match (field, field_value) {
+            (1, Value::Fixed64(bits)) => value = f64::from_bits(bits),
+            (2, Value::Varint(raw)) => timestamp_ms = raw as i64,
+            _ => {}
+        }
+    }
+    Ok((timestamp_ms, value))
+}
+
+/// The series of the encoded labels `key` (a run of `TimeSeries` field-1
+/// entries): from this thread's cache, or parsed, validated and interned.
+fn cached_series(key: &[u8]) -> Result<Arc<Series>, RemoteWriteError> {
+    thread_local! {
+        static CACHE: std::cell::RefCell<ahash::HashMap<Box<[u8]>, Arc<Series>>> =
+            std::cell::RefCell::default();
+    }
+    if let Some(series) = CACHE.with(|cache| cache.borrow().get(key).cloned()) {
+        return Ok(series);
+    }
+    let series = parse_labels(key)?;
+    CACHE.with(|cache| cache.borrow_mut().insert(key.into(), series.clone()));
+    Ok(series)
+}
+
+/// Parses, validates and interns the labels encoded in `key`.
+fn parse_labels(key: &[u8]) -> Result<Arc<Series>, RemoteWriteError> {
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
+    let mut reader = Reader::new(key);
+    while let Some((_, value)) = reader.field()? {
+        let Value::Bytes(label) = value else { continue };
+        let (mut name, mut text) = ("", "");
+        let mut fields = Reader::new(label);
+        let utf8 = |bytes| {
+            std::str::from_utf8(bytes)
+                .map_err(|e| RemoteWriteError::Protobuf(format!("label is not UTF-8: {e}")))
+        };
+        while let Some((field, field_value)) = fields.field()? {
+            match (field, field_value) {
+                (1, Value::Bytes(bytes)) => name = utf8(bytes)?,
+                (2, Value::Bytes(bytes)) => text = utf8(bytes)?,
+                _ => {}
+            }
+        }
+        pairs.push((name, text));
+    }
+    let mut names: Vec<&str> = pairs.iter().map(|(name, _)| *name).collect();
+    names.sort_unstable();
+    if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(RemoteWriteError::DuplicateLabel(pair[0].to_string()));
+    }
+    if !names.contains(&"__name__") {
+        return Err(RemoteWriteError::MissingMetricName);
+    }
+    Ok(crate::series_ids::intern_pairs(&pairs))
+}
+
+/// One protobuf field value.
+enum Value<'a> {
+    Varint(u64),
+    Fixed64(u64),
+    Bytes(&'a [u8]),
+    Fixed32,
+}
+
+/// A protobuf reader over borrowed bytes.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    position: usize,
+    /// Where the field read last starts (its tag).
+    field_start: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            position: 0,
+            field_start: 0,
+        }
+    }
+
+    fn error(message: &str) -> RemoteWriteError {
+        RemoteWriteError::Protobuf(message.into())
+    }
+
+    fn varint(&mut self) -> Result<u64, RemoteWriteError> {
+        let mut value = 0u64;
+        for shift in (0..64).step_by(7) {
+            let byte = *self
+                .bytes
+                .get(self.position)
+                .ok_or_else(|| Self::error("truncated varint"))?;
+            self.position += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte < 0x80 {
+                return Ok(value);
+            }
+        }
+        Err(Self::error("varint too long"))
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], RemoteWriteError> {
+        let end = self
+            .position
+            .checked_add(len)
+            .filter(|&end| end <= self.bytes.len())
+            .ok_or_else(|| Self::error("field runs past the end of its message"))?;
+        let taken = &self.bytes[self.position..end];
+        self.position = end;
+        Ok(taken)
+    }
+
+    /// The next field number and value; `None` at the end.
+    fn field(&mut self) -> Result<Option<(u64, Value<'a>)>, RemoteWriteError> {
+        if self.position == self.bytes.len() {
+            return Ok(None);
+        }
+        self.field_start = self.position;
+        let tag = self.varint()?;
+        let field = tag >> 3;
+        if field == 0 {
+            return Err(Self::error("field number 0"));
+        }
+        let value = match tag & 7 {
+            0 => Value::Varint(self.varint()?),
+            1 => Value::Fixed64(u64::from_le_bytes(
+                self.take(8)?.try_into().expect("8 bytes"),
+            )),
+            2 => {
+                let len =
+                    usize::try_from(self.varint()?).map_err(|_| Self::error("length too large"))?;
+                Value::Bytes(self.take(len)?)
+            }
+            5 => {
+                self.take(4)?;
+                Value::Fixed32
+            }
+            wire => return Err(Self::error(&format!("unsupported wire type {wire}"))),
+        };
+        Ok(Some((field, value)))
+    }
 }
 
 /// Snappy-compressed encoding of `request`, as a Remote Write sender sends it.
@@ -115,6 +352,31 @@ pub fn encode(request: &WriteRequest) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    /// Decodes a snappy-compressed Remote Write v1 body into a
+    /// `WriteRequest`, as [`decode_samples`] validates it: every series
+    /// must name its metric and carry each label once.
+    fn decode(body: &[u8], limits: &Limits) -> Result<WriteRequest, RemoteWriteError> {
+        let decoded = decompress(body, limits)?;
+        let request = WriteRequest::decode(decoded.as_slice())
+            .map_err(|e| RemoteWriteError::Protobuf(e.to_string()))?;
+        let samples: usize = request.timeseries.iter().map(|s| s.samples.len()).sum();
+        if samples > limits.max_samples {
+            return Err(RemoteWriteError::TooManySamples(limits.max_samples));
+        }
+        for series in &request.timeseries {
+            let mut names: Vec<&str> = series.labels.iter().map(|l| l.name.as_str()).collect();
+            names.sort_unstable();
+            if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
+                return Err(RemoteWriteError::DuplicateLabel(pair[0].to_string()));
+            }
+            if !names.contains(&"__name__") {
+                return Err(RemoteWriteError::MissingMetricName);
+            }
+        }
+        Ok(request)
+    }
 
     fn series(labels: &[(&str, &str)], samples: &[(i64, f64)]) -> TimeSeries {
         TimeSeries {
@@ -180,6 +442,124 @@ mod tests {
             decode(&encode(&duplicate), &limits),
             Err(RemoteWriteError::DuplicateLabel("job".into()))
         );
+    }
+
+    /// Walking the protobuf in place gives the samples and series of the
+    /// full decode, for both request shapes and labels in any order; and
+    /// the same errors for invalid series and malformed bodies.
+    #[test]
+    fn decoded_samples_match_the_full_decode() {
+        let limits = Limits::default();
+        let request = WriteRequest {
+            timeseries: vec![
+                series(
+                    &[("__name__", "m_rw_test"), ("job", "a")],
+                    &[(1, 1.0), (2, 2.5)],
+                ),
+                series(&[("job", "b"), ("__name__", "m_rw_test")], &[(3, -1.0)]),
+                series(&[("__name__", "m_rw_test"), ("job", "a")], &[(4, f64::NAN)]),
+                series(&[("__name__", "m_rw_test"), ("job", "c")], &[]),
+            ],
+        };
+        let body = encode(&request);
+        for _ in 0..2 {
+            let samples = decode_samples(&body, &limits).unwrap();
+            let expected: Vec<(BTreeMap<String, String>, i64, u64)> = request
+                .timeseries
+                .iter()
+                .flat_map(|s| {
+                    let labels: BTreeMap<String, String> = s
+                        .labels
+                        .iter()
+                        .map(|l| (l.name.clone(), l.value.clone()))
+                        .collect();
+                    s.samples
+                        .iter()
+                        .map(move |x| (labels.clone(), x.timestamp, x.value.to_bits()))
+                })
+                .collect();
+            let got: Vec<(BTreeMap<String, String>, i64, u64)> = samples
+                .iter()
+                .map(|s| ((*s.labels).clone(), s.timestamp_ms, s.value.to_bits()))
+                .collect();
+            assert_eq!(got, expected);
+        }
+        let unnamed = WriteRequest {
+            timeseries: vec![series(&[("job", "api")], &[(1, 1.0)])],
+        };
+        assert_eq!(
+            decode_samples(&encode(&unnamed), &limits).err(),
+            Some(RemoteWriteError::MissingMetricName)
+        );
+        let duplicate = WriteRequest {
+            timeseries: vec![series(
+                &[("__name__", "y"), ("job", "a"), ("job", "b")],
+                &[(1, 1.0)],
+            )],
+        };
+        assert_eq!(
+            decode_samples(&encode(&duplicate), &limits).err(),
+            Some(RemoteWriteError::DuplicateLabel("job".into()))
+        );
+        let garbage = snap::raw::Encoder::new().compress_vec(&[0xff; 8]).unwrap();
+        assert!(matches!(
+            decode_samples(&garbage, &limits),
+            Err(RemoteWriteError::Protobuf(_))
+        ));
+        let one = Limits {
+            max_samples: 1,
+            ..Limits::default()
+        };
+        assert_eq!(
+            decode_samples(&body, &one).err(),
+            Some(RemoteWriteError::TooManySamples(1))
+        );
+    }
+
+    /// The fast sample path reads what the generic one reads, and leaves
+    /// any other layout (fields swapped, an unknown field, a value-less or
+    /// negative-timestamp sample) to it.
+    #[test]
+    fn fast_and_generic_sample_paths_agree() {
+        let encoded = |sample: &Sample| sample.encode_to_vec();
+        for sample in [
+            Sample {
+                value: 1.5,
+                timestamp: 1_700_000_000_000,
+            },
+            Sample {
+                value: f64::NAN,
+                timestamp: 1,
+            },
+            Sample {
+                value: -2.0,
+                timestamp: -5,
+            },
+        ] {
+            let bytes = encoded(&sample);
+            let generic = sample_generic(&bytes).unwrap();
+            let fast = sample_fast(&bytes).expect("the sender's layout");
+            assert_eq!(fast.0, generic.0);
+            assert_eq!(fast.1.to_bits(), generic.1.to_bits());
+        }
+        // Timestamp before value, an unknown field after, a zero value
+        // (omitted by protobuf): read by the generic path only.
+        let swapped = [0x10, 0x07, 0x09, 0, 0, 0, 0, 0, 0, 0xf8, 0x3f];
+        assert_eq!(sample_fast(&swapped), None);
+        assert_eq!(sample_generic(&swapped).unwrap(), (7, 1.5));
+        let mut extra = encoded(&Sample {
+            value: 1.5,
+            timestamp: 7,
+        });
+        extra.extend_from_slice(&[0x18, 0x01]);
+        assert_eq!(sample_fast(&extra), None);
+        assert_eq!(sample_generic(&extra).unwrap(), (7, 1.5));
+        let zero = encoded(&Sample {
+            value: 0.0,
+            timestamp: 7,
+        });
+        assert_eq!(sample_fast(&zero), None);
+        assert_eq!(sample_generic(&zero).unwrap(), (7, 0.0));
     }
 
     /// Requests over a size limit are rejected before they are processed.
