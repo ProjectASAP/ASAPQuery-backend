@@ -6,6 +6,11 @@
 //! tier: a window evicted from memory is read back from its fragment.
 //! Segments are synced every sync interval, roll every `segment_ms` of
 //! windows, and are deleted once every window in them is past retention.
+//! Once a newer sealed segment exists, a segment's pages are advised cold
+//! ([`crate::segment::Segment::mark_cold`]): queries read a view's newest
+//! windows on every evaluation, an older window only once more, and
+//! without memory pressure the kernel would keep every page read while
+//! the segment was young on its active list.
 //! At startup the segments are indexed from their record heads, without
 //! decoding any fragment.
 //!
@@ -109,6 +114,8 @@ pub struct Written {
     /// Where each persisted view's fragment of the window is, for reading
     /// it back cold.
     pub locations: Vec<(PhysicalASAPNodeId, WindowLocation)>,
+    /// Segments marked cold by this append ([`GroupFiles::cool`]).
+    pub segments_marked_cold: u64,
 }
 
 /// The windows indexed at startup, by view: each window's range and
@@ -130,6 +137,29 @@ struct GroupFiles {
     active: Option<ActiveSegment>,
     /// Sealed segments, oldest first.
     sealed: Vec<Arc<Segment>>,
+}
+
+impl GroupFiles {
+    /// Seals the active segment.
+    fn seal_active(&mut self) -> std::io::Result<()> {
+        if let Some(active) = self.active.take() {
+            active.segment.seal()?;
+            self.sealed.push(active.segment);
+        }
+        Ok(())
+    }
+
+    /// Marks cold every sealed segment but the newest: queries read a
+    /// view's newest windows on every evaluation (the active segment and
+    /// the newest sealed one), while an older window is read only once
+    /// more, when it leaves a range's far edge. Returns how many it marked.
+    fn cool(&self) -> u64 {
+        let behind_newest = self.sealed.len().saturating_sub(1);
+        self.sealed[..behind_newest]
+            .iter()
+            .filter(|segment| segment.mark_cold())
+            .count() as u64
+    }
 }
 
 /// The view files of some refresh groups in one directory, for one plan.
@@ -252,10 +282,8 @@ impl ViewFiles {
     /// one.
     pub fn seal(&mut self, group: usize) -> std::io::Result<()> {
         let files = self.groups.entry(group).or_default();
-        if let Some(active) = files.active.take() {
-            active.segment.seal()?;
-            files.sealed.push(active.segment);
-        }
+        files.seal_active()?;
+        files.cool();
         self.unsynced.remove(&group);
         Ok(())
     }
@@ -316,9 +344,8 @@ impl ViewFiles {
             .as_ref()
             .is_some_and(|active| start_ms >= active.first_start_ms.saturating_add(segment_ms))
         {
-            let active = files.active.take().expect("checked");
-            active.segment.seal()?;
-            files.sealed.push(active.segment);
+            files.seal_active()?;
+            written.segments_marked_cold = files.cool();
         }
         if files.active.is_none() {
             files.active = Some(ActiveSegment {
@@ -460,6 +487,7 @@ impl ViewFiles {
                 }
                 files.sealed.push(segment);
             }
+            files.cool();
             for (view, _) in group_views {
                 let Some(mut windows) = by_view.remove(&view.node_id) else {
                     continue;
@@ -1376,6 +1404,48 @@ mod tests {
         assert_eq!(segments(&dir), 1);
         // The active segment is never deleted.
         assert_eq!(files.delete_expired(0, 1_000).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Once a newer sealed segment exists, older sealed segments are marked
+    /// cold (their pages advised cold, once each): only the newest sealed
+    /// segment and the active one stay hot. A cold segment reads back the
+    /// same rows.
+    #[test]
+    fn segments_behind_the_newest_sealed_one_are_marked_cold() {
+        let dir = segment_dir("cold");
+        let (_, batch) = every_family().remove(0);
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO)
+            .unwrap()
+            .with_segment_ms(20);
+        let mut locations = Vec::new();
+        let mut marked_cold = 0;
+        for end in (10..=80).step_by(10) {
+            let written = files
+                .append(0, (end - 10, end), &[(1, std::slice::from_ref(&batch))])
+                .unwrap();
+            marked_cold += written.segments_marked_cold;
+            locations.push(location_of(&written, 1));
+            if end == 20 {
+                // Map the first segment before it turns cold: the advice
+                // applies to a live mapping.
+                files.seal(0).unwrap();
+                locations[0].read(batch.schema(), ViewRead::Mmap).unwrap();
+            }
+        }
+        // Segments (0, 20], (20, 40], (40, 60] sealed; (60, 80] active.
+        let cold: Vec<bool> = locations.iter().map(WindowLocation::is_cold).collect();
+        assert_eq!(
+            cold,
+            [true, true, true, true, false, false, false, false],
+            "only (0, 20] and (20, 40] are behind the newest sealed segment"
+        );
+        assert_eq!(marked_cold, 2, "each segment is marked once");
+        files.seal(0).unwrap();
+        assert!(locations[4].is_cold(), "sealing (60, 80] cools (40, 60]");
+        assert!(!locations[6].is_cold());
+        let read = locations[0].read(batch.schema(), ViewRead::Mmap).unwrap();
+        assert_same_rows(&batch, &read, "a cold segment");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -167,6 +167,8 @@ pub struct Segment {
     /// Bytes of whole frames written.
     len: AtomicU64,
     sealed: AtomicBool,
+    /// Whether its pages were advised cold ([`Segment::mark_cold`]).
+    cold: AtomicBool,
     mapping: OnceLock<Result<Arc<Mapping>, String>>,
     /// The texts of its records, by key.
     texts: RwLock<Vec<Arc<str>>>,
@@ -229,6 +231,7 @@ impl Segment {
             file,
             len: AtomicU64::new(bytes.len() as u64),
             sealed: AtomicBool::new(false),
+            cold: AtomicBool::new(false),
             mapping: OnceLock::new(),
             texts: RwLock::new(Vec::new()),
             dictionary: Mutex::new(None),
@@ -302,6 +305,7 @@ impl Segment {
                 file,
                 len: AtomicU64::new(offset),
                 sealed: AtomicBool::new(true),
+                cold: AtomicBool::new(false),
                 mapping: OnceLock::new(),
                 texts: RwLock::new(texts),
                 dictionary: Mutex::new(None),
@@ -338,6 +342,43 @@ impl Segment {
         self.file.sync_data()?;
         self.sealed.store(true, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Whether its pages were advised cold.
+    pub fn is_cold(&self) -> bool {
+        self.cold.load(Ordering::SeqCst)
+    }
+
+    /// Advises the kernel, once, that a sealed segment's pages are cold:
+    /// no query reads them often any more, so they should leave the
+    /// active LRU list (which, without memory pressure, the kernel never
+    /// ages) and be the first page cache reclaimed. `MADV_COLD` deactivates
+    /// the pages its mapping maps and keeps them cached; the pages read
+    /// with `pread` while it was the active segment are cached but not
+    /// mapped, out of `MADV_COLD`'s reach, so `POSIX_FADV_DONTNEED` drops
+    /// those (they are clean: a sealed segment is synced). A later read
+    /// maps or reads them again: answers never change. Returns whether
+    /// this call marked it.
+    pub(crate) fn mark_cold(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        if !self.is_sealed() || self.cold.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        if let Some(Ok(mapping)) = self.mapping.get() {
+            // SAFETY: the whole live mapping; advice only.
+            unsafe { libc::madvise(mapping.ptr.as_ptr().cast(), mapping.len, libc::MADV_COLD) };
+        }
+        // SAFETY: a valid open descriptor; advice only (mapped pages are
+        // left to `MADV_COLD`).
+        unsafe {
+            libc::posix_fadvise(
+                self.file.as_raw_fd(),
+                0,
+                self.len() as libc::off_t,
+                libc::POSIX_FADV_DONTNEED,
+            )
+        };
+        true
     }
 
     pub(crate) fn sync(&self) -> std::io::Result<()> {
@@ -502,6 +543,11 @@ impl WindowLocation {
     /// Whether its segment is sealed (and so read through a mapping).
     pub fn is_sealed(&self) -> bool {
         self.segment.is_sealed()
+    }
+
+    /// Whether its segment's pages were advised cold.
+    pub fn is_cold(&self) -> bool {
+        self.segment.is_cold()
     }
 
     /// Whether `address` lies inside its segment's mapping.

@@ -215,6 +215,8 @@ pub struct Metrics {
     pub view_persist_over_bound: AtomicU64,
     /// Bytes of the view files (segments) held.
     pub view_file_bytes: AtomicU64,
+    /// View segments whose pages were advised cold.
+    pub view_segments_marked_cold: AtomicU64,
     /// The views' cold tier, when they are persisted.
     pub view_tier: std::sync::OnceLock<std::sync::Arc<crate::store::ViewTier>>,
 }
@@ -255,6 +257,7 @@ impl Metrics {
             view_windows_loaded: AtomicU64::new(0),
             view_persist_over_bound: AtomicU64::new(0),
             view_file_bytes: AtomicU64::new(0),
+            view_segments_marked_cold: AtomicU64::new(0),
             view_tier: std::sync::OnceLock::new(),
         }
     }
@@ -539,6 +542,11 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
             "asap_view_windows_not_persisted_total",
             "View windows not written to the view files (a sketch state, or an error).",
             load(&metrics.view_windows_not_persisted),
+        ),
+        (
+            "asap_view_segments_marked_cold_total",
+            "View segments whose pages were advised cold (MADV_COLD, POSIX_FADV_DONTNEED) once a newer sealed segment of their refresh group existed.",
+            load(&metrics.view_segments_marked_cold),
         ),
         (
             "asap_view_persist_over_bound_total",

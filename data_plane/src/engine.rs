@@ -2136,6 +2136,9 @@ fn serve_persist(
                         metrics
                             .view_windows_not_persisted
                             .fetch_add(written.not_persisted + skipped, Ordering::Relaxed);
+                        metrics
+                            .view_segments_marked_cold
+                            .fetch_add(written.segments_marked_cold, Ordering::Relaxed);
                         written.locations
                     }
                     Err(error) => {
