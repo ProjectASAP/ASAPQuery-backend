@@ -5,52 +5,31 @@ mod common;
 
 use std::sync::Arc;
 
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::StatusCode;
 use axum::Router;
 use control_plane::plan_workload;
 use data_plane::engine::EngineOptions;
 use data_plane::ingestion::IngestionOptions;
-use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
-use data_plane::{router, DataPlane, EXECUTION_HEADER};
-use http_body_util::BodyExt;
-use serde_json::{json, Value};
-use tower::ServiceExt;
+use data_plane::remote_write::{Label, Sample, TimeSeries};
+use data_plane::{router, DataPlane};
+use serde_json::json;
 
 const QUERY: &str = "sum by (job) (sum_over_time(data[10s]))";
 
 /// The plan of `QUERY` every 10 s, each request a range over the last 30 s
 /// at 10 s steps, without raw samples kept.
 fn plan_json() -> String {
-    let workload = serde_json::from_value(json!({
-        "query_workload": {"language": "promql", "repeating_queries": [{
-            "query": QUERY,
-            "demand": {"fixed_interval_at": {"interval": 10000, "evaluation_phase": 0}},
-            "requirements": {},
-            "predictability": {"predictable": {"known_at": null}},
-            "range_evaluation": {"step_ms": 10000, "span_ms": 30000},
-        }]},
-        "data_workload": {"arrival": {"ingesting": {"rows_per_second": 2.0}},
-          "sources": {"data": {"series_count": 2, "sample_interval": 1000,
-            "metric_type": "gauge", "column_signs": {"value": "non_negative"}}}},
-    }))
-    .unwrap();
-    let plan = plan_workload(&workload, &common::inputs(false)).unwrap().0;
-    serde_json::to_string(&plan).unwrap()
+    common::one_query_plan_json(
+        QUERY,
+        2,
+        json!({"range_evaluation": {"step_ms": 10000, "span_ms": 30000}}),
+    )
 }
 
 /// A data plane with two series of `data` sampled every second for 60 s,
 /// every window closed.
 async fn data_plane() -> Router {
-    let options = EngineOptions {
-        no_forward: true,
-        ingestion: IngestionOptions {
-            allowed_lateness_ms: 0,
-            stream_start_ms: Some(0),
-            ..IngestionOptions::default()
-        },
-        ..EngineOptions::default()
-    };
+    let options = common::no_forward_options();
     let state = Arc::new(
         DataPlane::with_options(plan_json(), "http://127.0.0.1:1".into(), options).unwrap(),
     );
@@ -77,42 +56,9 @@ async fn data_plane() -> Router {
                 .collect(),
         })
         .collect();
-    let written = app
-        .clone()
-        .oneshot(
-            Request::post("/api/v1/write")
-                .body(Body::from(encode(&WriteRequest { timeseries })))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(written.status(), StatusCode::NO_CONTENT);
-    let barrier = app
-        .clone()
-        .oneshot(
-            Request::post("/api/v1/precompute/watermark?time_ms=60000")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(barrier.status(), StatusCode::OK);
+    common::remote_write(&app, timeseries).await;
+    common::barrier(&app, 60_000).await;
     app
-}
-
-async fn get(app: &Router, uri: String) -> (StatusCode, Option<String>, Value) {
-    let response = app
-        .clone()
-        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let status = response.status();
-    let execution = response
-        .headers()
-        .get(EXECUTION_HEADER)
-        .map(|v| v.to_str().unwrap().to_string());
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    (status, execution, serde_json::from_slice(&body).unwrap())
 }
 
 fn encoded(query: &str) -> String {
@@ -124,9 +70,9 @@ fn encoded(query: &str) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_planned_range_query_answers_as_its_steps_do() {
     let app = data_plane().await;
-    let (status, execution, body) = get(
+    let (status, execution, body) = common::get(
         &app,
-        format!(
+        &format!(
             "/api/v1/query_range?query={}&start=30&end=60&step=10s",
             encoded(QUERY)
         ),
@@ -138,9 +84,9 @@ async fn a_planned_range_query_answers_as_its_steps_do() {
     let series = body["data"]["result"].as_array().unwrap();
     assert_eq!(series.len(), 2, "{body}");
     for time_s in [30, 40, 50, 60] {
-        let (status, _, instant) = get(
+        let (status, _, instant) = common::get(
             &app,
-            format!("/api/v1/query?query={}&time={time_s}", encoded(QUERY)),
+            &format!("/api/v1/query?query={}&time={time_s}", encoded(QUERY)),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{instant}");
@@ -167,11 +113,8 @@ async fn a_planned_range_query_answers_as_its_steps_do() {
 #[tokio::test]
 async fn refuses_an_unplanned_range_query() {
     let app = data_plane().await;
-    let (status, execution, body) = get(
-        &app,
-        "/api/v1/query_range?query=up&start=0&end=60&step=15".into(),
-    )
-    .await;
+    let (status, execution, body) =
+        common::get(&app, "/api/v1/query_range?query=up&start=0&end=60&step=15").await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(execution.as_deref(), Some("refused"));
     assert!(
@@ -184,22 +127,14 @@ async fn refuses_an_unplanned_range_query() {
 /// query's, not as instant queries.
 #[tokio::test(flavor = "multi_thread")]
 async fn range_steps_are_measured_apart_from_instant_queries() {
-    let options = EngineOptions {
-        no_forward: true,
-        ingestion: IngestionOptions {
-            allowed_lateness_ms: 0,
-            stream_start_ms: Some(0),
-            ..IngestionOptions::default()
-        },
-        ..EngineOptions::default()
-    };
+    let options = common::no_forward_options();
     let state = Arc::new(
         DataPlane::with_options(plan_json(), "http://127.0.0.1:1".into(), options).unwrap(),
     );
     let app = router(state.clone());
-    let (status, _, body) = get(
+    let (status, _, body) = common::get(
         &app,
-        format!(
+        &format!(
             "/api/v1/query_range?query={}&start=30&end=60&step=10",
             encoded(QUERY)
         ),
@@ -293,29 +228,8 @@ async fn a_refreshed_range_reads_its_older_steps_from_the_result_cache() {
                     .collect(),
             })
             .collect();
-        let written = app
-            .clone()
-            .oneshot(
-                Request::post("/api/v1/write")
-                    .body(Body::from(encode(&WriteRequest { timeseries })))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(written.status(), StatusCode::NO_CONTENT);
-        let barrier = app
-            .clone()
-            .oneshot(
-                Request::post(format!(
-                    "/api/v1/precompute/watermark?time_ms={}",
-                    to_s * 1000
-                ))
-                .body(Body::empty())
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(barrier.status(), StatusCode::OK);
+        common::remote_write(&app, timeseries).await;
+        common::barrier(&app, to_s * 1000).await;
     };
     let range = |end_s: i64| {
         format!(
@@ -331,13 +245,13 @@ async fn a_refreshed_range_reads_its_older_steps_from_the_result_cache() {
     // answered.
     let refreshed = start();
     write(refreshed.clone(), 0, 60).await;
-    let (status, _, body) = get(&refreshed, range(60)).await;
+    let (status, _, body) = common::get(&refreshed, &range(60)).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     for to_s in (70..=120).step_by(10) {
         write(refreshed.clone(), to_s - 10, to_s).await;
-        get(&refreshed, range(to_s)).await;
+        common::get(&refreshed, &range(to_s)).await;
     }
-    let (status, _, body) = get(&refreshed, range(120)).await;
+    let (status, _, body) = common::get(&refreshed, &range(120)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     for series in body["data"]["result"].as_array().unwrap() {
         let scale = if series["metric"]["job"] == "a" { 1 } else { 2 };
@@ -354,6 +268,6 @@ async fn a_refreshed_range_reads_its_older_steps_from_the_result_cache() {
     // windows are gone and nothing is cached.
     let cold = start();
     write(cold.clone(), 0, 120).await;
-    let (status, _, body) = get(&cold, range(120)).await;
+    let (status, _, body) = common::get(&cold, &range(120)).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
 }

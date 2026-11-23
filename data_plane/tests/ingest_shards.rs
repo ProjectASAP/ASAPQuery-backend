@@ -14,26 +14,13 @@ use data_plane::engine::EngineOptions;
 use data_plane::ingestion::IngestionOptions;
 use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use data_plane::{router, DataPlane};
-use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
 const QUERY: &str = "sum by (job) (sum_over_time(data[30s]))";
 
 fn plan_json() -> String {
-    let workload = serde_json::from_value(json!({
-        "query_workload": {"language": "promql", "repeating_queries": [{
-            "query": QUERY,
-            "demand": {"fixed_interval_at": {"interval": 10000, "evaluation_phase": 0}},
-            "requirements": {},
-            "predictability": {"predictable": {"known_at": null}},
-        }]},
-        "data_workload": {"arrival": {"ingesting": {"rows_per_second": 64.0}},
-          "sources": {"data": {"series_count": 64, "sample_interval": 1000,
-            "metric_type": "gauge", "column_signs": {"value": "non_negative"}}}},
-    }))
-    .unwrap();
-    serde_json::to_string(&plan_workload(&workload, &common::inputs(false)).unwrap().0).unwrap()
+    common::one_query_plan_json(QUERY, 64, json!({}))
 }
 
 fn data_plane(ingest_threads: usize) -> (Router, Arc<DataPlane>) {
@@ -42,15 +29,9 @@ fn data_plane(ingest_threads: usize) -> (Router, Arc<DataPlane>) {
 
 fn data_plane_with(ingest_threads: usize, shard_delay_ms: u64) -> (Router, Arc<DataPlane>) {
     let options = EngineOptions {
-        no_forward: true,
         ingest_threads,
         shard_delay_ms,
-        ingestion: IngestionOptions {
-            allowed_lateness_ms: 0,
-            stream_start_ms: Some(0),
-            ..IngestionOptions::default()
-        },
-        ..EngineOptions::default()
+        ..common::no_forward_options()
     };
     let state = Arc::new(
         DataPlane::with_options(plan_json(), "http://127.0.0.1:1".into(), options).unwrap(),
@@ -83,16 +64,7 @@ async fn write(app: &Router, series: usize) {
                     .collect(),
             })
             .collect();
-        let written = app
-            .clone()
-            .oneshot(
-                Request::post("/api/v1/write")
-                    .body(Body::from(encode(&WriteRequest { timeseries })))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(written.status(), StatusCode::NO_CONTENT);
+        common::remote_write(app, timeseries).await;
     }
 }
 
@@ -104,35 +76,7 @@ async fn answer(app: &Router, time_s: i64) -> Value {
 
 /// The status of `QUERY` at `time_s` and its body, results sorted by job.
 async fn status_and_answer(app: &Router, time_s: i64) -> (StatusCode, Value) {
-    let uri = format!(
-        "/api/v1/query?query={}&time={time_s}",
-        form_urlencoded::byte_serialize(QUERY.as_bytes()).collect::<String>()
-    );
-    let response = app
-        .clone()
-        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let status = response.status();
-    let mut body: Value =
-        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    if let Some(result) = body["data"]["result"].as_array_mut() {
-        result.sort_by_key(|s| s["metric"]["job"].as_str().unwrap().to_string());
-    }
-    (status, body)
-}
-
-async fn barrier(app: &Router, time_ms: i64) {
-    let response = app
-        .clone()
-        .oneshot(
-            Request::post(format!("/api/v1/precompute/watermark?time_ms={time_ms}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    status_and_answer_of(app, QUERY, time_s * 1000).await
 }
 
 /// 64 series over four shards answer as over one: each window's views are
@@ -143,7 +87,7 @@ async fn views_over_several_shards_equal_views_over_one() {
     let (four, _four_state) = data_plane(4);
     for app in [&one, &four] {
         write(app, 64).await;
-        barrier(app, 600_000).await;
+        common::barrier(app, 600_000).await;
     }
     for time_s in [560, 570, 580, 590, 600] {
         assert_eq!(
@@ -165,7 +109,7 @@ async fn a_shard_running_ahead_does_not_close_windows_early() {
     let (eight, _eight_state) = data_plane_with(8, 20);
     for app in [&one, &eight] {
         write(app, 64).await;
-        barrier(app, 600_000).await;
+        common::barrier(app, 600_000).await;
     }
     let mut answered = 0;
     for time_s in (30..=600).step_by(10) {
@@ -209,16 +153,7 @@ async fn write_seconds(
                 .collect(),
         })
         .collect();
-    let written = app
-        .clone()
-        .oneshot(
-            Request::post("/api/v1/write")
-                .body(Body::from(encode(&WriteRequest { timeseries })))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(written.status(), StatusCode::NO_CONTENT);
+    common::remote_write(app, timeseries).await;
 }
 
 /// The value of series `i` at `second`, as [`write`] writes it.
@@ -240,20 +175,6 @@ fn expected(time_s: i64) -> Vec<(String, f64)> {
         .collect()
 }
 
-fn per_job(body: &Value) -> Vec<(String, f64)> {
-    body["data"]["result"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|s| {
-            (
-                s["metric"]["job"].as_str().unwrap().to_string(),
-                s["value"][1].as_str().unwrap().parse().unwrap(),
-            )
-        })
-        .collect()
-}
-
 /// A scraper sends one timestamp over several requests. Half the series'
 /// samples at 30 s, the end of the window `(20, 30]`, come in a later
 /// request than the rest, after other samples at 30 s were routed; they
@@ -269,19 +190,19 @@ async fn samples_at_a_window_end_in_a_later_request_join_the_window() {
         write_seconds(&app, 0..32, 30..=30).await;
         write_seconds(&app, 32..64, 30..=30).await;
         write_seconds(&app, 0..64, 31..=40).await;
-        barrier(&app, 40_000).await;
+        common::barrier(&app, 40_000).await;
         assert_eq!(
             state.engine.stats().samples_dropped_late,
             0,
             "{shards} shards"
         );
         assert_eq!(
-            per_job(&answer(&app, 30).await),
+            common::per_job(&answer(&app, 30).await),
             expected(30),
             "{shards} shards"
         );
         assert_eq!(
-            per_job(&answer(&app, 40).await),
+            common::per_job(&answer(&app, 40).await),
             expected(40),
             "{shards} shards"
         );
@@ -296,7 +217,7 @@ async fn a_late_sample_is_dropped_on_any_shard_count() {
     for shards in [1, 8] {
         let (app, state) = data_plane(shards);
         write_seconds(&app, 0..64, 1..=40).await;
-        barrier(&app, 40_000).await;
+        common::barrier(&app, 40_000).await;
         // Series 5 at 25 s again, with another value: the window (20, 30] is
         // closed.
         let timeseries = vec![TimeSeries {
@@ -312,17 +233,8 @@ async fn a_late_sample_is_dropped_on_any_shard_count() {
                 value: 1000.0,
             }],
         }];
-        let written = app
-            .clone()
-            .oneshot(
-                Request::post("/api/v1/write")
-                    .body(Body::from(encode(&WriteRequest { timeseries })))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(written.status(), StatusCode::NO_CONTENT);
-        barrier(&app, 40_000).await;
+        common::remote_write(&app, timeseries).await;
+        common::barrier(&app, 40_000).await;
         let started = std::time::Instant::now();
         while state.engine.stats().samples_dropped_late < 1 {
             assert!(started.elapsed().as_secs() < 10, "{shards} shards");
@@ -334,7 +246,7 @@ async fn a_late_sample_is_dropped_on_any_shard_count() {
             "{shards} shards"
         );
         assert_eq!(
-            per_job(&answer(&app, 30).await),
+            common::per_job(&answer(&app, 30).await),
             expected(30),
             "{shards} shards"
         );
@@ -402,13 +314,6 @@ fn clock_data_plane(
     (router(state.clone()), state)
 }
 
-fn wall_clock_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
-}
-
 /// A feeder stamps samples up to a second ahead of the wall clock, each
 /// series at its own offset, as the demo's feeder does; the watermark then
 /// follows the wall clock, which moves with every shard's report even when
@@ -416,16 +321,16 @@ fn wall_clock_ms() -> i64 {
 /// still hold every sample: the watermark moves only behind a flush.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_watermark_capped_at_the_clock_moves_only_behind_a_flush() {
-    let start_ms = (wall_clock_ms() / 1000 + 1) * 1000;
+    let start_ms = (data_plane::ingestion::wall_clock_ms() / 1000 + 1) * 1000;
     let (app, state) = clock_data_plane(4, 250, start_ms);
-    while wall_clock_ms() < start_ms {
+    while data_plane::ingestion::wall_clock_ms() < start_ms {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     // Every 100 ms for 3 s: each series one sample, series i stamped
     // (i + 1) / 64 s after the send time.
     let mut sent: Vec<(usize, i64)> = Vec::new();
     for _ in 0..30 {
-        let now_ms = wall_clock_ms();
+        let now_ms = data_plane::ingestion::wall_clock_ms();
         let timeseries = (0..64usize)
             .map(|i| {
                 let timestamp = now_ms + (i as i64 + 1) * 1000 / 64;
@@ -449,23 +354,14 @@ async fn a_watermark_capped_at_the_clock_moves_only_behind_a_flush() {
                 }
             })
             .collect();
-        let written = app
-            .clone()
-            .oneshot(
-                Request::post("/api/v1/write")
-                    .body(Body::from(encode(&WriteRequest { timeseries })))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(written.status(), StatusCode::NO_CONTENT);
+        common::remote_write(&app, timeseries).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     let last_ms = sent.iter().map(|(_, t)| *t).max().unwrap();
-    while wall_clock_ms() <= last_ms {
+    while data_plane::ingestion::wall_clock_ms() <= last_ms {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    barrier(&app, last_ms).await;
+    common::barrier(&app, last_ms).await;
     assert_eq!(state.engine.stats().samples_dropped_late, 0);
     let mut times = 0;
     for time_ms in (start_ms + 2000..=last_ms).step_by(1000) {
@@ -480,7 +376,7 @@ async fn a_watermark_capped_at_the_clock_moves_only_behind_a_flush() {
             .collect();
         let (status, body) = status_and_answer_of(&app, CLOCK_QUERY, time_ms).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(per_job(&body), expected, "at {time_ms}");
+        assert_eq!(common::per_job(&body), expected, "at {time_ms}");
         times += 1;
     }
     assert!(times >= 1);
@@ -493,14 +389,7 @@ async fn status_and_answer_of(app: &Router, query: &str, time_ms: i64) -> (Statu
         form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>(),
         time_ms as f64 / 1000.0
     );
-    let response = app
-        .clone()
-        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let status = response.status();
-    let mut body: Value =
-        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let (status, _, mut body) = common::get(app, &uri).await;
     if let Some(result) = body["data"]["result"].as_array_mut() {
         result.sort_by_key(|s| s["metric"]["job"].as_str().unwrap().to_string());
     }
@@ -518,7 +407,6 @@ async fn a_precompute_that_cannot_keep_up_reaches_remote_write() {
         std::env::temp_dir().join(format!("ingest-shards-backpressure-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let options = EngineOptions {
-        no_forward: true,
         ingest_threads: 4,
         max_queued_samples: 2_000,
         max_precompute_backlog: 1,
@@ -526,12 +414,7 @@ async fn a_precompute_that_cannot_keep_up_reaches_remote_write() {
         persist_threads: 1,
         persist_delay_ms: 2_000,
         max_persist_backlog_bytes: 1,
-        ingestion: IngestionOptions {
-            allowed_lateness_ms: 0,
-            stream_start_ms: Some(0),
-            ..IngestionOptions::default()
-        },
-        ..EngineOptions::default()
+        ..common::no_forward_options()
     };
     let state = Arc::new(
         DataPlane::with_options(plan_json(), "http://127.0.0.1:1".into(), options).unwrap(),
@@ -583,18 +466,6 @@ async fn a_precompute_that_cannot_keep_up_reaches_remote_write() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The status of a barrier at `time_ms`.
-async fn barrier_status(app: Router, time_ms: i64) -> StatusCode {
-    app.oneshot(
-        Request::post(format!("/api/v1/precompute/watermark?time_ms={time_ms}"))
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await
-    .unwrap()
-    .status()
-}
-
 /// A barrier that comes while the coordinator waits for another
 /// barrier's flush covers the writes acknowledged before it: it takes the
 /// next pass, behind its own flush. Here three slow shards hold the first
@@ -603,12 +474,15 @@ async fn barrier_status(app: Router, time_ms: i64) -> StatusCode {
 async fn a_barrier_during_another_barriers_flush_covers_writes_before_it() {
     let (app, _state) = data_plane_with(4, 300);
     write_seconds(&app, 0..64, 1..=60).await;
-    let first = tokio::spawn(barrier_status(app.clone(), 60_000));
+    let first = tokio::spawn(common::barrier_status(app.clone(), 60_000));
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     write_seconds(&app, 0..64, 61..=70).await;
-    assert_eq!(barrier_status(app.clone(), 70_000).await, StatusCode::OK);
+    assert_eq!(
+        common::barrier_status(app.clone(), 70_000).await,
+        StatusCode::OK
+    );
     assert_eq!(first.await.unwrap(), StatusCode::OK);
-    assert_eq!(per_job(&answer(&app, 70).await), expected(70));
+    assert_eq!(common::per_job(&answer(&app, 70).await), expected(70));
 }
 
 /// Two barriers that come while one flush is waited for both answer.
@@ -617,11 +491,11 @@ async fn barriers_during_one_flush_all_answer() {
     let (app, _state) = data_plane_with(4, 300);
     write_seconds(&app, 0..64, 1..=60).await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let first = tokio::spawn(barrier_status(app.clone(), 50_000));
-    let second = tokio::spawn(barrier_status(app.clone(), 60_000));
+    let first = tokio::spawn(common::barrier_status(app.clone(), 50_000));
+    let second = tokio::spawn(common::barrier_status(app.clone(), 60_000));
     assert_eq!(first.await.unwrap(), StatusCode::OK);
     assert_eq!(second.await.unwrap(), StatusCode::OK);
-    assert_eq!(per_job(&answer(&app, 60).await), expected(60));
+    assert_eq!(common::per_job(&answer(&app, 60).await), expected(60));
 }
 
 /// A sample stamped further from the epoch than the data plane evaluates
@@ -647,18 +521,9 @@ async fn a_sample_beyond_the_time_range_is_dropped() {
             })
             .collect(),
     }];
-    let written = app
-        .clone()
-        .oneshot(
-            Request::post("/api/v1/write")
-                .body(Body::from(encode(&WriteRequest { timeseries })))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(written.status(), StatusCode::NO_CONTENT);
+    common::remote_write(&app, timeseries).await;
     write(&app, 4).await;
-    barrier(&app, 600_000).await;
+    common::barrier(&app, 600_000).await;
     assert!(state.engine.is_running());
     assert_eq!(state.engine.stats().samples_dropped_late, 2);
     answer(&app, 600).await;

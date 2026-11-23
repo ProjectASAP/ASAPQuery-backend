@@ -12,8 +12,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use data_plane::engine::EngineOptions;
-use data_plane::ingestion::IngestionOptions;
-use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
+use data_plane::remote_write::{Label, Sample, TimeSeries};
 use data_plane::{router, DataPlane};
 use http_body_util::BodyExt;
 use serde_json::Value;
@@ -35,14 +34,8 @@ const QUERIES: [&str; 2] = [
 /// minutes, every window closed.
 async fn data_plane(share: bool) -> (Router, Arc<DataPlane>) {
     let options = EngineOptions {
-        no_forward: true,
         share_one_evaluation_results: share,
-        ingestion: IngestionOptions {
-            allowed_lateness_ms: 0,
-            stream_start_ms: Some(0),
-            ..IngestionOptions::default()
-        },
-        ..EngineOptions::default()
+        ..common::no_forward_options()
     };
     let state = Arc::new(
         DataPlane::with_options(plan_json(), "http://127.0.0.1:1".into(), options).unwrap(),
@@ -69,26 +62,8 @@ async fn data_plane(share: bool) -> (Router, Arc<DataPlane>) {
                 .collect(),
         })
         .collect();
-    let written = app
-        .clone()
-        .oneshot(
-            Request::post("/api/v1/write")
-                .body(Body::from(encode(&WriteRequest { timeseries })))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(written.status(), StatusCode::NO_CONTENT);
-    let barrier = app
-        .clone()
-        .oneshot(
-            Request::post("/api/v1/precompute/watermark?time_ms=300000")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(barrier.status(), StatusCode::OK);
+    common::remote_write(&app, timeseries).await;
+    common::barrier(&app, 300_000).await;
     (app, state)
 }
 

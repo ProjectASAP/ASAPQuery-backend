@@ -22,8 +22,9 @@
 //! range over its last three evaluations (`range_evaluation`); the data
 //! plane's matrix equals the reference's query run at each step.
 
+mod common;
+
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 use std::sync::Arc;
 
 use asap_executor::physical_planner::compile;
@@ -40,7 +41,7 @@ use axum::Router;
 use control_plane::{plan_workload, DeploymentInputs};
 use data_plane::engine::EngineOptions;
 use data_plane::ingestion::IngestionOptions;
-use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
+use data_plane::remote_write::{Label, Sample, TimeSeries};
 use data_plane::{router, DataPlane, EXECUTION_HEADER};
 use futures::{executor::block_on, StreamExt};
 use http_body_util::BodyExt;
@@ -63,26 +64,10 @@ struct Point {
     value: f64,
 }
 
+/// The workloads compared; `PARITY_WORKLOAD=name` runs only the
+/// workloads whose name contains it.
 fn workloads() -> Vec<(String, PlanningWorkload)> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files: Vec<_> = ["../examples", "tests/workloads"]
-        .iter()
-        .flat_map(|dir| std::fs::read_dir(root.join(dir)).unwrap())
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|e| e == "json"))
-        .collect();
-    files.sort();
-    // `PARITY_WORKLOAD=name` runs only the workloads whose name contains it.
-    let only = std::env::var("PARITY_WORKLOAD").unwrap_or_default();
-    files
-        .into_iter()
-        .filter(|path| path.file_stem().unwrap().to_string_lossy().contains(&only))
-        .map(|path| {
-            let name = path.file_stem().unwrap().to_string_lossy().to_string();
-            let text = std::fs::read_to_string(&path).unwrap();
-            (name, serde_json::from_str(&text).unwrap())
-        })
-        .collect()
+    common::workloads(&std::env::var("PARITY_WORKLOAD").unwrap_or_default())
 }
 
 /// Every metric the plan scans, with the union of its `Scan`s' columns.
@@ -249,29 +234,9 @@ async fn data_plane(
                 samples,
             })
             .collect();
-        let written = app
-            .clone()
-            .oneshot(
-                Request::post("/api/v1/write")
-                    .body(Body::from(encode(&WriteRequest { timeseries })))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(written.status(), StatusCode::NO_CONTENT);
+        common::remote_write(&app, timeseries).await;
     }
-    let barrier = app
-        .clone()
-        .oneshot(
-            Request::post(format!(
-                "/api/v1/precompute/watermark?time_ms={EVALUATION_MS}"
-            ))
-            .body(Body::empty())
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(barrier.status(), StatusCode::OK);
+    common::barrier(&app, EVALUATION_MS).await;
     app
 }
 

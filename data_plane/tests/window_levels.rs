@@ -21,7 +21,6 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use control_plane::plan_workload;
 use data_plane::engine::EngineOptions;
-use data_plane::ingestion::IngestionOptions;
 use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use data_plane::{router, DataPlane};
 use http_body_util::BodyExt;
@@ -105,22 +104,6 @@ async fn answer(app: &Router, query: &str, time_s: i64) -> (StatusCode, Value) {
     (status, body)
 }
 
-fn per_job(body: &Value) -> Vec<(String, f64)> {
-    let mut rows: Vec<(String, f64)> = body["data"]["result"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|s| {
-            (
-                s["metric"]["job"].as_str().unwrap().to_string(),
-                s["value"][1].as_str().unwrap().parse().unwrap(),
-            )
-        })
-        .collect();
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-    rows
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn wider_levels_and_covers_answer_after_one_pass_closes_every_window() {
     let plan = plan();
@@ -143,14 +126,8 @@ async fn wider_levels_and_covers_answer_after_one_pass_closes_every_window() {
         "{retentions:?}"
     );
     let options = EngineOptions {
-        no_forward: true,
         precompute_threads: 4,
-        ingestion: IngestionOptions {
-            allowed_lateness_ms: 0,
-            stream_start_ms: Some(0),
-            ..IngestionOptions::default()
-        },
-        ..EngineOptions::default()
+        ..common::no_forward_options()
     };
     let state = Arc::new(
         DataPlane::with_options(
@@ -202,7 +179,7 @@ async fn wider_levels_and_covers_answer_after_one_pass_closes_every_window() {
             let (status, body) = answer(&app, query, time_s).await;
             assert_eq!(status, StatusCode::OK, "{query} at {time_s}: {body}");
             assert_eq!(
-                per_job(&body),
+                common::per_job(&body),
                 expected(query, time_s),
                 "{query} at {time_s}"
             );

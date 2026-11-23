@@ -21,7 +21,7 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use control_plane::plan_workload;
 use data_plane::engine::EngineOptions;
-use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
+use data_plane::remote_write::{Label, Sample, TimeSeries};
 use data_plane::{router, DataPlane, EXECUTION_HEADER};
 use http_body_util::BodyExt;
 use serde_json::Value;
@@ -72,7 +72,7 @@ async fn run(plan: &InstallablePlan, points: &[Point]) -> (Router, Arc<DataPlane
     );
     let app = router(state.clone());
     write_points(&app, &state, points).await;
-    barrier(&app, EVALUATION_MS).await;
+    common::barrier(&app, EVALUATION_MS).await;
     (app, state)
 }
 
@@ -110,16 +110,7 @@ async fn write_points(app: &Router, state: &DataPlane, points: &[Point]) {
                 }
             })
             .collect();
-        let written = app
-            .clone()
-            .oneshot(
-                Request::post("/api/v1/write")
-                    .body(Body::from(encode(&WriteRequest { timeseries })))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(written.status(), StatusCode::NO_CONTENT);
+        common::remote_write(app, timeseries).await;
     }
     for _ in 0..1000 {
         if state.engine.queued_samples() == 0 {
@@ -127,21 +118,6 @@ async fn write_points(app: &Router, state: &DataPlane, points: &[Point]) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-}
-
-/// The event-time barrier at `time_ms`: every window ending at or before
-/// it is refreshed.
-async fn barrier(app: &Router, time_ms: i64) {
-    let barrier = app
-        .clone()
-        .oneshot(
-            Request::post(format!("/api/v1/precompute/watermark?time_ms={time_ms}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(barrier.status(), StatusCode::OK);
 }
 
 /// The answer of `query` at `EVALUATION_MS`: each result series' labels and
@@ -827,6 +803,6 @@ async fn a_query_behind_the_newest_window_is_still_answered() {
         })
         .collect();
     write_points(&app, &state, &later).await;
-    barrier(&app, EVALUATION_MS + 40_000).await;
+    common::barrier(&app, EVALUATION_MS + 40_000).await;
     assert_eq!(answer(&app, query).await, before);
 }

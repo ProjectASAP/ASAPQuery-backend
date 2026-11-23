@@ -7,36 +7,18 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::StatusCode;
 use axum::Router;
-use control_plane::plan_workload;
-use data_plane::engine::EngineOptions;
-use data_plane::ingestion::IngestionOptions;
-use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
+use data_plane::remote_write::{Label, Sample, TimeSeries};
 use data_plane::{router, DataPlane};
-use http_body_util::BodyExt;
-use serde_json::Value;
-use tower::ServiceExt;
+use serde_json::{json, Value};
 
 const QUERY: &str = "sum(sum_over_time(data[10s]))";
 
 /// The plan of `QUERY` every 10 s over one series sampled every second,
 /// without raw samples kept: the query reads stored views only.
 fn plan_json() -> String {
-    let workload = serde_json::from_str(&format!(
-        r#"{{"query_workload": {{"language": "promql", "repeating_queries": [
-              {{"query": {QUERY:?},
-                "demand": {{"fixed_interval_at": {{"interval": 10000, "evaluation_phase": 0}}}},
-                "requirements": {{}},
-                "predictability": {{"predictable": {{"known_at": null}}}}}}]}},
-            "data_workload": {{"arrival": {{"ingesting": {{"rows_per_second": 1.0}}}},
-              "sources": {{"data": {{"series_count": 1, "sample_interval": 1000,
-                "metric_type": "gauge", "column_signs": {{"value": "non_negative"}}}}}}}}}}"#
-    ))
-    .unwrap();
-    let plan = plan_workload(&workload, &common::inputs(false)).unwrap().0;
-    serde_json::to_string(&plan).unwrap()
+    common::one_query_plan_json(QUERY, 1, json!({}))
 }
 
 /// Writes one sample of `value` every second in `(from_s, to_s]`.
@@ -54,43 +36,13 @@ async fn write(app: &Router, from_s: i64, to_s: i64, value: f64) {
         }],
         samples,
     }];
-    let response = app
-        .clone()
-        .oneshot(
-            Request::post("/api/v1/write")
-                .body(Body::from(encode(&WriteRequest { timeseries })))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-}
-
-async fn barrier(app: Router, time_ms: i64) -> StatusCode {
-    app.oneshot(
-        Request::post(format!("/api/v1/precompute/watermark?time_ms={time_ms}"))
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await
-    .unwrap()
-    .status()
+    common::remote_write(app, timeseries).await;
 }
 
 /// The status code and body of `QUERY` at `time_s`.
 async fn query(app: &Router, time_s: i64) -> (StatusCode, Value) {
-    let uri = format!(
-        "/api/v1/query?query={}&time={time_s}",
-        form_urlencoded::byte_serialize(QUERY.as_bytes()).collect::<String>()
-    );
-    let response = app
-        .clone()
-        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let status = response.status();
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    (status, serde_json::from_slice(&body).unwrap())
+    let (status, _, body) = common::get(app, &common::instant_uri(QUERY, time_s)).await;
+    (status, body)
 }
 
 fn value(body: &Value) -> f64 {
@@ -109,29 +61,24 @@ fn value(body: &Value) -> f64 {
 // The test holds the precompute gate across awaits on purpose.
 #[allow(clippy::await_holding_lock)]
 async fn queries_are_answered_while_a_refresh_runs() {
-    let options = EngineOptions {
-        no_forward: true,
-        ingestion: IngestionOptions {
-            allowed_lateness_ms: 0,
-            stream_start_ms: Some(0),
-            ..IngestionOptions::default()
-        },
-        ..EngineOptions::default()
-    };
+    let options = common::no_forward_options();
     let state = Arc::new(
         DataPlane::with_options(plan_json(), "http://127.0.0.1:1".into(), options).unwrap(),
     );
     let app = router(state.clone());
 
     write(&app, 0, 20, 1.0).await;
-    assert_eq!(barrier(app.clone(), 20_000).await, StatusCode::OK);
+    assert_eq!(
+        common::barrier_status(app.clone(), 20_000).await,
+        StatusCode::OK
+    );
     let (status, body) = query(&app, 20).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(value(&body), 10.0);
 
     let held = state.engine.hold_precompute();
     write(&app, 20, 40, 2.0).await;
-    let pending_barrier = tokio::spawn(barrier(app.clone(), 40_000));
+    let pending_barrier = tokio::spawn(common::barrier_status(app.clone(), 40_000));
     for _ in 0..500 {
         if state.engine.precompute_backlog() > 0 {
             break;

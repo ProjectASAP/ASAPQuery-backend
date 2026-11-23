@@ -12,10 +12,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use data_plane::engine::EngineOptions;
-use data_plane::ingestion::IngestionOptions;
-use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
+use data_plane::remote_write::{Label, Sample, TimeSeries};
 use data_plane::{router, DataPlane};
-use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -49,14 +47,8 @@ const RAW_QUERY: &str = "sum by (job) (rate(http_requests_total[1m]))";
 
 fn data_plane(plan_json: String, result_cache: bool) -> (Router, Arc<DataPlane>) {
     let options = EngineOptions {
-        no_forward: true,
         result_cache,
-        ingestion: IngestionOptions {
-            allowed_lateness_ms: 0,
-            stream_start_ms: Some(0),
-            ..IngestionOptions::default()
-        },
-        ..EngineOptions::default()
+        ..common::no_forward_options()
     };
     let state =
         Arc::new(DataPlane::with_options(plan_json, "http://127.0.0.1:1".into(), options).unwrap());
@@ -87,37 +79,13 @@ async fn write(app: &Router, metric: &str, times_ms: &[i64], barrier_ms: i64) {
                 .collect(),
         })
         .collect();
-    let written = app
-        .clone()
-        .oneshot(
-            Request::post("/api/v1/write")
-                .body(Body::from(encode(&WriteRequest { timeseries })))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(written.status(), StatusCode::NO_CONTENT);
-    let barrier = app
-        .clone()
-        .oneshot(
-            Request::post(format!("/api/v1/precompute/watermark?time_ms={barrier_ms}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(barrier.status(), StatusCode::OK);
+    common::remote_write(app, timeseries).await;
+    common::barrier(app, barrier_ms).await;
 }
 
+/// The JSON body of GET `uri`, which must answer 200.
 async fn get(app: &Router, uri: String) -> Value {
-    let response = app
-        .clone()
-        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let status = response.status();
-    let body =
-        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let (status, _, body) = common::get(app, &uri).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     body
 }
@@ -129,28 +97,8 @@ fn range_uri(query: &str, start_s: i64, end_s: i64, step_s: i64) -> String {
     )
 }
 
-fn instant_uri(query: &str, time_s: i64) -> String {
-    format!(
-        "/api/v1/query?query={}&time={time_s}",
-        form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
-    )
-}
-
-/// The value of the metric line starting with `prefix`.
-fn metric(state: &DataPlane, prefix: &str) -> u64 {
-    let text = state.engine.render_metrics();
-    text.lines()
-        .find(|l| l.starts_with(prefix))
-        .unwrap_or_else(|| panic!("{prefix} missing from\n{text}"))
-        .rsplit(' ')
-        .next()
-        .unwrap()
-        .parse::<f64>()
-        .unwrap() as u64
-}
-
 fn step_runs(state: &DataPlane) -> u64 {
-    metric(state, "asap_phase_runs_total{phase=\"query_range_step\"")
+    common::metric(state, "asap_phase_runs_total{phase=\"query_range_step\"") as u64
 }
 
 /// A repeated range request runs none of its final steps again and
@@ -165,7 +113,10 @@ async fn a_repeated_range_request_runs_only_the_steps_not_cached() {
     assert_eq!(step_runs(&state), 4);
     let second = get(&app, range_uri(VIEWS_QUERY, 30, 60, 10)).await;
     assert_eq!(step_runs(&state), 4, "every step came from the cache");
-    assert_eq!(metric(&state, "asap_range_query_steps_cached_total"), 4);
+    assert_eq!(
+        common::metric(&state, "asap_range_query_steps_cached_total") as u64,
+        4
+    );
     assert_eq!(first, second);
     let (uncached_app, uncached) = data_plane(views_plan_json(), false);
     write(&uncached_app, "data", &times, 60_000).await;
@@ -184,11 +135,14 @@ async fn an_instant_query_reads_the_range_step_at_its_time() {
     let times: Vec<i64> = (1..=60).map(|s| s * 1000).collect();
     write(&app, "data", &times, 60_000).await;
     let range = get(&app, range_uri(VIEWS_QUERY, 30, 60, 10)).await;
-    let hits = metric(&state, "asap_result_cache_hits_total");
-    let instant = get(&app, instant_uri(VIEWS_QUERY, 40)).await;
-    assert_eq!(metric(&state, "asap_result_cache_hits_total"), hits + 1);
+    let hits = common::metric(&state, "asap_result_cache_hits_total") as u64;
+    let instant = get(&app, common::instant_uri(VIEWS_QUERY, 40)).await;
     assert_eq!(
-        metric(&state, "asap_phase_runs_total{phase=\"query\","),
+        common::metric(&state, "asap_result_cache_hits_total") as u64,
+        hits + 1
+    );
+    assert_eq!(
+        common::metric(&state, "asap_phase_runs_total{phase=\"query\",") as u64,
         0,
         "the instant query did not run"
     );
@@ -260,7 +214,7 @@ async fn a_step_reaching_evicted_samples_is_refused() {
     let response = app
         .clone()
         .oneshot(
-            Request::get(instant_uri(RAW_QUERY, 120))
+            Request::get(common::instant_uri(RAW_QUERY, 120))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -268,7 +222,7 @@ async fn a_step_reaching_evicted_samples_is_refused() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(
-        metric(&state, "asap_result_cache_entries"),
+        common::metric(&state, "asap_result_cache_entries") as u64,
         0,
         "nothing cached"
     );
@@ -285,10 +239,10 @@ async fn a_sample_behind_the_watermark_does_not_change_final_answers() {
     for result_cache in [true, false] {
         let (app, state) = data_plane(common::plan_json("example1", true), result_cache);
         write(&app, "http_requests_total", &times, 240_000).await;
-        let first = get(&app, instant_uri(RAW_QUERY, 240)).await;
+        let first = get(&app, common::instant_uri(RAW_QUERY, 240)).await;
         // Within the query's 1m lookback, so not yet evicted.
         write(&app, "http_requests_total", &[230_000], 240_000).await;
-        let second = get(&app, instant_uri(RAW_QUERY, 240)).await;
+        let second = get(&app, common::instant_uri(RAW_QUERY, 240)).await;
         assert_eq!(first, second, "result cache {result_cache}");
         assert_eq!(state.engine.stats().samples_dropped_late, 2);
         answers.push(second);

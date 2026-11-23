@@ -11,13 +11,13 @@
 mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use asap_executor::planner::ir::operator::Source;
 use asap_executor::planner::ir::{NonASAPOp, Operator};
-use asap_planner::{InstallablePlan, PlanningWorkload};
+use asap_planner::InstallablePlan;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
@@ -35,36 +35,20 @@ const START_MS: i64 = 0;
 /// Through here: an hour.
 const END_MS: i64 = 3_600_000;
 
-fn workloads() -> Vec<(String, PlanningWorkload)> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files: Vec<PathBuf> = ["../examples", "tests/workloads"]
-        .iter()
-        .flat_map(|dir| std::fs::read_dir(root.join(dir)).unwrap())
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|e| e == "json"))
-        .collect();
-    files.sort();
-    files
-        .into_iter()
-        .map(|path| {
-            let name = path.file_stem().unwrap().to_string_lossy().to_string();
-            let text = std::fs::read_to_string(&path).unwrap();
-            (name, serde_json::from_str(&text).unwrap())
-        })
-        .collect()
-}
-
 /// Every plan of every public workload, raw data kept and not, planned
 /// as they are taken.
 fn plans() -> impl Iterator<Item = (String, InstallablePlan)> {
-    workloads().into_iter().flat_map(|(name, workload)| {
-        [true, false].into_iter().filter_map(move |raw| {
-            // Without wider chain levels: these tests time refresh groups
-            // of the plan shapes they pick (`window_levels` tests levels).
-            let (plan, _) = plan_workload(&workload, &common::inputs_without_levels(raw)).ok()?;
-            Some((format!("{name} (raw data retained: {raw})"), plan))
+    common::workloads("")
+        .into_iter()
+        .flat_map(|(name, workload)| {
+            [true, false].into_iter().filter_map(move |raw| {
+                // Without wider chain levels: these tests time refresh groups
+                // of the plan shapes they pick (`window_levels` tests levels).
+                let (plan, _) =
+                    plan_workload(&workload, &common::inputs_without_levels(raw)).ok()?;
+                Some((format!("{name} (raw data retained: {raw})"), plan))
+            })
         })
-    })
 }
 
 /// For each refresh group, the other groups whose views it reads.
@@ -199,19 +183,6 @@ async fn write(app: &Router, body: Vec<u8>) -> StatusCode {
         .status()
 }
 
-async fn barrier(app: &Router, time_ms: i64) {
-    let request = app.clone().oneshot(
-        Request::post(format!("/api/v1/precompute/watermark?time_ms={time_ms}"))
-            .body(Body::empty())
-            .unwrap(),
-    );
-    let response = tokio::time::timeout(Duration::from_secs(120), request)
-        .await
-        .unwrap_or_else(|_| panic!("the barrier at {time_ms} was not answered"))
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
 /// Feeds `plan` its samples through `END_MS` and closes every window,
 /// with views persisted to a fresh directory; returns each view file's
 /// bytes, the windows that failed, and whether some group's windows were
@@ -256,10 +227,10 @@ async fn view_files_checked(
         // watermark jumps (how far it jumps depends on timing); checking
         // inputs, ingestion runs on while windows compute instead.
         if !check_task_inputs {
-            barrier(&app, START_MS + (minute as i64 + 1) * 60_000).await;
+            common::barrier(&app, START_MS + (minute as i64 + 1) * 60_000).await;
         }
     }
-    barrier(&app, END_MS).await;
+    common::barrier(&app, END_MS).await;
     let failed = state.engine.stats().windows_failed;
     let split = state.engine.render_metrics().lines().any(|line| {
         line.starts_with("asap_precompute_window_parts{")
@@ -412,9 +383,9 @@ async fn groups_closing_together_are_ready_within_the_query_delay() {
     for body in requests(&plan, SERIES, START_MS, instant - 10_000) {
         assert_eq!(write(&app, body).await, StatusCode::NO_CONTENT);
     }
-    barrier(&app, instant - 10_000).await;
+    common::barrier(&app, instant - 10_000).await;
     let started = Instant::now();
-    barrier(&app, instant).await;
+    common::barrier(&app, instant).await;
     let elapsed = started.elapsed();
     assert!(
         elapsed < QUERY_DELAY,
@@ -526,9 +497,9 @@ async fn a_big_window_split_by_series_is_ready_within_its_deadline() {
     for body in requests(&plan, SERIES, START_MS, 1_200_000) {
         assert_eq!(write(&app, body).await, StatusCode::NO_CONTENT);
     }
-    barrier(&app, 1_140_000).await;
+    common::barrier(&app, 1_140_000).await;
     let started = Instant::now();
-    barrier(&app, 1_200_000).await;
+    common::barrier(&app, 1_200_000).await;
     let ready = started.elapsed();
     assert_eq!(state.engine.stats().windows_failed, 0, "{label}");
     assert!(

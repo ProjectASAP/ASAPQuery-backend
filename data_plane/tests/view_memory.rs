@@ -5,17 +5,12 @@ mod common;
 
 use std::sync::Arc;
 
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::StatusCode;
 use axum::Router;
-use control_plane::plan_workload;
 use data_plane::engine::EngineOptions;
-use data_plane::ingestion::IngestionOptions;
-use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
+use data_plane::remote_write::{Label, Sample, TimeSeries};
 use data_plane::{router, DataPlane};
-use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use tower::ServiceExt;
 
 const QUANTILE: &str = "quantile_over_time(0.9, data[1m])";
 const SERIES: usize = 50;
@@ -23,32 +18,18 @@ const SERIES: usize = 50;
 /// The plan of `QUANTILE` every 10 s over `SERIES` series of `data`,
 /// without raw samples kept: per-series sketch windows.
 fn plan_json() -> String {
-    let workload = serde_json::from_value(json!({
-        "query_workload": {"language": "promql", "repeating_queries": [{
-            "query": QUANTILE,
-            "demand": {"fixed_interval_at": {"interval": 10000, "evaluation_phase": 0}},
-            "requirements": {"accuracy": {"max_error": 0.05, "failure_probability": 0.01,
-              "accuracy_scope": "whole_result"}},
-            "predictability": {"predictable": {"known_at": null}},
-        }]},
-        "data_workload": {"arrival": {"ingesting": {"rows_per_second": SERIES as f64}},
-          "sources": {"data": {"series_count": SERIES, "sample_interval": 1000,
-            "metric_type": "gauge", "column_signs": {"value": "non_negative"}}}},
-    }))
-    .unwrap();
-    serde_json::to_string(&plan_workload(&workload, &common::inputs(false)).unwrap().0).unwrap()
+    common::one_query_plan_json(
+        QUANTILE,
+        SERIES,
+        json!({"requirements": {"accuracy": {"max_error": 0.05, "failure_probability": 0.01,
+          "accuracy_scope": "whole_result"}}}),
+    )
 }
 
 fn data_plane() -> (Router, Arc<DataPlane>) {
     let options = EngineOptions {
-        no_forward: true,
         view_dir: None,
-        ingestion: IngestionOptions {
-            allowed_lateness_ms: 0,
-            stream_start_ms: Some(0),
-            ..IngestionOptions::default()
-        },
-        ..EngineOptions::default()
+        ..common::no_forward_options()
     };
     let state = Arc::new(
         DataPlane::with_options(plan_json(), "http://127.0.0.1:1".into(), options).unwrap(),
@@ -79,44 +60,14 @@ async fn write(app: &Router, to_s: i64) {
                 .collect(),
         })
         .collect();
-    let written = app
-        .clone()
-        .oneshot(
-            Request::post("/api/v1/write")
-                .body(Body::from(encode(&WriteRequest { timeseries })))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(written.status(), StatusCode::NO_CONTENT);
-    let barrier = app
-        .clone()
-        .oneshot(
-            Request::post(format!(
-                "/api/v1/precompute/watermark?time_ms={}",
-                to_s * 1000
-            ))
-            .body(Body::empty())
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(barrier.status(), StatusCode::OK);
+    common::remote_write(app, timeseries).await;
+    common::barrier(app, to_s * 1000).await;
 }
 
 async fn query(app: &Router, time_s: i64) -> Value {
-    let uri = format!(
-        "/api/v1/query?query={}&time={time_s}",
-        form_urlencoded::byte_serialize(QUANTILE.as_bytes()).collect::<String>()
-    );
-    let response = app
-        .clone()
-        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    serde_json::from_slice(&body).unwrap()
+    let (status, _, body) = common::get(app, &common::instant_uri(QUANTILE, time_s)).await;
+    assert_eq!(status, StatusCode::OK);
+    body
 }
 
 fn view_bytes(state: &DataPlane) -> f64 {
