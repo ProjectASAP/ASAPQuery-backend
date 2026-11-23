@@ -171,15 +171,6 @@ pub fn by_identity(identity: &str) -> Option<Arc<Series>> {
     Some(interner.series[id as usize].clone())
 }
 
-/// The series of `labels`; interned on first sight.
-pub fn intern(labels: &BTreeMap<String, String>) -> Arc<Series> {
-    let pairs: Vec<(&str, &str)> = labels
-        .iter()
-        .map(|(n, v)| (n.as_str(), v.as_str()))
-        .collect();
-    intern_pairs(&pairs)
-}
-
 /// A series' label set, shared by every row and answer that carries it.
 pub type Labels = Arc<BTreeMap<String, String>>;
 

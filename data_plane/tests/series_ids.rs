@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use data_plane::series_ids::{intern, intern_pairs};
+use data_plane::series_ids::intern_pairs;
 
 fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
@@ -13,12 +13,12 @@ fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The same label set is one series whether it arrives as a map or as
-/// Remote Write label pairs in any order; another set is another series.
+/// The same label set is one series whatever the order of its Remote
+/// Write label pairs; another set is another series.
 #[test]
 fn one_label_set_is_one_series() {
     let map = labels(&[("__name__", "up"), ("job", "api"), ("instance", "1")]);
-    let a = intern(&map);
+    let a = intern_pairs(&[("__name__", "up"), ("job", "api"), ("instance", "1")]);
     let b = intern_pairs(&[("job", "api"), ("__name__", "up"), ("instance", "1")]);
     assert!(Arc::ptr_eq(&a, &b));
     assert_eq!(a.id, b.id);
