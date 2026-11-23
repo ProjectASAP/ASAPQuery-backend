@@ -457,23 +457,6 @@ impl EngineHandle {
                     .metrics
                     .view_file_bytes
                     .store(files.bytes(), Ordering::Relaxed);
-                // A group's segments expire with the longest retention of
-                // its views.
-                let retention_ms: Arc<Vec<i64>> = Arc::new(
-                    precompute
-                        .views()
-                        .iter()
-                        .map(|views| {
-                            views
-                                .iter()
-                                .map(|(view, _)| {
-                                    i64::try_from(view.retention_ms()).unwrap_or(i64::MAX)
-                                })
-                                .max()
-                                .unwrap_or(i64::MAX)
-                        })
-                        .collect(),
-                );
                 let unpersistable: Arc<BTreeSet<PhysicalASAPNodeId>> =
                     Arc::new(options.unpersistable_views.iter().copied().collect());
                 let mut shards = Vec::new();
@@ -481,19 +464,11 @@ impl EngineHandle {
                     let (shard, jobs) = channel();
                     let persist_shared = shared.clone();
                     let delay = std::time::Duration::from_millis(options.persist_delay_ms);
-                    let (retention_ms, unpersistable) =
-                        (retention_ms.clone(), unpersistable.clone());
+                    let unpersistable = unpersistable.clone();
                     std::thread::Builder::new()
                         .name(format!("persist-{index}"))
                         .spawn(move || {
-                            serve_persist(
-                                files,
-                                jobs,
-                                &persist_shared,
-                                delay,
-                                &retention_ms,
-                                &unpersistable,
-                            )
+                            serve_persist(files, jobs, &persist_shared, delay, &unpersistable)
                         })?;
                     shards.push(shard);
                 }
@@ -2083,7 +2058,6 @@ fn serve_persist(
     jobs: Receiver<PersistJob>,
     shared: &Shared,
     delay: std::time::Duration,
-    retention_ms: &[i64],
     unpersistable: &BTreeSet<PhysicalASAPNodeId>,
 ) {
     let metrics = &shared.metrics;
@@ -2158,10 +2132,9 @@ fn serve_persist(
                         None => slot.pin(),
                     }
                 }
-                let cutoff = range_ms
-                    .1
-                    .saturating_sub(retention_ms.get(group).copied().unwrap_or(i64::MAX));
-                if let Err(error) = files.delete_expired(group, cutoff) {
+                // Each view's windows expire at its own retention (the
+                // files recorded it when indexing).
+                if let Err(error) = files.delete_expired(group, range_ms.1) {
                     tracing::error!(group, %error, "deleting expired view segments failed");
                 }
                 let files_after = files.bytes();

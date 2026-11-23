@@ -216,9 +216,11 @@ async fn another_plans_view_files_are_not_loaded() {
     let other = plan_json("sum by (job) (sum_over_time(data[20s]))");
     let (_app, state) = data_plane(&other, &dir);
     assert_eq!(metric(&state, "asap_view_windows_loaded_total"), 0.0);
-    // The earlier plan's segments are set aside in their group directory.
+    // The earlier plan's segments are set aside where they are, in their
+    // group's retention directory.
     assert!(std::fs::read_dir(dir.join("group-0"))
         .unwrap()
+        .flat_map(|entry| std::fs::read_dir(entry.unwrap().path()).unwrap())
         .any(|entry| entry.unwrap().path().to_string_lossy().ends_with(".stale")));
     std::fs::remove_dir_all(&dir).unwrap();
 }

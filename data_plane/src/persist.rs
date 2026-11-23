@@ -1,11 +1,14 @@
 //! Materialized views on disk (docs/design/tiered-view-storage.md): per
-//! refresh group, a directory `group-<index>/` of time segments
-//! (`<first window end ms>.seg`, see [`crate::segment`]), one record per
+//! refresh group and retention of its views, a directory
+//! `group-<index>/retention-<ms>/` of time segments (`<first window end
+//! ms>.seg`, see [`crate::segment`]), so each view's windows are deleted at
+//! its own retention, not its group's longest; one record per
 //! refreshed window holding its `(start, end]` and one columnar fragment
 //! per view appended. The files are both the views' recovery and their cold
 //! tier: a window evicted from memory is read back from its fragment.
 //! Segments are synced every sync interval, roll every `segment_ms` of
-//! windows, and are deleted once every window in them is past retention.
+//! windows, and are deleted once every window in them is past their views'
+//! retention.
 //! Once a newer sealed segment exists, a segment's pages are advised cold
 //! ([`crate::segment::Segment::mark_cold`]): queries read a view's newest
 //! windows on every evaluation, an older window only once more, and
@@ -114,7 +117,7 @@ pub struct Written {
     /// Where each persisted view's fragment of the window is, for reading
     /// it back cold.
     pub locations: Vec<(PhysicalASAPNodeId, WindowLocation)>,
-    /// Segments marked cold by this append ([`GroupFiles::cool`]).
+    /// Segments marked cold by this append ([`RetentionFiles::cool`]).
     pub segments_marked_cold: u64,
 }
 
@@ -131,15 +134,15 @@ struct ActiveSegment {
     first_start_ms: i64,
 }
 
-/// One refresh group's segments.
+/// The segments of one refresh group's views of one retention.
 #[derive(Default)]
-struct GroupFiles {
+struct RetentionFiles {
     active: Option<ActiveSegment>,
     /// Sealed segments, oldest first.
     sealed: Vec<Arc<Segment>>,
 }
 
-impl GroupFiles {
+impl RetentionFiles {
     /// Seals the active segment.
     fn seal_active(&mut self) -> std::io::Result<()> {
         if let Some(active) = self.active.take() {
@@ -167,13 +170,18 @@ pub struct ViewFiles {
     dir: PathBuf,
     plan_hash: u64,
     segment_ms: i64,
-    groups: BTreeMap<usize, GroupFiles>,
+    /// Each view's retention: a refresh group's views of one retention
+    /// share segments, so each view's windows are deleted at its own
+    /// retention. A view not listed is kept until its group's files go.
+    view_retention_ms: BTreeMap<PhysicalASAPNodeId, i64>,
+    /// The segments by refresh group and retention.
+    files: BTreeMap<(usize, i64), RetentionFiles>,
     /// Files are synced at most this often; a window's record is durable
     /// within this long after it is written.
     sync_interval: Duration,
     last_sync: Instant,
-    /// Groups written since the last sync.
-    unsynced: BTreeSet<usize>,
+    /// The (group, retention) files written since the last sync.
+    unsynced: BTreeSet<(usize, i64)>,
 }
 
 /// A stable 64-bit FNV-1a hash of `bytes`.
@@ -203,7 +211,8 @@ impl ViewFiles {
             dir: dir.to_path_buf(),
             plan_hash,
             segment_ms: DEFAULT_SEGMENT_MS,
-            groups: BTreeMap::new(),
+            view_retention_ms: BTreeMap::new(),
+            files: BTreeMap::new(),
             sync_interval,
             last_sync: Instant::now(),
             unsynced: BTreeSet::new(),
@@ -217,6 +226,24 @@ impl ViewFiles {
         self
     }
 
+    /// Writes and deletes each view's windows by its retention (in ms,
+    /// past the newest window).
+    pub fn with_view_retention_ms(
+        mut self,
+        view_retention_ms: BTreeMap<PhysicalASAPNodeId, i64>,
+    ) -> Self {
+        self.view_retention_ms = view_retention_ms;
+        self
+    }
+
+    /// The retention `view`'s windows are written and deleted by.
+    fn retention_of(&self, view: PhysicalASAPNodeId) -> i64 {
+        self.view_retention_ms
+            .get(&view)
+            .copied()
+            .unwrap_or(i64::MAX)
+    }
+
     /// Splits the files into `shards` sets, refresh group `g` going to set
     /// `g % shards`: one writer per group, so records stay in window order.
     pub fn split(self, shards: usize) -> Vec<ViewFiles> {
@@ -226,14 +253,17 @@ impl ViewFiles {
                 dir: self.dir.clone(),
                 plan_hash: self.plan_hash,
                 segment_ms: self.segment_ms,
-                groups: BTreeMap::new(),
+                view_retention_ms: self.view_retention_ms.clone(),
+                files: BTreeMap::new(),
                 sync_interval: self.sync_interval,
                 last_sync: Instant::now(),
                 unsynced: BTreeSet::new(),
             })
             .collect();
-        for (group, files) in self.groups {
-            out[group % shards].groups.insert(group, files);
+        for ((group, retention_ms), files) in self.files {
+            out[group % shards]
+                .files
+                .insert((group, retention_ms), files);
         }
         out
     }
@@ -245,7 +275,7 @@ impl ViewFiles {
 
     /// Bytes of the segments held, over every group.
     pub fn bytes(&self) -> u64 {
-        self.groups
+        self.files
             .values()
             .flat_map(|g| g.sealed.iter().chain(g.active.iter().map(|a| &a.segment)))
             .map(|segment| segment.len())
@@ -265,8 +295,8 @@ impl ViewFiles {
     /// nanoseconds spent.
     pub fn sync(&mut self) -> std::io::Result<u64> {
         let started = Instant::now();
-        for group in std::mem::take(&mut self.unsynced) {
-            if let Some(active) = self.groups.get(&group).and_then(|g| g.active.as_ref()) {
+        for key in std::mem::take(&mut self.unsynced) {
+            if let Some(active) = self.files.get(&key).and_then(|g| g.active.as_ref()) {
                 active.segment.sync()?;
             }
         }
@@ -278,55 +308,92 @@ impl ViewFiles {
         self.dir.join(format!("group-{group}"))
     }
 
-    /// Seals `group`'s active segment now; its next window starts a new
-    /// one.
+    /// The directory of `group`'s segments holding views of `retention_ms`.
+    fn retention_dir(&self, group: usize, retention_ms: i64) -> PathBuf {
+        self.group_dir(group)
+            .join(format!("retention-{retention_ms}"))
+    }
+
+    /// Seals `group`'s active segments now; its next window starts new
+    /// ones.
     pub fn seal(&mut self, group: usize) -> std::io::Result<()> {
-        let files = self.groups.entry(group).or_default();
-        files.seal_active()?;
-        files.cool();
-        self.unsynced.remove(&group);
+        for (&key, files) in self.files.range_mut((group, i64::MIN)..=(group, i64::MAX)) {
+            files.seal_active()?;
+            files.cool();
+            self.unsynced.remove(&key);
+        }
         Ok(())
     }
 
-    /// Deletes `group`'s sealed segments whose every record ends at or
-    /// before `oldest_kept_end_ms`; returns how many. A reader still
+    /// Deletes `group`'s sealed segments whose every record is past its
+    /// views' retention of `newest_end_ms` (ends at or before
+    /// `newest_end_ms - retention`); returns how many. A reader still
     /// holding one keeps reading it (the file stays open until it is done).
-    pub fn delete_expired(
-        &mut self,
-        group: usize,
-        oldest_kept_end_ms: i64,
-    ) -> std::io::Result<usize> {
-        let Some(files) = self.groups.get_mut(&group) else {
-            return Ok(0);
-        };
+    pub fn delete_expired(&mut self, group: usize, newest_end_ms: i64) -> std::io::Result<usize> {
         let mut deleted = 0;
-        let mut kept = Vec::with_capacity(files.sealed.len());
-        for segment in files.sealed.drain(..) {
-            if segment.max_end_ms() <= oldest_kept_end_ms {
+        for (&(_, retention_ms), files) in
+            self.files.range_mut((group, i64::MIN)..=(group, i64::MAX))
+        {
+            let oldest_kept_end_ms = newest_end_ms.saturating_sub(retention_ms);
+            let mut kept = Vec::with_capacity(files.sealed.len());
+            let mut failed = None;
+            for segment in files.sealed.drain(..) {
+                if failed.is_some() || segment.max_end_ms() > oldest_kept_end_ms {
+                    kept.push(segment);
+                    continue;
+                }
                 match std::fs::remove_file(segment.path()) {
                     Ok(()) => deleted += 1,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => deleted += 1,
                     Err(error) => {
                         kept.push(segment);
-                        return Err(error);
+                        failed = Some(error);
                     }
                 }
-            } else {
-                kept.push(segment);
+            }
+            files.sealed = kept;
+            if let Some(error) = failed {
+                return Err(error);
             }
         }
-        files.sealed = kept;
         Ok(deleted)
     }
 
     /// Appends the rows each of `views` got for `(start, end]` as one record
-    /// of `group`'s active segment (rolling to a new one when due), synced
-    /// with the other files once the sync interval has passed. A view
-    /// holding a state with no byte encoding is left out of the record and
-    /// counted.
+    /// per retention of `group`'s views, each to the active segment of that
+    /// retention (rolling to a new one when due), synced with the other
+    /// files once the sync interval has passed. A view holding a state with
+    /// no byte encoding is left out of the record and counted.
     pub fn append(
         &mut self,
         group: usize,
+        range_ms: (i64, i64),
+        views: &[(PhysicalASAPNodeId, &[Batch])],
+    ) -> std::io::Result<Written> {
+        let mut by_retention: BTreeMap<i64, Vec<(PhysicalASAPNodeId, &[Batch])>> = BTreeMap::new();
+        for &(view, batches) in views {
+            by_retention
+                .entry(self.retention_of(view))
+                .or_default()
+                .push((view, batches));
+        }
+        let mut written = Written::default();
+        for (retention_ms, views) in by_retention {
+            let part = self.append_record(group, retention_ms, range_ms, &views)?;
+            written.bytes += part.bytes;
+            written.not_persisted += part.not_persisted;
+            written.locations.extend(part.locations);
+            written.segments_marked_cold += part.segments_marked_cold;
+        }
+        written.sync_ns = self.sync_if_due()?;
+        Ok(written)
+    }
+
+    /// Appends one record of `group`'s views of `retention_ms`.
+    fn append_record(
+        &mut self,
+        group: usize,
+        retention_ms: i64,
         (start_ms, end_ms): (i64, i64),
         views: &[(PhysicalASAPNodeId, &[Batch])],
     ) -> std::io::Result<Written> {
@@ -337,8 +404,10 @@ impl ViewFiles {
             group,
             version: FORMAT_VERSION,
         };
-        let path = self.group_dir(group).join(format!("{end_ms}.seg"));
-        let files = self.groups.entry(group).or_default();
+        let path = self
+            .retention_dir(group, retention_ms)
+            .join(format!("{end_ms}.seg"));
+        let files = self.files.entry((group, retention_ms)).or_default();
         if files
             .active
             .as_ref()
@@ -429,9 +498,8 @@ impl ViewFiles {
                 )
             })
             .collect();
-        self.unsynced.insert(group);
+        self.unsynced.insert((group, retention_ms));
         written.bytes += frame_bytes;
-        written.sync_ns = self.sync_if_due()?;
         Ok(written)
     }
 
@@ -439,31 +507,63 @@ impl ViewFiles {
     /// output schemas) within each view's retention of its newest window,
     /// with their locations, oldest first, read from record heads only:
     /// no fragment is decoded. Every segment found is sealed; appends start
-    /// a new one. A version 1 file, and a segment of another plan, group
-    /// or version, is renamed `*.stale`; a torn record at a segment's end is
-    /// cut off.
+    /// a new one. Records each view's retention, by which its windows are
+    /// written and deleted from now on. A segment directly in a group's
+    /// directory (written before segments were split by retention) is
+    /// deleted with the group's longest retention. A version 1 file, and a
+    /// segment of another plan, group or version, is renamed `*.stale`; a
+    /// torn record at a segment's end is cut off.
     pub fn index(
         &mut self,
         groups: &[Vec<(MaterializedView, SchemaRef)>],
     ) -> std::io::Result<ViewIndex> {
+        let millis =
+            |view: &MaterializedView| i64::try_from(view.retention_ms()).unwrap_or(i64::MAX);
+        for (view, _) in groups.iter().flatten() {
+            self.view_retention_ms.insert(view.node_id, millis(view));
+        }
         let mut index = ViewIndex::new();
         for (group, group_views) in groups.iter().enumerate() {
             let v1 = self.dir.join(format!("group-{group}.log"));
             if v1.exists() {
                 set_aside(&v1, "a version 1 view file")?;
             }
-            let dir = self.group_dir(group);
-            let mut paths: Vec<(i64, PathBuf)> = match std::fs::read_dir(&dir) {
-                Ok(entries) => entries
+            let longest_ms = group_views.iter().map(|(view, _)| millis(view)).max();
+            let segments = |dir: &Path| -> Vec<(i64, PathBuf)> {
+                std::fs::read_dir(dir)
+                    .into_iter()
+                    .flatten()
                     .filter_map(|entry| entry.ok().map(|e| e.path()))
                     .filter(|path| path.extension().is_some_and(|x| x == "seg"))
                     .filter_map(|path| {
                         let end = path.file_stem()?.to_str()?.parse::<i64>().ok()?;
                         Some((end, path))
                     })
-                    .collect(),
-                Err(_) => continue,
+                    .collect()
             };
+            let dir = self.group_dir(group);
+            // (retention, first window end, path), oldest first.
+            let mut paths: Vec<(i64, i64, PathBuf)> = Vec::new();
+            if let Some(longest_ms) = longest_ms {
+                paths.extend(
+                    segments(&dir)
+                        .into_iter()
+                        .map(|(end, path)| (longest_ms, end, path)),
+                );
+            }
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let retention_ms = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("retention-")?.parse::<i64>().ok());
+                if let Some(retention_ms) = retention_ms {
+                    paths.extend(
+                        segments(&entry.path())
+                            .into_iter()
+                            .map(|(end, path)| (retention_ms, end, path)),
+                    );
+                }
+            }
             paths.sort();
             let expected = SegmentHeader {
                 plan_hash: self.plan_hash,
@@ -471,8 +571,7 @@ impl ViewFiles {
                 version: FORMAT_VERSION,
             };
             let mut by_view = ViewIndex::new();
-            let files = self.groups.entry(group).or_default();
-            for (_, path) in paths {
+            for (retention_ms, _, path) in paths {
                 let Some((segment, heads)) = Segment::open(&path, &expected)? else {
                     set_aside(&path, "a segment of another plan, group or version")?;
                     continue;
@@ -485,9 +584,15 @@ impl ViewFiles {
                         ));
                     }
                 }
-                files.sealed.push(segment);
+                self.files
+                    .entry((group, retention_ms))
+                    .or_default()
+                    .sealed
+                    .push(segment);
             }
-            files.cool();
+            for (_, files) in self.files.range((group, i64::MIN)..=(group, i64::MAX)) {
+                files.cool();
+            }
             for (view, _) in group_views {
                 let Some(mut windows) = by_view.remove(&view.node_id) else {
                     continue;
@@ -1370,40 +1475,95 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The segment files under `dir`, in every refresh group and
+    /// retention directory.
+    fn segment_files(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|x| x == "seg") {
+                    out.push(path);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
     /// V9 (unit). Segments roll every `segment_ms` of windows, and only
-    /// sealed segments whose every record is past the cutoff are deleted.
+    /// sealed segments whose every record is past the view's retention of
+    /// the newest window are deleted.
     #[test]
     fn segments_roll_and_expire_whole() {
         let dir = segment_dir("roll");
         let (_, batch) = every_family().remove(0);
         let mut files = ViewFiles::open(&dir, 7, Duration::ZERO)
             .unwrap()
-            .with_segment_ms(20);
+            .with_segment_ms(20)
+            .with_view_retention_ms(BTreeMap::from([(1, 20)]));
         for end in (10..=60).step_by(10) {
             files
                 .append(0, (end - 10, end), &[(1, std::slice::from_ref(&batch))])
                 .unwrap();
         }
-        let segments = |dir: &Path| -> usize {
-            std::fs::read_dir(dir.join("group-0"))
-                .map(|entries| {
-                    entries
-                        .filter(|e| {
-                            e.as_ref()
-                                .unwrap()
-                                .path()
-                                .extension()
-                                .is_some_and(|x| x == "seg")
-                        })
-                        .count()
-                })
-                .unwrap_or(0)
-        };
-        assert_eq!(segments(&dir), 3, "(0, 20], (20, 40], (40, 60]");
-        assert_eq!(files.delete_expired(0, 40).unwrap(), 2);
-        assert_eq!(segments(&dir), 1);
+        assert_eq!(segment_files(&dir).len(), 3, "(0, 20], (20, 40], (40, 60]");
+        assert_eq!(files.delete_expired(0, 60).unwrap(), 2);
+        assert_eq!(segment_files(&dir).len(), 1);
         // The active segment is never deleted.
         assert_eq!(files.delete_expired(0, 1_000).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Each view's windows are deleted at its own retention: a refresh
+    /// group's views of different retentions are written to different
+    /// segments, so a short-retention view's bytes leave the disk once past
+    /// its retention while a long-retention view of the same group keeps
+    /// its windows (and stays readable).
+    #[test]
+    fn each_view_expires_at_its_own_retention() {
+        let dir = segment_dir("per-view-retention");
+        let (_, batch) = every_family().remove(0);
+        let (short, long) = (1, 2);
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO)
+            .unwrap()
+            .with_segment_ms(20)
+            .with_view_retention_ms(BTreeMap::from([(short, 20), (long, 1_000)]));
+        let mut oldest = None;
+        for end in (10..=80).step_by(10) {
+            let written = files
+                .append(
+                    0,
+                    (end - 10, end),
+                    &[
+                        (short, std::slice::from_ref(&batch)),
+                        (long, std::slice::from_ref(&batch)),
+                    ],
+                )
+                .unwrap();
+            oldest.get_or_insert((location_of(&written, short), location_of(&written, long)));
+        }
+        let (oldest_short, oldest_long) = oldest.unwrap();
+        assert_ne!(
+            oldest_short.segment_path(),
+            oldest_long.segment_path(),
+            "views of different retentions share no segment"
+        );
+        let bytes_before = files.bytes();
+        // Newest window ends at 80: the short view keeps windows ending
+        // after 60, so its segments (0, 20] and (20, 40] go; (40, 60] ends
+        // at the cutoff and goes too. The long view keeps everything.
+        assert_eq!(files.delete_expired(0, 80).unwrap(), 3);
+        assert!(!oldest_short.segment_path().exists());
+        assert!(oldest_long.segment_path().exists());
+        assert!(files.bytes() < bytes_before);
+        let read = oldest_long.read(batch.schema(), ViewRead::Mmap).unwrap();
+        assert_same_rows(&batch, &read, "the long-retention view's oldest window");
+        let left: Vec<PathBuf> = segment_files(&dir);
+        assert_eq!(left.len(), 5, "short: (60, 80]; long: four segments");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1571,6 +1731,126 @@ mod tests {
             .unwrap();
         assert!(index.get(&1).is_none_or(Vec::is_empty));
         assert!(!segment.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Segments written before the split by retention, directly
+    /// in `group-<g>/`, are indexed and kept until the group's longest
+    /// retention.
+    #[test]
+    fn old_layout_segments_load_and_expire_at_the_longest_retention() {
+        let dir = segment_dir("old-layout");
+        let (_, batch) = every_family().remove(0);
+        let view = |id: u64, retention: u64| -> MaterializedView {
+            serde_json::from_value(serde_json::json!({
+                "node_id": id,
+                "refresh": "at_ingestion",
+                "coverage": {"definition_id": format!("v{id}"), "selection": []},
+                "inputs": {"materialized_views": []},
+                "retention_ms": retention,
+            }))
+            .unwrap()
+        };
+        let groups = vec![vec![
+            (view(1, 20), batch.schema().clone()),
+            (view(2, 1_000), batch.schema().clone()),
+        ]];
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO)
+            .unwrap()
+            .with_segment_ms(20);
+        for end in (10..=80).step_by(10) {
+            files
+                .append(
+                    0,
+                    (end - 10, end),
+                    &[
+                        (1, std::slice::from_ref(&batch)),
+                        (2, std::slice::from_ref(&batch)),
+                    ],
+                )
+                .unwrap();
+        }
+        drop(files);
+        // Move every segment up into group-0/, the old layout.
+        let group_dir = dir.join("group-0");
+        for path in segment_files(&dir) {
+            std::fs::rename(&path, group_dir.join(path.file_name().unwrap())).unwrap();
+        }
+        for entry in std::fs::read_dir(&group_dir).unwrap().flatten() {
+            if entry.path().is_dir() {
+                std::fs::remove_dir_all(entry.path()).unwrap();
+            }
+        }
+        let old: Vec<PathBuf> = segment_files(&dir);
+        assert_eq!(old.len(), 4);
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO)
+            .unwrap()
+            .with_segment_ms(20);
+        let index = files.index(&groups).unwrap();
+        assert_eq!(
+            index[&2].len(),
+            8,
+            "the long view's windows: {:?}",
+            index.keys()
+        );
+        for (_, location) in &index[&2] {
+            assert_same_rows(
+                &batch,
+                &location.read(batch.schema(), ViewRead::Mmap).unwrap(),
+                "old layout",
+            );
+        }
+        assert!(!index[&1].is_empty());
+        // New windows go to the retention directories.
+        for end in (90..=200).step_by(10) {
+            files
+                .append(
+                    0,
+                    (end - 10, end),
+                    &[
+                        (1, std::slice::from_ref(&batch)),
+                        (2, std::slice::from_ref(&batch)),
+                    ],
+                )
+                .unwrap();
+        }
+        files.delete_expired(0, 200).unwrap();
+        assert!(
+            old.iter().all(|path| path.exists()),
+            "old segments live until 1,000 ms"
+        );
+        files.delete_expired(0, 1_200).unwrap();
+        assert!(old.iter().all(|path| !path.exists()), "and go past it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unlink failure keeps the rest of the sealed list, so
+    /// a later call deletes what it could not.
+    #[test]
+    fn a_failed_unlink_keeps_the_sealed_list() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = segment_dir("unlink");
+        let (_, batch) = every_family().remove(0);
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO)
+            .unwrap()
+            .with_segment_ms(20)
+            .with_view_retention_ms(BTreeMap::from([(1, 20)]));
+        for end in (10..=100).step_by(10) {
+            files
+                .append(0, (end - 10, end), &[(1, std::slice::from_ref(&batch))])
+                .unwrap();
+        }
+        assert_eq!(segment_files(&dir).len(), 5);
+        let retention_dir = dir.join("group-0").join("retention-20");
+        std::fs::set_permissions(&retention_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(files.delete_expired(0, 100).is_err());
+        std::fs::set_permissions(&retention_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            files.delete_expired(0, 100).unwrap(),
+            4,
+            "every expired segment, after the failure"
+        );
+        assert_eq!(segment_files(&dir).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

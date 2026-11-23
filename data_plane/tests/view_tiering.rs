@@ -249,16 +249,20 @@ async fn control_answers(
     out
 }
 
-/// The segment files of refresh group 0, oldest first.
+/// The segment files of refresh group 0 (in each of its retention
+/// directories), oldest first.
 fn segments(dir: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = std::fs::read_dir(dir.join("group-0"))
-        .map(|entries| {
-            entries
-                .map(|entry| entry.unwrap().path())
-                .filter(|path| path.extension().is_some_and(|x| x == "seg"))
-                .collect()
+        .into_iter()
+        .flatten()
+        .flat_map(|entry| {
+            std::fs::read_dir(entry.unwrap().path())
+                .into_iter()
+                .flatten()
         })
-        .unwrap_or_default();
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|x| x == "seg"))
+        .collect();
     out.sort_by_key(|path| {
         path.file_stem()
             .and_then(|stem| stem.to_str()?.parse::<i64>().ok())
