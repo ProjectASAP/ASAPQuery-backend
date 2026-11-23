@@ -2,13 +2,13 @@
 //! range-query parameters and results.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
 
 use crate::query::ResultSample;
 use crate::result_cache::Answer;
+use crate::series_ids::Labels;
 
 /// Parameters of an instant query, from its URL query and form body.
 pub struct InstantQuery {
@@ -205,12 +205,12 @@ impl Serialize for VectorResponse {
 /// labels once (shared with the step answers) and its points as numbers,
 /// and is serialized straight into the response body.
 pub struct MatrixResponse {
-    series: Vec<(Arc<BTreeMap<String, String>>, Vec<Point>)>,
+    series: Vec<(Labels, Vec<Point>)>,
 }
 
 impl MatrixResponse {
     pub fn new(steps: &[(i64, Answer)]) -> Self {
-        let mut by_labels: BTreeMap<&Arc<BTreeMap<String, String>>, Vec<Point>> = BTreeMap::new();
+        let mut by_labels: BTreeMap<&Labels, Vec<Point>> = BTreeMap::new();
         for (time_ms, samples) in steps {
             let time = *time_ms as f64 / 1000.0;
             for sample in samples.iter() {
@@ -287,7 +287,7 @@ impl Serialize for VectorResult<'_> {
     }
 }
 
-struct MatrixResult<'a>(&'a [(Arc<BTreeMap<String, String>>, Vec<Point>)]);
+struct MatrixResult<'a>(&'a [(Labels, Vec<Point>)]);
 
 impl Serialize for MatrixResult<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
