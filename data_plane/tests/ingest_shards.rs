@@ -623,3 +623,43 @@ async fn barriers_during_one_flush_all_answer() {
     assert_eq!(second.await.unwrap(), StatusCode::OK);
     assert_eq!(per_job(&answer(&app, 60).await), expected(60));
 }
+
+/// A sample stamped further from the epoch than the data plane evaluates
+/// (`prometheus::MAX_TIME_MS`) is dropped and counted, so window
+/// arithmetic over it cannot overflow; later samples are ingested as
+/// usual.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sample_beyond_the_time_range_is_dropped() {
+    let (app, state) = data_plane(1);
+    let timeseries = vec![TimeSeries {
+        labels: [("__name__", "data"), ("instance", "i0"), ("job", "job0")]
+            .into_iter()
+            .map(|(name, value)| Label {
+                name: name.into(),
+                value: value.into(),
+            })
+            .collect(),
+        samples: [i64::MIN, i64::MIN / 2]
+            .into_iter()
+            .map(|timestamp| Sample {
+                timestamp,
+                value: 1.0,
+            })
+            .collect(),
+    }];
+    let written = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/write")
+                .body(Body::from(encode(&WriteRequest { timeseries })))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(written.status(), StatusCode::NO_CONTENT);
+    write(&app, 4).await;
+    barrier(&app, 600_000).await;
+    assert!(state.engine.is_running());
+    assert_eq!(state.engine.stats().samples_dropped_late, 2);
+    answer(&app, 600).await;
+}

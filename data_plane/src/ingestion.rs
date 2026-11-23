@@ -41,6 +41,7 @@ use asap_executor::runtime::{Limits, RunContext, Scope};
 use asap_executor::values::{Batch, SchemaRef};
 use futures::executor::block_on;
 
+use crate::prometheus::MAX_TIME_MS;
 use crate::store::{RawData, RawSample, RawShards, RunStore, SeriesPartition, ViewStore};
 
 /// How ingestion treats sample times.
@@ -622,8 +623,9 @@ pub struct Routed {
 
 impl Routing {
     /// Routes `samples` at `now_ms`: drops samples of metrics no `Scan`
-    /// reads, samples more than `max_future_ms` ahead of `now_ms`, and
-    /// samples at or before their metric's eviction cutoff.
+    /// reads, samples more than `max_future_ms` ahead of `now_ms` or
+    /// further from the epoch than [`MAX_TIME_MS`], and samples at or
+    /// before their metric's eviction cutoff.
     pub fn route(&self, samples: Vec<RawSample>, now_ms: i64) -> Routed {
         let latest_allowed_ms = now_ms.saturating_add(self.max_future_ms);
         let mut routed = Routed {
@@ -654,8 +656,14 @@ impl Routing {
                 routed.stats.samples_unrouted += 1;
                 continue;
             }
-            if sample.timestamp_ms > latest_allowed_ms {
+            // Beyond the times the data plane evaluates, window arithmetic
+            // could overflow.
+            if sample.timestamp_ms > latest_allowed_ms.min(MAX_TIME_MS) {
                 routed.stats.samples_dropped_future += 1;
+                continue;
+            }
+            if sample.timestamp_ms < -MAX_TIME_MS {
+                routed.stats.samples_dropped_late += 1;
                 continue;
             }
             if self.groups_waiting && !*seen {
