@@ -1,0 +1,672 @@
+diff -ru -x target $ASAPQ_BENCH/ASAPQuery/asap-tools/data-sources/paced-feeder/src/encode.rs paced-feeder/src/encode.rs
+--- $ASAPQ_BENCH/ASAPQuery/asap-tools/data-sources/paced-feeder/src/encode.rs	2026-11-20 20:42:30.113822466 +0000
++++ paced-feeder/src/encode.rs	2026-11-21 16:31:06.745609522 +0000
+@@ -466,6 +466,7 @@
+             series,
+             kind: Kind::Counter,
+             seed: 0,
++            realistic: None,
+         };
+         Workload {
+             samples_per_sec: 1,
+diff -ru -x target $ASAPQ_BENCH/ASAPQuery/asap-tools/data-sources/paced-feeder/src/table.rs paced-feeder/src/table.rs
+--- $ASAPQ_BENCH/ASAPQuery/asap-tools/data-sources/paced-feeder/src/table.rs	2026-11-20 20:42:30.141822796 +0000
++++ paced-feeder/src/table.rs	2026-11-21 20:49:19.088426624 +0000
+@@ -54,7 +54,154 @@
+ #[serde(deny_unknown_fields)]
+ struct GaugeValues {
+     value: KeySkew,
+-    dist: ParetoDist,
++    #[serde(default)]
++    dist: Option<ParetoDist>,
++    /// Realistic values in place of the Pareto draws (2026-11-21).
++    #[serde(default)]
++    realistic: Option<RealisticSpec>,
++}
++
++/// `values.realistic`: what kind of realistic values, with defaults.
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
++enum RealisticSpec {
++    /// Log-normal latency in ms: median (× the series' Zipf scale), sigma,
++    /// a slow drift of the median, rounded to `decimals`.
++    Latency {
++        #[serde(default = "d_median")]
++        median: f64,
++        #[serde(default = "d_sigma")]
++        sigma: f64,
++        #[serde(default = "d_drift")]
++        drift: f64,
++        #[serde(default = "d_drift_period_s")]
++        drift_period_s: f64,
++        #[serde(default = "d_decimals")]
++        decimals: i32,
++    },
++    /// Smooth gauge: sinusoid plus smooth noise around `level` (× scale).
++    Smooth {
++        #[serde(default = "d_level")]
++        level: f64,
++        #[serde(default = "d_amplitude")]
++        amplitude: f64,
++        #[serde(default = "d_period_s")]
++        period_s: f64,
++        #[serde(default = "d_noise")]
++        noise: f64,
++        #[serde(default = "d_noise_period_s")]
++        noise_period_s: f64,
++        #[serde(default = "d_decimals")]
++        decimals: i32,
++    },
++    /// Zipf gauge: a Zipf(s) draw over the integers 1..=n, times the series'
++    /// scale, rounded to `decimals` (2026-11-21).
++    Zipf {
++        #[serde(default = "d_zipf_s")]
++        s: f64,
++        #[serde(default = "d_zipf_n")]
++        n: u64,
++        #[serde(default = "d_decimals")]
++        decimals: i32,
++        /// true (default): integer values, k · max(1, round(scale)).
++        #[serde(default = "d_true")]
++        integer: bool,
++    },
++    /// Zipf counter: Zipf(s) integer increments over 1..=n; `reset_fraction`
++    /// of the series reset every reset_min_s..reset_max_s.
++    ZipfCounter {
++        #[serde(default = "d_zipf_s")]
++        s: f64,
++        #[serde(default = "d_zipf_n")]
++        n: u64,
++        #[serde(default = "d_reset_fraction")]
++        reset_fraction: f64,
++        #[serde(default = "d_reset_min_s")]
++        reset_min_s: f64,
++        #[serde(default = "d_reset_max_s")]
++        reset_max_s: f64,
++    },
++    /// A per-series share of another Zipf counter's increments (`of`), ratio in
++    /// [ratio_min, ratio_max] per series; resets with it (2026-11-21).
++    Paired {
++        of: String,
++        #[serde(default = "d_ratio_min")]
++        ratio_min: f64,
++        #[serde(default = "d_ratio_max")]
++        ratio_max: f64,
++    },
++    /// Histogram bucket counter over the metric's `le` label (2026-11-21).
++    Histogram {
++        #[serde(default = "d_obs_max")]
++        obs_max: u64,
++        #[serde(default = "d_zipf_s")]
++        obs_s: f64,
++        #[serde(default = "d_hist_median")]
++        median: f64,
++        #[serde(default = "d_hist_sigma")]
++        sigma: f64,
++    },
++    /// Counter: integer increments averaging `rate` (× scale) per sample;
++    /// `reset_fraction` of the series reset every reset_min_s..reset_max_s.
++    Counter {
++        #[serde(default = "d_rate")]
++        rate: f64,
++        #[serde(default = "d_reset_fraction")]
++        reset_fraction: f64,
++        #[serde(default = "d_reset_min_s")]
++        reset_min_s: f64,
++        #[serde(default = "d_reset_max_s")]
++        reset_max_s: f64,
++    },
++}
++fn d_true() -> bool { true }
++fn d_ratio_min() -> f64 { 0.0 }
++fn d_ratio_max() -> f64 { 1.0 }
++fn d_obs_max() -> u64 { 20 }
++fn d_hist_median() -> f64 { 0.05 }
++fn d_hist_sigma() -> f64 { 1.0 }
++fn d_zipf_s() -> f64 { 1.1 }
++fn d_zipf_n() -> u64 { 1_000_000 }
++fn d_median() -> f64 { 50.0 }
++fn d_sigma() -> f64 { 0.5 }
++fn d_drift() -> f64 { 0.2 }
++fn d_drift_period_s() -> f64 { 600.0 }
++fn d_decimals() -> i32 { 2 }
++fn d_level() -> f64 { 100.0 }
++fn d_amplitude() -> f64 { 0.2 }
++fn d_period_s() -> f64 { 3600.0 }
++fn d_noise() -> f64 { 0.02 }
++fn d_noise_period_s() -> f64 { 30.0 }
++fn d_rate() -> f64 { 1.0 }
++fn d_reset_fraction() -> f64 { 0.05 }
++fn d_reset_min_s() -> f64 { 1800.0 }
++fn d_reset_max_s() -> f64 { 7200.0 }
++
++fn realistic(spec: Option<RealisticSpec>, sps: u32) -> Option<crate::workload::Realistic> {
++    use crate::workload::Realistic as R;
++    let samples = |s: f64| ((s * f64::from(sps)).round() as u64).max(1);
++    spec.map(|s| match s {
++        RealisticSpec::Latency { median, sigma, drift, drift_period_s, decimals } => R::Latency {
++            median, sigma, drift, drift_period: samples(drift_period_s), decimals,
++        },
++        RealisticSpec::Smooth { level, amplitude, period_s, noise, noise_period_s, decimals } => R::Smooth {
++            level, amplitude, period: samples(period_s), noise, noise_period: samples(noise_period_s), decimals,
++        },
++        RealisticSpec::Counter { rate, reset_fraction, reset_min_s, reset_max_s } => R::Counter {
++            rate, reset_fraction, reset_min: samples(reset_min_s), reset_max: samples(reset_max_s),
++        },
++        RealisticSpec::Zipf { s, n, decimals, integer } => R::Zipf {
++            table: std::sync::Arc::new(crate::workload::ZipfTable::new(s, n.max(1))), decimals, integer,
++        },
++        RealisticSpec::Paired { .. } | RealisticSpec::Histogram { .. } => {
++            unreachable!("paired and histogram are resolved in metric()")
++        }
++        RealisticSpec::ZipfCounter { s, n, reset_fraction, reset_min_s, reset_max_s } => R::ZipfCounter {
++            table: std::sync::Arc::new(crate::workload::ZipfTable::new(s, n.max(1))),
++            reset_fraction, reset_min: samples(reset_min_s), reset_max: samples(reset_max_s),
++            state: Default::default(),
++        },
++    })
+ }
+ 
+ #[derive(Deserialize)]
+@@ -67,6 +214,8 @@
+ #[serde(deny_unknown_fields)]
+ struct CounterValues {
+     increment: KeySkew,
++    #[serde(default)]
++    realistic: Option<RealisticSpec>,
+ }
+ 
+ /// The metrics of `workloads[0].e2e.metrics` in the table at `path`, in name
+@@ -103,7 +252,7 @@
+             records.push(Arc::new(metric));
+             continue;
+         }
+-        let (metric, rate) = metric(name, spec, seed).with_context(context)?;
++        let (metric, rate) = metric(name, spec, seed, &first.e2e.metrics).with_context(context)?;
+         metrics.push(metric);
+         rates.push(rate);
+     }
+@@ -148,7 +297,7 @@
+     })
+ }
+ 
+-fn metric(name: &str, spec: &Value, seed: u64) -> Result<(Metric, u32)> {
++fn metric(name: &str, spec: &Value, seed: u64, all: &BTreeMap<String, Value>) -> Result<(Metric, u32)> {
+     let kind = spec.get("type").and_then(Value::as_str).unwrap_or_default();
+     if kind != "gauge" && kind != "counter" {
+         bail!("type `{kind}` is not supported; the feeder generates `gauge`, `counter` and `records` metrics");
+@@ -161,21 +310,77 @@
+         );
+     }
+     let series = series_labels(&spec.labels)?;
+-    let (skew, kind) = if spec.kind == "gauge" {
++    let sps = spec.samples_per_sec_per_series;
++    let (skew, kind, real) = if spec.kind == "gauge" {
+         let values: GaugeValues = serde_json::from_value(spec.values).context("gauge `values`")?;
++        let pareto = values.dist.as_ref().map(|d| d.pareto).unwrap_or(2.0);
++        ensure!(values.dist.is_some() || values.realistic.is_some(), "gauge `values` needs `dist` or `realistic`");
++        ensure!(pareto > 0.0, "the Pareto shape must be positive");
+         ensure!(
+-            values.dist.pareto > 0.0,
+-            "the Pareto shape must be positive"
++            !matches!(values.realistic, Some(RealisticSpec::Counter { .. } | RealisticSpec::ZipfCounter { .. })),
++            "a gauge's `realistic` is `latency`, `smooth` or `zipf`"
+         );
+         let kind = Kind::Gauge {
+-            pareto_shape: values.dist.pareto,
++            pareto_shape: pareto,
+             pareto_scale: 1.0,
+         };
+-        (values.value, kind)
++        (values.value, kind, realistic(values.realistic, sps))
+     } else {
+         let values: CounterValues =
+             serde_json::from_value(spec.values).context("counter `values`")?;
+-        (values.increment, Kind::Counter)
++        ensure!(
++            matches!(values.realistic, None | Some(RealisticSpec::Counter { .. } | RealisticSpec::ZipfCounter { .. }
++                | RealisticSpec::Paired { .. } | RealisticSpec::Histogram { .. })),
++            "a counter's `realistic` is `counter`, `zipf_counter`, `paired` or `histogram`"
++        );
++        let real = match values.realistic {
++            Some(RealisticSpec::Paired { of, ratio_min, ratio_max }) => {
++                let base_spec = all.get(&of).with_context(|| format!("paired: no metric `{of}`"))?;
++                let base_real = base_spec.pointer("/values/realistic").context("paired: the base has no `realistic`")?;
++                ensure!(base_real.get("kind").and_then(Value::as_str) == Some("zipf_counter"),
++                        "paired: the base `{of}` must be a `zipf_counter`");
++                let f = |k: &str, d: f64| base_real.get(k).and_then(Value::as_f64).unwrap_or(d);
++                let base_sps = base_spec.get("samples_per_sec_per_series").and_then(Value::as_u64).unwrap_or(1) as f64;
++                let base_labels: Vec<LabelSpec> = serde_json::from_value(base_spec["labels"].clone())?;
++                let base_series = series_labels(&base_labels)?.len() as u64;
++                ensure!(series.len() as u64 % base_series == 0, "paired: series not a multiple of the base's");
++                Some(crate::workload::Realistic::Paired {
++                    base: crate::workload::PairBase {
++                        seed: splitmix64(seed ^ fnv1a(&of)),
++                        table: std::sync::Arc::new(crate::workload::ZipfTable::new(f("s", 1.1), f("n", 1e6) as u64)),
++                        reset_fraction: f("reset_fraction", 0.05),
++                        reset_min: ((f("reset_min_s", 1800.0) * base_sps).round() as u64).max(1),
++                        reset_max: ((f("reset_max_s", 7200.0) * base_sps).round() as u64).max(1),
++                        per: series.len() as u64 / base_series,
++                    },
++                    ratio_min,
++                    ratio_max,
++                    state: Default::default(),
++                })
++            }
++            Some(RealisticSpec::Histogram { obs_max, obs_s, median, sigma }) => {
++                let le_idx = spec.labels.iter().position(|l| l.name == "le").context("histogram: no `le` label")?;
++                ensure!(le_idx == spec.labels.len() - 1, "histogram: `le` must be the last label");
++                let per = spec.labels[le_idx].cardinality;
++                let bounds: Vec<f64> = series
++                    .iter()
++                    .map(|v| {
++                        let s = v[le_idx].as_str();
++                        if s == "+Inf" { Ok(f64::INFINITY) } else { s.parse::<f64>().with_context(|| format!("le `{s}`")) }
++                    })
++                    .collect::<Result<_>>()?;
++                Some(crate::workload::Realistic::Histogram {
++                    le_bounds: std::sync::Arc::new(bounds),
++                    per,
++                    obs: std::sync::Arc::new(crate::workload::ZipfTable::new(obs_s, obs_max.max(1))),
++                    median,
++                    sigma,
++                    state: Default::default(),
++                })
++            }
++            other => realistic(other, sps),
++        };
++        (values.increment, Kind::Counter, real)
+     };
+     ensure!(
+         skew.keys == series.len() as u64,
+@@ -194,6 +399,7 @@
+         scales,
+         kind,
+         seed: splitmix64(seed ^ fnv1a(name)),
++        realistic: real,
+     };
+     Ok((metric, spec.samples_per_sec_per_series))
+ }
+diff -ru -x target $ASAPQ_BENCH/ASAPQuery/asap-tools/data-sources/paced-feeder/src/workload.rs paced-feeder/src/workload.rs
+--- $ASAPQ_BENCH/ASAPQuery/asap-tools/data-sources/paced-feeder/src/workload.rs	2026-11-20 20:42:30.113822466 +0000
++++ paced-feeder/src/workload.rs	2026-11-21 20:48:57.020163207 +0000
+@@ -66,6 +66,140 @@
+     Counter,
+ }
+ 
++/// Realistic values (2026-11-21, `values.realistic` in the table), in place of
++/// the independent Pareto draws / constant increments. Every value is still a
++/// pure function of (seed, series, sample index), so any sample can be
++/// regenerated independently.
++/// Zipf(s) over the integers 1..=n: the normalized CDF (shared, built once).
++#[derive(Debug)]
++pub struct ZipfTable {
++    pub s: f64,
++    pub n: u64,
++    cdf: Vec<f64>,
++}
++
++impl ZipfTable {
++    pub fn new(s: f64, n: u64) -> Self {
++        let mut cdf = Vec::with_capacity(n as usize);
++        let mut acc = 0.0;
++        for k in 1..=n {
++            acc += (k as f64).powf(-s);
++            cdf.push(acc);
++        }
++        for c in cdf.iter_mut() {
++            *c /= acc;
++        }
++        Self { s, n, cdf }
++    }
++
++    /// The integer k in 1..=n whose CDF interval holds u in (0, 1].
++    pub fn sample(&self, u: f64) -> u64 {
++        (self.cdf.partition_point(|&c| c < u) as u64 + 1).min(self.n)
++    }
++}
++
++/// A paired counter's base (2026-11-21): the Zipf counter whose increments it
++/// takes a share of (hits of lookups, errors of requests), with that base's
++/// seed, increment table and reset schedule, so the pair's resets coincide.
++#[derive(Debug, Clone)]
++pub struct PairBase {
++    pub seed: u64,
++    pub table: Arc<ZipfTable>,
++    pub reset_fraction: f64,
++    pub reset_min: u64,
++    pub reset_max: u64,
++    /// Series of this metric per base series (this metric's extra labels vary
++    /// fastest, so base series = series / per).
++    pub per: u64,
++}
++
++/// Per-series running totals of a Zipf counter (generated in index order; a
++/// request for an earlier index recomputes from 0).
++#[derive(Debug, Default)]
++pub struct CounterState {
++    next: Vec<u64>,
++    total: Vec<f64>,
++}
++
++#[derive(Debug, Clone)]
++pub enum Realistic {
++    /// Latency-like: log-normal, median `median · scale` (the series' Zipf
++    /// scale), `sigma`, slowly drifting median (±`drift` over `drift_period`
++    /// samples), rounded to `decimals`.
++    Latency { median: f64, sigma: f64, drift: f64, drift_period: u64, decimals: i32 },
++    /// Smooth gauge: `level · scale · (1 + amplitude · sin(2π n / period + φ))`
++    /// plus smooth value noise (`noise` relative, knots every `noise_period`
++    /// samples, linearly interpolated), rounded to `decimals`.
++    Smooth { level: f64, amplitude: f64, period: u64, noise: f64, noise_period: u64, decimals: i32 },
++    /// Counter: integer increments averaging `rate · scale` per sample (each
++    /// increment in [0, 2·rate·scale]); a `reset_fraction` of the series reset
++    /// to 0 every `reset_min`..`reset_max` samples (per series).
++    Counter { rate: f64, reset_fraction: f64, reset_min: u64, reset_max: u64 },
++    /// Zipf gauge (2026-11-21): a Zipf(s) draw over 1..=n times the series'
++    /// scale, rounded to `decimals`.
++    /// `integer` (default): k · max(1, round(scale)), an integer (Zipf data as
++    /// sketch benchmarks use it); else k · scale rounded to `decimals`.
++    Zipf { table: Arc<ZipfTable>, decimals: i32, integer: bool },
++    /// Zipf counter: Zipf(s) integer increments over 1..=n, the same resets as
++    /// `Counter`.
++    ZipfCounter {
++        table: Arc<ZipfTable>,
++        reset_fraction: f64,
++        reset_min: u64,
++        reset_max: u64,
++        state: Arc<std::sync::Mutex<CounterState>>,
++    },
++    /// A counter that is a per-series share of a base Zipf counter's increments:
++    /// increment = floor(base increment · ratio), ratio fixed per series in
++    /// [ratio_min, ratio_max]; resets with its base. With per · ratio_max ≤ 1 the
++    /// sum over a base series' children never exceeds the base (errors ≤
++    /// requests); per = 1 and ratio ≤ 1 give hits ≤ lookups.
++    Paired { base: PairBase, ratio_min: f64, ratio_max: f64, state: Arc<std::sync::Mutex<CounterState>> },
++    /// A Prometheus histogram bucket counter: every sample interval of the
++    /// parent series (all labels but `le`, which varies fastest) has a Zipf(s)
++    /// number of observations (1..=obs_max), each with a log-normal value
++    /// (median, sigma); a bucket counts the observations ≤ its `le`
++    /// (`le_bounds[series]`), so buckets are cumulative and monotonic in `le`.
++    Histogram {
++        le_bounds: Arc<Vec<f64>>,
++        per: u64,
++        obs: Arc<ZipfTable>,
++        median: f64,
++        sigma: f64,
++        state: Arc<std::sync::Mutex<CounterState>>,
++    },
++}
++
++/// Adds `inc(idx)` for every index up to `n` to the series' running total
++/// (state), resetting to 0 where `reset(idx)`; earlier indexes restart from 0.
++fn running_total(
++    state: &std::sync::Mutex<CounterState>,
++    series: u64,
++    n: u64,
++    reset: impl Fn(u64) -> bool,
++    inc: impl Fn(u64) -> f64,
++) -> f64 {
++    let mut st = state.lock().unwrap();
++    let i = series as usize;
++    if st.next.len() <= i {
++        st.next.resize(i + 1, 0);
++        st.total.resize(i + 1, 0.0);
++    }
++    if st.next[i] > n {
++        st.next[i] = 0;
++        st.total[i] = 0.0;
++    }
++    while st.next[i] <= n {
++        let idx = st.next[i];
++        if reset(idx) {
++            st.total[i] = 0.0;
++        }
++        st.total[i] += inc(idx);
++        st.next[i] += 1;
++    }
++    st.total[i]
++}
++
+ #[derive(Debug, Clone)]
+ pub struct Metric {
+     pub name: String,
+@@ -76,6 +210,8 @@
+     pub scales: Vec<f64>,
+     pub kind: Kind,
+     pub seed: u64,
++    /// None: the original values (`kind`).
++    pub realistic: Option<Realistic>,
+ }
+ 
+ /// Gauge and counter `metrics` and `records` metrics, sent by one feeder.
+@@ -128,6 +264,7 @@
+                 pareto_scale,
+             },
+             seed,
++            realistic: None,
+         };
+         Self {
+             samples_per_sec,
+@@ -208,6 +345,9 @@
+ impl Metric {
+     pub fn value(&self, series: usize, sample_index: u64) -> f64 {
+         let scale = self.scales[series];
++        if let Some(r) = &self.realistic {
++            return realistic_value(r, self.seed, series as u64, scale, sample_index);
++        }
+         match self.kind {
+             // Pareto by inverse transform with `U` uniform in (0, 1], so every
+             // value is ≥ `scale · pareto_scale` and positive.
+@@ -223,6 +363,127 @@
+     }
+ }
+ 
++/// Whether a series resets, its reset period and phase offset (samples).
++fn reset_schedule(seed: u64, series: u64, fraction: f64, min: u64, max: u64) -> (bool, u64, u64) {
++    let resets = unit_uniform(seed ^ 0x7e5e7, series, 0) < fraction;
++    let span = max.saturating_sub(min).max(1);
++    let period = min.max(1) + (unit_uniform(seed ^ 0x9e71, series, 0) * span as f64) as u64;
++    let offset = (unit_uniform(seed ^ 0x0ff5, series, 0) * period as f64) as u64;
++    (resets, period, offset)
++}
++
++fn round_to(v: f64, decimals: i32) -> f64 {
++    let f = 10f64.powi(decimals);
++    (v * f).round() / f
++}
++
++/// Smooth value noise in [-1, 1]: hashed knots every `period` samples, linearly
++/// interpolated (stateless).
++fn value_noise(seed: u64, series: u64, n: u64, period: u64) -> f64 {
++    let period = period.max(1);
++    let k = n / period;
++    let frac = (n % period) as f64 / period as f64;
++    let a = 2.0 * unit_uniform(seed ^ 0x5eed, series, k) - 1.0;
++    let b = 2.0 * unit_uniform(seed ^ 0x5eed, series, k + 1) - 1.0;
++    a + (b - a) * frac
++}
++
++fn realistic_value(r: &Realistic, seed: u64, series: u64, scale: f64, n: u64) -> f64 {
++    match *r {
++        Realistic::Latency { median, sigma, drift, drift_period, decimals } => {
++            // Box-Muller from two hashed uniforms in (0, 1].
++            let u1 = unit_uniform(seed, series, 2 * n);
++            let u2 = unit_uniform(seed, series, 2 * n + 1);
++            let z = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
++            let m = median * scale * (1.0 + drift * value_noise(seed, series, n, drift_period));
++            round_to(m.max(1e-3) * (sigma * z).exp(), decimals)
++        }
++        Realistic::Smooth { level, amplitude, period, noise, noise_period, decimals } => {
++            let phase = std::f64::consts::TAU * unit_uniform(seed ^ 0xfa5e, series, 0);
++            let s = (std::f64::consts::TAU * n as f64 / period.max(1) as f64 + phase).sin();
++            let v = level * scale * (1.0 + amplitude * s + noise * value_noise(seed, series, n, noise_period));
++            round_to(v.max(0.0), decimals)
++        }
++        Realistic::Zipf { ref table, decimals, integer } => {
++            let k = table.sample(unit_uniform(seed ^ 0x21bf, series, n));
++            if integer {
++                (k as f64) * scale.round().max(1.0)
++            } else {
++                round_to(k as f64 * scale, decimals)
++            }
++        }
++        Realistic::ZipfCounter { ref table, reset_fraction, reset_min, reset_max, ref state } => {
++            let (resets, period, offset) = reset_schedule(seed, series, reset_fraction, reset_min, reset_max);
++            let mut st = state.lock().unwrap();
++            let i = series as usize;
++            if st.next.len() <= i {
++                st.next.resize(i + 1, 0);
++                st.total.resize(i + 1, 0.0);
++            }
++            if st.next[i] > n {
++                st.next[i] = 0;
++                st.total[i] = 0.0;
++            }
++            while st.next[i] <= n {
++                let idx = st.next[i];
++                if resets && idx > 0 && (idx + offset) % period == 0 {
++                    st.total[i] = 0.0;
++                }
++                st.total[i] += table.sample(unit_uniform(seed ^ 0xc0c0, series, idx)) as f64;
++                st.next[i] += 1;
++            }
++            st.total[i]
++        }
++        Realistic::Paired { ref base, ratio_min, ratio_max, ref state } => {
++            let b = series / base.per.max(1);
++            let (resets, period, offset) = reset_schedule(base.seed, b, base.reset_fraction, base.reset_min, base.reset_max);
++            let ratio = ratio_min + (ratio_max - ratio_min) * unit_uniform(seed ^ 0x9a1d, series, 0);
++            running_total(
++                state,
++                series,
++                n,
++                |idx| resets && idx > 0 && (idx + offset) % period == 0,
++                |idx| (base.table.sample(unit_uniform(base.seed ^ 0xc0c0, b, idx)) as f64 * ratio).floor(),
++            )
++        }
++        Realistic::Histogram { ref le_bounds, per, ref obs, median, sigma, ref state } => {
++            let parent = series / per.max(1);
++            let le = le_bounds[series as usize];
++            running_total(state, series, n, |_| false, |idx| {
++                let count = obs.sample(unit_uniform(seed ^ 0x0b5, parent, idx));
++                (0..count)
++                    .filter(|&j| {
++                        let u1 = unit_uniform(seed ^ 0x1a7, parent, (idx << 8) | (2 * j));
++                        let u2 = unit_uniform(seed ^ 0x1a7, parent, (idx << 8) | (2 * j + 1));
++                        let z = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
++                        median * (sigma * z).exp() <= le
++                    })
++                    .count() as f64
++            })
++        }
++        Realistic::Counter { rate, reset_fraction, reset_min, reset_max } => {
++            let lambda = (rate * scale).max(1.0);
++            // Cumulative integer count with bounded jitter: floor(λ(i+1) + J(i)),
++            // J(i) in [0, λ): monotone, increments in [0, 2λ).
++            let count = |i: u64| (lambda * (i + 1) as f64 + lambda * unit_uniform(seed ^ 0xc0, series, i)).floor();
++            let resets = unit_uniform(seed ^ 0x7e5e7, series, 0) < reset_fraction;
++            if !resets {
++                return count(n);
++            }
++            let span = reset_max.saturating_sub(reset_min).max(1);
++            let period = reset_min.max(1) + (unit_uniform(seed ^ 0x9e71, series, 0) * span as f64) as u64;
++            let offset = (unit_uniform(seed ^ 0x0ff5, series, 0) * period as f64) as u64;
++            let epoch_start = ((n + offset) / period) * period;
++            let start = epoch_start.saturating_sub(offset);
++            if start == 0 {
++                count(n)
++            } else {
++                count(n) - count(start - 1)
++            }
++        }
++    }
++}
++
+ /// Counter-based uniform draw in (0, 1]: a stateless hash of the inputs, so
+ /// any sample can be regenerated independently of the ones before it.
+ pub fn unit_uniform(seed: u64, series: u64, sample_index: u64) -> f64 {
+@@ -348,4 +609,83 @@
+             assert!(values.windows(2).all(|w| w[1] > w[0]));
+         }
+     }
++
++    #[test]
++    fn realistic_values_are_quantized_stateless_and_counters_monotone_between_resets() {
++        let lat = Realistic::Latency { median: 50.0, sigma: 0.5, drift: 0.2, drift_period: 600, decimals: 2 };
++        for n in 0..1000 {
++            let v = realistic_value(&lat, 9, 3, 1.0, n);
++            assert!(v > 0.0 && ((v * 100.0).round() - v * 100.0).abs() < 1e-6);
++            assert_eq!(v, realistic_value(&lat, 9, 3, 1.0, n));
++        }
++        let smooth = Realistic::Smooth { level: 100.0, amplitude: 0.2, period: 3600, noise: 0.02, noise_period: 30, decimals: 2 };
++        let a = realistic_value(&smooth, 9, 3, 1.0, 100);
++        let b = realistic_value(&smooth, 9, 3, 1.0, 101);
++        assert!((a - b).abs() < 2.0, "smooth: {a} {b}");
++        let ctr = Realistic::Counter { rate: 3.0, reset_fraction: 1.0, reset_min: 100, reset_max: 200 };
++        let mut resets = 0;
++        let mut prev = realistic_value(&ctr, 9, 3, 1.0, 0);
++        for n in 1..2000 {
++            let v = realistic_value(&ctr, 9, 3, 1.0, n);
++            assert_eq!(v, v.floor());
++            if v < prev { resets += 1 } else { assert!(v - prev < 6.0 + 1e-9) }
++            prev = v;
++        }
++        assert!(resets >= 9, "resets {resets}");
++    }
++
++    #[test]
++    fn zipf_values_follow_the_table_and_zipf_counters_reset() {
++        let table = Arc::new(ZipfTable::new(1.1, 1000));
++        let g = Realistic::Zipf { table: table.clone(), decimals: 0, integer: true };
++        let ones = (0..10_000).filter(|&n| realistic_value(&g, 3, 1, 1.0, n) == 1.0).count();
++        // P(k=1) = 1/H(1000, 1.1) ~ 0.21
++        assert!((1500..2700).contains(&ones), "ones {ones}");
++        let scaled = Realistic::Zipf { table: table.clone(), decimals: 2, integer: true };
++        assert!((0..100).all(|n| { let v = realistic_value(&scaled, 3, 1, 2.6, n); v == v.floor() && v >= 3.0 }));
++        let c = Realistic::ZipfCounter {
++            table, reset_fraction: 1.0, reset_min: 100, reset_max: 200,
++            state: Arc::new(std::sync::Mutex::new(CounterState::default())),
++        };
++        let mut prev = realistic_value(&c, 3, 1, 1.0, 0);
++        let mut resets = 0;
++        for n in 1..2000 {
++            let v = realistic_value(&c, 3, 1, 1.0, n);
++            if v < prev { resets += 1 } else { assert!(v - prev >= 1.0) }
++            prev = v;
++        }
++        assert!(resets >= 9, "resets {resets}");
++        // Regenerating an earlier index gives the same value.
++        let again = realistic_value(&c, 3, 1, 1.0, 1999);
++        assert_eq!(again, prev);
++        let early = realistic_value(&c, 3, 1, 1.0, 5);
++        assert_eq!(early, realistic_value(&c, 3, 1, 1.0, 5));
++    }
++
++    #[test]
++    fn histogram_buckets_are_cumulative_and_paired_counters_stay_below_their_base() {
++        let le = Arc::new(vec![0.01, 0.1, 1.0, f64::INFINITY]);
++        let h = Realistic::Histogram {
++            le_bounds: le, per: 4, obs: Arc::new(ZipfTable::new(1.1, 20)), median: 0.05, sigma: 1.0,
++            state: Arc::new(std::sync::Mutex::new(CounterState::default())),
++        };
++        for n in [0u64, 10, 100, 999] {
++            let v: Vec<f64> = (0..4).map(|b| realistic_value(&h, 5, b, 1.0, n)).collect();
++            assert!(v.windows(2).all(|w| w[0] <= w[1]), "{v:?}");
++            assert!(v[3] > 0.0);
++        }
++        let table = Arc::new(ZipfTable::new(1.1, 1000));
++        let base_state = Arc::new(std::sync::Mutex::new(CounterState::default()));
++        let base = Realistic::ZipfCounter { table: table.clone(), reset_fraction: 1.0, reset_min: 100, reset_max: 200, state: base_state };
++        let pair = Realistic::Paired {
++            base: PairBase { seed: 7, table, reset_fraction: 1.0, reset_min: 100, reset_max: 200, per: 1 },
++            ratio_min: 0.5, ratio_max: 0.99,
++            state: Arc::new(std::sync::Mutex::new(CounterState::default())),
++        };
++        for n in 0..1500 {
++            let b = realistic_value(&base, 7, 3, 1.0, n);
++            let p = realistic_value(&pair, 99, 3, 1.0, n);
++            assert!(p <= b, "n {n}: {p} > {b}");
++        }
++    }
+ }

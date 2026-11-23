@@ -1,0 +1,31 @@
+# Per-process CPU and RSS of the demo's processes (process-exporter groups by
+# the name below). Matched on command lines, so the monitoring stack's own
+# processes (its Prometheus, Grafana) are not counted.
+process_names:
+  # The live demo's processes (run_live_demo.sh, ports 197xx), apart from harness runs.
+  - name: live-reference-victoria-metrics
+    cmdline: ['victoria-metrics.*-httpListenAddr=127\.0\.0\.1:19714']
+  - name: live-reference-feeder
+    cmdline: ['paced_feeder.*127\.0\.0\.1:19714']
+  - name: live-data_plane
+    cmdline: ['data_plane.*--listen 127\.0\.0\.1:1971']
+  - name: live-victoria-metrics
+    cmdline: ['victoria-metrics.*-httpListenAddr=127\.0\.0\.1:1971']
+  - name: live-prometheus
+    cmdline: ['prometheus-3\.5\.0.*--web\.listen-address=127\.0\.0\.1:1971']
+  - name: live-feeders
+    cmdline: ['paced_feeder.*127\.0\.0\.1:1971']
+  - name: live-proxies
+    cmdline: ['live/proxy\.py']
+  - name: data_plane
+    comm: [data_plane]
+  - name: victoria-metrics
+    cmdline: ['victoria-metrics.*-httpListenAddr=127\.0\.0\.1:195']
+  - name: prometheus-reference
+    cmdline: ['prometheus-3\.5\.0.*--web\.listen-address=127\.0\.0\.1:19[1-4]']
+  - name: feeder
+    comm: [paced_feeder]
+  - name: harness
+    cmdline: ['python3.*run\.py']
+  - name: query_engine_rust
+    comm: [query_engine_rust]

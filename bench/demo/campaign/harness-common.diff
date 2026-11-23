@@ -1,0 +1,11 @@
+--- $BENCH_ROOT/tmp/campaign-stage/asapq-bench/harness/common.py	2026-11-20 15:57:57.685516800 +0000
++++ common.py	2026-11-20 21:01:18.071186745 +0000
+@@ -20,7 +20,7 @@
+ 
+ # Pinned releases (../fetch_binaries.sh downloads and checks them).
+ PROMETHEUS_VERSION = "3.5.0"
+-VICTORIAMETRICS_VERSION = "v1.155.0"
++VICTORIAMETRICS_VERSION = os.environ.get("VICTORIAMETRICS_VERSION", "v1.155.0")
+ 
+ 
+ BIN_DIR = Path(os.environ.get("BIN_DIR", "$BIN_DIR"))

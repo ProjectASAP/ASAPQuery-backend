@@ -1,0 +1,1322 @@
+{
+  "data_facts": {
+    "backfill_history_ms": 1200000,
+    "events": {
+      "assignment": "deterministic_rotating_pool_with_cross_leaf_overlap",
+      "distinct_key": "user_id",
+      "table": "events",
+      "time_column": "ts",
+      "user_id_universe_size": 10000,
+      "user_ids_per_leaf": 1000
+    },
+    "feeder_seed": 862,
+    "metrics": {
+      "data": {
+        "kind": "gauge",
+        "pareto_shape": 2.0,
+        "value_shape": "rank_scaled_pareto"
+      },
+      "data_total": {
+        "increment_shape": "rank_scaled_positive_deterministic",
+        "kind": "counter",
+        "resets": "none"
+      }
+    },
+    "scrape_interval_ms": 100,
+    "series": {
+      "leaf_count": 10000,
+      "ranking": {
+        "exponent": 1.1,
+        "kind": "deterministic_zipf_like",
+        "rank_scope": "leaf_series"
+      }
+    }
+  },
+  "description": "ASAPPlanner dag-viewer random-mixed-seed-862-long (origin/main), all 10 workload files joined as one multi-team dashboard: distinct (query, interval) pairs.",
+  "id": "seed862-long-joint",
+  "labels": [
+    {
+      "cardinality": 4,
+      "name": "region"
+    },
+    {
+      "cardinality": 5,
+      "child_of": "region",
+      "name": "service"
+    },
+    {
+      "cardinality": 10,
+      "child_of": "service",
+      "name": "job"
+    },
+    {
+      "cardinality": 50,
+      "child_of": "job",
+      "name": "label_0"
+    }
+  ],
+  "notes": [
+    "source: ASAPPlanner origin/main tools/dag-viewer/workloads/random-mixed-seed-862-long/workload-01..10.json joined"
+  ],
+  "queries": [
+    {
+      "grouping": [],
+      "id": "q01-sum-by-region-service-job-sum-over-time",
+      "interval_ms": 20000,
+      "lookback_ms": 1800000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "sum by (region, service, job) (sum_over_time(data[30m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "q01/rqe",
+          "interval_ms": 20000,
+          "lookback_ms": 1800000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q02-sum-by-region-service-sum-over-time-data",
+      "interval_ms": 20000,
+      "lookback_ms": 1800000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "sum by (region, service) (sum_over_time(data[30m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "q02/rqe",
+          "interval_ms": 20000,
+          "lookback_ms": 1800000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q03-avg-by-region-service-job-quantile-over",
+      "interval_ms": 1000,
+      "lookback_ms": 300000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "avg by (region, service, job) (quantile_over_time(0.99, data[300s]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "q03/rqe",
+          "interval_ms": 1000,
+          "lookback_ms": 300000,
+          "metric": "data",
+          "phi": 0.99
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q04-avg-by-region-quantile-over-time-0-95-da",
+      "interval_ms": 1000,
+      "lookback_ms": 300000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "avg by (region) (quantile_over_time(0.95, data[300s]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "q04/rqe",
+          "interval_ms": 1000,
+          "lookback_ms": 300000,
+          "metric": "data",
+          "phi": 0.95
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q05-avg-by-region-service-job-quantile-over",
+      "interval_ms": 1000,
+      "lookback_ms": 300000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "avg by (region, service, job) (quantile_over_time(0.75, data[300s]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "q05/rqe",
+          "interval_ms": 1000,
+          "lookback_ms": 300000,
+          "metric": "data",
+          "phi": 0.75
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q06-topk-by-region-service-4-sum-over-time-d",
+      "interval_ms": 1000,
+      "lookback_ms": 180000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "topk by (region, service) (4, sum_over_time(data[3m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q06/rqe",
+          "interval_ms": 1000,
+          "lookback_ms": 180000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q07-topk-by-region-service-4-sum-over-time-d",
+      "interval_ms": 30000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "topk by (region, service) (4, sum_over_time(data[60m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q07/rqe",
+          "interval_ms": 30000,
+          "lookback_ms": 3600000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q08-topk-by-region-service-8-increase-data-t",
+      "interval_ms": 20000,
+      "lookback_ms": 1800000,
+      "metrics": [
+        "data_total"
+      ],
+      "promql": "topk by (region, service) (8, increase(data_total[30m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q08/rqe",
+          "interval_ms": 20000,
+          "lookback_ms": 1800000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q09-topk-by-region-4-rate-data-total-60m",
+      "interval_ms": 30000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "data_total"
+      ],
+      "promql": "topk by (region) (4, rate(data_total[60m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q09/rqe",
+          "interval_ms": 30000,
+          "lookback_ms": 3600000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q10-sum-by-region-service-job-sum-over-time",
+      "interval_ms": 5000,
+      "lookback_ms": 900000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "sum by (region, service, job) (sum_over_time(data[15m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "q10/rqe",
+          "interval_ms": 5000,
+          "lookback_ms": 900000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q11-sum-by-region-service-sum-over-time-data",
+      "interval_ms": 5000,
+      "lookback_ms": 900000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "sum by (region, service) (sum_over_time(data[15m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "q11/rqe",
+          "interval_ms": 5000,
+          "lookback_ms": 900000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q12-avg-by-region-quantile-over-time-0-75-da",
+      "interval_ms": 1000,
+      "lookback_ms": 300000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "avg by (region) (quantile_over_time(0.75, data[300s]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "q12/rqe",
+          "interval_ms": 1000,
+          "lookback_ms": 300000,
+          "metric": "data",
+          "phi": 0.75
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q13-avg-by-region-service-quantile-over-time",
+      "interval_ms": 1000,
+      "lookback_ms": 300000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "avg by (region, service) (quantile_over_time(0.95, data[300s]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "q13/rqe",
+          "interval_ms": 1000,
+          "lookback_ms": 300000,
+          "metric": "data",
+          "phi": 0.95
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q14-topk-by-region-service-4-sum-over-time-d",
+      "interval_ms": 60000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "topk by (region, service) (4, sum_over_time(data[60m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q14/rqe",
+          "interval_ms": 60000,
+          "lookback_ms": 3600000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q15-topk-by-region-4-increase-data-total-15m",
+      "interval_ms": 5000,
+      "lookback_ms": 900000,
+      "metrics": [
+        "data_total"
+      ],
+      "promql": "topk by (region) (4, increase(data_total[15m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q15/rqe",
+          "interval_ms": 5000,
+          "lookback_ms": 900000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q16-topk-by-region-4-rate-data-total-60m",
+      "interval_ms": 60000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "data_total"
+      ],
+      "promql": "topk by (region) (4, rate(data_total[60m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q16/rqe",
+          "interval_ms": 60000,
+          "lookback_ms": 3600000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q17-sum-by-region-service-job-sum-over-time",
+      "interval_ms": 1000,
+      "lookback_ms": 180000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "sum by (region, service, job) (sum_over_time(data[3m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "q17/rqe",
+          "interval_ms": 1000,
+          "lookback_ms": 180000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q18-sum-by-region-service-sum-over-time-data",
+      "interval_ms": 1000,
+      "lookback_ms": 180000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "sum by (region, service) (sum_over_time(data[3m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "q18/rqe",
+          "interval_ms": 1000,
+          "lookback_ms": 180000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q19-avg-by-region-service-quantile-over-time",
+      "interval_ms": 1000,
+      "lookback_ms": 300000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "avg by (region, service) (quantile_over_time(0.90, data[300s]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "q19/rqe",
+          "interval_ms": 1000,
+          "lookback_ms": 300000,
+          "metric": "data",
+          "phi": 0.9
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q20-avg-by-region-service-job-quantile-over",
+      "interval_ms": 1000,
+      "lookback_ms": 300000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "avg by (region, service, job) (quantile_over_time(0.90, data[300s]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "q20/rqe",
+          "interval_ms": 1000,
+          "lookback_ms": 300000,
+          "metric": "data",
+          "phi": 0.9
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q21-topk-by-region-4-sum-over-time-data-3m",
+      "interval_ms": 1000,
+      "lookback_ms": 180000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "topk by (region) (4, sum_over_time(data[3m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q21/rqe",
+          "interval_ms": 1000,
+          "lookback_ms": 180000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q22-topk-by-region-4-sum-over-time-data-60m",
+      "interval_ms": 30000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "topk by (region) (4, sum_over_time(data[60m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q22/rqe",
+          "interval_ms": 30000,
+          "lookback_ms": 3600000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q23-topk-by-region-service-8-increase-data-t",
+      "interval_ms": 1000,
+      "lookback_ms": 180000,
+      "metrics": [
+        "data_total"
+      ],
+      "promql": "topk by (region, service) (8, increase(data_total[3m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q23/rqe",
+          "interval_ms": 1000,
+          "lookback_ms": 180000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q24-sum-by-region-service-job-sum-over-time",
+      "interval_ms": 10000,
+      "lookback_ms": 1800000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "sum by (region, service, job) (sum_over_time(data[30m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "q24/rqe",
+          "interval_ms": 10000,
+          "lookback_ms": 1800000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q25-sum-by-region-service-sum-over-time-data",
+      "interval_ms": 10000,
+      "lookback_ms": 1800000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "sum by (region, service) (sum_over_time(data[30m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "q25/rqe",
+          "interval_ms": 10000,
+          "lookback_ms": 1800000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q26-avg-by-region-service-quantile-over-time",
+      "interval_ms": 1000,
+      "lookback_ms": 300000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "avg by (region, service) (quantile_over_time(0.75, data[300s]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "q26/rqe",
+          "interval_ms": 1000,
+          "lookback_ms": 300000,
+          "metric": "data",
+          "phi": 0.75
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q27-topk-by-region-service-4-sum-over-time-d",
+      "interval_ms": 2000,
+      "lookback_ms": 180000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "topk by (region, service) (4, sum_over_time(data[3m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q27/rqe",
+          "interval_ms": 2000,
+          "lookback_ms": 180000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q28-topk-by-region-service-4-increase-data-t",
+      "interval_ms": 10000,
+      "lookback_ms": 1800000,
+      "metrics": [
+        "data_total"
+      ],
+      "promql": "topk by (region, service) (4, increase(data_total[30m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q28/rqe",
+          "interval_ms": 10000,
+          "lookback_ms": 1800000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q29-topk-by-region-8-rate-data-total-60m",
+      "interval_ms": 30000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "data_total"
+      ],
+      "promql": "topk by (region) (8, rate(data_total[60m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q29/rqe",
+          "interval_ms": 30000,
+          "lookback_ms": 3600000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q30-sum-by-region-service-job-sum-over-time",
+      "interval_ms": 10000,
+      "lookback_ms": 900000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "sum by (region, service, job) (sum_over_time(data[15m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "q30/rqe",
+          "interval_ms": 10000,
+          "lookback_ms": 900000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q31-sum-by-region-service-sum-over-time-data",
+      "interval_ms": 10000,
+      "lookback_ms": 900000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "sum by (region, service) (sum_over_time(data[15m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "q31/rqe",
+          "interval_ms": 10000,
+          "lookback_ms": 900000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q32-avg-by-region-service-quantile-over-time",
+      "interval_ms": 1000,
+      "lookback_ms": 300000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "avg by (region, service) (quantile_over_time(0.99, data[300s]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "q32/rqe",
+          "interval_ms": 1000,
+          "lookback_ms": 300000,
+          "metric": "data",
+          "phi": 0.99
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q33-avg-by-region-service-job-quantile-over",
+      "interval_ms": 1000,
+      "lookback_ms": 300000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "avg by (region, service, job) (quantile_over_time(0.50, data[300s]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "q33/rqe",
+          "interval_ms": 1000,
+          "lookback_ms": 300000,
+          "metric": "data",
+          "phi": 0.5
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q34-avg-by-region-quantile-over-time-0-90-da",
+      "interval_ms": 1000,
+      "lookback_ms": 300000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "avg by (region) (quantile_over_time(0.90, data[300s]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "q34/rqe",
+          "interval_ms": 1000,
+          "lookback_ms": 300000,
+          "metric": "data",
+          "phi": 0.9
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q35-topk-by-region-service-8-sum-over-time-d",
+      "interval_ms": 1000,
+      "lookback_ms": 180000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "topk by (region, service) (8, sum_over_time(data[3m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q35/rqe",
+          "interval_ms": 1000,
+          "lookback_ms": 180000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q36-topk-by-region-4-sum-over-time-data-60m",
+      "interval_ms": 60000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "topk by (region) (4, sum_over_time(data[60m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q36/rqe",
+          "interval_ms": 60000,
+          "lookback_ms": 3600000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q37-topk-by-region-service-8-increase-data-t",
+      "interval_ms": 10000,
+      "lookback_ms": 900000,
+      "metrics": [
+        "data_total"
+      ],
+      "promql": "topk by (region, service) (8, increase(data_total[15m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q37/rqe",
+          "interval_ms": 10000,
+          "lookback_ms": 900000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q38-topk-by-region-8-rate-data-total-60m",
+      "interval_ms": 60000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "data_total"
+      ],
+      "promql": "topk by (region) (8, rate(data_total[60m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q38/rqe",
+          "interval_ms": 60000,
+          "lookback_ms": 3600000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q39-avg-by-region-service-quantile-over-time",
+      "interval_ms": 1000,
+      "lookback_ms": 300000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "avg by (region, service) (quantile_over_time(0.50, data[300s]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "q39/rqe",
+          "interval_ms": 1000,
+          "lookback_ms": 300000,
+          "metric": "data",
+          "phi": 0.5
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q40-topk-by-region-service-8-sum-over-time-d",
+      "interval_ms": 60000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "topk by (region, service) (8, sum_over_time(data[60m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q40/rqe",
+          "interval_ms": 60000,
+          "lookback_ms": 3600000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q41-topk-by-region-service-8-increase-data-t",
+      "interval_ms": 5000,
+      "lookback_ms": 900000,
+      "metrics": [
+        "data_total"
+      ],
+      "promql": "topk by (region, service) (8, increase(data_total[15m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q41/rqe",
+          "interval_ms": 5000,
+          "lookback_ms": 900000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q42-topk-by-region-service-4-rate-data-total",
+      "interval_ms": 60000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "data_total"
+      ],
+      "promql": "topk by (region, service) (4, rate(data_total[60m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q42/rqe",
+          "interval_ms": 60000,
+          "lookback_ms": 3600000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q43-avg-by-region-service-job-quantile-over",
+      "interval_ms": 1000,
+      "lookback_ms": 300000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "avg by (region, service, job) (quantile_over_time(0.95, data[300s]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "q43/rqe",
+          "interval_ms": 1000,
+          "lookback_ms": 300000,
+          "metric": "data",
+          "phi": 0.95
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q44-avg-by-region-quantile-over-time-0-50-da",
+      "interval_ms": 1000,
+      "lookback_ms": 300000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "avg by (region) (quantile_over_time(0.50, data[300s]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "q44/rqe",
+          "interval_ms": 1000,
+          "lookback_ms": 300000,
+          "metric": "data",
+          "phi": 0.5
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q45-topk-by-region-4-sum-over-time-data-3m",
+      "interval_ms": 2000,
+      "lookback_ms": 180000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "topk by (region) (4, sum_over_time(data[3m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q45/rqe",
+          "interval_ms": 2000,
+          "lookback_ms": 180000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q46-topk-by-region-4-increase-data-total-30m",
+      "interval_ms": 20000,
+      "lookback_ms": 1800000,
+      "metrics": [
+        "data_total"
+      ],
+      "promql": "topk by (region) (4, increase(data_total[30m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q46/rqe",
+          "interval_ms": 20000,
+          "lookback_ms": 1800000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q47-topk-by-region-service-8-rate-data-total",
+      "interval_ms": 60000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "data_total"
+      ],
+      "promql": "topk by (region, service) (8, rate(data_total[60m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q47/rqe",
+          "interval_ms": 60000,
+          "lookback_ms": 3600000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q48-topk-by-region-8-increase-data-total-15m",
+      "interval_ms": 10000,
+      "lookback_ms": 900000,
+      "metrics": [
+        "data_total"
+      ],
+      "promql": "topk by (region) (8, increase(data_total[15m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q48/rqe",
+          "interval_ms": 10000,
+          "lookback_ms": 900000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q49-sum-by-region-service-job-sum-over-time",
+      "interval_ms": 2000,
+      "lookback_ms": 180000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "sum by (region, service, job) (sum_over_time(data[3m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "q49/rqe",
+          "interval_ms": 2000,
+          "lookback_ms": 180000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q50-sum-by-region-service-sum-over-time-data",
+      "interval_ms": 2000,
+      "lookback_ms": 180000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "sum by (region, service) (sum_over_time(data[3m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "q50/rqe",
+          "interval_ms": 2000,
+          "lookback_ms": 180000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q51-topk-by-region-service-8-sum-over-time-d",
+      "interval_ms": 30000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "topk by (region, service) (8, sum_over_time(data[60m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q51/rqe",
+          "interval_ms": 30000,
+          "lookback_ms": 3600000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q52-topk-by-region-4-increase-data-total-3m",
+      "interval_ms": 2000,
+      "lookback_ms": 180000,
+      "metrics": [
+        "data_total"
+      ],
+      "promql": "topk by (region) (4, increase(data_total[3m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q52/rqe",
+          "interval_ms": 2000,
+          "lookback_ms": 180000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q53-topk-by-region-service-4-rate-data-total",
+      "interval_ms": 30000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "data_total"
+      ],
+      "promql": "topk by (region, service) (4, rate(data_total[60m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q53/rqe",
+          "interval_ms": 30000,
+          "lookback_ms": 3600000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q54-topk-by-region-8-sum-over-time-data-3m",
+      "interval_ms": 2000,
+      "lookback_ms": 180000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "topk by (region) (8, sum_over_time(data[3m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q54/rqe",
+          "interval_ms": 2000,
+          "lookback_ms": 180000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    }
+  ],
+  "samples_per_sec_per_series": 10,
+  "seed": 862,
+  "version": 1
+}

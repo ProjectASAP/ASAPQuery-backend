@@ -1,0 +1,1061 @@
+{
+  "data_facts": {
+    "backfill_history_ms": 1200000,
+    "events": {
+      "assignment": "deterministic_rotating_pool_with_cross_leaf_overlap",
+      "distinct_key": "user_id",
+      "table": "events",
+      "time_column": "ts",
+      "user_id_universe_size": 10000,
+      "user_ids_per_leaf": 1000
+    },
+    "feeder_seed": 862,
+    "metrics": {
+      "data": {
+        "kind": "gauge",
+        "pareto_shape": 2.0,
+        "value_shape": "rank_scaled_pareto"
+      },
+      "data_total": {
+        "increment_shape": "rank_scaled_positive_deterministic",
+        "kind": "counter",
+        "resets": "none"
+      }
+    },
+    "scrape_interval_ms": 100,
+    "series": {
+      "leaf_count": 10000,
+      "ranking": {
+        "exponent": 1.1,
+        "kind": "deterministic_zipf_like",
+        "rank_scope": "leaf_series"
+      }
+    }
+  },
+  "description": "48-core demo workload (demo plan sections 8-9): 21 queries over data/data_total and HTTP, cache, queue, power and histogram metrics, 10 Hz integer Zipf data.",
+  "extra_metrics": {
+    "cache_hits_total": {
+      "labels": [
+        {
+          "cardinality": 4,
+          "name": "region"
+        },
+        {
+          "cardinality": 5,
+          "child_of": "region",
+          "name": "service"
+        },
+        {
+          "cardinality": 10,
+          "child_of": "service",
+          "name": "job"
+        },
+        {
+          "cardinality": 50,
+          "child_of": "job",
+          "name": "instance",
+          "scale_with_label0": 0.25
+        }
+      ],
+      "samples_per_sec_per_series": 10,
+      "type": "counter",
+      "values": {
+        "increment": {
+          "keys": 10000,
+          "zipf": 1.1
+        }
+      }
+    },
+    "cache_lookups_total": {
+      "labels": [
+        {
+          "cardinality": 4,
+          "name": "region"
+        },
+        {
+          "cardinality": 5,
+          "child_of": "region",
+          "name": "service"
+        },
+        {
+          "cardinality": 10,
+          "child_of": "service",
+          "name": "job"
+        },
+        {
+          "cardinality": 50,
+          "child_of": "job",
+          "name": "instance",
+          "scale_with_label0": 0.25
+        }
+      ],
+      "samples_per_sec_per_series": 10,
+      "type": "counter",
+      "values": {
+        "increment": {
+          "keys": 10000,
+          "zipf": 1.1
+        }
+      }
+    },
+    "calc_duration_bucket": {
+      "labels": [
+        {
+          "cardinality": 2,
+          "name": "env",
+          "values": [
+            "prod",
+            "staging"
+          ]
+        },
+        {
+          "cardinality": 50,
+          "name": "service"
+        },
+        {
+          "cardinality": 100,
+          "child_of": "service",
+          "name": "instance",
+          "scale_with_label0": 0.5
+        },
+        {
+          "cardinality": 8,
+          "name": "le",
+          "values": [
+            "0.005",
+            "0.01",
+            "0.05",
+            "0.1",
+            "0.5",
+            "1",
+            "5",
+            "+Inf"
+          ]
+        }
+      ],
+      "samples_per_sec_per_series": 10,
+      "type": "counter",
+      "values": {
+        "increment": {
+          "keys": 80000,
+          "zipf": 1.1
+        }
+      }
+    },
+    "capacity_rps": {
+      "labels": [
+        {
+          "cardinality": 4,
+          "name": "region"
+        },
+        {
+          "cardinality": 5,
+          "child_of": "region",
+          "name": "service"
+        },
+        {
+          "cardinality": 10,
+          "child_of": "service",
+          "name": "job"
+        }
+      ],
+      "samples_per_sec_per_series": 10,
+      "type": "gauge",
+      "values": {
+        "dist": {
+          "pareto": 2.0
+        },
+        "value": {
+          "keys": 200,
+          "zipf": 1.1
+        }
+      }
+    },
+    "data_latency_bucket": {
+      "labels": [
+        {
+          "cardinality": 2,
+          "name": "env",
+          "values": [
+            "prod",
+            "staging"
+          ]
+        },
+        {
+          "cardinality": 20,
+          "name": "app"
+        },
+        {
+          "cardinality": 250,
+          "child_of": "app",
+          "name": "instance",
+          "scale_with_label0": 1.25
+        },
+        {
+          "cardinality": 8,
+          "name": "le",
+          "values": [
+            "0.005",
+            "0.01",
+            "0.05",
+            "0.1",
+            "0.5",
+            "1",
+            "5",
+            "+Inf"
+          ]
+        }
+      ],
+      "samples_per_sec_per_series": 10,
+      "type": "counter",
+      "values": {
+        "increment": {
+          "keys": 80000,
+          "zipf": 1.1
+        }
+      }
+    },
+    "delivery_latency_bucket": {
+      "labels": [
+        {
+          "cardinality": 4,
+          "name": "region"
+        },
+        {
+          "cardinality": 250,
+          "child_of": "region",
+          "name": "host",
+          "scale_with_label0": 1.25
+        },
+        {
+          "cardinality": 10,
+          "name": "kind",
+          "values": [
+            "written",
+            "read",
+            "queued",
+            "retried",
+            "dropped",
+            "acked",
+            "nacked",
+            "expired",
+            "deferred",
+            "skipped"
+          ]
+        },
+        {
+          "cardinality": 8,
+          "name": "le",
+          "values": [
+            "0.005",
+            "0.01",
+            "0.05",
+            "0.1",
+            "0.5",
+            "1",
+            "5",
+            "+Inf"
+          ]
+        }
+      ],
+      "samples_per_sec_per_series": 10,
+      "type": "counter",
+      "values": {
+        "increment": {
+          "keys": 80000,
+          "zipf": 1.1
+        }
+      }
+    },
+    "http_errors_total": {
+      "labels": [
+        {
+          "cardinality": 4,
+          "name": "region"
+        },
+        {
+          "cardinality": 5,
+          "child_of": "region",
+          "name": "service"
+        },
+        {
+          "cardinality": 10,
+          "child_of": "service",
+          "name": "job"
+        },
+        {
+          "cardinality": 50,
+          "child_of": "job",
+          "name": "instance",
+          "scale_with_label0": 0.25
+        }
+      ],
+      "samples_per_sec_per_series": 10,
+      "type": "counter",
+      "values": {
+        "increment": {
+          "keys": 10000,
+          "zipf": 1.1
+        }
+      }
+    },
+    "http_request_duration_seconds_bucket": {
+      "labels": [
+        {
+          "cardinality": 4,
+          "name": "region"
+        },
+        {
+          "cardinality": 5,
+          "child_of": "region",
+          "name": "service"
+        },
+        {
+          "cardinality": 10,
+          "child_of": "service",
+          "name": "job"
+        },
+        {
+          "cardinality": 50,
+          "child_of": "job",
+          "name": "instance",
+          "scale_with_label0": 0.25
+        },
+        {
+          "cardinality": 8,
+          "name": "le",
+          "values": [
+            "0.005",
+            "0.01",
+            "0.05",
+            "0.1",
+            "0.5",
+            "1",
+            "5",
+            "+Inf"
+          ]
+        }
+      ],
+      "samples_per_sec_per_series": 10,
+      "type": "counter",
+      "values": {
+        "increment": {
+          "keys": 80000,
+          "zipf": 1.1
+        }
+      }
+    },
+    "http_requests_total": {
+      "labels": [
+        {
+          "cardinality": 4,
+          "name": "region"
+        },
+        {
+          "cardinality": 5,
+          "child_of": "region",
+          "name": "service"
+        },
+        {
+          "cardinality": 10,
+          "child_of": "service",
+          "name": "job"
+        }
+      ],
+      "samples_per_sec_per_series": 10,
+      "type": "counter",
+      "values": {
+        "increment": {
+          "keys": 200,
+          "zipf": 1.1
+        }
+      }
+    },
+    "power": {
+      "labels": [
+        {
+          "cardinality": 4,
+          "name": "region"
+        },
+        {
+          "cardinality": 2500,
+          "child_of": "region",
+          "name": "host",
+          "scale_with_label0": 12.5
+        }
+      ],
+      "samples_per_sec_per_series": 10,
+      "type": "gauge",
+      "values": {
+        "dist": {
+          "pareto": 2.0
+        },
+        "value": {
+          "keys": 10000,
+          "zipf": 1.1
+        }
+      }
+    },
+    "queue_depth": {
+      "labels": [
+        {
+          "cardinality": 4,
+          "name": "region"
+        },
+        {
+          "cardinality": 5,
+          "child_of": "region",
+          "name": "service"
+        },
+        {
+          "cardinality": 10,
+          "child_of": "service",
+          "name": "job"
+        },
+        {
+          "cardinality": 50,
+          "child_of": "job",
+          "name": "instance",
+          "scale_with_label0": 0.25
+        }
+      ],
+      "samples_per_sec_per_series": 10,
+      "type": "gauge",
+      "values": {
+        "dist": {
+          "pareto": 2.0
+        },
+        "value": {
+          "keys": 10000,
+          "zipf": 1.1
+        }
+      }
+    },
+    "request_latency_seconds": {
+      "labels": [
+        {
+          "cardinality": 4,
+          "name": "region"
+        },
+        {
+          "cardinality": 5,
+          "child_of": "region",
+          "name": "service"
+        },
+        {
+          "cardinality": 10,
+          "child_of": "service",
+          "name": "job"
+        },
+        {
+          "cardinality": 50,
+          "child_of": "job",
+          "name": "instance",
+          "scale_with_label0": 0.25
+        }
+      ],
+      "samples_per_sec_per_series": 10,
+      "type": "gauge",
+      "values": {
+        "dist": {
+          "pareto": 2.0
+        },
+        "value": {
+          "keys": 10000,
+          "zipf": 1.1
+        }
+      }
+    }
+  },
+  "id": "demo48",
+  "labels": [
+    {
+      "cardinality": 4,
+      "name": "region"
+    },
+    {
+      "cardinality": 5,
+      "child_of": "region",
+      "name": "service"
+    },
+    {
+      "cardinality": 10,
+      "child_of": "service",
+      "name": "job"
+    },
+    {
+      "cardinality": 50,
+      "child_of": "job",
+      "name": "label_0"
+    }
+  ],
+  "notes": [
+    "http_requests_total and capacity_rps have one series per job (200): A and B join them on(job) as the group_left right side, which needs one series per job.",
+    "Histograms (http_request_duration_seconds_bucket, delivery_latency_bucket, calc_duration_bucket, data_latency_bucket): per sample a Zipf(1.1) number of observations in 1..20, log-normal (median 0.05, sigma 1); buckets cumulative over le.",
+    "cache_hits_total <= cache_lookups_total (per-series ratio 0.5-0.99); http_errors_total = a 0-2% share of its job's http_requests_total increments.",
+    "Other counters: Zipf(1.1, N=1e6) integer increments, 5% of series reset every 30-120 min; gauges: Zipf integers x an integer per-series multiplier.",
+    "L5 uses MetricsQL's implicit subquery rate(label_replace(...)[1m]).",
+    "Decided 2026-11-22: L6's offset moved onto the selector (same meaning; the plan's form is not valid PromQL). L1 and L5 run on VictoriaMetrics only (engines field); ASAP plans and answers the other 19 queries.",
+    "Decided 2026-11-22: the run is 3 h from zero; windows longer than 3h (A, B, E, L1, L2, L3: 6h) are capped at 3h; the original query text is in promql_original."
+  ],
+  "queries": [
+    {
+      "grouping": [],
+      "id": "q01-quantile-1h",
+      "interval_ms": 10000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "quantile_over_time(0.99, data[1h])",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "q01-quantile-1h/rqe",
+          "interval_ms": 10000,
+          "lookback_ms": 3600000,
+          "metric": "data",
+          "phi": 0.99
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q02-topk-rate-1h",
+      "interval_ms": 15000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "data_total"
+      ],
+      "promql": "topk(10, sum by (region, service, job) (rate(data_total[1h])))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "q02-topk-rate-1h/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 3600000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q03-max-30m",
+      "interval_ms": 10000,
+      "lookback_ms": 1800000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "max_over_time(data[30m])",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "max",
+          "grouping_labels": [],
+          "id": "q03-max-30m/rqe",
+          "interval_ms": 10000,
+          "lookback_ms": 1800000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q04-increase-1h",
+      "interval_ms": 15000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "data_total"
+      ],
+      "promql": "sum by (region, service) (increase(data_total[1h]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "q04-increase-1h/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 3600000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q05-quantile-1h-range",
+      "interval_ms": 15000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "data"
+      ],
+      "promql": "quantile_over_time(0.99, data[1h])",
+      "range": {
+        "span_ms": 3600000,
+        "step_ms": 15000
+      },
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "q05-quantile-1h-range/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 3600000,
+          "metric": "data",
+          "phi": 0.99
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "A-error-ratio",
+      "interval_ms": 15000,
+      "lookback_ms": 10800000,
+      "metrics": [
+        "http_errors_total",
+        "http_requests_total"
+      ],
+      "promql": "(increase(http_errors_total[3h]) / on(job) group_left() increase(http_requests_total[3h])) > 0.01",
+      "promql_original": "(increase(http_errors_total[6h]) / on(job) group_left() increase(http_requests_total[6h])) > 0.01",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "A-error-ratio/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 10800000,
+          "metric": "http_errors_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "B-capacity",
+      "interval_ms": 15000,
+      "lookback_ms": 10800000,
+      "metrics": [
+        "http_requests_total",
+        "capacity_rps"
+      ],
+      "promql": "(rate(http_requests_total[30s]) * 100 / on(job) group_left() max_over_time(capacity_rps[3h])) >= 80",
+      "promql_original": "(rate(http_requests_total[30s]) * 100 / on(job) group_left() max_over_time(capacity_rps[6h])) >= 80",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "max",
+          "grouping_labels": [],
+          "id": "B-capacity/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 10800000,
+          "metric": "http_requests_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "C-cache-hit",
+      "interval_ms": 15000,
+      "lookback_ms": 60000,
+      "metrics": [
+        "cache_hits_total",
+        "cache_lookups_total"
+      ],
+      "promql": "(avg by (region, service, job) (rate(cache_hits_total[60s]) / rate(cache_lookups_total[60s])) * 100) >= 90",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "C-cache-hit/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 60000,
+          "metric": "cache_hits_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "D-count-regions",
+      "interval_ms": 15000,
+      "lookback_ms": 1800000,
+      "metrics": [
+        "http_requests_total"
+      ],
+      "promql": "count by (region) (sum by (region, service) (increase(http_requests_total[30m])) > 1000)",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "D-count-regions/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 1800000,
+          "metric": "http_requests_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "E-quantile",
+      "interval_ms": 15000,
+      "lookback_ms": 10800000,
+      "metrics": [
+        "request_latency_seconds"
+      ],
+      "promql": "quantile_over_time(0.99, request_latency_seconds[3h])",
+      "promql_original": "quantile_over_time(0.99, request_latency_seconds[6h])",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "E-quantile/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 10800000,
+          "metric": "request_latency_seconds",
+          "phi": 0.99
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "G1-topk",
+      "interval_ms": 15000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "http_requests_total"
+      ],
+      "promql": "topk(10, increase(http_requests_total[1h]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "G1-topk/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 3600000,
+          "metric": "http_requests_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "H-histogram",
+      "interval_ms": 15000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "http_request_duration_seconds_bucket"
+      ],
+      "promql": "histogram_quantile(0.99, sum by (le, job) (rate(http_request_duration_seconds_bucket[1h])))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "H-histogram/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 3600000,
+          "metric": "http_request_duration_seconds_bucket",
+          "phi": 0.99
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "I-max-sum",
+      "interval_ms": 15000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "queue_depth"
+      ],
+      "promql": "sum by (region) (max by (region, service) (max_over_time(queue_depth[1h])))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "max",
+          "grouping_labels": [],
+          "id": "I-max-sum/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 3600000,
+          "metric": "queue_depth"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "J-max-offset",
+      "interval_ms": 15000,
+      "lookback_ms": 7200000,
+      "metrics": [
+        "queue_depth"
+      ],
+      "promql": "max by (job) (max_over_time(queue_depth[1h])) > max by (job) (max_over_time(queue_depth[1h] offset 1h))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "max",
+          "grouping_labels": [],
+          "id": "J-max-offset/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 7200000,
+          "metric": "queue_depth"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "K-ratio",
+      "interval_ms": 15000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "http_errors_total",
+        "http_requests_total"
+      ],
+      "promql": "sum(increase(http_errors_total[1h])) / sum(increase(http_requests_total[1h]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "K-ratio/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 3600000,
+          "metric": "http_errors_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "engines": [
+        "victoriametrics",
+        "vmcluster"
+      ],
+      "grouping": [],
+      "id": "L1-stddev",
+      "interval_ms": 15000,
+      "lookback_ms": 10800000,
+      "metrics": [
+        "power"
+      ],
+      "promql": "stddev_over_time(power{host=~\".*\"}[3h])",
+      "promql_original": "stddev_over_time(power{host=~\".*\"}[6h])",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "stddev",
+          "grouping_labels": [],
+          "id": "L1-stddev/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 10800000,
+          "metric": "power"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "L2-max-regex",
+      "interval_ms": 15000,
+      "lookback_ms": 10800000,
+      "metrics": [
+        "power"
+      ],
+      "promql": "quantile_over_time(1., power{host=~\"2\\\\..*\"}[3h])",
+      "promql_original": "quantile_over_time(1., power{host=~\"2\\\\..*\"}[6h])",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "L2-max-regex/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 10800000,
+          "metric": "power",
+          "phi": 0.99
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "L3-quantile",
+      "interval_ms": 15000,
+      "lookback_ms": 10800000,
+      "metrics": [
+        "power"
+      ],
+      "promql": "quantile_over_time(0.99, power{host=~\".*\"}[3h])",
+      "promql_original": "quantile_over_time(0.99, power{host=~\".*\"}[6h])",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "L3-quantile/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 10800000,
+          "metric": "power",
+          "phi": 0.99
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "L4-hosts",
+      "interval_ms": 15000,
+      "lookback_ms": 40000,
+      "metrics": [
+        "delivery_latency_bucket"
+      ],
+      "promql": "sum by (le) (rate(delivery_latency_bucket{region=~\"0|1\", host=~\"0\\\\.0|0\\\\.1|0\\\\.2|0\\\\.3|0\\\\.4|0\\\\.5|0\\\\.6|0\\\\.7|0\\\\.8|0\\\\.9|0\\\\.10|0\\\\.11|0\\\\.12|0\\\\.13|0\\\\.14|0\\\\.15|0\\\\.16|0\\\\.17|0\\\\.18|0\\\\.19|0\\\\.20|0\\\\.21|0\\\\.22|0\\\\.23|0\\\\.24|0\\\\.25|0\\\\.26|0\\\\.27|0\\\\.28|0\\\\.29|0\\\\.30|0\\\\.31|0\\\\.32|0\\\\.33|0\\\\.34|0\\\\.35|0\\\\.36|0\\\\.37|0\\\\.38|0\\\\.39|0\\\\.40|0\\\\.41|0\\\\.42|0\\\\.43|0\\\\.44|0\\\\.45|0\\\\.46|0\\\\.47|0\\\\.48|0\\\\.49|0\\\\.50|0\\\\.51|0\\\\.52|0\\\\.53|0\\\\.54|0\\\\.55|0\\\\.56|0\\\\.57|0\\\\.58|0\\\\.59|0\\\\.60|0\\\\.61|0\\\\.62|0\\\\.63|0\\\\.64|0\\\\.65|0\\\\.66|0\\\\.67|0\\\\.68|0\\\\.69|0\\\\.70|0\\\\.71|0\\\\.72|0\\\\.73|0\\\\.74|0\\\\.75|0\\\\.76|0\\\\.77|0\\\\.78|0\\\\.79|0\\\\.80|0\\\\.81|0\\\\.82|0\\\\.83|0\\\\.84|0\\\\.85|0\\\\.86|0\\\\.87|0\\\\.88|0\\\\.89|0\\\\.90|0\\\\.91|0\\\\.92|0\\\\.93|0\\\\.94|0\\\\.95|0\\\\.96|0\\\\.97|0\\\\.98|0\\\\.99|0\\\\.100|0\\\\.101|0\\\\.102|0\\\\.103|0\\\\.104|0\\\\.105|0\\\\.106|0\\\\.107|0\\\\.108|0\\\\.109|0\\\\.110|0\\\\.111|0\\\\.112|0\\\\.113|0\\\\.114|0\\\\.115|0\\\\.116|0\\\\.117|0\\\\.118|0\\\\.119|0\\\\.120|0\\\\.121|0\\\\.122|0\\\\.123|0\\\\.124|0\\\\.125|0\\\\.126|0\\\\.127|1\\\\.0|1\\\\.1|1\\\\.2|1\\\\.3|1\\\\.4|1\\\\.5|1\\\\.6|1\\\\.7|1\\\\.8|1\\\\.9|1\\\\.10|1\\\\.11|1\\\\.12|1\\\\.13|1\\\\.14|1\\\\.15|1\\\\.16|1\\\\.17|1\\\\.18|1\\\\.19|1\\\\.20|1\\\\.21|1\\\\.22|1\\\\.23|1\\\\.24|1\\\\.25|1\\\\.26|1\\\\.27|1\\\\.28|1\\\\.29|1\\\\.30|1\\\\.31|1\\\\.32|1\\\\.33|1\\\\.34|1\\\\.35|1\\\\.36|1\\\\.37|1\\\\.38|1\\\\.39|1\\\\.40|1\\\\.41|1\\\\.42|1\\\\.43|1\\\\.44|1\\\\.45|1\\\\.46|1\\\\.47|1\\\\.48|1\\\\.49|1\\\\.50|1\\\\.51|1\\\\.52|1\\\\.53|1\\\\.54|1\\\\.55|1\\\\.56|1\\\\.57|1\\\\.58|1\\\\.59|1\\\\.60|1\\\\.61|1\\\\.62|1\\\\.63|1\\\\.64|1\\\\.65|1\\\\.66|1\\\\.67|1\\\\.68|1\\\\.69|1\\\\.70|1\\\\.71|1\\\\.72|1\\\\.73|1\\\\.74|1\\\\.75|1\\\\.76|1\\\\.77|1\\\\.78|1\\\\.79|1\\\\.80|1\\\\.81|1\\\\.82|1\\\\.83|1\\\\.84|1\\\\.85|1\\\\.86|1\\\\.87|1\\\\.88|1\\\\.89|1\\\\.90|1\\\\.91|1\\\\.92|1\\\\.93|1\\\\.94|1\\\\.95|1\\\\.96|1\\\\.97|1\\\\.98|1\\\\.99|1\\\\.100|1\\\\.101|1\\\\.102|1\\\\.103|1\\\\.104|1\\\\.105|1\\\\.106|1\\\\.107|1\\\\.108|1\\\\.109|1\\\\.110|1\\\\.111|1\\\\.112|1\\\\.113|1\\\\.114|1\\\\.115|1\\\\.116|1\\\\.117|1\\\\.118|1\\\\.119|1\\\\.120|1\\\\.121|1\\\\.122|1\\\\.123|1\\\\.124|1\\\\.125|1\\\\.126|1\\\\.127\", kind=\"written\"}[40s]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "L4-hosts/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 40000,
+          "metric": "delivery_latency_bucket"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "engines": [
+        "victoriametrics",
+        "vmcluster"
+      ],
+      "grouping": [],
+      "id": "L5-label-replace",
+      "interval_ms": 15000,
+      "lookback_ms": 60000,
+      "metrics": [
+        "calc_duration_bucket"
+      ],
+      "promql": "histogram_quantile(0.95, sum by (le, svc) (rate(label_replace(calc_duration_bucket{env=\"prod\"}, \"svc\", \"$1\", \"service\", \"([0-9])[0-9]*\")[1m]))) > 2",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "L5-label-replace/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 60000,
+          "metric": "calc_duration_bucket",
+          "phi": 0.99
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "L6-offset",
+      "interval_ms": 15000,
+      "lookback_ms": 60000,
+      "metrics": [
+        "data_latency_bucket"
+      ],
+      "promql": "histogram_quantile(0.95, sum by (le, app, instance) (rate(data_latency_bucket{app=~\"1.*\", instance=~\".*\\\\.1.*\", env=\"prod\"}[30s] offset 30s)))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "L6-offset/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 60000,
+          "metric": "data_latency_bucket",
+          "phi": 0.99
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    }
+  ],
+  "samples_per_sec_per_series": 10,
+  "seed": 862,
+  "value_overrides": {
+    "cache_hits_total": {
+      "kind": "paired",
+      "of": "cache_lookups_total",
+      "ratio_max": 0.99,
+      "ratio_min": 0.5
+    },
+    "calc_duration_bucket": {
+      "kind": "histogram",
+      "median": 0.05,
+      "obs_max": 20,
+      "obs_s": 1.1,
+      "sigma": 1.0
+    },
+    "data_latency_bucket": {
+      "kind": "histogram",
+      "median": 0.05,
+      "obs_max": 20,
+      "obs_s": 1.1,
+      "sigma": 1.0
+    },
+    "delivery_latency_bucket": {
+      "kind": "histogram",
+      "median": 0.05,
+      "obs_max": 20,
+      "obs_s": 1.1,
+      "sigma": 1.0
+    },
+    "http_errors_total": {
+      "kind": "paired",
+      "of": "http_requests_total",
+      "ratio_max": 0.02,
+      "ratio_min": 0.0
+    },
+    "http_request_duration_seconds_bucket": {
+      "kind": "histogram",
+      "median": 0.05,
+      "obs_max": 20,
+      "obs_s": 1.1,
+      "sigma": 1.0
+    }
+  },
+  "version": 1
+}

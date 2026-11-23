@@ -1,0 +1,333 @@
+{
+  "data_facts": {
+    "backfill_history_ms": 1200000,
+    "events": {
+      "assignment": "deterministic_rotating_pool_with_cross_leaf_overlap",
+      "distinct_key": "user_id",
+      "table": "events",
+      "time_column": "ts",
+      "user_id_universe_size": 10000,
+      "user_ids_per_leaf": 1000
+    },
+    "feeder_seed": 862,
+    "metrics": {
+      "data": {
+        "kind": "gauge",
+        "pareto_shape": 2.0,
+        "value_shape": "rank_scaled_pareto"
+      },
+      "data_total": {
+        "increment_shape": "rank_scaled_positive_deterministic",
+        "kind": "counter",
+        "resets": "none"
+      }
+    },
+    "scrape_interval_ms": 100,
+    "series": {
+      "leaf_count": 10000,
+      "ranking": {
+        "exponent": 1.1,
+        "kind": "deterministic_zipf_like",
+        "rank_scope": "leaf_series"
+      }
+    }
+  },
+  "description": "typical-dashboard's panels refreshed every 60 s at 10 samples/s per series.",
+  "id": "typical-dashboard-60s-10hz",
+  "labels": [
+    {
+      "cardinality": 4,
+      "name": "region"
+    },
+    {
+      "cardinality": 5,
+      "child_of": "region",
+      "name": "service"
+    },
+    {
+      "cardinality": 10,
+      "child_of": "service",
+      "name": "job"
+    },
+    {
+      "cardinality": 50,
+      "child_of": "job",
+      "name": "label_0"
+    }
+  ],
+  "queries": [
+    {
+      "grouping": [
+        "job"
+      ],
+      "id": "p01-rate-job-5m",
+      "interval_ms": 60000,
+      "lookback_ms": 300000,
+      "promql": "sum by (job) (rate(data_total[5m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [
+            "job"
+          ],
+          "id": "p01-rate-job-5m/rqe",
+          "interval_ms": 60000,
+          "lookback_ms": 300000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [
+        "region"
+      ],
+      "id": "p02-increase-region-1h",
+      "interval_ms": 60000,
+      "lookback_ms": 3600000,
+      "promql": "sum by (region) (increase(data_total[1h]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [
+            "region"
+          ],
+          "id": "p02-increase-region-1h/rqe",
+          "interval_ms": 60000,
+          "lookback_ms": 3600000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [
+        "job"
+      ],
+      "id": "p03-avg-job-5m",
+      "interval_ms": 60000,
+      "lookback_ms": 300000,
+      "promql": "avg by (job) (avg_over_time(data[5m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "avg",
+          "grouping_labels": [
+            "job"
+          ],
+          "id": "p03-avg-job-5m/rqe",
+          "interval_ms": 60000,
+          "lookback_ms": 300000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [
+        "job"
+      ],
+      "id": "p04-max-job-15m",
+      "interval_ms": 60000,
+      "lookback_ms": 900000,
+      "promql": "max by (job) (max_over_time(data[15m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "max",
+          "grouping_labels": [
+            "job"
+          ],
+          "id": "p04-max-job-15m/rqe",
+          "interval_ms": 60000,
+          "lookback_ms": 900000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [
+        "job"
+      ],
+      "id": "p05-topk-rate-5m",
+      "interval_ms": 60000,
+      "lookback_ms": 300000,
+      "promql": "topk(5, sum by (job) (rate(data_total[5m])))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [
+            "job"
+          ],
+          "id": "p05-topk-rate-5m/rqe",
+          "interval_ms": 60000,
+          "lookback_ms": 300000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [
+        "job"
+      ],
+      "id": "p07-quantile-ot-job-15m",
+      "interval_ms": 60000,
+      "lookback_ms": 900000,
+      "promql": "avg by (job) (quantile_over_time(0.99, data[15m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [
+            "job"
+          ],
+          "id": "p07-quantile-ot-job-15m/rqe",
+          "interval_ms": 60000,
+          "lookback_ms": 900000,
+          "metric": "data",
+          "phi": 0.99
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [
+        "region",
+        "service"
+      ],
+      "id": "p08-avg-service-30m",
+      "interval_ms": 60000,
+      "lookback_ms": 1800000,
+      "promql": "avg by (region, service) (avg_over_time(data[30m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "avg",
+          "grouping_labels": [
+            "region",
+            "service"
+          ],
+          "id": "p08-avg-service-30m/rqe",
+          "interval_ms": 60000,
+          "lookback_ms": 1800000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [
+        "service"
+      ],
+      "id": "p09-rate-service-1h",
+      "interval_ms": 60000,
+      "lookback_ms": 3600000,
+      "promql": "sum by (service) (rate(data_total[1h]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [
+            "service"
+          ],
+          "id": "p09-rate-service-1h/rqe",
+          "interval_ms": 60000,
+          "lookback_ms": 3600000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [
+        "region"
+      ],
+      "id": "p10-max-region-1h",
+      "interval_ms": 60000,
+      "lookback_ms": 3600000,
+      "promql": "max by (region) (max_over_time(data[1h]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "max",
+          "grouping_labels": [
+            "region"
+          ],
+          "id": "p10-max-region-1h/rqe",
+          "interval_ms": 60000,
+          "lookback_ms": 3600000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [
+        "service",
+        "job"
+      ],
+      "id": "p11-topk-increase-15m",
+      "interval_ms": 60000,
+      "lookback_ms": 900000,
+      "promql": "topk(10, sum by (service, job) (increase(data_total[15m])))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [
+            "service",
+            "job"
+          ],
+          "id": "p11-topk-increase-15m/rqe",
+          "interval_ms": 60000,
+          "lookback_ms": 900000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [
+        "region"
+      ],
+      "id": "p12-quantile-ot-region-1h",
+      "interval_ms": 60000,
+      "lookback_ms": 3600000,
+      "promql": "avg by (region) (quantile_over_time(0.5, data[1h]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [
+            "region"
+          ],
+          "id": "p12-quantile-ot-region-1h/rqe",
+          "interval_ms": 60000,
+          "lookback_ms": 3600000,
+          "metric": "data",
+          "phi": 0.5
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    }
+  ],
+  "samples_per_sec_per_series": 10,
+  "seed": 862,
+  "version": 1
+}

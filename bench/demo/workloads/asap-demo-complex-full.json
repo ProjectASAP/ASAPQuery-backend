@@ -1,0 +1,525 @@
+{
+  "data_facts": {
+    "backfill_history_ms": 1200000,
+    "events": {
+      "assignment": "deterministic_rotating_pool_with_cross_leaf_overlap",
+      "distinct_key": "user_id",
+      "table": "events",
+      "time_column": "ts",
+      "user_id_universe_size": 10000,
+      "user_ids_per_leaf": 1000
+    },
+    "feeder_seed": 862,
+    "metrics": {
+      "data": {
+        "kind": "gauge",
+        "pareto_shape": 2.0,
+        "value_shape": "rank_scaled_pareto"
+      },
+      "data_total": {
+        "increment_shape": "rank_scaled_positive_deterministic",
+        "kind": "counter",
+        "resets": "none"
+      }
+    },
+    "scrape_interval_ms": 100,
+    "series": {
+      "leaf_count": 10000,
+      "ranking": {
+        "exponent": 1.1,
+        "kind": "deterministic_zipf_like",
+        "rank_scope": "leaf_series"
+      }
+    }
+  },
+  "description": "asap-demo-complex with the original windows (planning only).",
+  "extra_metrics": {
+    "cache_hits_total": {
+      "labels": [
+        {
+          "cardinality": 4,
+          "name": "region"
+        },
+        {
+          "cardinality": 5,
+          "child_of": "region",
+          "name": "service"
+        },
+        {
+          "cardinality": 10,
+          "child_of": "service",
+          "name": "job"
+        },
+        {
+          "cardinality": 5,
+          "child_of": "job",
+          "name": "instance"
+        }
+      ],
+      "samples_per_sec_per_series": 10,
+      "type": "counter",
+      "values": {
+        "increment": {
+          "keys": 1000,
+          "zipf": 1.1
+        }
+      }
+    },
+    "cache_lookups_total": {
+      "labels": [
+        {
+          "cardinality": 4,
+          "name": "region"
+        },
+        {
+          "cardinality": 5,
+          "child_of": "region",
+          "name": "service"
+        },
+        {
+          "cardinality": 10,
+          "child_of": "service",
+          "name": "job"
+        },
+        {
+          "cardinality": 5,
+          "child_of": "job",
+          "name": "instance"
+        }
+      ],
+      "samples_per_sec_per_series": 10,
+      "type": "counter",
+      "values": {
+        "increment": {
+          "keys": 1000,
+          "zipf": 1.1
+        }
+      }
+    },
+    "capacity_rps": {
+      "labels": [
+        {
+          "cardinality": 4,
+          "name": "region"
+        },
+        {
+          "cardinality": 5,
+          "child_of": "region",
+          "name": "service"
+        },
+        {
+          "cardinality": 10,
+          "child_of": "service",
+          "name": "job"
+        }
+      ],
+      "samples_per_sec_per_series": 10,
+      "type": "gauge",
+      "values": {
+        "dist": {
+          "pareto": 2.0
+        },
+        "value": {
+          "keys": 200,
+          "zipf": 1.1
+        }
+      }
+    },
+    "http_request_duration_seconds_bucket": {
+      "labels": [
+        {
+          "cardinality": 4,
+          "name": "region"
+        },
+        {
+          "cardinality": 5,
+          "child_of": "region",
+          "name": "service"
+        },
+        {
+          "cardinality": 10,
+          "child_of": "service",
+          "name": "job"
+        },
+        {
+          "cardinality": 8,
+          "name": "le",
+          "values": [
+            "0.005",
+            "0.01",
+            "0.05",
+            "0.1",
+            "0.5",
+            "1",
+            "5",
+            "+Inf"
+          ]
+        }
+      ],
+      "samples_per_sec_per_series": 10,
+      "type": "counter",
+      "values": {
+        "increment": {
+          "keys": 1600,
+          "zipf": 1.1
+        }
+      }
+    },
+    "http_requests_total": {
+      "labels": [
+        {
+          "cardinality": 4,
+          "name": "region"
+        },
+        {
+          "cardinality": 5,
+          "child_of": "region",
+          "name": "service"
+        },
+        {
+          "cardinality": 10,
+          "child_of": "service",
+          "name": "job"
+        }
+      ],
+      "samples_per_sec_per_series": 10,
+      "type": "counter",
+      "values": {
+        "increment": {
+          "keys": 200,
+          "zipf": 1.1
+        }
+      }
+    },
+    "queue_depth": {
+      "labels": [
+        {
+          "cardinality": 4,
+          "name": "region"
+        },
+        {
+          "cardinality": 5,
+          "child_of": "region",
+          "name": "service"
+        },
+        {
+          "cardinality": 10,
+          "child_of": "service",
+          "name": "job"
+        },
+        {
+          "cardinality": 5,
+          "child_of": "job",
+          "name": "instance"
+        }
+      ],
+      "samples_per_sec_per_series": 10,
+      "type": "gauge",
+      "values": {
+        "dist": {
+          "pareto": 2.0
+        },
+        "value": {
+          "keys": 1000,
+          "zipf": 1.1
+        }
+      }
+    }
+  },
+  "id": "asap-demo-complex-full",
+  "labels": [
+    {
+      "cardinality": 4,
+      "name": "region"
+    },
+    {
+      "cardinality": 5,
+      "child_of": "region",
+      "name": "service"
+    },
+    {
+      "cardinality": 10,
+      "child_of": "service",
+      "name": "job"
+    },
+    {
+      "cardinality": 50,
+      "child_of": "job",
+      "name": "label_0"
+    }
+  ],
+  "metric_names": {
+    "data": "request_latency_seconds",
+    "data_total": "http_errors_total"
+  },
+  "notes": [
+    "Data are made semantically valid for both engines alike (FEEDER_VALUES=zipf plus value_overrides):",
+    "http_request_duration_seconds_bucket: per sample interval of each (region, service, job) a Zipf(1.1) number of observations in 1..20, each a log-normal latency (median 0.05 s, sigma 1.0); every bucket counts the observations <= its le, so buckets are cumulative and monotonic across le (+Inf = all); no resets.",
+    "cache_hits_total = per sample floor(cache_lookups_total increment x a per-series hit ratio in [0.5, 0.99]), resetting with lookups: hits <= lookups always.",
+    "http_errors_total (5 label_0 series per job) = per sample floor(http_requests_total increment of the job x a per-series ratio in [0, 0.02]), resetting with requests: errors summed per job <= 10% of requests.",
+    "Other counters: Zipf(1.1, N=1e6) integer increments, 5% of series reset every 30-120 min; gauges: Zipf integers x an integer per-series multiplier.",
+    "asap-demo-complex: windows x1/6 of the original (6h->1h, 1h->10m, 30m->5m, 60s->10s, 30s->5s, offset 1h->10m)."
+  ],
+  "queries": [
+    {
+      "grouping": [],
+      "id": "A-error-ratio",
+      "interval_ms": 15000,
+      "lookback_ms": 21600000,
+      "metrics": [
+        "http_errors_total",
+        "http_requests_total"
+      ],
+      "promql": "(increase(http_errors_total[6h]) / on(job) group_left() increase(http_requests_total[6h])) > 0.01",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "A-error-ratio/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 21600000,
+          "metric": "http_errors_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "B-capacity",
+      "interval_ms": 15000,
+      "lookback_ms": 21600000,
+      "metrics": [
+        "http_requests_total",
+        "capacity_rps"
+      ],
+      "promql": "(rate(http_requests_total[30s]) * 100 / on(job) group_left() max_over_time(capacity_rps[6h])) >= 80",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "max",
+          "grouping_labels": [],
+          "id": "B-capacity/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 21600000,
+          "metric": "http_requests_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "C-cache-hit",
+      "interval_ms": 15000,
+      "lookback_ms": 60000,
+      "metrics": [
+        "cache_hits_total",
+        "cache_lookups_total"
+      ],
+      "promql": "(avg by (region, service, job) (rate(cache_hits_total[60s]) / rate(cache_lookups_total[60s])) * 100) >= 90",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "C-cache-hit/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 60000,
+          "metric": "cache_hits_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "D-count-regions",
+      "interval_ms": 15000,
+      "lookback_ms": 1800000,
+      "metrics": [
+        "http_requests_total"
+      ],
+      "promql": "count by (region) (sum by (region, service) (increase(http_requests_total[30m])) > 1000)",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "D-count-regions/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 1800000,
+          "metric": "http_requests_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "E-quantile",
+      "interval_ms": 15000,
+      "lookback_ms": 21600000,
+      "metrics": [
+        "request_latency_seconds"
+      ],
+      "promql": "quantile_over_time(0.99, request_latency_seconds[6h])",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "E-quantile/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 21600000,
+          "metric": "request_latency_seconds",
+          "phi": 0.99
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "G1-topk",
+      "interval_ms": 15000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "http_requests_total"
+      ],
+      "promql": "topk(10, increase(http_requests_total[1h]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [],
+          "id": "G1-topk/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 3600000,
+          "metric": "http_requests_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "H-histogram",
+      "interval_ms": 15000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "http_request_duration_seconds_bucket"
+      ],
+      "promql": "histogram_quantile(0.99, sum by (le, job) (rate(http_request_duration_seconds_bucket[1h])))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [],
+          "id": "H-histogram/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 3600000,
+          "metric": "http_request_duration_seconds_bucket",
+          "phi": 0.99
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "I-max-sum",
+      "interval_ms": 15000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "queue_depth"
+      ],
+      "promql": "sum by (region) (max by (region, service) (max_over_time(queue_depth[1h])))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "max",
+          "grouping_labels": [],
+          "id": "I-max-sum/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 3600000,
+          "metric": "queue_depth"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "J-max-offset",
+      "interval_ms": 15000,
+      "lookback_ms": 7200000,
+      "metrics": [
+        "queue_depth"
+      ],
+      "promql": "max by (job) (max_over_time(queue_depth[1h])) > max by (job) (max_over_time(queue_depth[1h] offset 1h))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "max",
+          "grouping_labels": [],
+          "id": "J-max-offset/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 7200000,
+          "metric": "queue_depth"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "K-ratio",
+      "interval_ms": 15000,
+      "lookback_ms": 3600000,
+      "metrics": [
+        "http_errors_total",
+        "http_requests_total"
+      ],
+      "promql": "sum(increase(http_errors_total[1h])) / sum(increase(http_requests_total[1h]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [],
+          "id": "K-ratio/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 3600000,
+          "metric": "http_errors_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    }
+  ],
+  "samples_per_sec_per_series": 10,
+  "seed": 862,
+  "value_overrides": {
+    "cache_hits_total": {
+      "kind": "paired",
+      "of": "cache_lookups_total",
+      "ratio_max": 0.99,
+      "ratio_min": 0.5
+    },
+    "http_errors_total": {
+      "kind": "paired",
+      "of": "http_requests_total",
+      "ratio_max": 0.02,
+      "ratio_min": 0.0
+    },
+    "http_request_duration_seconds_bucket": {
+      "kind": "histogram",
+      "median": 0.05,
+      "obs_max": 20,
+      "obs_s": 1.1,
+      "sigma": 1.0
+    }
+  },
+  "version": 1
+}

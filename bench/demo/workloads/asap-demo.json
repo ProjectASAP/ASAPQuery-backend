@@ -1,0 +1,343 @@
+{
+  "data_facts": {
+    "backfill_history_ms": 1200000,
+    "events": {
+      "assignment": "deterministic_rotating_pool_with_cross_leaf_overlap",
+      "distinct_key": "user_id",
+      "table": "events",
+      "time_column": "ts",
+      "user_id_universe_size": 10000,
+      "user_ids_per_leaf": 1000
+    },
+    "feeder_seed": 862,
+    "metrics": {
+      "data": {
+        "kind": "gauge",
+        "pareto_shape": 2.0,
+        "value_shape": "rank_scaled_pareto"
+      },
+      "data_total": {
+        "increment_shape": "rank_scaled_positive_deterministic",
+        "kind": "counter",
+        "resets": "none"
+      }
+    },
+    "scrape_interval_ms": 1000,
+    "series": {
+      "leaf_count": 10000,
+      "ranking": {
+        "exponent": 1.1,
+        "kind": "deterministic_zipf_like",
+        "rank_scope": "leaf_series"
+      }
+    }
+  },
+  "description": "Presentation demo: a latency gauge `lat` and a request counter `reqs` per series (labels region/service/job/label_0), 1 sample/s, every query refreshed every 15 s over the last hour (range_evaluation step 15 s, span 1 h). Also: 5xx requests per job over 1 h, the 5xx ratio over 5 m, and the 6 h maximum queue depth per job (from `http_requests_total` with 20 status codes, one 5xx, uniform increments: 5% 5xx; and the gauge `queue_depth`).",
+  "extra_metrics": {
+    "http_requests_total": {
+      "labels": [
+        {
+          "cardinality": 10,
+          "name": "job"
+        },
+        {
+          "cardinality": 5,
+          "child_of": "job",
+          "name": "instance",
+          "scale_with_label0": true
+        },
+        {
+          "cardinality": 20,
+          "name": "status",
+          "values": [
+            "200",
+            "201",
+            "202",
+            "204",
+            "206",
+            "301",
+            "302",
+            "304",
+            "307",
+            "308",
+            "400",
+            "401",
+            "403",
+            "404",
+            "405",
+            "409",
+            "410",
+            "422",
+            "429",
+            "503"
+          ]
+        }
+      ],
+      "samples_per_sec_per_series": 1,
+      "type": "counter",
+      "values": {
+        "increment": {
+          "keys": 1000,
+          "zipf": 0.0
+        }
+      }
+    },
+    "queue_depth": {
+      "labels": [
+        {
+          "cardinality": 10,
+          "name": "job"
+        },
+        {
+          "cardinality": 5,
+          "child_of": "job",
+          "name": "instance",
+          "scale_with_label0": true
+        }
+      ],
+      "samples_per_sec_per_series": 1,
+      "type": "gauge",
+      "values": {
+        "dist": {
+          "pareto": 2.0
+        },
+        "value": {
+          "keys": 50,
+          "zipf": 1.1
+        }
+      }
+    }
+  },
+  "id": "asap-demo",
+  "labels": [
+    {
+      "cardinality": 4,
+      "name": "region"
+    },
+    {
+      "cardinality": 5,
+      "child_of": "region",
+      "name": "service"
+    },
+    {
+      "cardinality": 10,
+      "child_of": "service",
+      "name": "job"
+    },
+    {
+      "cardinality": 50,
+      "child_of": "job",
+      "name": "label_0"
+    }
+  ],
+  "metric_names": {
+    "data": "lat",
+    "data_total": "reqs"
+  },
+  "queries": [
+    {
+      "grouping": [
+        "region",
+        "service",
+        "job",
+        "label_0"
+      ],
+      "id": "q1-p99-latency-1h",
+      "interval_ms": 15000,
+      "lookback_ms": 3600000,
+      "promql": "quantile_over_time(0.99, lat[1h])",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [
+            "region",
+            "service",
+            "job",
+            "label_0"
+          ],
+          "id": "q1-p99-latency-1h/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 3600000,
+          "metric": "lat",
+          "phi": 0.99
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [
+        "job"
+      ],
+      "id": "q2-top-jobs-rate-1h",
+      "interval_ms": 15000,
+      "lookback_ms": 3600000,
+      "promql": "topk(10, sum by (job) (rate(reqs[1h])))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "topk",
+          "grouping_labels": [
+            "job"
+          ],
+          "id": "q2-top-jobs-rate-1h/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 3600000,
+          "metric": "reqs"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [
+        "region",
+        "service",
+        "job",
+        "label_0"
+      ],
+      "id": "q3-max-latency-30m",
+      "interval_ms": 15000,
+      "lookback_ms": 1800000,
+      "promql": "max_over_time(lat[30m])",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "max",
+          "grouping_labels": [
+            "region",
+            "service",
+            "job",
+            "label_0"
+          ],
+          "id": "q3-max-latency-30m/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 1800000,
+          "metric": "lat"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [
+        "job"
+      ],
+      "id": "q4-requests-by-job-1m",
+      "interval_ms": 15000,
+      "lookback_ms": 60000,
+      "promql": "sum by (job) (rate(reqs[1m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [
+            "job"
+          ],
+          "id": "q4-requests-by-job-1m/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 60000,
+          "metric": "reqs"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [
+        "job"
+      ],
+      "id": "q5-5xx-by-job-1h",
+      "interval_ms": 15000,
+      "lookback_ms": 3600000,
+      "promql": "sum by (job) (increase(http_requests_total{status=~\"5..\"}[1h]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [
+            "job"
+          ],
+          "id": "q5-5xx-by-job-1h/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 3600000,
+          "metric": "http_requests_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [
+        "job"
+      ],
+      "id": "q6-5xx-ratio-5m",
+      "interval_ms": 15000,
+      "lookback_ms": 300000,
+      "promql": "sum by (job) (rate(http_requests_total{status=~\"5..\"}[5m])) / sum by (job) (rate(http_requests_total[5m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [
+            "job"
+          ],
+          "id": "q6-5xx-ratio-5m/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 300000,
+          "metric": "http_requests_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [
+        "job"
+      ],
+      "id": "q7-max-queue-6h",
+      "interval_ms": 15000,
+      "lookback_ms": 21600000,
+      "promql": "max by (job) (max_over_time(queue_depth[6h]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "max",
+          "grouping_labels": [
+            "job"
+          ],
+          "id": "q7-max-queue-6h/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 21600000,
+          "metric": "queue_depth"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [],
+      "id": "q8-samples-visible-5m",
+      "interval_ms": 15000,
+      "lookback_ms": 300000,
+      "promql": "sum(count_over_time(lat[5m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "count",
+          "grouping_labels": [],
+          "id": "q8-samples-visible-5m/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 300000,
+          "metric": "lat"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    }
+  ],
+  "samples_per_sec_per_series": 1,
+  "seed": 862,
+  "version": 1
+}
