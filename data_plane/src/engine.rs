@@ -1,19 +1,28 @@
 //! The engine: the installed plan, compiled once when it is installed,
 //! and the threads that execute it:
 //!
-//! - `ingest` decodes nothing (Remote Write is decoded on the HTTP side):
-//!   it appends samples to its copy of the raw data, advances the
-//!   watermark, publishes the raw data and hands each closed refresh
-//!   window, with the raw data as it was when the window closed, to
-//! - `precompute`, which runs the window's ingestion run, appends the
-//!   views' rows to its copy of the views and publishes them;
+//! - `ingest-N` shards each route the samples of the series hashed to them
+//!   (Remote Write is decoded on the HTTP side) and append them to their
+//!   own copy of the raw data, and seal and evict it when told;
+//! - the `ingest` coordinator keeps the watermark over the shards, closes
+//!   the windows it passes, publishes the raw data and hands each closed
+//!   refresh window, with the raw data as it was when the window closed,
+//!   to the precompute pool;
+//! - the precompute pool: `precompute-N` workers compute closed windows in
+//!   parallel (a group starts a window only after the windows of the
+//!   groups it reads are committed, [`RefreshTaskGraph`]), and the
+//!   `precompute` committer appends each group's windows' rows in window
+//!   order to its copy of the views and publishes them;
+//! - `persist-N` threads write each refreshed window to the view files,
+//!   after it is published;
 //! - `query-N` workers each run one query to completion over the newest
 //!   published snapshot, so a query never waits for ingestion. A run's
 //!   output stream is not `Send`, so a run never moves between threads.
 //!
 //! Windows closed and not yet refreshed (the precompute backlog) are
-//! bounded by `max_precompute_backlog`: when it is full, the ingest thread
-//! waits, its queue fills and Remote Write gets 503.
+//! bounded by `max_precompute_backlog`: when it is full, the ingest
+//! coordinator waits, the shards' queues fill and Remote Write gets 503
+//! (`max_queued_samples`).
 //!
 //! Each thread records the thread CPU and wall time of its phases in
 //! [`Metrics`], exported on `/metrics`.

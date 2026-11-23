@@ -95,8 +95,7 @@ struct Args {
     /// of once per evaluation time (for comparison).
     #[arg(long)]
     no_shared_results: bool,
-    /// How long a query-time result is kept behind the newest evaluation
-    /// time computed.
+    /// How long a query-time result is kept behind the watermark.
     #[arg(long, default_value_t = EngineOptions::default().query_time_results_retention_ms)]
     query_time_results_retention_ms: u64,
     /// The most bytes of query-time results kept.
@@ -108,8 +107,8 @@ struct Args {
     /// The most bytes of final query answers the result cache keeps.
     #[arg(long, default_value_t = EngineOptions::default().result_cache_max_bytes)]
     result_cache_bytes: usize,
-    /// Where the materialized views are persisted (one file per view) and
-    /// loaded from at startup.
+    /// Where the materialized views are persisted (one file per refresh
+    /// group) and loaded from at startup.
     #[arg(long, default_value = "asap-views")]
     view_dir: PathBuf,
     /// Keep the materialized views in memory only.

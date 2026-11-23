@@ -2,10 +2,10 @@
 //! the Prometheus query API for an installed plan.
 //!
 //! The installed plan is ASAPPlanner's `InstallablePlan`: one selected
-//! physical ASAP DAG. The engine's ingest thread stores the raw samples its
-//! `Scan`s read, its precompute thread refreshes the materialized views in
-//! ingestion runs, and query worker threads answer the plan's instant
-//! queries with query runs, all through the Planner's executor
+//! physical ASAP DAG. The engine's ingest shards store the raw samples its
+//! `Scan`s read, its precompute pool refreshes the materialized views in
+//! ingestion runs, and query worker threads answer the plan's instant and
+//! range queries with query runs, all through the Planner's executor
 //! ([`engine`]); every other query, and any planned query it cannot
 //! answer, is forwarded to Prometheus (or refused with `--no-forward`).
 

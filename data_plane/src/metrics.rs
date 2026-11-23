@@ -398,7 +398,7 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
     gauge(
         &mut out,
         "asap_samples_queued",
-        "Samples queued for the ingest thread.",
+        "Samples queued for the ingest shards.",
         gauges.samples_queued as f64,
     );
     gauge(

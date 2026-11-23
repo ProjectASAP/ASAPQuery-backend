@@ -2,7 +2,8 @@
 //! `asap_executor::sources::DataStore`:
 //!
 //! - **raw data**: every Remote Write sample of a metric some `Scan` of the
-//!   plan reads, as a time series table `(ts, value, *labels)`. A read
+//!   plan reads, as a time series table `(ts, value,
+//!   $promql_series_identity, labels...)`. A read
 //!   returns the samples in the request's time range; the executor's own
 //!   `TimeRange`s keep each window, an instant selector's latest sample per
 //!   series, and drop Prometheus stale markers.
@@ -22,9 +23,10 @@
 //! computed once and shared by the queries at that time.
 //!
 //! A run reads a [`RunStore`]: an immutable snapshot sharing both parts.
-//! Each part has one writer (raw data: the ingest thread; views: the
-//! precompute thread), which changes its own copy (copy on write: clones
-//! share every chunk and batch) and publishes it ([`PublishedStore`]), so
+//! Each copy of a part has one writer (raw data: each ingest shard, for
+//! its own series; views: the precompute committer), which changes it
+//! (copy on write: clones share every chunk and batch); the copies are
+//! published ([`PublishedStore`]; raw data by the ingest coordinator), so
 //! a run never sees a change and never blocks one.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};

@@ -21,10 +21,11 @@
 //! Raw samples are kept while a window still to be closed or a query-time
 //! `Scan` (back to its `retention_ms`) reads them.
 //!
-//! [`Ingestion`] (the ingest thread) stores samples, keeps the watermark
-//! and closes windows; each closed window is refreshed by [`Precompute`]
-//! (the precompute thread) over the raw data as it was when the window
-//! closed, so the samples it reads are those the serial engine read.
+//! [`Ingestion`] (the ingest coordinator) keeps the watermark and closes
+//! windows, and the ingest shards store the samples ([`Routing`]); each
+//! closed window is refreshed by [`Precompute`] (the precompute pool) over
+//! the raw data as it was when the window closed, so the samples it reads
+//! are those a serial engine would read.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;

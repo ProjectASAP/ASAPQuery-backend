@@ -1,7 +1,8 @@
 //! Materialized views on disk: one append-only file per refresh group,
 //! `group-<index>.log`, one record per refreshed window holding its
 //! `(start, end]` and the rows of each view the window was appended to,
-//! synced to disk (one `fdatasync`) before the next window is refreshed.
+//! synced to disk (`fdatasync`) every `view_sync_interval_ms` by the
+//! persist thread that writes the file.
 //! At startup the records still within each view's retention are loaded
 //! back into the view store; open windows and raw samples are not
 //! persisted.
