@@ -70,15 +70,15 @@ Non-goals (v1):
 - Materializing at query time across evaluations (views refreshed on first
   read, query-time `AcrossEvaluations`): Stage 3 does not select it on the
   demo workloads, with or without raw data kept and whether or not the
-  backend declares `query_time_results_retained`; revisit with
-  ProjectASAP/ASAPPlanner#754. A plan that needs it is refused.
+  backend declares `query_time_results_retained`; revisit once the Planner
+  selects it. A plan that needs it is refused.
 - Computing views in the background after ingestion.
 - Streaming (per-sample, incremental) operators: a window's views are
   computed by one batch run when the window closes. Streaming means the
-  generic push operators of ProjectASAP/ASAPPlanner#1421; the raw buffer
+  generic push operators planned for the Planner executor; the raw buffer
   bytes and the precompute CPU peaks measured here decide whether it is
   needed.
-- Reusing DataFusion's operator implementations (ProjectASAP/ASAPPlanner#1421):
+- Reusing DataFusion's operator implementations (a planned Planner executor change):
   it replaces the executor's whole operator layer and changes edge-case
   semantics, so it is separate, multi-week work.
 - Persisting raw samples or open windows, checkpointing, and changing the
@@ -381,7 +381,7 @@ contains, by these rules:
 
 | Plan element | Precompute engine | Query engine |
 | --- | --- | --- |
-| Ingestion-time view (`AcrossEvaluations` at ingestion) | grouped by the plan with the views of the same window width W and phase p (a refresh group, `ingestion_refresh_groups`); one `execute_ingestion` run per closed window `(e − W, e]`; when one watermark advance closes windows of several groups, they run in plan order, so a group runs after the groups whose views it reads | a slot: its stored windows that tile the run's `TimeRange` |
+| Ingestion-time view (`AcrossEvaluations` at ingestion) | grouped by the plan with the views of the same window width W and phase p (a refresh group, `ingestion_refresh_groups`); one `execute_ingestion` run per closed window `(e − W, e]`; when one watermark advance closes windows of several groups, they run in parallel on the precompute pool, and a group starts a window only after the windows of the groups it reads are committed (`RefreshTaskGraph`) | a slot: its stored windows that tile the run's `TimeRange` |
 | Ingestion-time `None` node (e.g. the `Scan` under a view) | computed inside each refresh group's run that reaches it (a `Scan` under two groups is read by each group's run); within one run, once for all its consumers | — |
 | Query-time `OneEvaluation` node read by several queries' runs | — | cut out like a view: computed once per evaluation time T, single flight, then a slot of each run that reads it |
 | Query-time `OneEvaluation` node with several consumers inside one run | — | computed once inside that run, held until its consumers finish (the executor's rule) |
@@ -391,9 +391,10 @@ contains, by these rules:
 Each query root is compiled once at install, with views and shared nodes as
 slots. An instant query at T runs its compiled root once; a range query runs
 it once per step, at most one step per query worker at a time. The plans
-below come from `asap_planner --run-until stage3` at ASAPPlanner `1b18ad92`
-(workload files are ASAPPlanner's sketch plan snapshot workloads, ids in
-parentheses). Each listing shows plan node
+below are illustrative: they come from `asap_planner --run-until stage3` at
+an earlier ASAPPlanner commit than the one pinned (workload files are
+ASAPPlanner's sketch plan snapshot workloads, ids in parentheses), and the
+pinned Planner may choose differently. Each listing shows plan node
 `n<k>`, its timing and lifetime, the operator, and the nodes it reads.
 
 #### 1. One query, a diamond inside it (`ratio-of-quantiles-1h-mvp`)
@@ -511,7 +512,7 @@ n21  Query     OneEvaluation      Aggregate sum by (job)          <- n20  (root)
   feeds both the DDSketch and the Max chain, n10 feeds both the Rate and the
   Increase chain (one producer, several consumers, each scan read once).
 - Query: four roots, each over its own view; no node is read by two
-  queries, so nothing is cut. (At ASAPPlanner `1b18ad92` with default cost
+  queries, so nothing is cut. (At that earlier Planner commit, with default cost
   inputs the plan's quantile chain is a KLL sketch; KLL seeds its
   compaction coin at random, so the parity test compares this plan's
   answers within 5%.) The quantile root merges 240 windows per
@@ -532,7 +533,7 @@ n6  Query OneEvaluation  Sort           <- n5
 n7  Query None           Limit          <- n6   (root)
 ```
 
-- Precompute: no views. The ingest thread only keeps the raw panes that the
+- Precompute: no views. The ingest shards only keep the raw panes that the
   query-time scans read (their retention).
 - Query: each root reads raw data through its own `Scan` slot, sorts and
   limits; the plan gives each query its own scan, so each run reads the
@@ -709,9 +710,10 @@ Sketch, with or without a heap), UnivMon (with its key-byte counters),
 Hydra-KLL and Hydra-Count-Min, whose grid is shared by every group of a
 build and so is stored once per record and rebuilt once, shared again by
 the rows. A UnivMon whose heaps mix key types has no ASAPv1 encoding
-(`asap_sketchlib` #265); its (view, window) pairs are counted in
+(an `asap_sketchlib` limitation); its (view, window) pairs are counted in
 `asap_view_windows_not_persisted_total` and the refresh is unaffected.
-UnivMon merges break heap ties in a nondeterministic order (#266), so a
+UnivMon merges break heap ties in a nondeterministic order (also in
+`asap_sketchlib`), so a
 merge after reload may differ slightly from one before. Files are not compacted while running; records past
 retention are skipped at load.
 
@@ -847,7 +849,8 @@ answers table. No percentile panels and no CPU-over-time lines.
 
 ## Minimal complexity
 
-- Two threads and a worker pool replace one thread. The new public
+- Ingest shards with a coordinator, a precompute pool with a committer,
+  persist threads and query workers replace one thread. The new public
   surface is what the demo needs: `/metrics`, planned `query_range`, the
   view files, and the flags that bound queues, workers and caches.
 - Panes are the smallest unit every refresh window tiles, so one buffer
@@ -869,20 +872,21 @@ answers table. No percentile panels and no CPU-over-time lines.
 | Open pane for query-time `Scan`s | each request's samples are an immutable chunk, published after every request; reads take the chunks so far | one mutable Arrow builder per pane copied into a batch on every read |
 | View persistence | append-only file per refresh group, one record per window, texts in a per-file dictionary, synced on an interval (5 s, as VictoriaMetrics), tied to the plan, loaded within retention | a sync per window (on the test host, 0.2–0.5 s per sync capped refreshes at a few windows per second); a file per view; label text per row; a checkpoint of the whole store; persisting raw samples |
 | When views are computed | when their window closes | query time; background |
-| Operators | the Planner executor's | DataFusion's now (ASAPPlanner#1421) |
+| Operators | the Planner executor's | DataFusion's now (a planned Planner executor change) |
 | Should a view be bounded or unbounded? | stored views are bounded: one immutable instance per (definition, window). How a window is computed (one batch run when it closes, or incremental streaming updates) is a separate choice, and freshness for a query at "now" is a third one (reading the open window's partial state, flagged as partial), not in the demo | one unbounded, continuously updated view per definition |
 
 ### Target design beyond the demo
 
-- **Sharded ingestion.** Route samples by series hash to one ingest shard per
-  core, sharing nothing. Mergeable views (sum, count, sketches) keep one
-  partial state per (view, window, shard), merged at query time, so
-  ingestion needs no cross-thread barrier. Views that are not mergeable
-  (exact distinct, exact quantile, joins) need all rows of a group on one
-  shard: compute them on one shard first and add a repartition step only if
-  it becomes the bottleneck. A window is readable once every shard wrote it;
-  the global watermark is the minimum over shards, and the router broadcasts
-  time so an idle shard still closes its windows.
+- **Per-shard views.** Ingestion is sharded by series hash (above), but
+  one coordinator closes each window over every shard's raw data after a
+  flush, and the precompute pool computes it (split by series only for
+  groups that compute each series alone). What remains: mergeable views
+  (sum, count, sketches) keep one partial state per (view, window, shard),
+  computed on the shard and merged at query time, so ingestion needs no
+  cross-shard flush. Views that are not mergeable (exact distinct, exact
+  quantile, joins) need all rows of a group on one shard: compute them on
+  one shard first and add a repartition step only if it becomes the
+  bottleneck.
 - **Cost model.** Per-shard partial states multiply the memory and writes of
   low-cardinality views by up to the shard count, and buffering raw samples
   until a window closes costs about input rate × longest window × bytes per
@@ -891,40 +895,34 @@ answers table. No percentile panels and no CPU-over-time lines.
   (`update_batch(values, group_ids)`), the shape of DataFusion's
   `GroupsAccumulator`, whether or not DataFusion's code is reused.
 
-### Hierarchical rollups (after the demo)
+### Hierarchical rollups
 
-Today a chain has one width, the gcd of the evaluation interval, the
-window and the offsets (Pass 2 `add_chain_groups`,
-`stage1-pass2-reuse-candidates/src/rules/chains.rs`). So
+A chain of one width makes a long range expensive:
 `quantile_over_time(0.99, lat[1h])` every 15 s over 10k series merges
 3600 / 15 = 240 DDSketches per series per evaluation (2.4M). At 1 Hz each
 holds 15 samples, so merging is no cheaper than scanning the raw rows
-(ProjectASAP/ASAPPlanner#1315 measured 3.5x at 1 Hz and 10 s windows, against
-145x at 10 Hz and 60 s windows).
+(a Planner measurement found 3.5x at 1 Hz and 10 s windows, against 145x
+at 10 Hz and 60 s windows).
 
-Design:
-
-- The plan decides the levels, and Stage 3 costs them.
-- A coarse chain is a view whose input is the fine chain's view, not raw
-  data. It is computed at ingestion time on the precompute thread when its
-  coarse window closes, in a refresh group ordered after the fine one, so
-  it needs no raw data and no background recompute.
-- A query's `TimeRange` tiles `(t − 1h, t]` from several chains: fine
-  windows at the unaligned edges, coarse windows in the middle.
-- Each level is its own view definition, keyed by width, so the store
-  needs nothing new.
+This is built as the multi-level window chains above: Planner Pass 2 adds
+wider levels of a chain as candidates (`rules/chains.rs`), Stage 3 costs
+them, the executor builds a wider level with `SummaryMergeWindows` from the
+next narrower level's stored windows and reads a range through
+`TimeRangeCover` (narrow windows at the unaligned edges, wide ones in the
+middle), and the data plane computes each level at ingestion time in its
+own refresh group after the level it reads, keeping the narrower windows
+until the wider level has read them. Each level is its own view
+definition, so the store needs nothing new.
 
 Numbers for the example: 15 s alone, 240 merges per series; 15 s + 5 min,
 at most about 49 (about 31 on average, 5–8x fewer); 15 s / 1 min / 5 min /
 15 min, about 10–15. The 5-minute level costs about 10k × 20 merges per
 5 minutes at ingestion, about 670 merges/s, and about 1/20 more storage.
-The fine level is still kept for the whole window (for the unaligned head).
-Mergeable sketches and exact accumulators keep their guarantees.
 
-Work: Planner Pass 2 candidates 1–2 days; plan representation and Stage 3
-cost 1–2 days; executor tiling from several slots about 1 day; data plane
-refresh ordering about 0.5 day. The demo reports the 1 Hz / 15 s case as
-this known limit and also runs workloads with more samples per window.
+Still missing: level widths come from a fixed list (1 min, 5 min, 15 min,
+1 h, 6 h, 1 d) with at most three wider levels per chain, not chosen per
+workload; and the demo does not yet report the 1 Hz / 15 s case with
+levels against one width.
 
 ## Quality attributes and evidence
 
@@ -967,9 +965,10 @@ this known limit and also runs workloads with more samples per window.
   group tables are not pre-sized.
 - Sketch answers are within the plan's error target, not exact; only planned
   queries are answered.
-- Open: sharded ingestion and its cost-model terms; batch sketch updates.
+- Open: the cost-model terms of raw buffering and per-shard state; batch
+  sketch updates.
 - Follow-ups: the backend builds `MaterializedView` values through their
   serde JSON form (the retention margin, and the on-first-read slot of a
-  shared query-time node); both belong in executor APIs. The ingest thread's
-  per-request bookkeeping (publishing the raw data, compaction, eviction)
+  shared query-time node); both belong in executor APIs. The ingest
+  coordinator's and shards' per-request bookkeeping (publishing the raw data, compaction, eviction)
   is linear in the panes retained; it changes only if profiling shows it.
