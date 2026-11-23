@@ -20,7 +20,7 @@ pub mod result_cache;
 pub mod series_ids;
 pub mod store;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,8 +51,6 @@ pub struct DataPlane {
     /// Base URL of the Prometheus that answers forwarded queries.
     pub prometheus_url: String,
     pub limits: remote_write::Limits,
-    /// Samples accepted since startup.
-    pub samples: AtomicU64,
     /// Never forward a query to Prometheus: a query the plan cannot answer
     /// gets an error with the reason ([`EngineOptions::no_forward`]).
     pub no_forward: bool,
@@ -87,7 +85,6 @@ impl DataPlane {
             engine,
             prometheus_url: prometheus_url.trim_end_matches('/').to_string(),
             limits: remote_write::Limits::default(),
-            samples: AtomicU64::new(0),
             client: forward_client(DEFAULT_FORWARD_TIMEOUT),
         })
     }
@@ -126,16 +123,12 @@ async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
     let timer = metrics::Timer::start();
     match remote_write::decode_samples(&body, &state.limits) {
         Ok(samples) => {
-            let count = samples.len() as u64;
             state.engine.metrics().remote_write_decode.record(timer);
-            if count == 0 {
+            if samples.is_empty() {
                 return StatusCode::NO_CONTENT.into_response();
             }
             match state.engine.try_ingest(samples) {
-                Ok(()) => {
-                    state.samples.fetch_add(count, Ordering::Relaxed);
-                    StatusCode::NO_CONTENT.into_response()
-                }
+                Ok(()) => StatusCode::NO_CONTENT.into_response(),
                 // Remote Write senders retry on 503.
                 Err(IngestError::Busy) => (
                     StatusCode::SERVICE_UNAVAILABLE,
