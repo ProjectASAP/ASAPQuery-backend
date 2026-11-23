@@ -246,3 +246,30 @@ async fn a_step_answered_before_its_samples_arrived_runs_again() {
         get(&fresh_app, range_uri(RAW_QUERY, 240, 300, 60)).await
     );
 }
+
+/// A step whose window reaches raw samples already evicted is refused, not
+/// answered from the samples left (a partial window), and not kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_step_reaching_evicted_samples_is_refused() {
+    let (app, state) = data_plane(common::plan_json("example1", true), true);
+    let times: Vec<i64> = (1..=40).map(|s| s * 15_000).collect();
+    write(&app, "http_requests_total", &times, 600_000).await;
+    // The barrier evicts the samples the 1m lookback no longer reaches;
+    // a later write runs after that eviction on every shard.
+    write(&app, "http_requests_total", &[600_000], 600_000).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(instant_uri(RAW_QUERY, 120))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        metric(&state, "asap_result_cache_entries"),
+        0,
+        "nothing cached"
+    );
+}

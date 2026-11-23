@@ -358,18 +358,25 @@ impl RawData {
         partition: Option<&PartitionReads>,
     ) -> Result<Vec<Batch>, Error> {
         let columns = column_kinds(metric, request)?;
-        let Some(metric) = self.by_metric.get(metric) else {
+        let Some(metric_data) = self.by_metric.get(metric) else {
             return Ok(Vec::new());
         };
-        // Evicted samples are not read, as if they were gone.
-        let (start, end) = request.time_range_ms.unwrap_or((i64::MIN, i64::MAX));
-        let start = start.max(metric.evicted_through_ms.unwrap_or(i64::MIN));
+        // A range starting before the evicted samples cannot be read whole:
+        // the read fails, as a missing view window does. A read of every
+        // sample returns the kept ones.
+        let evicted_through = metric_data.evicted_through_ms.unwrap_or(i64::MIN);
+        let (start, end) = request.time_range_ms.unwrap_or((evicted_through, i64::MAX));
+        if start < evicted_through {
+            return Err(Error::Invalid(format!(
+                "the raw samples of {metric} at or before {evicted_through} are evicted, so ({start}, {end}] cannot be read whole"
+            )));
+        }
         if start >= end {
             return Ok(Vec::new());
         }
         // Pane `(e - w, e]` overlaps `(start, end]` when
         // `start < e < end + w`.
-        let panes = metric.panes.range((
+        let panes = metric_data.panes.range((
             Bound::Excluded(start),
             Bound::Excluded(end.saturating_add(self.pane_width_ms)),
         ));
@@ -541,8 +548,9 @@ fn column_kinds(metric: &str, request: &RawDataRequest) -> Result<Vec<ColumnKind
 pub type RawShards = Arc<Vec<Arc<RawData>>>;
 
 /// What one run reads: the store as it was when the run started. It
-/// records the first view read that found no rows, which says the query
-/// cannot be answered from what is stored (rather than that it failed).
+/// records the first view or raw read that found its rows missing (a view
+/// window not stored, raw samples evicted), which says the query cannot be
+/// answered from what is stored (rather than that it failed).
 pub struct RunStore {
     raw_data: RawShards,
     views: Arc<ViewStore>,
@@ -553,7 +561,7 @@ pub struct RunStore {
     /// The query-time results the run reads, by node: each computed for
     /// the run's evaluation time before the run starts and held by the run.
     query_time_results: HashMap<PhysicalASAPNodeId, Arc<Vec<Batch>>>,
-    missing_view_rows: Mutex<Option<String>>,
+    missing_rows: Mutex<Option<String>>,
 }
 
 impl RunStore {
@@ -575,7 +583,7 @@ impl RunStore {
             raw_reads,
             partition: None,
             query_time_results,
-            missing_view_rows: Mutex::new(None),
+            missing_rows: Mutex::new(None),
         }
     }
 
@@ -591,12 +599,19 @@ impl RunStore {
         }
     }
 
-    /// Why the run's first view read failed, if one did.
-    pub fn missing_view_rows(&self) -> Option<String> {
-        self.missing_view_rows
+    /// Why the run's first view or raw read failed, if one did.
+    pub fn missing_rows(&self) -> Option<String> {
+        self.missing_rows
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    fn record_missing(&self, error: &Error) {
+        self.missing_rows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(|| error.to_string());
     }
 }
 
@@ -614,12 +629,13 @@ impl DataStore for RunStore {
         };
         let mut batches = Vec::new();
         for shard in self.raw_data.iter() {
-            batches.extend(shard.read(
+            let read = shard.read(
                 metric,
                 request,
                 self.raw_reads.as_deref(),
                 self.partition.as_ref(),
-            )?);
+            );
+            batches.extend(read.inspect_err(|error| self.record_missing(error))?);
         }
         Ok(stream::iter(batches)
             .map(move |batch| {
@@ -652,12 +668,7 @@ impl DataStore for RunStore {
         }
         self.views
             .read(view, request, context)
-            .inspect_err(|error| {
-                self.missing_view_rows
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get_or_insert_with(|| error.to_string());
-            })
+            .inspect_err(|error| self.record_missing(error))
     }
 }
 
@@ -1401,7 +1412,9 @@ mod tests {
 
     /// Eviction drops the panes ending at or before the cutoff, keeps the
     /// pane the cutoff falls in, and no read returns a sample at or
-    /// before the cutoff.
+    /// before the cutoff: a read of a range starting before it fails (its
+    /// window would be partial), a read of every sample returns the kept
+    /// ones.
     #[test]
     fn evicts_whole_panes() {
         let schema = schema();
@@ -1422,12 +1435,18 @@ mod tests {
             .filter(|s| s.timestamp_ms > 12_000)
             .cloned()
             .collect();
-        for range in [None, Some((0, 14_000))] {
+        for range in [None, Some((12_000, 14_000))] {
             assert_eq!(
                 sorted(read_rows(&raw, &schema, range, None)),
                 sorted(row_read(&kept, &schema, range)),
             );
         }
+        let request = RawDataRequest {
+            time_range_ms: Some((0, 14_000)),
+            schema: &schema,
+            predicates: &[],
+        };
+        assert!(raw.read("m_store_test", &request, None, None).is_err());
     }
 
     /// A view read returns exactly the stored windows that tile the

@@ -55,10 +55,11 @@ pub enum Unanswered {
     NotPlanned(String),
     #[error("the data plane cannot run this query: {0}")]
     Unsupported(String),
-    /// A view's rows for a window the run reads are not stored (e.g. the
-    /// first window after startup, or one before its retention).
+    /// Rows the run reads are not stored: a view's window (e.g. the first
+    /// window after startup, or one before its retention) or raw samples
+    /// already evicted.
     #[error("{0}")]
-    MissingViewRows(String),
+    MissingRows(String),
     #[error("execution failed: {0}")]
     Execution(String),
 }
@@ -293,8 +294,8 @@ impl QueryEngine {
             shared,
         ));
         run_compiled(&run.compiled, run_store.clone(), time_ms, &self.limits).map_err(|error| {
-            match run_store.missing_view_rows() {
-                Some(missing) => Unanswered::MissingViewRows(missing),
+            match run_store.missing_rows() {
+                Some(missing) => Unanswered::MissingRows(missing),
                 None => Unanswered::Execution(error.to_string()),
             }
         })
