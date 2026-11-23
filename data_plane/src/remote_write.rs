@@ -92,29 +92,6 @@ fn decompress(body: &[u8], limits: &Limits) -> Result<Vec<u8>, RemoteWriteError>
         .map_err(|e| RemoteWriteError::Snappy(e.to_string()))
 }
 
-/// Decodes a snappy-compressed Remote Write v1 body. Every series must name
-/// its metric and carry each label once.
-pub fn decode(body: &[u8], limits: &Limits) -> Result<WriteRequest, RemoteWriteError> {
-    let decoded = decompress(body, limits)?;
-    let request = WriteRequest::decode(decoded.as_slice())
-        .map_err(|e| RemoteWriteError::Protobuf(e.to_string()))?;
-    let samples: usize = request.timeseries.iter().map(|s| s.samples.len()).sum();
-    if samples > limits.max_samples {
-        return Err(RemoteWriteError::TooManySamples(limits.max_samples));
-    }
-    for series in &request.timeseries {
-        let mut names: Vec<&str> = series.labels.iter().map(|l| l.name.as_str()).collect();
-        names.sort_unstable();
-        if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
-            return Err(RemoteWriteError::DuplicateLabel(pair[0].to_string()));
-        }
-        if !names.contains(&"__name__") {
-            return Err(RemoteWriteError::MissingMetricName);
-        }
-    }
-    Ok(request)
-}
-
 /// The samples of a snappy-compressed Remote Write v1 body, each with its
 /// interned series, in request order. Stale markers are kept: the
 /// executor's sample selector drops them from range windows and ends
@@ -124,7 +101,8 @@ pub fn decode(body: &[u8], limits: &Limits) -> Result<WriteRequest, RemoteWriteE
 /// series is looked up by the bytes of its encoded labels in a per-thread
 /// cache, so a known series costs a hash and a compare; only a new one is
 /// parsed, validated (UTF-8, `__name__`, no duplicate label) and interned.
-/// Errors are those of [`decode`].
+/// Errors: the body is too large, not snappy or not protobuf, has too
+/// many samples, or a series has no `__name__` or a label twice.
 pub fn decode_samples(body: &[u8], limits: &Limits) -> Result<Vec<RawSample>, RemoteWriteError> {
     let decoded = decompress(body, limits)?;
     // A sample takes at least 11 encoded bytes (tag, length, value,
@@ -375,6 +353,30 @@ pub fn encode(request: &WriteRequest) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// Decodes a snappy-compressed Remote Write v1 body into a
+    /// `WriteRequest`, as [`decode_samples`] validates it: every series
+    /// must name its metric and carry each label once.
+    fn decode(body: &[u8], limits: &Limits) -> Result<WriteRequest, RemoteWriteError> {
+        let decoded = decompress(body, limits)?;
+        let request = WriteRequest::decode(decoded.as_slice())
+            .map_err(|e| RemoteWriteError::Protobuf(e.to_string()))?;
+        let samples: usize = request.timeseries.iter().map(|s| s.samples.len()).sum();
+        if samples > limits.max_samples {
+            return Err(RemoteWriteError::TooManySamples(limits.max_samples));
+        }
+        for series in &request.timeseries {
+            let mut names: Vec<&str> = series.labels.iter().map(|l| l.name.as_str()).collect();
+            names.sort_unstable();
+            if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
+                return Err(RemoteWriteError::DuplicateLabel(pair[0].to_string()));
+            }
+            if !names.contains(&"__name__") {
+                return Err(RemoteWriteError::MissingMetricName);
+            }
+        }
+        Ok(request)
+    }
 
     fn series(labels: &[(&str, &str)], samples: &[(i64, f64)]) -> TimeSeries {
         TimeSeries {
