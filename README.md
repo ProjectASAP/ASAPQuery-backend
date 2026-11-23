@@ -41,11 +41,13 @@ through its `DataStore` interface:
   view's `retention_ms`.
 
 **Threads.** `--ingest-threads` `ingest-N` shards (default a quarter of the
-cores) each store the samples of their series, an `ingest` coordinator
-keeps the watermark over them and closes windows, a `precompute` thread
-refreshes the closed windows' views, and `query-N`
-worker threads (`--query-threads`, default one per core) answer queries,
-each over the newest published snapshot of the store. See
+cores, at least 1) each store the samples of their series, an `ingest`
+coordinator keeps the watermark over them and closes windows,
+`--precompute-threads` `precompute-N` workers (default a quarter of the
+cores, 1 to 4) compute the closed windows' views in parallel and a
+`precompute` committer stores each refresh group's windows in window order,
+and `query-N` worker threads (`--query-threads`, default one per core)
+answer queries, each over the newest published snapshot of the store. See
 [docs/design/data-plane-demo.md](docs/design/data-plane-demo.md).
 
 **Ingestion.** The plan lists its views refreshed at ingestion by refresh
@@ -104,8 +106,8 @@ only at a time the watermark has passed, whose inputs are complete
 (`--no-shared-results` computes it in every query's run, for comparison).
 A plan that would compute any other node in several queries' runs is
 refused. Runs in progress hold up to `--query-threads` times the run
-memory limit, plus the query-time results (`--query-time-results-max-bytes`)
-and queued requests.
+memory limit, plus the query-time results (`--query-time-results-max-bytes`,
+default 1 GiB) and queued requests.
 
 **Measurements.** `GET /metrics` exports, in the Prometheus text format,
 the thread CPU and wall time of each phase
@@ -123,6 +125,11 @@ query worker at a time, as a Prometheus matrix; it is not answered if any
 step is not, and the remaining steps are then not run. Plan a dashboard's range requests with the workload's
 `range_evaluation` (`{"step_ms": 60000, "span_ms": 3600000}`), so the plan
 delivers every step time.
+
+Final answers are kept in a result cache (`--result-cache-bytes`, default
+256 MiB; `--no-result-cache` turns it off): an answer at a time the
+watermark has passed, or of a query that reads no raw samples, is reused by
+later instant queries and range steps at that time.
 
 **Persistence.** Each refresh group's views are appended to one file in
 `--view-dir` (default `asap-views`; `--no-view-persistence` keeps views in
@@ -160,7 +167,7 @@ Not supported yet: views refreshed on first read (so the backend declares
 ## Running
 
 ```sh
-# Plan #509 Example 1 with this backend's capabilities.
+# Plan the planner-layering Example 1 with this backend's capabilities.
 cargo run -p control_plane -- \
   --workload examples/planner-layering-example1.json --out plan.json --report report.json
 
@@ -204,5 +211,5 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-The Planner revision is pinned in `Cargo.toml` (ASAPPlanner `056da657`); see
+The Planner revision is pinned in `Cargo.toml` (ASAPPlanner `846a70a`); see
 [scripts/ci/README.md](scripts/ci/README.md).
