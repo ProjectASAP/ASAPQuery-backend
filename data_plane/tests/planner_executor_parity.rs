@@ -21,6 +21,13 @@
 //! Range queries: the mixed workloads again, each query requested as a
 //! range over its last three evaluations (`range_evaluation`); the data
 //! plane's matrix equals the reference's query run at each step.
+//!
+//! Push precompute (docs/design/parallel-precompute.md, T1 and T2): the
+//! same comparison with the views built by push pipelines over K = 1, 2,
+//! 4 and 8 ingest shards; and each stored view's rows equal the window
+//! path's.
+
+mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -38,7 +45,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use control_plane::{plan_workload, DeploymentInputs};
-use data_plane::engine::EngineOptions;
+use data_plane::engine::{EngineOptions, PrecomputeMode};
 use data_plane::ingestion::IngestionOptions;
 use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use data_plane::{router, DataPlane, EXECUTION_HEADER};
@@ -216,6 +223,37 @@ async fn data_plane(
     result_cache: bool,
     views: Views,
 ) -> Router {
+    // `PARITY_INGEST_THREADS=n` runs the data plane over `n` ingest shards.
+    let ingest_threads = std::env::var("PARITY_INGEST_THREADS")
+        .map_or(EngineOptions::default().ingest_threads, |n| {
+            n.parse().unwrap()
+        });
+    let shards = Shards {
+        ingest_threads,
+        precompute_mode: PrecomputeMode::Window,
+    };
+    data_plane_over(plan, points, start_ms, result_cache, shards, views)
+        .await
+        .0
+}
+
+/// How the data plane under test ingests: shard count and precompute mode.
+#[derive(Debug, Clone, Copy)]
+struct Shards {
+    ingest_threads: usize,
+    precompute_mode: PrecomputeMode,
+}
+
+/// As [`data_plane`], over `shards`, with view windows kept as `views`
+/// says; also returns the data plane, whose stored views T2 compares.
+async fn data_plane_over(
+    plan: &InstallablePlan,
+    points: &[Point],
+    start_ms: i64,
+    result_cache: bool,
+    shards: Shards,
+    views: Views,
+) -> (Router, Arc<DataPlane>) {
     let (view_dir, view_cache_max_bytes) = match views {
         Views::InMemory => (None, None),
         Views::EveryReadCold => (Some(fresh_view_dir()), Some(0)),
@@ -225,12 +263,8 @@ async fn data_plane(
         view_cache_max_bytes,
         no_forward: true,
         result_cache,
-        // `PARITY_INGEST_THREADS=n` runs the data plane over `n` ingest
-        // shards.
-        ingest_threads: std::env::var("PARITY_INGEST_THREADS")
-            .map_or(EngineOptions::default().ingest_threads, |n| {
-                n.parse().unwrap()
-            }),
+        ingest_threads: shards.ingest_threads,
+        precompute_mode: shards.precompute_mode,
         // `PARITY_PRECOMPUTE_THREADS=n` computes windows on `n` threads.
         precompute_threads: std::env::var("PARITY_PRECOMPUTE_THREADS")
             .map_or(EngineOptions::default().precompute_threads, |n| {
@@ -302,7 +336,7 @@ async fn data_plane(
         .await
         .unwrap();
     assert_eq!(barrier.status(), StatusCode::OK);
-    app
+    (app, state)
 }
 
 /// The data plane's answer to `query` at the evaluation time, or its error.
@@ -946,4 +980,141 @@ async fn compare_range_answers(views: Views) {
         non_empty_steps * 10 >= compared_steps * 9,
         "only {non_empty_steps} of {compared_steps} equal steps have rows"
     );
+}
+
+/// T1. Push precompute answers what the Planner's executor answers (and so
+/// what the window path answers, which the test above checks) on every
+/// parity workload, raw data kept and not kept, over K = 1, 2, 4 and 8
+/// ingest shards. KLL plans within 5%, as above.
+#[tokio::test(flavor = "multi_thread")]
+async fn push_precompute_answers_what_the_planner_executor_answers() {
+    let mut mismatches = Vec::new();
+    let mut compared = 0;
+    // `PARITY_PUSH_SHARDS=1,4,8,12` overrides the shard counts.
+    let shard_counts: Vec<usize> = std::env::var("PARITY_PUSH_SHARDS")
+        .map(|v| v.split(',').map(|n| n.parse().unwrap()).collect())
+        .unwrap_or_else(|_| vec![1, 2, 4, 8]);
+    for ingest_threads in shard_counts {
+        let shards = Shards {
+            ingest_threads,
+            precompute_mode: PrecomputeMode::Push,
+        };
+        for (name, workload) in workloads() {
+            for raw_data_retained in [true, false] {
+                let label = format!("{name} (raw kept: {raw_data_retained}, K = {ingest_threads})");
+                let Ok((plan, _)) = plan_workload(&workload, &common::inputs(raw_data_retained))
+                else {
+                    continue;
+                };
+                let start_ms = EVALUATION_MS - reach_back_ms(&plan);
+                let points = points(&plan, start_ms);
+                let expected = reference_answers(&plan, &points, start_ms);
+                let (app, _state) = data_plane_over(&plan, &points, start_ms, false, shards, Views::EveryReadCold).await;
+                for (query, expected) in plan.query_texts.iter().zip(&expected) {
+                    let served = served_answer(&app, query).await;
+                    match (expected, &served) {
+                        (Ok(expected), Ok(served))
+                            if same_within(served, expected, tolerance(&plan)) =>
+                        {
+                            compared += 1
+                        }
+                        (Err(_), Err(_)) => {}
+                        _ => mismatches.push(format!(
+                            "{label}: {query}:\n  push      {served:?}\n  reference {expected:?}"
+                        )),
+                    }
+                }
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    assert!(compared >= 40, "only {compared} answers compared");
+}
+
+/// One stored view window, comparable across two data planes: its range
+/// and its rows, each printed and the rows sorted (so by keys).
+type StoredWindow = ((i64, i64), Vec<String>);
+
+/// Every stored view's windows, by view.
+fn stored_views(state: &DataPlane) -> BTreeMap<String, Vec<StoredWindow>> {
+    state
+        .engine
+        .snapshot()
+        .view_rows()
+        .into_iter()
+        .map(|(view, windows)| {
+            let windows = windows
+                .into_iter()
+                .map(|(range, batches)| {
+                    let mut rows: Vec<String> = batches
+                        .iter()
+                        .flat_map(Batch::to_rows)
+                        .map(|row| format!("{row:?}"))
+                        .collect();
+                    rows.sort();
+                    (range, rows)
+                })
+                .collect();
+            (format!("{view}"), windows)
+        })
+        .collect()
+}
+
+/// The stored windows' ranges and row counts only, for views whose states
+/// may differ within the plan's target (KLL compacts at random).
+fn shapes(
+    views: &BTreeMap<String, Vec<StoredWindow>>,
+) -> BTreeMap<String, Vec<((i64, i64), usize)>> {
+    views
+        .iter()
+        .map(|(view, windows)| {
+            let shape = windows
+                .iter()
+                .map(|(range, rows)| (*range, rows.len()))
+                .collect();
+            (view.clone(), shape)
+        })
+        .collect()
+}
+
+/// T2. Push precompute stores the same view rows as the window path: per
+/// (view, window), the same keys and the same states (exact values, or
+/// sketch bytes). KLL plans store the same windows and keys; their states
+/// may differ within the target, which T1 checks through the answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn push_precompute_stores_the_window_paths_view_rows() {
+    let window = Shards {
+        ingest_threads: 4,
+        precompute_mode: PrecomputeMode::Window,
+    };
+    let push = Shards {
+        ingest_threads: 4,
+        precompute_mode: PrecomputeMode::Push,
+    };
+    let mut mismatches = Vec::new();
+    let mut compared_views = 0;
+    for (name, workload) in workloads() {
+        for raw_data_retained in [true, false] {
+            let label = format!("{name} (raw kept: {raw_data_retained})");
+            let Ok((plan, _)) = plan_workload(&workload, &common::inputs(raw_data_retained)) else {
+                continue;
+            };
+            let start_ms = EVALUATION_MS - reach_back_ms(&plan);
+            let points = points(&plan, start_ms);
+            let (_, by_window) = data_plane_over(&plan, &points, start_ms, false, window, Views::InMemory).await;
+            let (_, by_push) = data_plane_over(&plan, &points, start_ms, false, push, Views::InMemory).await;
+            let (expected, served) = (stored_views(&by_window), stored_views(&by_push));
+            compared_views += expected.len();
+            let equal = if tolerance(&plan) > 1e-9 {
+                shapes(&expected) == shapes(&served)
+            } else {
+                expected == served
+            };
+            if !equal {
+                mismatches.push(format!("{label}: stored views differ"));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    assert!(compared_views >= 20, "only {compared_views} views compared");
 }

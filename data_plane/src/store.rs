@@ -353,7 +353,7 @@ impl RawData {
     /// when `None`) as batches of `request`'s schema: one per chunk of the
     /// panes overlapping the range, the open pane's included. A chunk read
     /// whole is converted once per `reads` and shared by its later reads.
-    fn read(
+    pub(crate) fn read(
         &self,
         metric: &str,
         request: &RawDataRequest,
@@ -1079,6 +1079,25 @@ impl ViewStore {
             .entry(reader)
             .or_insert(end_ms);
         *through = (*through).max(end_ms);
+    }
+
+    /// Every view's rows: per view, each window's `(start, end]` and
+    /// batches, oldest first (cold windows are decoded; a window that
+    /// cannot be read is left out).
+    pub fn rows(&self) -> BTreeMap<PhysicalASAPNodeId, Vec<((i64, i64), Vec<Batch>)>> {
+        self.by_view
+            .iter()
+            .map(|(view, rows)| {
+                let windows = rows
+                    .iter()
+                    .filter_map(|w| {
+                        let batches = w.slot.batches().ok()?;
+                        Some((w.time_range_ms, batches.as_ref().clone()))
+                    })
+                    .collect();
+                (*view, windows)
+            })
+            .collect()
     }
 
     /// Appends `batches` as `view`'s rows covering `time_range_ms`

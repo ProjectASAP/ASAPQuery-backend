@@ -180,8 +180,110 @@ pub struct QueryMetrics {
     pub range_steps_cached: AtomicU64,
 }
 
+/// Push precompute's measurements, by refresh group and ingest shard.
+pub struct PushMetrics {
+    /// Folding one morsel into a group's open windows on a shard.
+    pub push: Vec<Vec<PhaseStats>>,
+    /// Sealing a window of a group on a shard.
+    pub seal: Vec<Vec<PhaseStats>>,
+    /// Combining a window's partials, by group.
+    pub combine: Vec<PhaseStats>,
+    /// Committing pushed windows.
+    pub commit: PhaseStats,
+    /// Bytes of open-window state, by group and shard.
+    pub state_bytes: Vec<Vec<AtomicU64>>,
+    /// Open instances by shard.
+    pub open_instances: Vec<AtomicU64>,
+    /// From the newest committed window's end to its commit.
+    pub commit_lag_ms: AtomicI64,
+}
+
+impl PushMetrics {
+    pub fn new(groups: usize, shards: usize) -> Self {
+        let grid = || {
+            (0..groups)
+                .map(|_| (0..shards).map(|_| PhaseStats::default()).collect())
+                .collect()
+        };
+        Self {
+            push: grid(),
+            seal: grid(),
+            combine: (0..groups).map(|_| PhaseStats::default()).collect(),
+            commit: PhaseStats::default(),
+            state_bytes: (0..groups)
+                .map(|_| (0..shards).map(|_| AtomicU64::new(0)).collect())
+                .collect(),
+            open_instances: (0..shards).map(|_| AtomicU64::new(0)).collect(),
+            commit_lag_ms: AtomicI64::new(0),
+        }
+    }
+
+    /// Open-window state over every group and shard.
+    pub fn total_state_bytes(&self) -> u64 {
+        self.state_bytes
+            .iter()
+            .flatten()
+            .map(|b| b.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    fn render(&self, out: &mut String) {
+        for (group, shards) in self.push.iter().enumerate() {
+            for (shard, stats) in shards.iter().enumerate() {
+                stats.render(
+                    out,
+                    &format!("phase=\"precompute_push\",group=\"{group}\",shard=\"{shard}\""),
+                );
+            }
+        }
+        for (group, shards) in self.seal.iter().enumerate() {
+            for (shard, stats) in shards.iter().enumerate() {
+                stats.render(
+                    out,
+                    &format!("phase=\"precompute_seal\",group=\"{group}\",shard=\"{shard}\""),
+                );
+            }
+        }
+        for (group, stats) in self.combine.iter().enumerate() {
+            stats.render(
+                out,
+                &format!("phase=\"precompute_combine\",group=\"{group}\""),
+            );
+        }
+        self.commit.render(out, "phase=\"precompute_commit\"");
+    }
+
+    fn render_gauges(&self, out: &mut String) {
+        let _ = writeln!(out, "# HELP asap_precompute_state_bytes Bytes of open push-window state.\n# TYPE asap_precompute_state_bytes gauge");
+        for (group, shards) in self.state_bytes.iter().enumerate() {
+            for (shard, bytes) in shards.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "asap_precompute_state_bytes{{group=\"{group}\",shard=\"{shard}\"}} {}",
+                    bytes.load(Ordering::Relaxed)
+                );
+            }
+        }
+        let _ = writeln!(out, "# HELP asap_precompute_open_instances Open push windows per shard.\n# TYPE asap_precompute_open_instances gauge");
+        for (shard, open) in self.open_instances.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "asap_precompute_open_instances{{shard=\"{shard}\"}} {}",
+                open.load(Ordering::Relaxed)
+            );
+        }
+        let _ = writeln!(
+            out,
+            "# HELP asap_window_commit_lag_seconds From the newest committed window's end to its commit.\n# TYPE asap_window_commit_lag_seconds gauge\nasap_window_commit_lag_seconds {}",
+            self.commit_lag_ms.load(Ordering::Relaxed) as f64 / 1e3
+        );
+    }
+}
+
 /// Every measurement the engine's threads record.
 pub struct Metrics {
+    /// Push precompute's measurements (push mode only).
+    pub push: Option<PushMetrics>,
     /// Remote Write decode and series interning, on the HTTP threads.
     pub remote_write_decode: PhaseStats,
     /// Storing one ingest command's samples on the ingest thread: routing,
@@ -226,6 +328,7 @@ impl Metrics {
     /// and view ids) and the planned `queries`.
     pub fn new(groups: &[(i64, Vec<String>)], queries: &[String]) -> Self {
         Self {
+            push: None,
             remote_write_decode: PhaseStats::default(),
             append: PhaseStats::default(),
             precompute: groups
@@ -316,6 +419,9 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
     for (labels, stats) in &metrics.precompute {
         stats.render(&mut out, labels);
     }
+    if let Some(push) = &metrics.push {
+        push.render(&mut out);
+    }
     for (query, query_metrics) in &metrics.queries {
         let labels = format!("phase=\"query\",query=\"{}\"", escape(query));
         query_metrics.run.render(&mut out, &labels);
@@ -382,8 +488,12 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
         ("dropped_late", stats.samples_dropped_late),
         ("dropped_future", stats.samples_dropped_future),
         ("unrouted", stats.samples_unrouted),
+        ("late_for_views", stats.samples_late_for_views),
     ] {
         let _ = writeln!(out, "asap_samples_total{{outcome=\"{outcome}\"}} {count}");
+    }
+    if let Some(push) = &metrics.push {
+        push.render_gauges(&mut out);
     }
     family(
         &mut out,

@@ -33,8 +33,9 @@ use crate::ingestion::{
     ClosedWindow, Computed, Ingestion, IngestionOptions, IngestionStats, Precompute,
     RefreshTaskGraph, Refreshed, Routing,
 };
-use crate::metrics::{Gauges, Metrics, Timer};
+use crate::metrics::{Gauges, Metrics, PushMetrics, Timer};
 use crate::persist::{plan_hash, ViewFiles, ViewRead};
+use crate::push::{Partial, PushGroup, PushShard};
 use crate::query::{QueryEngine, Snapshot, Unanswered};
 use crate::result_cache::{Answer, ResultCache};
 use crate::store::SeriesPartition;
@@ -45,6 +46,21 @@ use crate::store::{
 use crate::window_cache::WindowCache;
 use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
 use asap_executor::values::Batch;
+
+/// How the views of a closed refresh window are built
+/// (docs/design/parallel-precompute.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PrecomputeMode {
+    /// One ingestion run per closed window, over the raw samples the
+    /// shards buffered for it (`--precompute-mode=window`).
+    #[default]
+    Window,
+    /// Each ingest shard folds its samples into its own instance of each
+    /// window's pipelines as they arrive; at close the shards' partials are
+    /// combined and committed. Groups that cannot be pushed keep the
+    /// window path.
+    Push,
+}
 
 /// How the engine ingests samples and runs queries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +160,19 @@ pub struct EngineOptions {
     /// in the heap.
     #[doc(hidden)]
     pub unpersistable_views: Vec<PhysicalASAPNodeId>,
+    /// How the views of a closed window are built.
+    pub precompute_mode: PrecomputeMode,
+    /// Push mode: how each shard coalesces samples into morsels before
+    /// folding them.
+    pub push_batching: crate::push::MorselBatching,
+    /// Push mode: bytes of open-window state all shards may hold together;
+    /// a shard reserves before folding a batch and waits while older
+    /// windows are open. `None`: no limit.
+    pub precompute_memory_budget_bytes: Option<u64>,
+    /// For tests, push mode: the combine of the window ending at this time
+    /// (ms) panics.
+    #[doc(hidden)]
+    pub panic_in_combine_of_window_end_ms: Option<i64>,
 }
 
 /// The default `view_segment_ms`: 15 minutes, about five segments per hour
@@ -189,6 +218,10 @@ impl Default for EngineOptions {
             view_read: ViewRead::Mmap,
             cold_decode_delay_ms: 0,
             unpersistable_views: Vec::new(),
+            precompute_mode: PrecomputeMode::Window,
+            precompute_memory_budget_bytes: None,
+            push_batching: crate::push::MorselBatching::default(),
+            panic_in_combine_of_window_end_ms: None,
         }
     }
 }
@@ -250,6 +283,13 @@ enum ShardMessage {
     },
     /// Report `Flushed` once every message before is run.
     Flush,
+    /// Push mode: seal these windows of groups built by push and send
+    /// their partials; each group's windows through `through` are closed
+    /// or skipped.
+    Seal {
+        windows: Vec<ClosedWindow>,
+        through: Vec<Option<i64>>,
+    },
 }
 
 /// What the precompute committer does next, in the order the windows
@@ -258,6 +298,11 @@ enum PrecomputeJob {
     Refresh {
         window: ClosedWindow,
         raw_data: RawShards,
+        closed_at: Instant,
+    },
+    /// A window of a group built by push: the shards send its partials.
+    Push {
+        window: ClosedWindow,
         closed_at: Instant,
     },
     /// Answers `barrier_ms` once every window queued before is refreshed.
@@ -340,6 +385,26 @@ impl EngineHandle {
     /// invalid or the data plane cannot execute it.
     pub fn spawn(plan_json: String, options: EngineOptions) -> anyhow::Result<(Self, Vec<String>)> {
         let (mut ingestion, precompute, query, query_texts) = install(&plan_json, &options)?;
+        let precompute = Arc::new(precompute);
+        // Push mode: the groups the shards build by push.
+        let push_groups: Vec<Option<PushGroup>> = match options.precompute_mode {
+            PrecomputeMode::Window => vec![None; precompute.groups().len()],
+            PrecomputeMode::Push => {
+                let tasks = precompute.tasks();
+                let candidates: Vec<bool> = (0..tasks.split_by_series.len())
+                    .map(|g| {
+                        tasks.split_by_series[g] && !tasks.serial[g] && tasks.reads[g].is_empty()
+                    })
+                    .collect();
+                crate::push::probe(
+                    &precompute,
+                    &candidates,
+                    &ingestion.group_windows(),
+                    &ingestion.group_metrics(),
+                )
+            }
+        };
+        ingestion.set_push_groups(push_groups.iter().map(Option::is_some).collect());
         let mut views = ViewStore::default().with_stream_start(options.ingestion.stream_start_ms);
         let mut tier = None;
         let files = match &options.view_dir {
@@ -382,9 +447,29 @@ impl EngineHandle {
             .into_iter()
             .map(|(width_ms, views)| (width_ms, views.iter().map(ToString::to_string).collect()))
             .collect();
-        let metrics = Metrics::new(&groups, &query_texts);
+        let mut metrics = Metrics::new(&groups, &query_texts);
         if let Some(tier) = &tier {
             let _ = metrics.view_tier.set(tier.clone());
+        }
+        if options.precompute_mode == PrecomputeMode::Push {
+            metrics.push = Some(PushMetrics::new(groups.len(), shard_count));
+        }
+        let pushed: Arc<Vec<bool>> = Arc::new(push_groups.iter().map(Option::is_some).collect());
+        // The committer's inbox; the shards' partials reach it through a
+        // forwarder.
+        let (events, inbox) = channel::<PoolEvent>();
+        let (partials, partial_inbox) = channel::<Partial>();
+        {
+            let events = events.clone();
+            std::thread::Builder::new()
+                .name("precompute-partials".into())
+                .spawn(move || {
+                    for partial in partial_inbox {
+                        if events.send(PoolEvent::Partial(partial)).is_err() {
+                            break;
+                        }
+                    }
+                })?;
         }
         let running = Arc::new(AtomicBool::new(true));
         let shared = Arc::new(Shared {
@@ -417,11 +502,35 @@ impl EngineHandle {
             } else {
                 options.shard_delay_ms
             });
+            let push_init = (options.precompute_mode == PrecomputeMode::Push).then(|| {
+                (
+                    precompute.clone(),
+                    push_groups.clone(),
+                    ingestion.pane_width_ms(),
+                    options.precompute_memory_budget_bytes,
+                    partials.clone(),
+                    options.push_batching,
+                )
+            });
             std::thread::Builder::new()
                 .name(format!("ingest-{index}"))
                 .spawn(move || {
                     let _guard = guard;
-                    serve_shard(index, raw_data, messages, coordinator, &shard_shared, delay);
+                    let push =
+                        push_init.map(|(precompute, groups, pane, budget, partials, batching)| {
+                            PushShard::new(
+                                index, precompute, groups, pane, budget, partials, batching,
+                            )
+                        });
+                    serve_shard(
+                        index,
+                        raw_data,
+                        messages,
+                        coordinator,
+                        &shard_shared,
+                        delay,
+                        push,
+                    );
                 })?;
             shards.push(shard);
         }
@@ -439,6 +548,7 @@ impl EngineHandle {
                     command_receiver,
                     jobs,
                     &ingest_shared,
+                    &pushed,
                 );
             })?;
         let views = Arc::new(views);
@@ -487,14 +597,17 @@ impl EngineHandle {
                 .spawn(move || serve_view_cache(tier, budget, monitor_running))?;
         }
         spawn_precompute(
-            Arc::new(precompute),
+            precompute,
             views,
             persist,
             job_receiver,
+            (events, inbox),
             PoolOptions {
                 threads: options.precompute_threads.max(1),
                 slow_refreshes: options.slow_refreshes.clone(),
                 check_task_inputs: options.check_task_inputs,
+                push_parts: shard_count as u32,
+                panic_in_combine_of_window_end_ms: options.panic_in_combine_of_window_end_ms,
             },
             RunningGuard(running),
             &shared,
@@ -927,6 +1040,7 @@ fn serve_shard(
     coordinator: Sender<Command>,
     shared: &Shared,
     delay: std::time::Duration,
+    mut push: Option<PushShard>,
 ) {
     let mut newest_ms: Option<i64> = None;
     // A message taken while draining a batch, to run next.
@@ -962,6 +1076,12 @@ fn serve_shard(
                 }
                 continue;
             }
+            ShardMessage::Seal { windows, through } => {
+                if let Some(push) = &mut push {
+                    push.seal(&windows, &through, &shared.metrics);
+                }
+                continue;
+            }
         };
         // Every batch already queued, appended and reported at once: one
         // report (and so at most one coordinator pass) per drained queue,
@@ -982,6 +1102,9 @@ fn serve_shard(
             let routed = routing.route(samples, crate::ingestion::wall_clock_ms());
             Arc::make_mut(&mut raw_data).append(&routed.accepted);
             newest_ms = newest_ms.max(routed.newest_ms);
+            if let Some(push) = &mut push {
+                push.push(&routed.accepted, &shared.metrics);
+            }
             {
                 let mut stats = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
                 stats.samples_accepted += routed.stats.samples_accepted;
@@ -1035,6 +1158,7 @@ fn serve_ingest(
     commands: Receiver<Command>,
     jobs: SyncSender<PrecomputeJob>,
     shared: &Shared,
+    pushed: &[bool],
 ) {
     const TICK: std::time::Duration = std::time::Duration::from_millis(100);
     let mut newest: Vec<Option<i64>> = vec![None; shards.len()];
@@ -1151,7 +1275,21 @@ fn serve_ingest(
             answered.push((barrier_ms, reply));
         }
         let snapshot: RawShards = Arc::new(raw_shards.clone());
-        if !queue_refreshes(&closed, &snapshot, &jobs, shared) {
+        let sealed: Vec<ClosedWindow> = closed
+            .iter()
+            .copied()
+            .filter(|w| pushed.get(w.group).copied().unwrap_or(false))
+            .collect();
+        if !sealed.is_empty() {
+            let through = ingestion.refreshed_through();
+            for shard in &shards {
+                let _ = shard.send(ShardMessage::Seal {
+                    windows: sealed.clone(),
+                    through: through.clone(),
+                });
+            }
+        }
+        if !queue_refreshes(&closed, &snapshot, &jobs, shared, pushed) {
             break;
         }
         let routing = Arc::new(ingestion.routing());
@@ -1224,13 +1362,21 @@ fn queue_refreshes(
     raw_data: &RawShards,
     jobs: &SyncSender<PrecomputeJob>,
     shared: &Shared,
+    pushed: &[bool],
 ) -> bool {
     for &window in closed {
         shared.precompute_backlog.fetch_add(1, Ordering::SeqCst);
-        let job = PrecomputeJob::Refresh {
-            window,
-            raw_data: raw_data.clone(),
-            closed_at: Instant::now(),
+        let job = if pushed.get(window.group).copied().unwrap_or(false) {
+            PrecomputeJob::Push {
+                window,
+                closed_at: Instant::now(),
+            }
+        } else {
+            PrecomputeJob::Refresh {
+                window,
+                raw_data: raw_data.clone(),
+                closed_at: Instant::now(),
+            }
         };
         if jobs.send(job).is_err() {
             return false;
@@ -1244,6 +1390,9 @@ struct PoolOptions {
     threads: usize,
     slow_refreshes: Vec<SlowRefresh>,
     check_task_inputs: bool,
+    /// The partials a pushed window combines: one per ingest shard.
+    push_parts: u32,
+    panic_in_combine_of_window_end_ms: Option<i64>,
 }
 
 /// What the precompute committer waits for.
@@ -1258,6 +1407,8 @@ enum PoolEvent {
         result: Result<Computed, String>,
         times: TaskTimes,
     },
+    /// A shard's partial of a pushed window.
+    Partial(Partial),
     /// No job will come any more.
     Closed,
 }
@@ -1293,6 +1444,7 @@ fn spawn_precompute(
     views: Arc<ViewStore>,
     persist: Option<PersistPool>,
     jobs: Receiver<PrecomputeJob>,
+    (events, inbox): (Sender<PoolEvent>, Receiver<PoolEvent>),
     options: PoolOptions,
     guard: RunningGuard,
     shared: &Arc<Shared>,
@@ -1307,7 +1459,6 @@ fn spawn_precompute(
             .parts
             .store(parts as u64, Ordering::Relaxed);
     }
-    let (events, inbox) = channel();
     // Windows taken from the backlog and not yet committed: one at a time
     // when the committer computes them itself; with workers, two per
     // worker, so a slow window does not leave the others idle while the
@@ -1333,6 +1484,8 @@ fn spawn_precompute(
                 threads: options.threads,
                 slow_refreshes: options.slow_refreshes.clone(),
                 check_task_inputs: options.check_task_inputs,
+                push_parts: options.push_parts,
+                panic_in_combine_of_window_end_ms: options.panic_in_combine_of_window_end_ms,
             };
             std::thread::Builder::new()
                 .name(format!("precompute-{index}"))
@@ -1369,8 +1522,10 @@ fn spawn_precompute(
             .name("precompute-queue".into())
             .spawn(move || {
                 for job in jobs {
-                    if matches!(job, PrecomputeJob::Refresh { .. })
-                        && !slots.acquire(&shared.running)
+                    if matches!(
+                        job,
+                        PrecomputeJob::Refresh { .. } | PrecomputeJob::Push { .. }
+                    ) && !slots.acquire(&shared.running)
                     {
                         break;
                     }
@@ -1600,6 +1755,10 @@ fn serve_precompute(
                     raw_data,
                     closed_at,
                 }) => tasks.push(window, raw_data, closed_at),
+                PoolEvent::Job(PrecomputeJob::Push { window, closed_at }) => {
+                    tasks.push_window(window, closed_at, options.push_parts)
+                }
+                PoolEvent::Partial(partial) => tasks.partial(partial),
                 PoolEvent::Job(PrecomputeJob::Barrier { barrier_ms, reply }) => {
                     tasks.barrier(barrier_ms, reply)
                 }
@@ -1649,7 +1808,14 @@ fn serve_precompute(
             let Some(task) = tasks.next_commit() else {
                 break;
             };
-            commit_window(precompute, task, &mut views, &mut to_persist, shared);
+            commit_window(
+                precompute,
+                task,
+                &mut views,
+                &mut to_persist,
+                options,
+                shared,
+            );
             committed = true;
             slots.release();
         }
@@ -1694,6 +1860,7 @@ fn commit_window(
     task: CommitTask,
     views: &mut Arc<ViewStore>,
     to_persist: &mut Vec<ToPersist>,
+    options: &PoolOptions,
     shared: &Shared,
 ) {
     let window = task.window;
@@ -1702,16 +1869,57 @@ fn commit_window(
             .precompute_gate
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        task.result
-            .and_then(|mut parts| match parts.len() {
-                1 => Ok(parts.remove(0)),
-                _ => precompute.merge(parts).map_err(|e| e.to_string()),
+        let combine = |parts: Vec<Computed>| -> Result<Computed, String> {
+            if task.pushed {
+                let delay_ms: u64 = options
+                    .slow_refreshes
+                    .iter()
+                    .filter(|s| s.group.is_none_or(|g| g == window.group))
+                    .filter(|s| s.end_ms.is_none_or(|e| e == window.end_ms))
+                    .map(|s| s.delay_ms)
+                    .sum();
+                if delay_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                }
+            }
+            let timer = Timer::start();
+            let combined = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if task.pushed && options.panic_in_combine_of_window_end_ms == Some(window.end_ms) {
+                    panic!(
+                        "combine of the window ending at {} panicked (test hook)",
+                        window.end_ms
+                    );
+                }
+                let mut parts = parts;
+                match parts.len() {
+                    1 => Ok(parts.remove(0)),
+                    _ => precompute.merge(parts).map_err(|e| e.to_string()),
+                }
+            }))
+            .unwrap_or_else(|_| Err("the combine panicked".to_string()))?;
+            if let (true, Some(push)) = (task.pushed, &shared.metrics.push) {
+                push.combine[window.group].record(timer);
+            }
+            Ok(if task.pushed {
+                precompute.missing_only(window, combined, views)
+            } else {
+                combined
             })
-            .and_then(|computed| {
-                precompute
-                    .commit(window, computed, views)
-                    .map_err(|e| e.to_string())
-            })
+        };
+        let timer = Timer::start();
+        let result = task.result.and_then(combine).and_then(|computed| {
+            precompute
+                .commit(window, computed, views)
+                .map_err(|e| e.to_string())
+        });
+        if let (true, Some(push)) = (task.pushed, &shared.metrics.push) {
+            push.commit.record(timer);
+            push.commit_lag_ms.store(
+                (crate::ingestion::wall_clock_ms() - window.end_ms).max(0),
+                Ordering::Relaxed,
+            );
+        }
+        result
     };
     let now = Instant::now();
     let latency = &shared.metrics.precompute_windows[window.group];
@@ -1742,6 +1950,8 @@ fn commit_window(
 /// part.
 struct CommitTask {
     window: ClosedWindow,
+    /// Built by push: its parts are the shards' partials.
+    pushed: bool,
     result: Result<Vec<Computed>, String>,
     closed_at: Instant,
     times: TaskTimes,
@@ -1766,6 +1976,7 @@ enum TaskState {
 
 struct WindowTask {
     window: ClosedWindow,
+    pushed: bool,
     closed_at: Instant,
     state: TaskState,
 }
@@ -1787,6 +1998,8 @@ struct WindowTasks {
     next_seq: u64,
     /// Each barrier, after the windows before `seq`.
     barriers: VecDeque<(u64, i64, oneshot::Sender<i64>)>,
+    /// Partials of pushed windows whose job has not come yet.
+    early: Vec<Partial>,
 }
 
 impl WindowTasks {
@@ -1797,6 +2010,7 @@ impl WindowTasks {
             tasks: BTreeMap::new(),
             next_seq: 0,
             barriers: VecDeque::new(),
+            early: Vec::new(),
         }
     }
 
@@ -1809,11 +2023,55 @@ impl WindowTasks {
             self.next_seq,
             WindowTask {
                 window,
+                pushed: false,
                 closed_at,
                 state: TaskState::Waiting(raw_data),
             },
         );
         self.next_seq += 1;
+    }
+
+    /// A pushed window: computing on the shards, one partial per shard.
+    fn push_window(&mut self, window: ClosedWindow, closed_at: Instant, parts: u32) {
+        let seq = self.next_seq;
+        self.tasks.insert(
+            seq,
+            WindowTask {
+                window,
+                pushed: true,
+                closed_at,
+                state: TaskState::Running {
+                    parts,
+                    done: BTreeMap::new(),
+                    times: None,
+                },
+            },
+        );
+        self.next_seq += 1;
+        let early: Vec<Partial> = std::mem::take(&mut self.early);
+        for partial in early {
+            self.partial(partial);
+        }
+    }
+
+    /// A shard's partial of a pushed window.
+    fn partial(&mut self, partial: Partial) {
+        let seq = self
+            .tasks
+            .iter()
+            .find_map(|(&seq, task)| (task.pushed && task.window == partial.window).then_some(seq));
+        match seq {
+            Some(seq) => self.computed(
+                seq,
+                partial.shard,
+                partial.result,
+                TaskTimes {
+                    started: partial.started,
+                    computed: partial.sealed_at,
+                },
+            ),
+            None => self.early.push(partial),
+        }
     }
 
     fn barrier(&mut self, barrier_ms: i64, reply: oneshot::Sender<i64>) {
@@ -1911,6 +2169,7 @@ impl WindowTasks {
         };
         Some(CommitTask {
             window: task.window,
+            pushed: task.pushed,
             result,
             closed_at: task.closed_at,
             times,
