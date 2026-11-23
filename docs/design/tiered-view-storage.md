@@ -191,8 +191,12 @@ against the budget first, and the cache gets the rest.
 
 ### On-disk format
 
-Per refresh group, a directory `group-<g>/` of time segments
-`<first window end ms>.seg`. Each segment is append-only. It is
+Per refresh group and retention of its views, a directory
+`group-<g>/retention-<ms>/` of time segments `<first window end ms>.seg`:
+a group's views of one retention share segments, so each view's windows
+are deleted at its own retention, not at its group's longest (a 15 s group
+holding a 1 h and a 6 h view would otherwise keep the 1 h view's bytes
+5 h too long). Each segment is append-only. It is
 **active** while its persist thread appends to it and **sealed** once the
 thread rolls to the next one; a sealed segment never changes again until
 it is deleted whole. A segment holds the existing framing (a little-endian
