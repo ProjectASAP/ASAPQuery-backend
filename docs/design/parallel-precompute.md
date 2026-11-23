@@ -98,8 +98,8 @@ repartitioning.
   - `/metrics` breaks precompute down by group, shard and step.
 - `--precompute-mode=window` keeps the window-task pool path, for
   comparison and for plans that cannot be pushed (D4, D7).
-  `--precompute-mode=push` is the new path. The default is decided by E1
-  (D9).
+  `--precompute-mode=push` is the new path and the `data_plane` default
+  (D9; "Demo workload A/B").
 
 ## Goals and non-goals
 
@@ -934,6 +934,77 @@ cores.
   - With fewer, larger requests the window path does better (0.51M at K = 28; the
     in-process bench reaches 1.4M with one request per scrape). It stays
     coordinator-bound.
+
+### Demo workload A/B (push against the window path)
+
+**Setup.**
+
+- **Build.** The demo branch with push merged in, one binary for both arms;
+  only `--precompute-mode` differs.
+- **Workload.** The demo's own workload (`demo48`, docs/design/demo-plan.md
+  §8): 19 queries over 14 metrics, 2,800 series per base label set at
+  10 samples/s (about 342k samples/s routed to views, 4 paced feeders, Zipf
+  values), every query from the stream start, 4 query users, 2 s allowed
+  lateness, view files on.
+- **Hosts.** Two hosts of the same model (2 × 10-core E5-2660 v2, 40
+  threads), one arm each, started at the same aligned stream start. The
+  engine is pinned to 20 CPUs (10 cores and their hyperthreads) in a cgroup
+  of 20 cores and 100 GiB; feeders and the query client use the other 20.
+- **Length.** 45 min of queries per arm, then a VictoriaMetrics arm on the
+  same host as the accuracy reference (its post-run answers and PromQL over
+  its kept raw samples).
+- **Groups.** Push builds the three base refresh groups; the four wider
+  window-chain levels (`SummaryMergeWindows`) keep the window path.
+
+| | window path | push |
+| --- | --- | --- |
+| ASAP CPU, cgroup (core-seconds) | 1,620 | 1,589 |
+| ingest shard threads / precompute threads (core-seconds) | 283 / 423 | 677 / 10 |
+| working set, peak / steady (MB) | 941 / 730 | 750 / 657 |
+| anon, peak / steady (MB) | 891 / 684 | 707 / 611 |
+| `memory.current`, peak / steady (MB) | 2,279 / 1,902 | 2,066 / 1,832 |
+| peak RSS (MB) | 920 | 744 |
+| raw samples held at the end (MB) | 39.1 | 0 |
+| view files on disk / view bytes in the heap (MB) | 793 / 73.9 | 793 / 70.7 |
+| windows committed / failed | 1,057 / 0 | 1,057 / 0 |
+| window ready after its end, mean / max (s) | 2.07 / 2.55 | 2.03 / 2.45 |
+| samples accepted / dropped late | 778.2M / 0 | 778.2M / 0 |
+| Remote Write requests failed (503 included) | 0 | 0 |
+| queries answered | 14,400 / 14,400 | 14,400 / 14,400 |
+| query latency p50 / p99 (ms) | 10.9 / 147.2 | 10.9 / 145.7 |
+| within 5% of the reference (verified points) | 306 / 306 | 306 / 306 |
+
+Steady is the median over the last 10 minutes. Window ready includes the
+2 s lateness.
+
+- **Answers.** Every recorded answer (360 per arm) is identical between the
+  arms, and the per-query error against the reference is the same: 0–0.81%
+  for exact and histogram queries and at most 5.00% for the quantile
+  sketches. Three queries (54 points per arm) have no verifiable reference
+  in the harness, in both arms.
+- **Per-query latency.** p50 and p99 of each query are within the run-to-run
+  noise of each other (largest p99 gap: the 1 h range query, 236 against
+  250 ms).
+- **Saturation point.** On one of the hosts, the same plan with 2,800
+  series per metric of all 14 metrics stamped 15 min in the past and sent
+  as fast as accepted (16 sender threads, 503 retried with backoff):
+
+  | | window path | push |
+  | --- | --- | --- |
+  | samples accepted per second | 2.22M (88M more dropped late) | 3.59M (none dropped) |
+  | engine CPU (core-seconds) | 2,111 | 869 |
+  | peak RSS (MB) | 7,108 | 857 |
+
+  The window path keeps raw samples until the windows reading them close,
+  so under catch-up load it holds gigabytes of raw panes, and senders that
+  run ahead close windows other senders' samples are still headed for;
+  push holds no raw samples for its groups.
+
+**Conclusion.** On the demo workload push uses 2% less CPU and 10–20% less
+working set and anon memory, holds no raw samples, and has the same window
+latency, query latency and answers. Under catch-up load it accepts 1.6× the
+samples at 41% of the CPU and 12% of the memory. Push is the `data_plane`
+default (D9); `--precompute-mode window` keeps the window path.
 
 ## Minimal complexity
 

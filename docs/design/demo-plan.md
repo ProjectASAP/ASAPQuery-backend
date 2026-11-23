@@ -79,9 +79,16 @@ read views (and, for query-time scans, the raw panes), never the raw stream.
   narrower level's committed windows when it closes
   (`SummaryMergeWindows`); each level has its own retention, and a
   narrower level keeps the windows a wider level has yet to read.
-- Push pipelines (optional, off by default): shards fold batched samples
-  (32k samples or 1 s) straight into the operators; a window is ready about
-  12 s after it ends at any thread count.
+- The demo runs push precompute (`--precompute-mode push`, the default):
+  each ingest shard folds its series' samples, batched (32k samples or
+  1 s), into the open windows' pipelines as they arrive, and at close the
+  shards' partials are concatenated and committed. Groups that cannot be
+  pushed, such as the wider levels of a window chain, keep the window path
+  above; `--precompute-mode window` runs every group that way. On the demo
+  workload push used 2% less CPU, 10–20% less working set and no raw
+  samples, with the same window latency, query latency and answers; under
+  catch-up load it accepted 1.6× the samples at 41% of the CPU
+  (`parallel-precompute.md`, "Demo workload A/B").
 
 ## 5. View storage
 

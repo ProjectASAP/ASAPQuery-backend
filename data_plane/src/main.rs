@@ -66,10 +66,12 @@ struct Args {
     /// series hashed to it. Default: a quarter of the cores, at least 1.
     #[arg(long, default_value_t = EngineOptions::default().ingest_threads)]
     ingest_threads: usize,
-    /// How the views of a closed window are built: `window` (one ingestion
-    /// run per closed window) or `push` (shards fold samples as they
-    /// arrive; not implemented yet, so install refuses it).
-    #[arg(long, default_value = "window", value_parser = ["window", "push"])]
+    /// How the views of a closed window are built: `push` (each ingest
+    /// shard folds its samples into the open windows' pipelines as they
+    /// arrive; groups that cannot be pushed, such as wider levels of a
+    /// window chain, keep the window path) or `window` (one ingestion run
+    /// per closed window over buffered raw samples).
+    #[arg(long, default_value = "push", value_parser = ["window", "push"])]
     precompute_mode: String,
     /// Push mode: bytes of open-window state all shards may hold together.
     #[arg(long)]
