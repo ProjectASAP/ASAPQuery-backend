@@ -82,8 +82,9 @@ impl RangeQuery {
     /// or a Prometheus duration such as `15s` or `1m30s`). `Ok(None)` if
     /// one is missing or a time is in another format, such as RFC 3339 (the
     /// query is then forwarded); `Err` if they cannot be evaluated: a time
-    /// beyond [`MAX_TIME_MS`], a step that is not positive, an end before
-    /// the start, or more than [`MAX_RANGE_STEPS`] steps.
+    /// beyond [`MAX_TIME_MS`], a step that is not positive or is beyond
+    /// [`MAX_TIME_MS`], an end before the start, or more than
+    /// [`MAX_RANGE_STEPS`] steps.
     pub fn parse(url_query: Option<&str>, form: &[u8]) -> Result<Option<Self>, BadRange> {
         let params: BTreeMap<String, String> =
             form_urlencoded::parse(url_query.unwrap_or_default().as_bytes())
@@ -111,11 +112,13 @@ impl RangeQuery {
         let (Some(start_ms), Some(end_ms)) = (time("start", start)?, time("end", end)?) else {
             return Ok(None);
         };
-        let step_ms = step_ms(step).filter(|&ms| ms > 0).ok_or_else(|| {
-            BadRange(format!(
-                "invalid parameter \"step\": {step:?} is not a positive duration"
-            ))
-        })?;
+        let step_ms = step_ms(step)
+            .filter(|&ms| ms > 0 && ms <= MAX_TIME_MS)
+            .ok_or_else(|| {
+                BadRange(format!(
+                    "invalid parameter \"step\": {step:?} is not a positive duration the data plane can evaluate"
+                ))
+            })?;
         if end_ms < start_ms {
             return Err(BadRange(
                 "invalid parameter \"end\": end timestamp must not be before start time".into(),
@@ -139,7 +142,7 @@ impl RangeQuery {
     /// `end_ms`.
     pub fn times_ms(&self) -> impl Iterator<Item = i64> + '_ {
         (0..)
-            .map(|i| self.start_ms + i * self.step_ms)
+            .map_while(|i: i64| i.checked_mul(self.step_ms)?.checked_add(self.start_ms))
             .take_while(|t| *t <= self.end_ms)
     }
 }
@@ -354,6 +357,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(q.times_ms().count(), 5);
+        // Evaluation times stop instead of wrapping past i64::MAX.
+        let q = RangeQuery {
+            query: "up".into(),
+            start_ms: 1,
+            end_ms: 2,
+            step_ms: i64::MAX,
+        };
+        assert_eq!(q.times_ms().collect::<Vec<_>>(), [1]);
         assert_eq!(step_ms("1h30m"), Some(5_400_000));
         assert_eq!(step_ms("500ms"), Some(500));
         assert!(RangeQuery::parse(Some("query=up&start=0&end=60"), b"")
@@ -371,6 +382,8 @@ mod tests {
             "query=up&start=60&end=0&step=1",
             "query=up&start=0&end=11001&step=1",
             "query=up&start=1e300&end=1e300&step=1",
+            "query=up&start=1&end=2&step=9223372036854775807ms",
+            "query=up&start=1&end=2&step=1e18",
         ] {
             assert!(RangeQuery::parse(Some(bad), b"").is_err(), "{bad}");
         }
