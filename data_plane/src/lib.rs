@@ -429,7 +429,7 @@ async fn answer_range(state: &DataPlane, range: RangeQuery) -> Result<Vec<u8>, U
     // every worker so busy no timer or socket is polled: built on the
     // blocking pool instead.
     tokio::task::spawn_blocking(move || {
-        serde_json::to_vec(&prometheus::MatrixResponse::new(&steps))
+        prometheus::range_response_body(&steps)
             .map_err(|error| Unanswered::Execution(format!("the range response: {error}")))
     })
     .await

@@ -966,6 +966,7 @@ dependencies = [
  "prost",
  "reqwest",
  "rmp-serde",
+ "ryu",
  "serde",
  "serde_bytes",
  "serde_json",

@@ -9,6 +9,8 @@ asap-executor.workspace = true
 asap_sketchlib.workspace = true
 serde_bytes = "0.11"
 ahash = "0.8"
+# Shortest round-trip float digits for range responses (prometheus.rs).
+ryu = "1"
 libc = "0.2"
 # The data plane's allocator (main.rs): many small per-request allocations.
 tikv-jemallocator = "0.6"

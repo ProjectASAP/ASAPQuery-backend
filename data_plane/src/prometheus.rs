@@ -2,7 +2,6 @@
 //! range-query parameters and results.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
@@ -200,39 +199,136 @@ impl Serialize for VectorResponse {
     }
 }
 
-/// A Prometheus range-query response: each series' value at each
-/// evaluation time it has one, series sorted by labels. Holds each series'
-/// labels once (shared with the step answers) and its points as numbers,
-/// and is serialized straight into the response body.
-pub struct MatrixResponse {
-    series: Vec<(Arc<BTreeMap<String, String>>, Vec<Point>)>,
-}
-
-impl MatrixResponse {
-    pub fn new(steps: &[(i64, Answer)]) -> Self {
-        let mut by_labels: BTreeMap<&Arc<BTreeMap<String, String>>, Vec<Point>> = BTreeMap::new();
-        for (time_ms, samples) in steps {
-            let time = *time_ms as f64 / 1000.0;
-            for sample in samples.iter() {
-                by_labels
-                    .entry(&sample.labels)
-                    .or_default()
-                    .push(Point(time, sample.value));
+/// The JSON body of a range-query response over `steps`, each step's
+/// evaluation time and answer: Prometheus' matrix, each series' value at
+/// each evaluation time it has one, series sorted by labels.
+///
+/// Written directly rather than through serde types: a long range of
+/// many series is mostly cached step answers (241 steps of 2,800 series
+/// in a dashboard's 1 h panel), and grouping them by comparing label maps,
+/// then formatting each value into its own `String`, cost about a second.
+/// Each series' labels are one `Arc` shared by every step's answer (the
+/// interned series, or `series_ids::result_labels`), so a series is
+/// found by that pointer and its labels compared only once; each step's
+/// time and each series' labels are formatted once.
+pub fn range_response_body(steps: &[(i64, Answer)]) -> Result<Vec<u8>, serde_json::Error> {
+    type Labels = BTreeMap<String, String>;
+    // Each series' points as (step, value), in step order.
+    let mut series: Vec<(&Labels, Vec<(u32, f64)>)> = Vec::new();
+    let mut by_labels: BTreeMap<&Labels, usize> = BTreeMap::new();
+    let mut by_pointer: ahash::HashMap<*const Labels, usize> = ahash::HashMap::default();
+    for (step, (_, samples)) in steps.iter().enumerate() {
+        for sample in samples.iter() {
+            let labels: &Labels = &sample.labels;
+            let index = *by_pointer
+                .entry(labels as *const Labels)
+                .or_insert_with(|| {
+                    *by_labels.entry(labels).or_insert_with(|| {
+                        series.push((labels, Vec::new()));
+                        series.len() - 1
+                    })
+                });
+            series[index].1.push((step as u32, sample.value));
+        }
+    }
+    // Each step's time as serde_json writes the f64 seconds.
+    let times: Vec<Vec<u8>> = steps
+        .iter()
+        .map(|(time_ms, _)| serde_json::to_vec(&(*time_ms as f64 / 1000.0)))
+        .collect::<Result<_, _>>()?;
+    let points: usize = series.iter().map(|(_, p)| p.len()).sum();
+    let mut out = Vec::with_capacity(64 + series.len() * 128 + points * 32);
+    out.extend_from_slice(br#"{"status":"success","data":{"resultType":"matrix","result":["#);
+    for (n, index) in by_labels.values().enumerate() {
+        let (labels, points) = &series[*index];
+        if n > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(br#"{"metric":"#);
+        serde_json::to_writer(&mut out, labels)?;
+        out.extend_from_slice(br#","values":["#);
+        for (k, (step, value)) in points.iter().enumerate() {
+            if k > 0 {
+                out.push(b',');
             }
+            out.push(b'[');
+            out.extend_from_slice(&times[*step as usize]);
+            out.extend_from_slice(b",\"");
+            write_value(&mut out, *value).map_err(serde_json::Error::io)?;
+            out.extend_from_slice(b"\"]");
         }
-        Self {
-            series: by_labels
-                .into_iter()
-                .map(|(labels, points)| (labels.clone(), points))
-                .collect(),
-        }
+        out.extend_from_slice(b"]}");
     }
+    out.extend_from_slice(b"]}}");
+    Ok(out)
 }
 
-impl Serialize for MatrixResponse {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        Envelope::new("matrix", MatrixResult(&self.series)).serialize(serializer)
+/// A value as [`format_value`] writes it, without allocating: shortest
+/// round-trip digits, never an exponent, as Rust's `Display` writes them,
+/// built from `ryu`'s digits at a fraction of the formatting machinery's
+/// cost (most of a long range's body is values). Where two shortest
+/// digit strings round-trip, `ryu` may pick the other last digit; both
+/// read back as the same `f64`.
+fn write_value(out: &mut Vec<u8>, value: f64) -> std::io::Result<()> {
+    use std::io::Write;
+    if value.is_nan() {
+        return out.write_all(b"NaN");
     }
+    if value.is_infinite() {
+        return out.write_all(if value > 0.0 { b"+Inf" } else { b"-Inf" });
+    }
+    let mut buffer = ryu::Buffer::new();
+    let text = buffer.format_finite(value).as_bytes();
+    // Most values: plain decimal already; `Display` writes no `.0`.
+    if !text.contains(&b'e') {
+        return out.write_all(text.strip_suffix(b".0").unwrap_or(text));
+    }
+    let (negative, text) = match text.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        _ => (false, text),
+    };
+    // `ryu` writes `d.ddd`, `d.dddeX` or `deX`: the digits, and where the
+    // decimal point falls among them.
+    let (mantissa, exponent) = match text.iter().position(|&b| b == b'e') {
+        Some(e) => (
+            &text[..e],
+            std::str::from_utf8(&text[e + 1..])
+                .ok()
+                .and_then(|x| x.parse::<i32>().ok())
+                .unwrap_or(0),
+        ),
+        None => (text, 0),
+    };
+    let (whole, fraction) = match mantissa.iter().position(|&b| b == b'.') {
+        Some(dot) => (&mantissa[..dot], &mantissa[dot + 1..]),
+        None => (mantissa, &mantissa[..0]),
+    };
+    let mut digits: Vec<u8> = whole.iter().chain(fraction).copied().collect();
+    let mut point = whole.len() as i32 + exponent;
+    let leading = digits.iter().take_while(|&&d| d == b'0').count();
+    digits.drain(..leading);
+    point -= leading as i32;
+    while digits.last() == Some(&b'0') {
+        digits.pop();
+    }
+    if negative {
+        out.push(b'-');
+    }
+    if digits.is_empty() {
+        out.push(b'0');
+    } else if point <= 0 {
+        out.extend_from_slice(b"0.");
+        out.extend(std::iter::repeat_n(b'0', (-point) as usize));
+        out.extend_from_slice(&digits);
+    } else if point as usize >= digits.len() {
+        out.extend_from_slice(&digits);
+        out.extend(std::iter::repeat_n(b'0', point as usize - digits.len()));
+    } else {
+        out.extend_from_slice(&digits[..point as usize]);
+        out.push(b'.');
+        out.extend_from_slice(&digits[point as usize..]);
+    }
+    Ok(())
 }
 
 /// `{"status": "success", "data": {"resultType": .., "result": ..}}`.
@@ -283,22 +379,6 @@ impl Serialize for VectorResult<'_> {
         serializer.collect_seq(self.0.iter().map(|sample| Sample {
             metric: &sample.labels,
             value: Point(self.1, sample.value),
-        }))
-    }
-}
-
-struct MatrixResult<'a>(&'a [(Arc<BTreeMap<String, String>>, Vec<Point>)]);
-
-impl Serialize for MatrixResult<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        struct Series<'a> {
-            metric: &'a BTreeMap<String, String>,
-            values: &'a [Point],
-        }
-        serializer.collect_seq(self.0.iter().map(|(labels, points)| Series {
-            metric: labels,
-            values: points,
         }))
     }
 }
@@ -391,11 +471,141 @@ mod tests {
             (2000, Arc::new(vec![sample(&a, 3.0)])),
         ];
         assert_eq!(
-            serde_json::to_value(MatrixResponse::new(&steps)).unwrap(),
+            serde_json::from_slice::<Value>(&range_response_body(&steps).unwrap()).unwrap(),
             json!({"status": "success", "data": {"resultType": "matrix", "result": [
                 {"metric": {"job": "a"}, "values": [[1.0, "2"], [2.0, "3"]]},
                 {"metric": {"job": "b"}, "values": [[1.0, "1"]]},
             ]}})
+        );
+    }
+
+    /// The range body is byte for byte what serializing the matrix with
+    /// serde wrote before it was written directly: series grouped and
+    /// sorted by labels whether or not their labels share an `Arc`,
+    /// special values, label text needing escapes, sub-second times.
+    #[test]
+    fn range_body_equals_the_serde_matrix() {
+        #[derive(Serialize)]
+        struct Series<'a> {
+            metric: &'a BTreeMap<String, String>,
+            values: Vec<Point>,
+        }
+        fn reference(steps: &[(i64, Answer)]) -> Vec<u8> {
+            let mut by_labels: BTreeMap<&BTreeMap<String, String>, Vec<Point>> = BTreeMap::new();
+            for (time_ms, samples) in steps {
+                for sample in samples.iter() {
+                    by_labels
+                        .entry(&sample.labels)
+                        .or_default()
+                        .push(Point(*time_ms as f64 / 1000.0, sample.value));
+                }
+            }
+            let result: Vec<Series> = by_labels
+                .into_iter()
+                .map(|(metric, values)| Series { metric, values })
+                .collect();
+            serde_json::to_vec(&Envelope::new("matrix", result)).unwrap()
+        }
+        let shared = Arc::new(BTreeMap::from([
+            ("job".to_string(), "a \"quoted\" \\ \u{1}".to_string()),
+            ("__name__".to_string(), "m".to_string()),
+        ]));
+        let other = BTreeMap::from([("job".to_string(), "b".to_string())]);
+        let values = [
+            1.5,
+            f64::NAN,
+            f64::INFINITY,
+            -0.0,
+            1e21,
+            1e-7,
+            -3.25,
+            123456789.125,
+        ];
+        let steps: Vec<(i64, Answer)> = values
+            .iter()
+            .enumerate()
+            .map(|(step, &value)| {
+                let mut samples = vec![
+                    ResultSample {
+                        labels: Arc::new(other.clone()),
+                        value: -value,
+                    },
+                    ResultSample {
+                        labels: shared.clone(),
+                        value,
+                    },
+                ];
+                if step % 3 == 0 {
+                    samples.push(ResultSample {
+                        labels: Arc::default(),
+                        value: f64::NEG_INFINITY,
+                    });
+                }
+                (1_700_000_000_000 + step as i64 * 15_001, Arc::new(samples))
+            })
+            .collect();
+        assert_eq!(
+            String::from_utf8(range_response_body(&steps).unwrap()).unwrap(),
+            String::from_utf8(reference(&steps)).unwrap()
+        );
+    }
+
+    /// A value is written in `Display`'s notation (no exponent, no `.0`)
+    /// and reads back as exactly the same `f64`, over special values,
+    /// powers of ten either side of the exponent switch, and a million
+    /// pseudo-random bit patterns; nearly always the text is `Display`'s.
+    #[test]
+    fn values_are_written_as_display_writes_them() {
+        let mut values = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.1,
+            1.5,
+            1e21,
+            1e22,
+            1e-7,
+            1e-6,
+            5e-324,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            123456789.125,
+            1e15,
+            1e16,
+            1e17,
+            9007199254740993.0,
+        ];
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..1_000_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            values.push(f64::from_bits(state));
+        }
+        let mut differ = 0;
+        let count = values.len();
+        for value in values {
+            let mut out = Vec::new();
+            write_value(&mut out, value).unwrap();
+            let text = String::from_utf8(out).unwrap();
+            let display = format_value(value);
+            if value.is_finite() {
+                assert_eq!(
+                    text.parse::<f64>().unwrap().to_bits(),
+                    value.to_bits(),
+                    "{text}"
+                );
+                assert!(!text.contains('e') && !text.ends_with(".0"), "{text}");
+                assert_eq!(text.len(), display.len(), "{text} vs {display}");
+            } else {
+                assert_eq!(text, display);
+            }
+            differ += usize::from(text != display);
+        }
+        assert!(
+            differ * 100 < count,
+            "{differ} of {count} differ from Display"
         );
     }
 
