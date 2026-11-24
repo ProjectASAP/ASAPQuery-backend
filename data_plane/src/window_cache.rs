@@ -31,8 +31,6 @@ pub struct CacheStats {
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
-    /// Windows decoded by `get_or_load` (one per miss that loaded).
-    pub loads: u64,
 }
 
 struct Entry {
@@ -68,7 +66,6 @@ pub struct WindowCache {
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
-    loads: AtomicU64,
 }
 
 impl Inner {
@@ -158,7 +155,6 @@ impl WindowCache {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
-            loads: AtomicU64::new(0),
         }
     }
 
@@ -230,7 +226,6 @@ impl WindowCache {
             }
             return result.clone().expect("set").map_err(Error::Invalid);
         }
-        self.loads.fetch_add(1, Ordering::Relaxed);
         // A panic in `load` must not leave waiters waiting.
         let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(load))
             .unwrap_or_else(|_| Err(Error::Invalid("decoding a view window panicked".into())));
@@ -312,7 +307,6 @@ impl WindowCache {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
-            loads: self.loads.load(Ordering::Relaxed),
         }
     }
 }
@@ -420,7 +414,6 @@ mod tests {
             assert!(cache.stats().bytes <= 300);
         }
         let stats = cache.stats();
-        assert_eq!(stats.loads, loads);
         assert!(stats.evictions >= 7);
         assert!(stats.misses >= loads);
     }
