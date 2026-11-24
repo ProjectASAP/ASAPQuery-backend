@@ -830,17 +830,18 @@ impl WindowSlot {
                     std::thread::sleep(tier.decode_delay);
                 }
                 let timer = Timer::start();
-                let batch = location.read(&self.schema, tier.read).map_err(|error| {
-                    Error::Invalid(format!(
-                        "materialized view {} window ending {}: {error}",
-                        self.key.view, self.key.end_ms
-                    ))
-                })?;
+                let (batch, state_bytes) =
+                    location.read(&self.schema, tier.read).map_err(|error| {
+                        Error::Invalid(format!(
+                            "materialized view {} window ending {}: {error}",
+                            self.key.view, self.key.end_ms
+                        ))
+                    })?;
                 tier.decode.record(timer);
                 tier.cold_reads.fetch_add(1, Ordering::Relaxed);
                 tier.cold_read_bytes
                     .fetch_add(location.read_bytes(), Ordering::Relaxed);
-                let bytes = batch.memory_bytes() as u64;
+                let bytes = (batch.memory_bytes() + state_bytes) as u64;
                 Ok((Arc::new(vec![batch]), bytes))
             })
     }

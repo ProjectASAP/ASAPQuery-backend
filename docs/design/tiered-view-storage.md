@@ -204,7 +204,7 @@ it is deleted whole. A segment holds the existing framing (a little-endian
 8-byte boundary (zero padding) so fixed-width columns can be borrowed in
 place:
 
-- a header frame (MessagePack): plan hash, group, **format version 2**,
+- a header frame (MessagePack): plan hash, group, **format version 3**,
   and the segment start;
 - one record frame per refreshed window. Its head is a small MessagePack
   map, followed by the parts it points at:
@@ -245,6 +245,44 @@ segment, and a segment's first use of a text writes it again. Deleting an
 old segment then never strands a later one's keys. At 10k series and about
 96 B per identity this costs about 1–2 MB per segment.
 
+**Compact, compressed fragments (format version 3).** The mapped state
+layout is large for the small states of narrow panes. In the live demo a
+DDSketch of the ten samples one series has in a 1 s pane took 160 B a
+row on disk (an 88-byte head with `alpha`, the admission rate and a count
+that every row repeats, then sparse `u32` keys), more than the raw samples;
+an exact counter took 72 B. Format 3 keeps the columnar fragment and
+changes two things:
+
+- **Compact state and text columns.** A DDSketch column stores `alpha`
+  and the admission rate once, leaves out the count (the bucket and zero
+  counts sum to it), and keeps only non-empty buckets: per store a varint
+  header, the first bucket index as a delta from the previous row's, then
+  either varint gaps and counts (sparse) or every count from the first
+  non-empty bucket to the last (dense), whichever is shorter. Exact records
+  keep a tag byte of which fields are set, the floats that are, and
+  timestamps as varint deltas from the previous row's; a counter's
+  increase is left out when it is the plain difference of its values. A
+  column's varints form one stream and each float field (sum, min, max;
+  start, last value) its own stream of byte planes, so the sign and
+  exponent bytes of one field across series sit together. Text keys are
+  varint deltas from the previous row's key. KLL and Count-Min columns keep
+  the mapped layout. Every encoding is lossless: a read rebuilds the mapped
+  layout byte for byte, so answers do not change; a state not in the form
+  the executor writes is kept whole.
+- **zstd level 1 per fragment.** A stored fragment is its columnar bytes'
+  length (`u32`) and those bytes compressed. A cold read still reads one
+  (view, window) fragment; level 3 saved under 2% more for twice the
+  encode CPU.
+
+Measured on the demo's segments (27 minutes, 7.1 GB, format 2), bytes a
+row including the record frame: DDSketch at a 1 s pane 160 → 17, at 5 s
+233 → 31, at 60 s 272 → 89; exact counter at 1 s 72 → 7.5; exact sum at
+1 s 40 → 3.2. A cold read now decompresses and rebuilds the states into
+buffers of its own instead of borrowing the mapping, and the window cache
+charges those bytes; the page cache holds the smaller compressed
+fragments. Format 2 segments are set aside at startup like those of
+another plan.
+
 Index: `WindowLocation { segment: Arc<Segment>, offset: u64, len: u32 }`
 points at a view's fragment. It lives in the `ViewWindow` in memory (about
 40 B per (view, window)); there is no index file. At startup the index is
@@ -283,8 +321,10 @@ not 240 decoded windows.
 
 **`mmap` of sealed segments.** A sealed segment is mapped once, read-only
 (`MAP_SHARED`, `PROT_READ`), when its first window is read cold, and
-unmapped when its last `Arc<Segment>` drops. Decoding reads directly from
-the mapped bytes:
+unmapped when its last `Arc<Segment>` drops. (Format 3 decompresses each
+fragment from the mapping and decodes the copy: columns are no longer
+borrowed from the mapping; see "Compact, compressed fragments".) In
+format 2, decoding read directly from the mapped bytes:
 
 - text keys, timestamps and plain columns become Arrow buffers over the
   mapping itself (`Buffer::from_custom_allocation` with the
@@ -684,8 +724,8 @@ same build with tiering off (`--view-cache-max-bytes` unbounded and
 | V17 | Metrics. | Any plan, a few windows, budget zero. | `asap_view_cache_{bytes,entries}`, `asap_view_{pending,pinned,file}_bytes`, `asap_view_cache_{hits,misses,evictions}_total`, `asap_view_cold_reads_total`, `asap_view_cold_read_bytes_total`, `phase="view_decode"` CPU. | Fails: new series. |
 | B1 | Bench at 10k (reported, not CI). | Dashboard-heavy and typical-dashboard at 10k series, 1 sample/s, in the harness's cgroups with the same `memory.max` for both engines; tiering off, on with the default budget, on with a budget of zero. | RSS, `memory.current` split into anon and file, peak and steady; query latency per query; CPU per phase incl. `view_decode`; disk bytes. | Tiering-off numbers come from today's code. |
 | B2 | Cold versus warm page cache (reported). | As B1, budget zero; before a round of queries, drop the segments' pages (`POSIX_FADV_DONTNEED` on each file) for the cold case. | Query latency and read bytes cold vs warm; cache hit ratio over a run (checks the recency policy). | — |
-| V18 (revised) | States and fixed-width columns are used from the mapping. | A window of 1,000 KLL and 1,000 DDSketch rows read cold from a sealed segment. | Each view's item and bucket slices lie inside the segment's mapping; text keys and plain columns too; the dictionary is shared by every window of the segment. With `--view-read=pread` they lie outside it, and the answers are equal. | Fails: no view types. |
-| V18 (implemented, kept) | Fixed-width columns and texts are borrowed from the mapping, not copied. | A window of 1,000 rows read cold from a sealed segment. | The text keys' and timestamps' buffer addresses lie inside the segment's mapping; the dictionary values array is shared by every window of the segment. With `--view-read=pread` they lie outside it, and the rows are equal. | Fails: as V2. |
+| V18 (revised; superseded by format 3) | States and fixed-width columns are used from the mapping. | A window of 1,000 KLL and 1,000 DDSketch rows read cold from a sealed segment. | Each view's item and bucket slices lie inside the segment's mapping; text keys and plain columns too; the dictionary is shared by every window of the segment. With `--view-read=pread` they lie outside it, and the answers are equal. | Fails: no view types. |
+| V18 (format 3) | A cold read rebuilds its state columns in buffers of its own and reports their bytes; the segment's texts stay one shared dictionary. | A KLL window of 1,000 rows read cold from a sealed segment, and by `--view-read=pread`. | Same rows; the reported state bytes equal the states' mapped layout plus offsets; the dictionary values array is shared by every window of the segment. | Fails in format 2: columns are borrowed, nothing is reported. |
 | V19 | No `SIGBUS`: only sealed segments are mapped, and a sealed segment is never shortened. | Read a window of the active segment (by `pread`), seal it, read again (mapped); unlink a mapped segment and read through a held location; restart over a segment with a torn tail. | All reads equal; the torn tail is cut before any mapping; no crash. | Fails: as V2. |
 | V20 | A query over cold windows allocates only its accumulators. | Dashboard plan, 1k series, 1 h of windows, window cache budget 0, all segments sealed; a counting global allocator in the test binary; `quantile_over_time(0.99, lat[1h])` and `max_over_time(lat[30m])`. | Bytes allocated during the run ≤ accumulators (series × one accumulator state) + output + a fixed bound, and at least 10× below the decoded windows' bytes; same answers as tiering off. | Fails: windows are decoded, and `SummaryMerge` collects them. |
 | V21 | Executor: `SummaryMerge` folds batch by batch and accepts mapped states. | Executor test (ASAPPlanner): a stream of 240 batches whose state columns are `Mapped`; a stream mixing owned and mapped batches; Counter windows out of order in the stream. | Same output as over owned states; at most one input batch held at a time; Counter merged in time order. | Fails: no `Mapped` storage; merge collects. |

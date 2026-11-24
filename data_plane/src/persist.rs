@@ -573,7 +573,7 @@ impl ViewFiles {
             let mut by_view = ViewIndex::new();
             for (retention_ms, _, path) in paths {
                 let Some((segment, heads)) = Segment::open(&path, &expected)? else {
-                    set_aside(&path, "a segment of another plan, group or version")?;
+                    set_aside(&path, "a segment of another plan, group or file format version (this build reads format 3 only)")?;
                     continue;
                 };
                 for head in heads {
@@ -1094,12 +1094,13 @@ mod tests {
     // docs/design/tiered-view-storage.md, tests V2, V3, V9, V12, V13,
     // V18, V19. They fail until the segment format is implemented.
 
-    use asap_executor::arrow::array::{DictionaryArray, Float64Array};
+    use asap_executor::arrow::array::DictionaryArray;
     use asap_executor::arrow::datatypes::UInt32Type;
     use asap_executor::planner::ir::schema::{
         DataType, Field, FieldDataType, Schema, PROMQL_SERIES_IDENTITY,
     };
     use asap_executor::planner::summary_type::{ExactKind, ExactParams, SketchAlgorithm};
+    use asap_executor::values::state_view_bytes;
 
     /// A fresh directory for one test's segments.
     fn segment_dir(test: &str) -> PathBuf {
@@ -1303,6 +1304,59 @@ mod tests {
         out
     }
 
+    /// One 1 s pane of 1,000 series, ten samples each, in a DDSketch at
+    /// alpha 0.02 (the demo's finest quantile view): the window's stored
+    /// fragment, with its series and label columns.
+    fn ten_sample_ddsketch_window() -> Batch {
+        // Samples uniform in [50, 100), full precision (xorshift).
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut sample = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            50.0 + 50.0 * (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let states = (0..1000)
+            .map(|_| {
+                let mut sketch = DdSketch::new(0.02);
+                for _ in 0..10 {
+                    sketch.add(&sample());
+                }
+                Arc::new(DDSketchAccumulator::restore_from_disk(sketch).unwrap())
+                    as Arc<dyn AggregateCore>
+            })
+            .collect();
+        window_batch(
+            1_000,
+            FieldDataType::Sketch(SketchAlgorithm::DDSketch),
+            states,
+        )
+    }
+
+    /// The window of [`ten_sample_ddsketch_window`] takes 30.2 kB on disk
+    /// (30 B a series, most of it the full-precision sum, min and max), not
+    /// the 126 kB of the mapped layout (106 kB of DDSketch views alone).
+    #[test]
+    fn a_ten_sample_ddsketch_window_is_stored_compact() {
+        let dir = segment_dir("dd-bytes");
+        let batch = ten_sample_ddsketch_window();
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
+        let written = files
+            .append(0, (0, 1_000), &[(1, std::slice::from_ref(&batch))])
+            .unwrap();
+        let views: usize = batch
+            .to_rows()
+            .iter()
+            .map(|row| match &row[4] {
+                Value::Summary { state, .. } => state_view_bytes(state.as_ref()).unwrap().len(),
+                _ => unreachable!(),
+            })
+            .sum();
+        assert_eq!(views, 106_176);
+        assert_eq!(location_of(&written, 1).len(), 30_194);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// V2. A cold window decodes, from its columnar fragment, to the rows
     /// that were committed, read from the active segment (by `pread`) and
     /// again once the segment is sealed (mapped), and with `ViewRead::Pread`.
@@ -1321,13 +1375,13 @@ mod tests {
                 !location.is_sealed(),
                 "{what}: the newest segment is active"
             );
-            let active = location.read(batch.schema(), ViewRead::Mmap).unwrap();
+            let active = location.read(batch.schema(), ViewRead::Mmap).unwrap().0;
             assert_same_rows(&batch, &active, &format!("{what}, active segment"));
             files.seal(0).unwrap();
             assert!(location.is_sealed(), "{what}");
-            let mapped = location.read(batch.schema(), ViewRead::Mmap).unwrap();
+            let mapped = location.read(batch.schema(), ViewRead::Mmap).unwrap().0;
             assert_same_rows(&batch, &mapped, &format!("{what}, mapped"));
-            let pread = location.read(batch.schema(), ViewRead::Pread).unwrap();
+            let pread = location.read(batch.schema(), ViewRead::Pread).unwrap().0;
             assert_same_rows(&batch, &pread, &format!("{what}, pread"));
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -1348,11 +1402,11 @@ mod tests {
             .unwrap();
         let location = location_of(&written, 1);
         for how in [ViewRead::Pread, ViewRead::Mmap] {
-            assert_eq!(location.read(empty.schema(), how).unwrap().num_rows(), 0);
+            assert_eq!(location.read(empty.schema(), how).unwrap().0.num_rows(), 0);
         }
         files.seal(0).unwrap();
         for how in [ViewRead::Pread, ViewRead::Mmap] {
-            assert_eq!(location.read(empty.schema(), how).unwrap().num_rows(), 0);
+            assert_eq!(location.read(empty.schema(), how).unwrap().0.num_rows(), 0);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1385,31 +1439,34 @@ mod tests {
             if view == 2 {
                 assert!(read.is_err(), "a damaged fragment must not decode");
             } else {
-                assert_same_rows(batch, &read.unwrap(), &format!("view {view}"));
+                assert_same_rows(batch, &read.unwrap().0, &format!("view {view}"));
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// V18. Reading a sealed segment borrows the text keys and plain
-    /// columns from the mapping, and every window of the segment shares one
-    /// dictionary; `ViewRead::Pread` copies them and reads the same rows.
+    /// A cold read rebuilds a KLL column (no compact form) in the mapped
+    /// layout in buffers of its own and reports their bytes, which the
+    /// batch's own memory count leaves out; every window of a segment
+    /// shares one dictionary of texts; `ViewRead::Pread` reads the same rows.
     #[test]
-    fn mapped_reads_borrow_fixed_width_columns() {
-        let dir = segment_dir("borrow");
+    fn cold_reads_report_state_bytes_and_share_one_dictionary() {
+        let dir = segment_dir("cold-read");
         let (_, a, b) = states().remove(1);
         let (a, b): (Arc<dyn AggregateCore>, Arc<dyn AggregateCore>) = (Arc::from(a), Arc::from(b));
         let kll = FieldDataType::Sketch(SketchAlgorithm::Kll);
-        let rows = |end| {
-            window_batch(
-                end,
-                kll.clone(),
-                (0..1000)
-                    .map(|i| if i % 2 == 0 { a.clone() } else { b.clone() })
-                    .collect(),
-            )
-        };
-        let (first, second) = (rows(10), rows(20));
+        let states: Vec<Arc<dyn AggregateCore>> = (0..1000)
+            .map(|i| if i % 2 == 0 { a.clone() } else { b.clone() })
+            .collect();
+        let held = 4 * (states.len() + 1)
+            + states
+                .iter()
+                .map(|s| state_view_bytes(s.as_ref()).unwrap().len().div_ceil(8) * 8)
+                .sum::<usize>();
+        let (first, second) = (
+            window_batch(10, kll.clone(), states.clone()),
+            window_batch(20, kll, states),
+        );
         let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
         let w1 = files
             .append(0, (0, 10), &[(1, std::slice::from_ref(&first))])
@@ -1419,9 +1476,11 @@ mod tests {
             .unwrap();
         files.seal(0).unwrap();
         let (l1, l2) = (location_of(&w1, 1), location_of(&w2, 1));
-        let r1 = l1.read(first.schema(), ViewRead::Mmap).unwrap();
-        let r2 = l2.read(second.schema(), ViewRead::Mmap).unwrap();
+        let (r1, state_bytes) = l1.read(first.schema(), ViewRead::Mmap).unwrap();
+        let (r2, _) = l2.read(second.schema(), ViewRead::Mmap).unwrap();
         assert_same_rows(&first, &r1, "mapped");
+        assert_eq!(state_bytes, held);
+        assert_eq!(r1.state_column(4).unwrap().state_memory_bytes(), 0);
         let identity = |batch: &Batch| {
             batch
                 .column(1)
@@ -1430,28 +1489,12 @@ mod tests {
                 .expect("a cold text column is a dictionary over the segment's texts")
                 .clone()
         };
-        let keys = identity(&r1).keys().values().as_ptr() as usize;
-        assert!(l1.maps(keys), "text keys are copied, not borrowed");
-        let values = r1
-            .column(3)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap();
-        assert!(
-            l1.maps(values.values().as_ptr() as usize),
-            "values are copied, not borrowed"
-        );
-        // The KLL states are read in place (a mapped column, charged
-        // nothing), not rebuilt as objects.
-        let states = r1.state_column(4).expect("a state column");
-        assert_eq!(states.state_memory_bytes(), 0);
         assert!(
             Arc::ptr_eq(identity(&r1).values(), identity(&r2).values()),
             "one dictionary per segment"
         );
-        let copied = l1.read(first.schema(), ViewRead::Pread).unwrap();
+        let (copied, _) = l1.read(first.schema(), ViewRead::Pread).unwrap();
         assert_same_rows(&first, &copied, "pread");
-        assert!(!l1.maps(identity(&copied).keys().values().as_ptr() as usize));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1468,9 +1511,9 @@ mod tests {
             .unwrap();
         files.seal(0).unwrap();
         let location = location_of(&written, 1);
-        let before = location.read(batch.schema(), ViewRead::Mmap).unwrap();
+        let before = location.read(batch.schema(), ViewRead::Mmap).unwrap().0;
         std::fs::remove_file(location.segment_path()).unwrap();
-        let after = location.read(batch.schema(), ViewRead::Mmap).unwrap();
+        let after = location.read(batch.schema(), ViewRead::Mmap).unwrap().0;
         assert_same_rows(&before, &after, "after unlink");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1560,7 +1603,7 @@ mod tests {
         assert!(!oldest_short.segment_path().exists());
         assert!(oldest_long.segment_path().exists());
         assert!(files.bytes() < bytes_before);
-        let read = oldest_long.read(batch.schema(), ViewRead::Mmap).unwrap();
+        let read = oldest_long.read(batch.schema(), ViewRead::Mmap).unwrap().0;
         assert_same_rows(&batch, &read, "the long-retention view's oldest window");
         let left: Vec<PathBuf> = segment_files(&dir);
         assert_eq!(left.len(), 5, "short: (60, 80]; long: four segments");
@@ -1604,7 +1647,7 @@ mod tests {
         files.seal(0).unwrap();
         assert!(locations[4].is_cold(), "sealing (60, 80] cools (40, 60]");
         assert!(!locations[6].is_cold());
-        let read = locations[0].read(batch.schema(), ViewRead::Mmap).unwrap();
+        let (read, _) = locations[0].read(batch.schema(), ViewRead::Mmap).unwrap();
         assert_same_rows(&batch, &read, "a cold segment");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1652,7 +1695,7 @@ mod tests {
         for (_, location) in &index[&1] {
             assert_same_rows(
                 &batch,
-                &location.read(batch.schema(), ViewRead::Mmap).unwrap(),
+                &location.read(batch.schema(), ViewRead::Mmap).unwrap().0,
                 "after the cut",
             );
         }
@@ -1796,7 +1839,7 @@ mod tests {
         for (_, location) in &index[&2] {
             assert_same_rows(
                 &batch,
-                &location.read(batch.schema(), ViewRead::Mmap).unwrap(),
+                &location.read(batch.schema(), ViewRead::Mmap).unwrap().0,
                 "old layout",
             );
         }
