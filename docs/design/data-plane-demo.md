@@ -679,13 +679,17 @@ metric, a sample every 15 s, four panels each a 1 h range at 15 s steps,
 
 ### Persisting views
 
-Each refresh group has one append-only file in `--view-dir` (default
-`asap-views`; `--no-view-persistence` keeps views in memory only): a header
-naming the plan (a hash of the plan file) and the group, then one record
-per refreshed window, a length and a MessagePack payload holding
-`(start, end]` and the rows of each view appended. A text (a label value or
-a series identity) is stored once per file: a record carries the texts it
-adds to the file's dictionary, and rows hold indices. Persisting runs in
+Views are written to `--view-dir` (default `asap-views`;
+`--no-view-persistence` keeps views in memory only), per refresh group and
+per retention of its views, as a directory `group-<index>/retention-<ms>/`
+of time segments (`<first window end ms>.seg`, `--view-segment-ms` of
+windows each). A segment starts with a header naming the plan (a hash of
+the plan file), the group and the format version, then holds one record per
+refreshed window: its `(start, end]` and one columnar fragment per view
+appended. The segments are both the views' recovery and their cold tier: a
+window evicted from memory is read back from its fragment
+([tiered view storage](tiered-view-storage.md) describes the format, the
+read path and the memory policy). Persisting runs in
 the background: the precompute committer publishes a refreshed window first
 and then queues its rows for a pool of `--persist-threads` threads
 (`persist-N`; default a quarter of the cores, 1 to 4), which encode, write
@@ -705,11 +709,12 @@ of in-memory data to disk ... (default 5s)"). A refreshed window is
 therefore durable within that interval, the same class of guarantee
 VictoriaMetrics gives: after a crash, the windows of the last interval may
 be lost and are left missing (their raw samples are not persisted). 0
-syncs after every window. A file of another plan or
-group is renamed `*.stale` and never loaded. At startup the records within
-each view's retention of its newest one are loaded back, oldest first; a
-torn or oversized record at a file's end (a crash while writing) is cut
-off, so later records stay aligned. A view that already stores a window is
+syncs after every window. A segment of another plan, group or format
+version, and a version 1 file (`group-<index>.log`), is renamed `*.stale`
+and never read. At startup the segments are indexed from their record
+heads, without decoding any fragment; a torn record at a segment's end (a
+crash while writing), or the first record that does not decode and
+everything after it, is cut off, so later records' text keys stay aligned. A view that already stores a window is
 not appended to again, while the group's other views are. Raw samples are
 not persisted, so after a restart that loaded views, windows whose samples
 arrived before the restart stay missing: a declared stream start no longer
@@ -729,8 +734,8 @@ the rows. A UnivMon whose heaps mix key types has no ASAPv1 encoding
 `asap_view_windows_not_persisted_total` and the refresh is unaffected.
 UnivMon merges break heap ties in a nondeterministic order (also in
 `asap_sketchlib`), so a
-merge after reload may differ slightly from one before. Files are not compacted while running; records past
-retention are skipped at load.
+merge after reload may differ slightly from one before. A segment is
+deleted once every window in it is past its views' retention.
 
 ### Measurements
 

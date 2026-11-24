@@ -131,26 +131,36 @@ Final answers are kept in a result cache (`--result-cache-bytes`, default
 watermark has passed, or of a query that reads no raw samples, is reused by
 later instant queries and range steps at that time.
 
-**Persistence.** Each refresh group's views are appended to one file in
-`--view-dir` (default `asap-views`; `--no-view-persistence` keeps views in
-memory only), one record per refreshed window. Encoding, writing and
-syncing run on `--persist-threads` `persist-N` threads (default a quarter
-of the cores, 1 to 4; refresh group `g` goes to thread `g % n`, so each
-file has one writer and keeps window order) after the window is published,
-so disk I/O does not slow refreshes. Up to `--max-persist-backlog-bytes`
-(default 256 MiB) of refreshed windows wait for them; beyond that
-refreshes wait (`asap_view_persist_wait_seconds_total`,
-`asap_persist_backlog_bytes`).
+**Persistence and tiered views.** Views are written to `--view-dir`
+(default `asap-views`; `--no-view-persistence` keeps views in memory only):
+per refresh group and per retention of its views, a directory
+`group-<index>/retention-<ms>/` of time segments, each holding
+`--view-segment-ms` (default 900,000) of windows, one record per refreshed
+window with one columnar fragment per view. A segment is deleted once
+every window in it is past its views' retention. The files are both the
+views' recovery and their cold tier: decoded windows stay in memory up to
+`--view-cache-max-bytes` (default from the cgroup's `memory.max`, else no
+limit) and leave it after `--view-cache-idle-ms` (default 60 s) without a
+read; an evicted window is read back from its fragment, by `mmap` of sealed
+segments or `pread` (`--view-read`), with states read in place. Encoding,
+writing and syncing run on `--persist-threads` `persist-N` threads (default
+a quarter of the cores, 1 to 4; refresh group `g` goes to thread `g % n`,
+so each file has one writer and keeps window order) after the window is
+published, so disk I/O does not slow refreshes; windows queued past
+`--max-persist-backlog-bytes` (default 256 MiB) are counted
+(`asap_view_persist_over_bound_total`, `asap_persist_backlog_bytes`).
+Design: [tiered view storage](docs/design/tiered-view-storage.md).
 Files are synced every
 `--view-sync-interval-ms` (default 5,000, VictoriaMetrics' default
 `-inmemoryDataFlushInterval` as of v1.155.0), so a refreshed window is
 durable within that interval, the same guarantee VictoriaMetrics gives its
-in-memory data; 0 syncs after every window. Label values and series
-identities are stored once per file, in a text dictionary. A
-file names the plan it was written for; another plan's file is set aside
-(`*.stale`), never loaded. At startup the records within each view's
-retention are loaded back, a torn last record is cut off, and a window a
-view already stores is not refreshed for it again. Raw samples and open
+in-memory data; 0 syncs after every window. A segment names the plan,
+group and format version it was written for; another plan's, group's or
+version's segment is set aside (`*.stale`), never read. At startup the
+segments are indexed from their record heads without decoding fragments; a
+torn last record, or the first record that does not decode and everything
+after it, is cut off; and a window a view already stores is not refreshed
+for it again. Raw samples and open
 windows are not persisted, so after a restart the windows whose samples
 arrived before it stay missing (`--stream-start-ms` no longer makes the
 first window complete). Sketch states are stored as `asap_sketchlib`'s
