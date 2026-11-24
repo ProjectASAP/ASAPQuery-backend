@@ -396,11 +396,12 @@ async fn status_and_answer_of(app: &Router, query: &str, time_ms: i64) -> (Statu
     (status, body)
 }
 
-/// When the precompute cannot keep up (here its persist queue is full and
-/// every window's write is slow), the coordinator waits for it; the shards'
-/// samples then stay counted in their queues until the coordinator takes
-/// their reports, so the queues fill and Remote Write gets 503, rather than
-/// shards draining into an unbounded backlog of reports.
+/// When the precompute cannot keep up (here every window's computation is
+/// slow and its backlog holds one window), the coordinator waits for it;
+/// the shards' samples then stay counted in their queues until the
+/// coordinator takes their reports, so the queues fill and Remote Write
+/// gets 503, rather than shards draining into an unbounded backlog of
+/// reports.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_precompute_that_cannot_keep_up_reaches_remote_write() {
     let dir =
@@ -411,9 +412,13 @@ async fn a_precompute_that_cannot_keep_up_reaches_remote_write() {
         max_queued_samples: 2_000,
         max_precompute_backlog: 1,
         view_dir: Some(dir.clone()),
-        persist_threads: 1,
-        persist_delay_ms: 2_000,
-        max_persist_backlog_bytes: 1,
+        slow_refreshes: vec![data_plane::engine::SlowRefresh {
+            group: None,
+            end_ms: None,
+            part: None,
+            delay_ms: 2_000,
+            per_series: false,
+        }],
         ..common::no_forward_options()
     };
     let state = Arc::new(

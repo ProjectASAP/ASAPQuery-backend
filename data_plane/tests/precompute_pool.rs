@@ -236,13 +236,24 @@ async fn view_files_checked(
         line.starts_with("asap_precompute_window_parts{")
             && line.rsplit(' ').next().is_some_and(|parts| parts != "1")
     });
+    // Each group's segments, by path under the view directory.
     let mut files = BTreeMap::new();
-    for entry in std::fs::read_dir(&dir).unwrap() {
-        let path = entry.unwrap().path();
-        files.insert(
-            path.file_name().unwrap().to_string_lossy().to_string(),
-            std::fs::read(&path).unwrap(),
-        );
+    let mut directories = vec![dir.clone()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                directories.push(path);
+                continue;
+            }
+            files.insert(
+                path.strip_prefix(&dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+                std::fs::read(&path).unwrap(),
+            );
+        }
     }
     state.engine.stop();
     let _ = std::fs::remove_dir_all(&dir);

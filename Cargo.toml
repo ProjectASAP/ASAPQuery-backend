@@ -10,10 +10,11 @@ version = "0.1.0"
 # The backend depends on two Planner crates, at one immutable revision:
 # `asap-planner` to plan and `asap-executor` to execute. Planner IR types
 # are reached through `asap_executor::planner`.
-asap-planner = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "846a70ab202b5b205137db258dd5223df2ba81e4" }
-asap-executor = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "846a70ab202b5b205137db258dd5223df2ba81e4" }
+asap-planner = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "90a6e867da9edb121fb33cd55facf31d5deb2a1f" }
+asap-executor = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "90a6e867da9edb121fb33cd55facf31d5deb2a1f" }
 # The sketch library the Planner's executor pins, for the byte encodings of
-# the sketch states the data plane persists; keep it at the Planner's rev.
+# the sketch states the data plane persists; keep it at the Planner's rev
+# (here overridden below for the executor too).
 asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", rev = "389530ce23b121520f0218a4471e376db2c35945" }
 
 serde = { version = "1.0", features = ["derive"] }
@@ -29,3 +30,10 @@ tokio = { version = "1.0", features = ["full"] }
 axum = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 control_plane = { path = "control_plane" }
+
+# asap_sketchlib#271's head, ahead of the Planner's pin (389530c): DDSketch
+# view merges in place, with width-specialized loops (a 1 h quantile over
+# cold windows 3x faster). Drop when the Planner's pin moves past it. The
+# `www.` URL is a distinct source, so it may patch the one the Planner names.
+[patch."https://github.com/ProjectASAP/asap_sketchlib"]
+asap_sketchlib = { git = "https://www.github.com/ProjectASAP/asap_sketchlib", rev = "355093f48f2649df1b86f2d390c2faa145a5f0a0" }
