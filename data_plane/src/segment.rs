@@ -11,9 +11,11 @@
 //!
 //! A fragment holds one view's rows of one window by column, so a cold read
 //! decodes one (view, window) without the record's other views, and a
-//! fixed-width column of a sealed (mapped) segment is used in place.
+//! fixed-width column of a sealed (mapped) segment is used in place. A text
+//! column holding each row's series label is not stored: it is rebuilt from
+//! the series identity column.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -29,7 +31,7 @@ use asap_executor::arrow::datatypes::{
     ArrowPrimitiveType, DataType as ArrowType, Float64Type, Int64Type, TimeUnit,
     TimestampMillisecondType, UInt32Type,
 };
-use asap_executor::planner::ir::schema::{DataType, FieldDataType, Schema};
+use asap_executor::planner::ir::schema::{DataType, FieldDataType, Schema, PROMQL_SERIES_IDENTITY};
 use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
 use asap_executor::summary_kernels::HydraCms;
 use asap_executor::values::{
@@ -39,9 +41,10 @@ use asap_executor::Error;
 use serde::{Deserialize, Serialize};
 
 use crate::persist::{decode_stored_state, encode_state, Grids, StoredValue};
+use crate::series_ids::labels_of_identity;
 
 /// The view file format version these segments are.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Frame kinds.
 const HEADER_FRAME: u32 = 0;
@@ -62,6 +65,10 @@ const STATES: u32 = 6;
 /// data section, the states (each 8-byte aligned) in the second section;
 /// read in place, never rebuilt.
 const MAPPED_STATES: u32 = 7;
+/// A text column whose every row holds its series identity's label of the
+/// column's name (`""` when the series has none): no data, rebuilt on read
+/// from the identity column, whose index is the descriptor's flags.
+const IDENTITY_LABEL: u32 = 8;
 /// Flag: a timestamp column whose rows all hold one value, stored once.
 const CONSTANT: u32 = 1;
 /// Bytes of one column descriptor: kind, flags, data offset and length,
@@ -178,6 +185,9 @@ pub struct Segment {
     /// Every text dictionary built, the current one and those a window
     /// read before a rebuild may still hold, to count each live one once.
     dictionaries_built: Mutex<Vec<Weak<dyn Array>>>,
+    /// What [`IDENTITY_LABEL`] columns read from the segment are built
+    /// from ([`Segment::label_values`]).
+    identity_label_values: Mutex<IdentityLabelValues>,
     /// The newest window end of its records.
     max_end_ms: AtomicI64,
 }
@@ -239,6 +249,7 @@ impl Segment {
             texts: RwLock::new(Vec::new()),
             dictionary: Mutex::new(None),
             dictionaries_built: Mutex::default(),
+            identity_label_values: Mutex::default(),
             max_end_ms: AtomicI64::new(i64::MIN),
         }))
     }
@@ -314,6 +325,7 @@ impl Segment {
                 texts: RwLock::new(texts),
                 dictionary: Mutex::new(None),
                 dictionaries_built: Mutex::default(),
+                identity_label_values: Mutex::default(),
                 max_end_ms: AtomicI64::new(max_end_ms),
             }),
             heads,
@@ -459,10 +471,11 @@ impl Segment {
             .map_err(|e| Error::Invalid(format!("mapping {}: {e}", self.path.display())))
     }
 
-    /// Bytes of its text dictionaries still in memory: each is one array
+    /// Bytes of its text dictionaries still in memory (the texts, and the
+    /// label values of [`IDENTITY_LABEL`] columns): each is one array
     /// shared by the windows read from the segment while it was current,
-    /// so it is counted once for the segment. Several only while the
-    /// active segment's dictionary grew under a window still held.
+    /// so it is counted once for the segment. Several of one kind only
+    /// while the active segment's texts grew under a window still held.
     pub(crate) fn dictionary_bytes(&self) -> usize {
         let mut built = self
             .dictionaries_built
@@ -497,6 +510,80 @@ impl Segment {
             .unwrap_or_else(|e| e.into_inner())
             .push(Arc::downgrade(&values));
         Ok(values)
+    }
+}
+
+/// Each segment text's labels taken as a series identity, and per label
+/// name one value per text: the dictionary of every [`IDENTITY_LABEL`]
+/// column of that name, indexed by the rows' identity keys.
+#[derive(Default)]
+struct IdentityLabelValues {
+    /// By text key: the labels of the text taken as a series identity;
+    /// `None` for a text that is no identity. Extended as texts are added.
+    labels_by_text: Vec<Option<Arc<BTreeMap<String, String>>>>,
+    /// By label name: per text key, that label (`""` without it, or for a
+    /// text that is no identity). Rebuilt when a read needs a key past it.
+    values_by_label: HashMap<String, ArrayRef>,
+}
+
+impl Segment {
+    /// The values of `label` for the texts with keys below `needed` taken
+    /// as series identities, as one array shared by the windows read from
+    /// the segment ([`IdentityLabelValues`]).
+    fn label_values(&self, label: &str, needed: usize) -> Result<ArrayRef, Error> {
+        let mut identity = self
+            .identity_label_values
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(values) = identity
+            .values_by_label
+            .get(label)
+            .filter(|v| v.len() >= needed)
+        {
+            return Ok(values.clone());
+        }
+        // The texts added since, copied out so appends do not wait for
+        // their parsing.
+        let added: Vec<Arc<str>> = {
+            let texts = self.texts.read().unwrap_or_else(|e| e.into_inner());
+            if texts.len() < needed {
+                return Err(Error::Invalid(format!(
+                    "{}: a text key past the segment's texts",
+                    self.path.display()
+                )));
+            }
+            texts[identity.labels_by_text.len()..].to_vec()
+        };
+        identity
+            .labels_by_text
+            .extend(added.iter().map(|text| parse_identity(text)));
+        let values: ArrayRef = Arc::new(StringArray::from_iter_values(
+            identity.labels_by_text.iter().map(|labels| {
+                labels
+                    .as_ref()
+                    .and_then(|labels| labels.get(label))
+                    .map_or("", String::as_str)
+            }),
+        ));
+        identity
+            .values_by_label
+            .insert(label.to_string(), values.clone());
+        self.dictionaries_built
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::downgrade(&values));
+        Ok(values)
+    }
+}
+
+/// The labels of the series whose identity text is `text`: an interned
+/// series' own, else parsed (not kept beyond the segment); `None` for a
+/// text that is no label set's JSON.
+fn parse_identity(text: &str) -> Option<Arc<BTreeMap<String, String>>> {
+    match crate::series_ids::by_identity(text) {
+        Some(series) => Some(series.labels().clone()),
+        None if text.starts_with('{') => serde_json::from_str(text).ok().map(Arc::new),
+        None => None,
     }
 }
 
@@ -723,6 +810,7 @@ pub(crate) fn encode_fragment(
     out.extend_from_slice(&(columns as u32).to_le_bytes());
     let descriptors_at = out.len();
     out.resize(descriptors_at + columns * DESCRIPTOR_BYTES, 0);
+    let identity_labels = IdentityLabels::of(schema, rows);
     for (column, field) in schema.fields.iter().enumerate() {
         let values = rows.iter().map(|row| &row[column]);
         let nulls: Vec<bool> = rows
@@ -732,82 +820,95 @@ pub(crate) fn encode_fragment(
         // The second section: the validity bitmap, or a mapped state
         // column's states.
         let mut second: Option<Vec<u8>> = None;
-        let (kind, mut flags, data): (u32, u32, Vec<u8>) = match &field.dtype {
-            FieldDataType::Plain(DataType::Utf8) => {
-                let mut data = Vec::with_capacity(rows.len() * 4);
-                for value in values {
-                    let key = match value {
-                        Value::Utf8(text) => texts.key(text),
-                        _ => 0,
-                    };
-                    data.extend_from_slice(&key.to_le_bytes());
+        // The identity column, when this column holds its series' label.
+        let label_of_identity_column = identity_labels
+            .as_ref()
+            .filter(|labels| labels.holds_label(rows, column, &field.name))
+            .map(|labels| labels.column as u32);
+        let (kind, mut flags, data): (u32, u32, Vec<u8>) = if let Some(identity_column) =
+            label_of_identity_column
+        {
+            (IDENTITY_LABEL, identity_column, Vec::new())
+        } else {
+            match &field.dtype {
+                FieldDataType::Plain(DataType::Utf8) => {
+                    let mut data = Vec::with_capacity(rows.len() * 4);
+                    for value in values {
+                        let key = match value {
+                            Value::Utf8(text) => texts.key(text),
+                            _ => 0,
+                        };
+                        data.extend_from_slice(&key.to_le_bytes());
+                    }
+                    (TEXT, 0, data)
                 }
-                (TEXT, 0, data)
-            }
-            FieldDataType::Plain(DataType::Float64) => {
-                let mut data = Vec::with_capacity(rows.len() * 8);
-                for value in values {
-                    let v = match value {
-                        Value::Float64(v) => *v,
-                        _ => 0.0,
-                    };
-                    data.extend_from_slice(&v.to_le_bytes());
+                FieldDataType::Plain(DataType::Float64) => {
+                    let mut data = Vec::with_capacity(rows.len() * 8);
+                    for value in values {
+                        let v = match value {
+                            Value::Float64(v) => *v,
+                            _ => 0.0,
+                        };
+                        data.extend_from_slice(&v.to_le_bytes());
+                    }
+                    (FLOAT64, 0, data)
                 }
-                (FLOAT64, 0, data)
-            }
-            FieldDataType::Plain(DataType::Int64) => {
-                let mut data = Vec::with_capacity(rows.len() * 8);
-                for value in values {
-                    let v = match value {
-                        Value::Int64(v) => *v,
-                        _ => 0,
-                    };
-                    data.extend_from_slice(&v.to_le_bytes());
+                FieldDataType::Plain(DataType::Int64) => {
+                    let mut data = Vec::with_capacity(rows.len() * 8);
+                    for value in values {
+                        let v = match value {
+                            Value::Int64(v) => *v,
+                            _ => 0,
+                        };
+                        data.extend_from_slice(&v.to_le_bytes());
+                    }
+                    (INT64, 0, data)
                 }
-                (INT64, 0, data)
-            }
-            FieldDataType::Plain(DataType::Timestamp) => {
-                let times: Vec<i64> = values
-                    .map(|value| match value {
-                        Value::Timestamp(t) => *t,
-                        _ => 0,
-                    })
-                    .collect();
-                let constant = !times.is_empty()
-                    && !nulls.iter().any(|&n| n)
-                    && times.iter().all(|&t| t == times[0]);
-                let data: Vec<u8> = if constant {
-                    times[0].to_le_bytes().to_vec()
-                } else {
-                    times.iter().flat_map(|t| t.to_le_bytes()).collect()
-                };
-                (TIMESTAMP, if constant { CONSTANT } else { 0 }, data)
-            }
-            FieldDataType::Plain(_) => {
-                let values: Vec<&Value> = values.collect();
-                (GENERIC, 0, rmp_serde::to_vec(&values).ok()?)
-            }
-            family if family_has_mapped_form(family) && mapped_states(rows, column).is_some() => {
-                let (offsets, states) = mapped_states(rows, column).expect("checked");
-                second = Some(states);
-                (MAPPED_STATES, 0, offsets)
-            }
-            _ => {
-                // States: u32 offsets[rows + 1], then each state's stored bytes.
-                let mut offsets = Vec::with_capacity(rows.len() + 1);
-                let mut bytes = Vec::new();
-                offsets.push(0u32);
-                for value in values {
-                    let Value::Summary { state, .. } = value else {
-                        return None;
+                FieldDataType::Plain(DataType::Timestamp) => {
+                    let times: Vec<i64> = values
+                        .map(|value| match value {
+                            Value::Timestamp(t) => *t,
+                            _ => 0,
+                        })
+                        .collect();
+                    let constant = !times.is_empty()
+                        && !nulls.iter().any(|&n| n)
+                        && times.iter().all(|&t| t == times[0]);
+                    let data: Vec<u8> = if constant {
+                        times[0].to_le_bytes().to_vec()
+                    } else {
+                        times.iter().flat_map(|t| t.to_le_bytes()).collect()
                     };
-                    let stored = encode_state(state.as_ref(), grids)?;
-                    bytes.extend(rmp_serde::to_vec(&stored).ok()?);
-                    offsets.push(u32::try_from(bytes.len()).ok()?);
+                    (TIMESTAMP, if constant { CONSTANT } else { 0 }, data)
                 }
-                let mut data: Vec<u8> = offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
-                data.extend(bytes);
-                (STATES, 0, data)
+                FieldDataType::Plain(_) => {
+                    let values: Vec<&Value> = values.collect();
+                    (GENERIC, 0, rmp_serde::to_vec(&values).ok()?)
+                }
+                family
+                    if family_has_mapped_form(family) && mapped_states(rows, column).is_some() =>
+                {
+                    let (offsets, states) = mapped_states(rows, column).expect("checked");
+                    second = Some(states);
+                    (MAPPED_STATES, 0, offsets)
+                }
+                _ => {
+                    // States: u32 offsets[rows + 1], then each state's stored bytes.
+                    let mut offsets = Vec::with_capacity(rows.len() + 1);
+                    let mut bytes = Vec::new();
+                    offsets.push(0u32);
+                    for value in values {
+                        let Value::Summary { state, .. } = value else {
+                            return None;
+                        };
+                        let stored = encode_state(state.as_ref(), grids)?;
+                        bytes.extend(rmp_serde::to_vec(&stored).ok()?);
+                        offsets.push(u32::try_from(bytes.len()).ok()?);
+                    }
+                    let mut data: Vec<u8> = offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
+                    data.extend(bytes);
+                    (STATES, 0, data)
+                }
             }
         };
         let (data_offset, data_len) = section(&mut out, &data);
@@ -836,6 +937,61 @@ pub(crate) fn encode_fragment(
     }
     out.resize(padded(out.len()), 0);
     Some(out)
+}
+
+/// The labels of each row's series, from the series identity column, for
+/// telling which text columns are its labels ([`IDENTITY_LABEL`]).
+struct IdentityLabels {
+    /// The series identity column's index.
+    column: usize,
+    /// Each row's labels; `None` when a row's identity is none.
+    by_row: Vec<Option<Arc<BTreeMap<String, String>>>>,
+}
+
+impl IdentityLabels {
+    /// `None` when there are no rows, or `schema` has no series identity
+    /// text column or no other text column.
+    fn of(schema: &Schema, rows: &[Vec<Value>]) -> Option<Self> {
+        if rows.is_empty() {
+            return None;
+        }
+        let is_text = |dtype: &FieldDataType| *dtype == FieldDataType::Plain(DataType::Utf8);
+        let column = schema
+            .fields
+            .iter()
+            .position(|field| field.name == PROMQL_SERIES_IDENTITY && is_text(&field.dtype))?;
+        if !schema
+            .fields
+            .iter()
+            .enumerate()
+            .any(|(index, field)| index != column && is_text(&field.dtype))
+        {
+            return None;
+        }
+        let by_row = rows
+            .iter()
+            .map(|row| match &row[column] {
+                Value::Utf8(identity) => labels_of_identity(identity),
+                _ => None,
+            })
+            .collect();
+        Some(Self { column, by_row })
+    }
+
+    /// Whether every row's `column` is its series' label `name` (`""`
+    /// without it), so the column need not be stored.
+    fn holds_label(&self, rows: &[Vec<Value>], column: usize, name: &str) -> bool {
+        column != self.column
+            && rows
+                .iter()
+                .zip(&self.by_row)
+                .all(|(row, labels)| match (&row[column], labels) {
+                    (Value::Utf8(text), Some(labels)) => {
+                        **text == *labels.get(name).map_or("", String::as_str)
+                    }
+                    _ => false,
+                })
+    }
 }
 
 /// Column `column` of `rows` in the executor's mapped state layout: the
@@ -912,6 +1068,35 @@ fn primitive<T: ArrowPrimitiveType>(
     PrimitiveArray::<T>::try_new(values, nulls).map_err(|e| Error::Invalid(e.to_string()))
 }
 
+/// One column's descriptor in a fragment: its kind and flags, and its data
+/// and second sections (offset and length, inside the fragment).
+struct Descriptor {
+    kind: u32,
+    flags: u32,
+    data: (usize, usize),
+    valid: (usize, usize),
+}
+
+/// Column `column`'s descriptor in fragment `bytes`; damaged when a
+/// section lies past the fragment's end.
+fn descriptor(bytes: &[u8], column: usize) -> Result<Descriptor, Error> {
+    let at = 8 + column * DESCRIPTOR_BYTES;
+    let kind_flags = word(bytes, at)?;
+    let section = |at: usize| -> Result<(usize, usize), Error> {
+        let (offset, len) = (word(bytes, at)? as usize, word(bytes, at + 8)? as usize);
+        if offset.checked_add(len).is_none_or(|end| end > bytes.len()) {
+            return Err(damaged());
+        }
+        Ok((offset, len))
+    };
+    Ok(Descriptor {
+        kind: (kind_flags & 0xffff_ffff) as u32,
+        flags: (kind_flags >> 32) as u32,
+        data: section(at + 8)?,
+        valid: section(at + 24)?,
+    })
+}
+
 /// The fragment in `source` as one batch of `schema`, and the bytes of its
 /// mapped state columns ([`WindowLocation::read`]).
 fn decode_fragment(
@@ -932,28 +1117,12 @@ fn decode_fragment(
     let mut out = Vec::with_capacity(columns);
     let mut mapped_state_bytes = 0;
     for (column, field) in schema.fields.iter().enumerate() {
-        let at = 8 + column * DESCRIPTOR_BYTES;
-        let kind_flags = word(bytes, at)?;
-        let (kind, flags) = ((kind_flags & 0xffff_ffff) as u32, (kind_flags >> 32) as u32);
-        let data = (
-            word(bytes, at + 8)? as usize,
-            word(bytes, at + 16)? as usize,
-        );
-        let valid = (
-            word(bytes, at + 24)? as usize,
-            word(bytes, at + 32)? as usize,
-        );
-        if data
-            .0
-            .checked_add(data.1)
-            .is_none_or(|end| end > bytes.len())
-            || valid
-                .0
-                .checked_add(valid.1)
-                .is_none_or(|end| end > bytes.len())
-        {
-            return Err(damaged());
-        }
+        let Descriptor {
+            kind,
+            flags,
+            data,
+            valid,
+        } = descriptor(bytes, column)?;
         let nulls = if valid.1 == 0 || kind == MAPPED_STATES {
             None
         } else {
@@ -969,6 +1138,27 @@ fn decode_fragment(
                 let keys = primitive::<UInt32Type>(source, data, rows, nulls)?;
                 let needed = keys.iter().flatten().max().map_or(0, |k| k as usize + 1);
                 let values = segment.dictionary(needed)?;
+                Arc::new(
+                    DictionaryArray::<UInt32Type>::try_new(keys, values)
+                        .map_err(|e| Error::Invalid(e.to_string()))?,
+                )
+            }
+            IDENTITY_LABEL => {
+                // The identity column's keys, as this column's keys into
+                // the label's values by text.
+                let identity_column = flags as usize;
+                let identity = descriptor(bytes, identity_column)?;
+                if identity_column >= columns
+                    || identity.kind != TEXT
+                    || identity.valid.1 != 0
+                    || data.1 != 0
+                    || valid.1 != 0
+                {
+                    return Err(damaged());
+                }
+                let keys = primitive::<UInt32Type>(source, identity.data, rows, None)?;
+                let needed = keys.values().iter().max().map_or(0, |&k| k as usize + 1);
+                let values = segment.label_values(&field.name, needed)?;
                 Arc::new(
                     DictionaryArray::<UInt32Type>::try_new(keys, values)
                         .map_err(|e| Error::Invalid(e.to_string()))?,
