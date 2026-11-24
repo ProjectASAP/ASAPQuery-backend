@@ -1164,8 +1164,14 @@ async fn memory_reservations_wait_then_fail_only_a_lone_window() {
             ..options(PUSH, 4)
         },
     );
-    for (i, body) in small.into_iter().chain(large).enumerate() {
-        let _ = i;
+    for body in small {
+        assert_eq!(post(&app, body).await, StatusCode::NO_CONTENT);
+    }
+    // The small window is sealed before the large one opens, so the large
+    // one is alone however fast ingest runs (an older open window would
+    // let its reservation wait rather than fail).
+    barrier(&app, 10_000).await;
+    for body in large {
         assert_eq!(post(&app, body).await, StatusCode::NO_CONTENT);
     }
     for second in 21..=30i64 {
