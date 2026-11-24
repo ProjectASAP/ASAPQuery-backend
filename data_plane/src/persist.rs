@@ -129,6 +129,9 @@ pub type ViewIndex = BTreeMap<PhysicalASAPNodeId, Vec<((i64, i64), WindowLocatio
 struct ActiveSegment {
     segment: Arc<Segment>,
     texts: HashMap<Arc<str>, u32>,
+    /// The labels of each series identity its records held, looked up once
+    /// per segment ([`SegmentTexts::identity_labels`]).
+    labels_by_identity: crate::segment::LabelsByIdentity,
     /// The start of its first window: it rolls once a window starts
     /// `segment_ms` or more after it.
     first_start_ms: i64,
@@ -420,6 +423,7 @@ impl ViewFiles {
             files.active = Some(ActiveSegment {
                 segment: Segment::create(&path, &header)?,
                 texts: HashMap::new(),
+                labels_by_identity: HashMap::new(),
                 first_start_ms: start_ms,
             });
             written.bytes += files.active.as_ref().expect("set").segment.len();
@@ -427,6 +431,7 @@ impl ViewFiles {
         let active = files.active.as_mut().expect("set");
         let mut texts = SegmentTexts {
             known: &active.texts,
+            labels_by_identity: &mut active.labels_by_identity,
             base: active.segment.text_count() as u32,
             new: Vec::new(),
             new_index: HashMap::new(),
@@ -573,7 +578,13 @@ impl ViewFiles {
             let mut by_view = ViewIndex::new();
             for (retention_ms, _, path) in paths {
                 let Some((segment, heads)) = Segment::open(&path, &expected)? else {
-                    set_aside(&path, "a segment of another plan, group or version")?;
+                    set_aside(
+                        &path,
+                        &format!(
+                            "a segment of another plan, group or format version (this data \
+                             plane reads version {FORMAT_VERSION})"
+                        ),
+                    )?;
                     continue;
                 };
                 for head in heads {
@@ -1460,6 +1471,177 @@ mod tests {
         assert!(mapped_state_bytes > (first.num_rows() + 1) * 4);
         assert_eq!(mapped_state_bytes, copied_state_bytes);
         assert!(!l1.maps(identity(&copied).keys().values().as_ptr() as usize));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A view of `series` series with the series identity, three label
+    /// columns and the value. `labels_match`: each label column holds its
+    /// series' label (`zone` is no label, so `""`); otherwise `job` holds
+    /// another text. Odd series are no input series (no `__name__`, as a
+    /// `rate` result): their identities are never interned.
+    fn labeled_window(end_ms: i64, series: usize, labels_match: bool) -> Batch {
+        let schema = Arc::new(Schema::with_time_index(
+            vec![
+                Field::plain("ts", DataType::Timestamp, false),
+                Field::plain(PROMQL_SERIES_IDENTITY, DataType::Utf8, false),
+                Field::plain("job", DataType::Utf8, false),
+                Field::plain("region", DataType::Utf8, false),
+                Field::plain("zone", DataType::Utf8, false),
+                Field::plain("v", DataType::Float64, false),
+            ],
+            0,
+            vec![],
+        ));
+        let rows = (0..series)
+            .map(|s| {
+                let mut labels: BTreeMap<String, String> = [
+                    ("job".to_string(), format!("job-{}", s % 7)),
+                    ("region".to_string(), format!("region-{}", s % 3)),
+                    ("series".to_string(), format!("series-{s}")),
+                ]
+                .into();
+                let identity: Arc<str> = if s % 2 == 0 {
+                    labels.insert("__name__".into(), "data".into());
+                    crate::series_ids::intern(&labels).identity.clone()
+                } else {
+                    labels.insert("series".into(), format!("never-interned-{s}"));
+                    serde_json::to_string(&labels).unwrap().into()
+                };
+                let job = if labels_match {
+                    labels["job"].clone()
+                } else {
+                    format!("other-{}", s % 7)
+                };
+                vec![
+                    Value::Timestamp(end_ms),
+                    Value::Utf8(identity),
+                    Value::Utf8(job.into()),
+                    Value::Utf8(labels["region"].clone().into()),
+                    Value::Utf8("".into()),
+                    Value::Float64(s as f64),
+                ]
+            })
+            .collect();
+        Batch::try_new(schema, rows).unwrap()
+    }
+
+    /// A text column holding its series' label is not stored: it reads
+    /// back, from the active segment and once sealed, from the series
+    /// identity, saving its 4-byte key per row; a text column that is not
+    /// its series' label is stored as before.
+    #[test]
+    fn label_columns_are_read_back_from_the_series_identity() {
+        let dir = segment_dir("identity-labels");
+        let series = 300;
+        let (labeled, other) = (
+            labeled_window(10, series, true),
+            labeled_window(10, series, false),
+        );
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
+        let written = files
+            .append(
+                0,
+                (0, 10),
+                &[
+                    (1, std::slice::from_ref(&labeled)),
+                    (2, std::slice::from_ref(&other)),
+                ],
+            )
+            .unwrap();
+        let (l1, l2) = (location_of(&written, 1), location_of(&written, 2));
+        // `job` (other) is stored in view 2 only; `region` and `zone` in
+        // neither.
+        assert_eq!(l2.len() - l1.len(), series as u32 * 4);
+        for (location, batch, what) in [(&l1, &labeled, "labels"), (&l2, &other, "other")] {
+            let active = location.read(batch.schema(), ViewRead::Mmap).unwrap().0;
+            assert_same_rows(batch, &active, &format!("{what}, active segment"));
+        }
+        // A later window with series new to the active segment: the label
+        // values built for the first read are extended by the new texts.
+        let later = labeled_window(20, series + 50, true);
+        let later_written = files
+            .append(0, (10, 20), &[(1, std::slice::from_ref(&later))])
+            .unwrap();
+        let l3 = location_of(&later_written, 1);
+        assert!(!l3.is_sealed());
+        let read = l3.read(later.schema(), ViewRead::Mmap).unwrap().0;
+        assert_same_rows(&later, &read, "labels, extended values");
+        let read = l1.read(labeled.schema(), ViewRead::Mmap).unwrap().0;
+        assert_same_rows(&labeled, &read, "labels, first window after the extension");
+        files.seal(0).unwrap();
+        for how in [ViewRead::Mmap, ViewRead::Pread] {
+            for (location, batch, what) in [(&l1, &labeled, "labels"), (&l2, &other, "other")] {
+                let read = location.read(batch.schema(), how).unwrap().0;
+                assert_same_rows(batch, &read, &format!("{what}, sealed, {how:?}"));
+            }
+        }
+        // After a restart: the segment indexed from its file.
+        drop((written, l1, l2));
+        drop(files);
+        let view = |id: u64| -> MaterializedView {
+            serde_json::from_value(serde_json::json!({
+                "node_id": id,
+                "refresh": "at_ingestion",
+                "coverage": {"definition_id": format!("v{id}"), "selection": []},
+                "inputs": {"materialized_views": []},
+                "retention_ms": 1_000_000,
+            }))
+            .unwrap()
+        };
+        let groups = vec![vec![
+            (view(1), labeled.schema().clone()),
+            (view(2), other.schema().clone()),
+        ]];
+        let index = ViewFiles::open(&dir, 7, Duration::ZERO)
+            .unwrap()
+            .index(&groups)
+            .unwrap();
+        for (id, batch, what) in [(1, &labeled, "labels"), (2, &other, "other")] {
+            let location = &index[&id][0].1;
+            let read = location.read(batch.schema(), ViewRead::Mmap).unwrap().0;
+            assert_same_rows(batch, &read, &format!("{what}, indexed at startup"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A segment of an older format version is set aside at startup, not
+    /// read: its label columns are stored, not rebuilt.
+    #[test]
+    fn an_older_format_version_segment_is_set_aside() {
+        let dir = segment_dir("version");
+        let batch = labeled_window(10, 3, true);
+        let view: MaterializedView = serde_json::from_value(serde_json::json!({
+            "node_id": 1,
+            "refresh": "at_ingestion",
+            "coverage": {"definition_id": "v", "selection": []},
+            "inputs": {"materialized_views": []},
+            "retention_ms": 1_000_000,
+        }))
+        .unwrap();
+        let groups = vec![vec![(view, batch.schema().clone())]];
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
+        let written = files
+            .append(0, (0, 10), &[(1, std::slice::from_ref(&batch))])
+            .unwrap();
+        let path = location_of(&written, 1).segment_path().to_path_buf();
+        drop(written);
+        drop(files);
+        // The header frame's payload ends with the version (a MessagePack
+        // fixint): rewrite it as the previous one.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let header_len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        assert_eq!(u32::from(bytes[8 + header_len - 1]), FORMAT_VERSION);
+        bytes[8 + header_len - 1] = (FORMAT_VERSION - 1) as u8;
+        std::fs::write(&path, bytes).unwrap();
+        let index = ViewFiles::open(&dir, 7, Duration::ZERO)
+            .unwrap()
+            .index(&groups)
+            .unwrap();
+        assert!(index.get(&1).is_none_or(Vec::is_empty));
+        assert!(!path.exists());
+        let mut stale = path.into_os_string();
+        stale.push(".stale");
+        assert!(PathBuf::from(stale).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
