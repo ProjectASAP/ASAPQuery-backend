@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::ingestion::IngestionStats;
@@ -194,6 +194,8 @@ pub struct PushMetrics {
     pub state_bytes: Vec<Vec<AtomicU64>>,
     /// Open instances by shard.
     pub open_instances: Vec<AtomicU64>,
+    /// By shard: some group has more than one window open there.
+    pub older_window_open: Vec<AtomicBool>,
     /// From the newest committed window's end to its commit.
     pub commit_lag_ms: AtomicI64,
 }
@@ -214,6 +216,7 @@ impl PushMetrics {
                 .map(|_| (0..shards).map(|_| AtomicU64::new(0)).collect())
                 .collect(),
             open_instances: (0..shards).map(|_| AtomicU64::new(0)).collect(),
+            older_window_open: (0..shards).map(|_| AtomicBool::new(false)).collect(),
             commit_lag_ms: AtomicI64::new(0),
         }
     }

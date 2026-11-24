@@ -176,9 +176,10 @@ pub struct EngineOptions {
     /// Push mode: how each shard coalesces samples into morsels before
     /// folding them.
     pub push_batching: crate::push::MorselBatching,
-    /// Push mode: bytes of open-window state all shards may hold together;
-    /// a shard reserves before folding a batch and waits while older
-    /// windows are open. `None`: no limit.
+    /// Push mode: bytes of open-window state all shards may hold together.
+    /// Over it, nothing waits: while some group has an older window open
+    /// (whose seal will free memory) the state is kept; otherwise a shard
+    /// fails its largest open window. `None`: no limit.
     pub precompute_memory_budget_bytes: Option<u64>,
     /// For tests, push mode: the combine of the window ending at this time
     /// (ms) panics.

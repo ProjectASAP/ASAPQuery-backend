@@ -522,13 +522,16 @@ impl PushShard {
         late
     }
 
-    /// Publishes this shard's open state and fails, under the memory
-    /// budget, an instance that alone holds the shard over it: while older
-    /// windows are open, sealing them will free memory, so nothing fails.
+    /// Publishes this shard's open state and, over the memory budget,
+    /// fails this shard's largest instance when every group has only one
+    /// window open on every shard: while a group has an older window open,
+    /// sealing it will free memory, so nothing fails.
     fn account(&mut self, metrics: &Metrics) {
         let Some(push) = &metrics.push else { return };
         let mut by_group = vec![0u64; self.groups.len()];
+        let mut open_by_group = vec![0usize; self.groups.len()];
         for ((group, _), instance) in &self.instances {
+            open_by_group[*group] += 1;
             if instance.failed.is_none() {
                 by_group[*group] += instance.context.peak_bytes() as u64;
             }
@@ -538,28 +541,31 @@ impl PushShard {
         }
         push.open_instances[self.shard as usize]
             .store(self.instances.len() as u64, Ordering::Relaxed);
+        push.older_window_open[self.shard as usize]
+            .store(open_by_group.iter().any(|&n| n > 1), Ordering::Relaxed);
         let Some(budget) = self.budget_bytes else {
             return;
         };
-        // An older window open on any shard will be sealed and free its
-        // state: wait for it (the reservation succeeds late) rather than
-        // fail. Only a lone window over the budget fails.
         let older_open = push
-            .open_instances
+            .older_window_open
             .iter()
-            .any(|open| open.load(Ordering::Relaxed) > 1);
-        if push.total_state_bytes() <= budget || self.instances.len() != 1 || older_open {
+            .any(|open| open.load(Ordering::Relaxed));
+        if push.total_state_bytes() <= budget || older_open {
             return;
         }
-        if let Some(((group, _), instance)) = self.instances.iter_mut().next() {
-            if instance.failed.is_none() {
-                instance.failed = Some(format!(
-                    "the precompute memory budget ({budget} bytes) is exceeded and no older window is open"
-                ));
-                instance.context.cancel();
-                instance.feed.seal();
-                push.state_bytes[*group][self.shard as usize].store(0, Ordering::Relaxed);
-            }
+        let largest = self
+            .instances
+            .iter_mut()
+            .filter(|(_, instance)| instance.failed.is_none())
+            .max_by_key(|(_, instance)| instance.context.peak_bytes());
+        if let Some(((group, _), instance)) = largest {
+            instance.failed = Some(format!(
+                "the precompute memory budget ({budget} bytes) is exceeded and no older window is open"
+            ));
+            instance.context.cancel();
+            instance.feed.seal();
+            // Its group has no other window open here.
+            push.state_bytes[*group][self.shard as usize].store(0, Ordering::Relaxed);
         }
         self.pool.run_until_stalled();
     }

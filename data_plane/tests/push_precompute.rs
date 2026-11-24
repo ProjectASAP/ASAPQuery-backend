@@ -1095,11 +1095,11 @@ fn per_request() -> data_plane::push::MorselBatching {
     }
 }
 
-/// T15. A memory reservation waits while older windows are open and fails
-/// the window only when nothing else is open. With a budget for one open
-/// window and two windows open at once (lateness), ingest slows (queue,
-/// then 503) but no window fails; a single window over budget fails alone,
-/// and later windows commit.
+/// T15. Over the memory budget, state is kept while older windows are
+/// open, and a window fails only when nothing else is open. With a budget
+/// for one open window and two windows open at once (lateness), no window
+/// fails; a single window over budget fails alone, and later windows
+/// commit.
 #[tokio::test(flavor = "multi_thread")]
 async fn memory_reservations_wait_then_fail_only_a_lone_window() {
     let plan = plan(
@@ -1188,6 +1188,36 @@ async fn memory_reservations_wait_then_fail_only_a_lone_window() {
     assert_eq!(stats.windows_failed, 1, "{stats:?}");
     // The windows around it and the (empty) one holding the stream start.
     assert_eq!(stats.windows_refreshed, 3, "{stats:?}");
+}
+
+/// T15, with two push groups: each group has one window open, so no older
+/// window will free memory, and a budget below one window's state fails
+/// windows rather than letting every group's state grow past it.
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_budget_fails_lone_windows_of_several_groups() {
+    let plan = plan(
+        &[
+            ("quantile_over_time(0.9, data[10s])", 10_000),
+            ("sum_over_time(data[60s])", 60_000),
+        ],
+        &["data"],
+        200,
+        1000,
+        false,
+    );
+    assert_eq!(group_widths(&plan).len(), 2);
+    let (app, state) = install(
+        &plan,
+        EngineOptions {
+            precompute_memory_budget_bytes: Some(1),
+            push_batching: per_request(),
+            ..options(PUSH, 4)
+        },
+    );
+    write_seconds(&app, &["data"], 200, 0, 25).await;
+    barrier(&app, 20_000).await;
+    let stats = state.engine.stats();
+    assert!(stats.windows_failed > 0, "{stats:?}");
 }
 
 // ── T16: chunked seal ───────────────────────────────────────────────────
