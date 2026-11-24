@@ -3,9 +3,9 @@
 //!
 //! A segment is an append-only file of frames, each an 8-byte head (a
 //! little-endian `u32` payload length and a `u32` kind) and its payload,
-//! padded to a multiple of 8 bytes so every frame and every part inside a
-//! record starts 8-byte aligned. The first frame is the segment's header;
-//! each later frame is one refreshed window's record: its parts (the texts
+//! padded to a multiple of 8 bytes (an alignment format 2 read columns in
+//! place with; format 3 decompresses each fragment before decoding). The
+//! first frame is the segment's header; each later frame is one refreshed window's record: its parts (the texts
 //! new to the segment, the Hydra-Count-Min grids, one fragment per view),
 //! then its head (MessagePack) and the head's length as the last 4 bytes.
 //!
@@ -702,10 +702,23 @@ pub(crate) fn encode_fragment(
         // The second section: the validity bitmap, or a mapped state
         // column's states.
         let mut second: Option<Vec<u8>> = None;
-        // The column in the executor's mapped state layout, when its family
-        // and every state have one (a keyed exact state has none).
+        // A state column of a family with a compact form, compacted from
+        // each state's mapped layout (`None` when a state has none, e.g. a
+        // keyed exact state, or the column has no compact form).
+        let mut compact = compact_kind(&field.dtype).and_then(|kind| {
+            let views = rows
+                .iter()
+                .map(|row| match &row[column] {
+                    Value::Summary { state, .. } => state_view_bytes(state.as_ref()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some((kind, encode_states(kind, views.iter())?))
+        });
+        // Otherwise the column in the mapped layout, when it has one.
         let mut mapped = match &field.dtype {
             FieldDataType::Plain(_) => None,
+            _ if compact.is_some() => None,
             family if family_has_mapped_form(family) => mapped_states(rows, column),
             _ => None,
         };
@@ -760,25 +773,14 @@ pub(crate) fn encode_fragment(
                 let values: Vec<&Value> = values.collect();
                 (GENERIC, 0, rmp_serde::to_vec(&values).ok()?)
             }
+            _ if compact.is_some() => {
+                let (compact_kind, compact) = compact.take().expect("checked");
+                (COMPACT_STATES, compact_kind.code(), compact)
+            }
             _ if mapped.is_some() => {
                 let (offsets, states) = mapped.take().expect("checked");
-                let compact = compact_kind(&field.dtype).and_then(|kind| {
-                    let offsets: Vec<usize> = offsets
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .map(|o| u32::from_le_bytes(*o) as usize)
-                        .collect();
-                    let column = offsets.windows(2).map(|pair| &states[pair[0]..pair[1]]);
-                    Some((kind, encode_states(kind, column)?))
-                });
-                match compact {
-                    Some((kind, compact)) => (COMPACT_STATES, kind.code(), compact),
-                    None => {
-                        second = Some(states);
-                        (MAPPED_STATES, 0, offsets)
-                    }
-                }
+                second = Some(states);
+                (MAPPED_STATES, 0, offsets)
             }
             _ => {
                 // States: u32 offsets[rows + 1], then each state's stored bytes.
@@ -894,7 +896,12 @@ fn compress(columnar: &[u8]) -> Option<Vec<u8>> {
 /// The columnar bytes of a stored fragment.
 fn decompress(stored: &[u8]) -> Result<Vec<u8>, Error> {
     let length = u32::from_le_bytes(stored.get(..4).ok_or_else(damaged)?.try_into().unwrap());
-    if u64::from(length) > MAX_FRAME_BYTES {
+    // The length is checked against the frame's own content size before it
+    // sizes an allocation.
+    let content_size = zstd::zstd_safe::get_frame_content_size(&stored[4..]);
+    if u64::from(length) > MAX_FRAME_BYTES
+        || !matches!(content_size, Ok(Some(size)) if size == u64::from(length))
+    {
         return Err(damaged());
     }
     let columnar = zstd::bulk::decompress(&stored[4..], length as usize).map_err(|_| damaged())?;
@@ -1006,7 +1013,9 @@ fn decode_fragment(
                 one_column(field, values.into_iter().map(|v| vec![v]).collect())?.0
             }
             COMPACT_STATES => {
-                let compact = CompactKind::from_code(flags).ok_or_else(damaged)?;
+                let compact = CompactKind::from_code(flags)
+                    .filter(|&kind| Some(kind) == compact_kind(&field.dtype))
+                    .ok_or_else(damaged)?;
                 let (states, offsets) =
                     decode_states(compact, &bytes[data.0..data.0 + data.1], rows)
                         .ok_or_else(damaged)?;

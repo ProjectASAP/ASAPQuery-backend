@@ -201,8 +201,8 @@ holding a 1 h and a 6 h view would otherwise keep the 1 h view's bytes
 thread rolls to the next one; a sealed segment never changes again until
 it is deleted whole. A segment holds the existing framing (a little-endian
 `u32` length and a payload per frame), with every frame starting on an
-8-byte boundary (zero padding) so fixed-width columns can be borrowed in
-place:
+8-byte boundary (zero padding; format 2 borrowed fixed-width columns in
+place, format 3 decompresses each fragment):
 
 - a header frame (MessagePack): plan hash, group, **format version 3**,
   and the segment start;
@@ -216,7 +216,7 @@ Record v2 head = { start_ms, end_ms,
                    views: [(view id, offset, len)] }   // one columnar fragment per view
 ```
 
-**Columnar fragments.** Each view's rows of the window are one fragment,
+**Columnar fragments** (format 2; format 3 changes the encodings, see "Compact, compressed fragments" below). Each view's rows of the window are one fragment,
 laid out by column (all offsets relative to the fragment, every section
 8-byte aligned):
 
@@ -348,8 +348,8 @@ instead of an error; `--view-read=pread` reads every fragment with
 where that matters or a measured case prefers it. B3 compares the two.
 
 **The active segment** holds the newest windows, which are mostly still
-in the cache. A cold read of one of them uses `pread` of the fragment
-into an 8-byte-aligned buffer, then the same decoder; mapping a file that
+in the cache. A cold read of one of them uses `pread` of the fragment,
+then the same decoder; mapping a file that
 is still growing would need re-mapping as it grows and is not worth it for
 the few windows involved. When the segment is sealed, later reads map it.
 
@@ -385,6 +385,8 @@ the merges, and cold reads stay rare. Nothing in this design depends on
 levels: each level is its own view, tiered the same way.
 
 ### Zero-copy state views (revision, for approval)
+
+*Superseded for storage by format 3 ("Compact, compressed fragments"): a cold read decompresses its fragment and rebuilds the states in buffers of its own, so they are no longer read in place from the mapping. The executor's mapped-state API below is what those rebuilt buffers use.*
 
 **Why.** Decoding a cold window rebuilds every state on the heap. The
 implementation measured so far (sketch states rebuilt from their mapped
@@ -670,7 +672,7 @@ here changes the Planner.
 | Question | Decision | Rejected and why |
 | --- | --- | --- |
 | Where cold windows live | the persistence files | a second cold file (double write); encoded bytes in the heap (compact, but not reclaimable, so the cgroup OOM stays) |
-| Read primitive | `mmap` of sealed segments, decoding in place (fixed-width columns and the dictionary borrowed, states rebuilt from the mapped bytes); `pread` for the active segment and as `--view-read=pread` | `pread` everywhere: copies every fragment into a buffer, and the row data again into Arrow arrays; kept as the fallback. `mmap` of the active segment: needs re-mapping as it grows, for windows that are mostly still cached |
+| Read primitive | `mmap` of sealed segments (format 3: each fragment decompressed from the mapping and decoded into buffers of its own; format 2: decoding in place (fixed-width columns and the dictionary borrowed, states rebuilt from the mapped bytes); `pread` for the active segment and as `--view-read=pread` | `pread` everywhere: copies every fragment into a buffer, and the row data again into Arrow arrays; kept as the fallback. `mmap` of the active segment: needs re-mapping as it grows, for windows that are mostly still cached |
 | Fragment encoding | columnar per (view, window), state bytes unchanged | row-wise `Vec<Vec<StoredValue>>` as today: per-value tags and interleaved identity indices (140 B per exact state), a row-to-batch conversion on every decode, nothing to borrow |
 | Index granularity | (view, window) → slice, in memory | (series, window) → offset: no reader reads one series of a view window; an index file: rebuilt from the frames at startup instead |
 | Hot policy | CLOCK recency + idle time + byte budget, insert on commit | plan-derived next-read (couples the store to the executor's tiling; follow-up if B2 shows bad evictions); LRU list (a lock on every read) |
@@ -686,7 +688,7 @@ here changes the Planner.
   `pread` only for the active segment and as a fallback option. B3 still
   compares the two.
 - **Hot policy:** recency (CLOCK, idle time, byte budget).
-- **Fragment encoding:** columnar, with format version 2.
+- **Fragment encoding:** columnar, format version 3 (compact state and text columns, zstd level 1 per fragment).
 - **No cgroup limit:** no budget, plus idle eviction.
 - **Old view files:** renamed `*.stale`.
 - **Revision (pending approval):** states are used from the mapping
@@ -727,7 +729,7 @@ same build with tiering off (`--view-cache-max-bytes` unbounded and
 | V18 (revised; superseded by format 3) | States and fixed-width columns are used from the mapping. | A window of 1,000 KLL and 1,000 DDSketch rows read cold from a sealed segment. | Each view's item and bucket slices lie inside the segment's mapping; text keys and plain columns too; the dictionary is shared by every window of the segment. With `--view-read=pread` they lie outside it, and the answers are equal. | Fails: no view types. |
 | V18 (format 3) | A cold read rebuilds its state columns in buffers of its own and reports their bytes; the segment's texts stay one shared dictionary. | A KLL window of 1,000 rows read cold from a sealed segment, and by `--view-read=pread`. | Same rows; the reported state bytes equal the states' mapped layout plus offsets; the dictionary values array is shared by every window of the segment. | Fails in format 2: columns are borrowed, nothing is reported. |
 | V19 | No `SIGBUS`: only sealed segments are mapped, and a sealed segment is never shortened. | Read a window of the active segment (by `pread`), seal it, read again (mapped); unlink a mapped segment and read through a held location; restart over a segment with a torn tail. | All reads equal; the torn tail is cut before any mapping; no crash. | Fails: as V2. |
-| V20 | A query over cold windows allocates only its accumulators. | Dashboard plan, 1k series, 1 h of windows, window cache budget 0, all segments sealed; a counting global allocator in the test binary; `quantile_over_time(0.99, lat[1h])` and `max_over_time(lat[30m])`. | Bytes allocated during the run ≤ accumulators (series × one accumulator state) + output + a fixed bound, and at least 10× below the decoded windows' bytes; same answers as tiering off. | Fails: windows are decoded, and `SummaryMerge` collects them. |
+| V20 (format 2; format 3 also holds each read window's rebuilt states) | A query over cold windows allocates only its accumulators. | Dashboard plan, 1k series, 1 h of windows, window cache budget 0, all segments sealed; a counting global allocator in the test binary; `quantile_over_time(0.99, lat[1h])` and `max_over_time(lat[30m])`. | Bytes allocated during the run ≤ accumulators (series × one accumulator state) + output + a fixed bound, and at least 10× below the decoded windows' bytes; same answers as tiering off. | Fails: windows are decoded, and `SummaryMerge` collects them. |
 | V21 | Executor: `SummaryMerge` folds batch by batch and accepts mapped states. | Executor test (ASAPPlanner): a stream of 240 batches whose state columns are `Mapped`; a stream mixing owned and mapped batches; Counter windows out of order in the stream. | Same output as over owned states; at most one input batch held at a time; Counter merged in time order. | Fails: no `Mapped` storage; merge collects. |
 | V22 | Compressed-sample windows through the data plane. | A plan with a `CompressedSamples` chain (Planner fixture): commit, persist, read sealed and active, restart; a query reading the open window. | Blob bytes on disk equal the block the executor sealed; decoded rows equal the raw samples; the open window's samples are included when `reads_unsealed_window`; decoded rows are not kept after the run. | Fails: no compressed-sample chains in the pinned Planner. |
 | B3 | `pread` versus `mmap` (reported). | `examples/view_read_bench.rs` over one 10k-series segment of the dashboard plan: decode each window with `--view-read=mmap` and `pread`, page cache warm and cold. | ns per window and per state by family, bytes copied, `RssAnon`/`RssFile`. | — |

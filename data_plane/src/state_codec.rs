@@ -83,7 +83,7 @@ impl CompactKind {
 
 // ---------------------------------------------------------------- varints
 
-pub fn put_uvarint(out: &mut Vec<u8>, mut value: u64) {
+fn put_uvarint(out: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
         out.push(value as u8 | 0x80);
         value >>= 7;
@@ -91,7 +91,7 @@ pub fn put_uvarint(out: &mut Vec<u8>, mut value: u64) {
     out.push(value as u8);
 }
 
-pub fn uvarint(bytes: &[u8], at: &mut usize) -> Option<u64> {
+fn uvarint(bytes: &[u8], at: &mut usize) -> Option<u64> {
     let mut value = 0u64;
     for shift in (0..64).step_by(7) {
         let byte = *bytes.get(*at)?;
@@ -107,11 +107,11 @@ pub fn uvarint(bytes: &[u8], at: &mut usize) -> Option<u64> {
     None
 }
 
-pub fn put_ivarint(out: &mut Vec<u8>, value: i64) {
+fn put_ivarint(out: &mut Vec<u8>, value: i64) {
     put_uvarint(out, ((value << 1) ^ (value >> 63)) as u64);
 }
 
-pub fn ivarint(bytes: &[u8], at: &mut usize) -> Option<i64> {
+fn ivarint(bytes: &[u8], at: &mut usize) -> Option<i64> {
     let zigzag = uvarint(bytes, at)?;
     Some((zigzag >> 1) as i64 ^ -((zigzag & 1) as i64))
 }
@@ -141,21 +141,24 @@ const VIEW_LAYOUT_VERSION: u32 = 1;
 /// Bytes of a DDSketch view before its arrays: magic and version, seven
 /// 8-byte fields, six 4-byte fields.
 const DD_HEAD_BYTES: usize = 88;
+/// The widest store a DDSketch view may span, in buckets (the view
+/// reader's limit): bucket index arithmetic stays far inside `i32`.
+const MAX_SPAN: i64 = 1 << 20;
 
 /// One DDSketch store's non-empty buckets: absolute bucket index, count.
 type Buckets = Vec<(i32, u64)>;
 
 /// A DDSketch view's contents, as its compact form keeps them.
 #[derive(Debug, Default, Clone, PartialEq)]
-pub struct DdContents {
-    pub alpha: u64,
-    pub sum: u64,
-    pub min: u64,
-    pub max: u64,
-    pub zero_count: u64,
-    pub admission_rate: u64,
-    pub positive: Buckets,
-    pub negative: Buckets,
+struct DdContents {
+    alpha: u64,
+    sum: u64,
+    min: u64,
+    max: u64,
+    zero_count: u64,
+    admission_rate: u64,
+    positive: Buckets,
+    negative: Buckets,
 }
 
 /// Count bytes of a store's counts at `width` (padded to 8).
@@ -181,9 +184,10 @@ fn span(buckets: &Buckets) -> usize {
     }
 }
 
-/// Reads a DDSketch view's contents; `None` when the bytes are not a
-/// DDSketch view of layout version 1.
-pub fn dd_contents(view: &[u8]) -> Option<DdContents> {
+/// Reads a DDSketch view's contents into `dd` (its bucket lists reused);
+/// `None` when the bytes are not a DDSketch view of layout version 1 in the
+/// form its writer writes.
+fn read_dd(view: &[u8], dd: &mut DdContents) -> Option<()> {
     if view.get(..4)? != DD_MAGIC || u32_at(view, 4)? != VIEW_LAYOUT_VERSION {
         return None;
     }
@@ -205,17 +209,20 @@ pub fn dd_contents(view: &[u8]) -> Option<DdContents> {
         return None;
     }
     let mut at = DD_HEAD_BYTES;
-    let mut store = |offset: i32, len: usize| -> Option<Buckets> {
-        let keys = if sparse {
-            let keys = view.get(at..at + len * 4)?;
-            at = padded(at + len * 4);
-            Some(keys)
-        } else {
-            None
-        };
-        let counts = view.get(at..at + len * width)?;
-        at = padded(at + len * width);
-        let mut buckets = Vec::new();
+    // An array, and the zero padding after it.
+    let mut array = |bytes: usize| -> Option<&[u8]> {
+        let array = view.get(at..at + bytes)?;
+        let end = padded(at + bytes);
+        if view.get(at + bytes..end)?.iter().any(|&b| b != 0) {
+            return None;
+        }
+        at = end;
+        Some(array)
+    };
+    let mut store = |offset: i32, len: usize, buckets: &mut Buckets| -> Option<()> {
+        buckets.clear();
+        let keys = if sparse { Some(array(len * 4)?) } else { None };
+        let counts = array(len * width)?;
         for i in 0..len {
             let raw = &counts[i * width..(i + 1) * width];
             let mut word = [0u8; 8];
@@ -226,6 +233,9 @@ pub fn dd_contents(view: &[u8]) -> Option<DdContents> {
                 None => i as u32,
             };
             let index = offset.checked_add(i32::try_from(relative).ok()?)?;
+            if buckets.last().is_some_and(|&(last, _)| last >= index) {
+                return None;
+            }
             if count != 0 {
                 buckets.push((index, count));
             } else if sparse {
@@ -233,24 +243,25 @@ pub fn dd_contents(view: &[u8]) -> Option<DdContents> {
                 return None;
             }
         }
-        Some(buckets)
+        Some(())
     };
     let (positive_offset, negative_offset) = (u32_at(view, 72)? as i32, u32_at(view, 80)? as i32);
-    let positive = store(positive_offset, u32_at(view, 76)? as usize)?;
-    let negative = store(negative_offset, u32_at(view, 84)? as usize)?;
+    store(
+        positive_offset,
+        u32_at(view, 76)? as usize,
+        &mut dd.positive,
+    )?;
+    store(
+        negative_offset,
+        u32_at(view, 84)? as usize,
+        &mut dd.negative,
+    )?;
     if at != view.len() {
         return None;
     }
-    let contents = DdContents {
-        alpha,
-        sum,
-        min,
-        max,
-        zero_count,
-        admission_rate,
-        positive,
-        negative,
-    };
+    (dd.alpha, dd.sum, dd.min, dd.max) = (alpha, sum, min, max);
+    (dd.zero_count, dd.admission_rate) = (zero_count, admission_rate);
+    let contents = &*dd;
     // Only the form the view writer writes, so the compact form rebuilds
     // these bytes exactly: the narrowest count width, the smaller of the
     // dense and sparse forms, a dense store trimmed to non-empty ends, an
@@ -262,6 +273,8 @@ pub fn dd_contents(view: &[u8]) -> Option<DdContents> {
         Some((first, _)) => *first == offset && (sparse || span(buckets) == len),
     };
     let canonical = width == form_width
+        && span(&contents.positive) as i64 <= MAX_SPAN
+        && span(&contents.negative) as i64 <= MAX_SPAN
         && sparse == form_sparse
         && trimmed(
             &contents.positive,
@@ -273,7 +286,7 @@ pub fn dd_contents(view: &[u8]) -> Option<DdContents> {
             negative_offset,
             u32_at(view, 84)? as usize,
         );
-    (canonical && contents.count()? == count).then_some(contents)
+    (canonical && contents.count()? == count).then_some(())
 }
 
 impl DdContents {
@@ -308,7 +321,7 @@ impl DdContents {
     }
 
     /// Its view bytes, as `DdSketch::to_view_bytes` writes them.
-    pub fn view_bytes(&self, out: &mut Vec<u8>) -> Option<()> {
+    fn view_bytes(&self, out: &mut Vec<u8>) -> Option<()> {
         let (width, sparse) = self.form();
         let (positive, negative) = (&self.positive, &self.negative);
         let start = out.len();
@@ -525,20 +538,23 @@ fn put_buckets(out: &mut Vec<u8>, buckets: &Buckets, previous_first: &mut i32) {
     }
 }
 
-fn buckets(reader: &mut StreamReader, previous_first: &mut i32) -> Option<Buckets> {
+/// Reads one store's buckets into `out` (cleared first).
+fn buckets(reader: &mut StreamReader, previous_first: &mut i32, out: &mut Buckets) -> Option<()> {
+    out.clear();
     let header = reader.uvarint()?;
     let (entries, dense) = (usize::try_from(header >> 1).ok()?, header & 1 == 1);
     if entries == 0 {
-        return (!dense).then(Vec::new);
+        return (!dense).then_some(());
     }
     // Every entry takes at least a byte; a bad length must not size an
     // allocation.
     if entries > reader.ints.len() - reader.at {
         return None;
     }
-    let first = i32::try_from(i64::from(*previous_first) + reader.ivarint()?).ok()?;
+    let first = i64::from(*previous_first).checked_add(reader.ivarint()?)?;
+    let first = i32::try_from(first).ok()?;
     *previous_first = first;
-    let mut out = Vec::with_capacity(entries);
+    out.reserve(entries);
     if dense {
         for slot in 0..entries {
             let count = reader.uvarint()?;
@@ -557,14 +573,14 @@ fn buckets(reader: &mut StreamReader, previous_first: &mut i32) -> Option<Bucket
             index = index.checked_add(gap)?.checked_add(1)?;
             out.push((index, 0));
         }
-        for bucket in &mut out {
+        for bucket in out.iter_mut() {
             bucket.1 = reader.uvarint()?;
             if bucket.1 == 0 {
                 return None;
             }
         }
     }
-    Some(out)
+    (span(out) as i64 <= MAX_SPAN).then_some(())
 }
 
 // ------------------------------------------------------------ the columns
@@ -576,17 +592,18 @@ const RAW: u8 = 0xff;
 /// `kind`) in compact form; `None` when the column has no compact form
 /// (its sketches differ in index mapping or admission rate, or a state is
 /// not of `kind`'s layout).
-pub fn encode_states<'a>(
+pub fn encode_states(
     kind: CompactKind,
-    states: impl Iterator<Item = &'a [u8]>,
+    states: impl Iterator<Item = impl AsRef<[u8]>>,
 ) -> Option<Vec<u8>> {
     let mut out = Streams::default();
     match kind {
         CompactKind::DDSketch => {
             let mut shared: Option<(u64, u64)> = None;
             let mut previous = (0i32, 0i32);
+            let mut dd = DdContents::default();
             for state in states {
-                let dd = dd_contents(state)?;
+                read_dd(state.as_ref(), &mut dd)?;
                 match shared {
                     None => {
                         shared = Some((dd.alpha, dd.admission_rate));
@@ -609,6 +626,7 @@ pub fn encode_states<'a>(
             let mut previous_times = [0i64; 2];
             let mut words = [0u64; 7];
             for state in states {
+                let state = state.as_ref();
                 if state.len() != size {
                     return None;
                 }
@@ -664,7 +682,9 @@ fn put_record(
         (CompactKind::Counter, [0, rest @ ..]) if *rest == ABSENT_COUNTER => out.ints.push(0),
         (CompactKind::Counter, [1, start, start_time, last, last_time, total, samples]) => {
             // The increase, when it is the plain difference (no reset).
-            let plain = (f64::from_bits(*last) - f64::from_bits(*start)).to_bits() == *total;
+            // (Never for a NaN difference: its payload need not repeat.)
+            let difference = f64::from_bits(*last) - f64::from_bits(*start);
+            let plain = !difference.is_nan() && difference.to_bits() == *total;
             out.ints.push(1 | u8::from(plain) << 1);
             time(&mut out.ints, 0, *start_time);
             time(&mut out.ints, 1, *last_time);
@@ -702,43 +722,50 @@ fn put_record(
 /// damaged.
 pub fn decode_states(kind: CompactKind, bytes: &[u8], rows: usize) -> Option<(Vec<u64>, Vec<u32>)> {
     let mut reader = StreamReader::new(bytes)?;
-    let mut view = Vec::new();
-    let mut offsets = Vec::with_capacity(rows.min(bytes.len()) + 1);
+    // Every row takes at least a byte: `rows` past that is damage, and must
+    // not size an allocation.
+    if rows > bytes.len() {
+        return None;
+    }
+    let mut words: Vec<u64> = Vec::new();
+    let mut offsets = Vec::with_capacity(rows + 1);
     offsets.push(0u32);
+    let offset = |words: &Vec<u64>| u32::try_from(words.len() * 8).ok();
     match kind {
         CompactKind::DDSketch => {
             if rows > 0 {
-                let alpha = reader.u64()?;
-                let admission_rate = reader.u64()?;
+                let mut dd = DdContents {
+                    alpha: reader.u64()?,
+                    admission_rate: reader.u64()?,
+                    ..DdContents::default()
+                };
                 let mut previous = (0i32, 0i32);
+                let mut view = Vec::new();
                 for _ in 0..rows {
-                    let zero_count = reader.uvarint()?;
-                    let positive = buckets(&mut reader, &mut previous.0)?;
-                    let negative = buckets(&mut reader, &mut previous.1)?;
-                    DdContents {
-                        alpha,
-                        sum: reader.float(0)?,
-                        min: reader.float(1)?,
-                        max: reader.float(2)?,
-                        zero_count,
-                        admission_rate,
-                        positive,
-                        negative,
-                    }
-                    .view_bytes(&mut view)?;
-                    offsets.push(u32::try_from(view.len()).ok()?);
+                    dd.zero_count = reader.uvarint()?;
+                    buckets(&mut reader, &mut previous.0, &mut dd.positive)?;
+                    buckets(&mut reader, &mut previous.1, &mut dd.negative)?;
+                    (dd.sum, dd.min, dd.max) =
+                        (reader.float(0)?, reader.float(1)?, reader.float(2)?);
+                    view.clear();
+                    dd.view_bytes(&mut view)?;
+                    let (view_words, _) = view.as_chunks::<8>();
+                    words.extend(view_words.iter().map(|w| u64::from_le_bytes(*w)));
+                    offsets.push(offset(&words)?);
                 }
             }
         }
         _ => {
+            let size = kind.record_bytes().expect("an exact kind");
+            words.reserve(rows * size / 8);
             let mut previous_times = [0i64; 2];
             for _ in 0..rows {
-                record(kind, &mut reader, &mut previous_times, &mut view)?;
-                offsets.push(u32::try_from(view.len()).ok()?);
+                record(kind, &mut reader, &mut previous_times, &mut words)?;
+                offsets.push(offset(&words)?);
             }
         }
     }
-    reader.finished().then(|| (to_words(&view), offsets))
+    reader.finished().then_some((words, offsets))
 }
 
 /// One exact record of `kind`, appended to `view` in its mapped layout.
@@ -746,12 +773,13 @@ fn record(
     kind: CompactKind,
     reader: &mut StreamReader,
     previous_times: &mut [i64; 2],
-    view: &mut Vec<u8>,
+    view: &mut Vec<u64>,
 ) -> Option<()> {
     let size = kind.record_bytes().expect("an exact kind");
     let tag = reader.byte()?;
     if tag == RAW {
-        view.extend_from_slice(reader.raw(size)?);
+        let (raw, _) = reader.raw(size)?.as_chunks::<8>();
+        view.extend(raw.iter().map(|w| u64::from_le_bytes(*w)));
         return Some(());
     }
     let mut time = |reader: &mut StreamReader, field: usize| -> Option<u64> {
@@ -808,17 +836,8 @@ fn record(
         }
         _ => return None,
     };
-    for word in record {
-        put_u64(view, *word);
-    }
+    view.extend_from_slice(record);
     Some(())
-}
-
-/// `bytes` (a multiple of 8 long) as little-endian words.
-fn to_words(bytes: &[u8]) -> Vec<u64> {
-    let (words, rest) = bytes.as_chunks::<8>();
-    debug_assert!(rest.is_empty());
-    words.iter().map(|w| u64::from_le_bytes(*w)).collect()
 }
 
 /// A column of text keys in compact form: each a signed varint delta from
@@ -841,7 +860,7 @@ pub fn decode_text_keys(bytes: &[u8], rows: usize) -> Option<Vec<u32>> {
     let mut keys = Vec::with_capacity(rows);
     let (mut at, mut previous) = (0, 0i64);
     for _ in 0..rows {
-        previous += ivarint(bytes, &mut at)?;
+        previous = previous.checked_add(ivarint(bytes, &mut at)?)?;
         keys.push(u32::try_from(previous).ok()?);
     }
     (at == bytes.len()).then_some(keys)
@@ -851,6 +870,11 @@ pub fn decode_text_keys(bytes: &[u8], rows: usize) -> Option<Vec<u32>> {
 mod tests {
     use super::*;
     use asap_sketchlib::{DdSketch, DdSketchView};
+
+    fn dd_contents(view: &[u8]) -> Option<DdContents> {
+        let mut dd = DdContents::default();
+        read_dd(view, &mut dd).map(|()| dd)
+    }
 
     fn dd(alpha: f64, samples: &[f64]) -> Vec<u8> {
         let mut sketch = DdSketch::new(alpha);
@@ -945,6 +969,27 @@ mod tests {
     fn ddsketches_of_two_alphas_have_no_compact_column() {
         let states = [dd(0.02, &[1.0]), dd(0.05, &[1.0])];
         assert!(encode_states(CompactKind::DDSketch, states.iter().map(Vec::as_slice)).is_none());
+    }
+
+    /// Views the writer never writes (keys out of order, non-zero padding)
+    /// have no compact form: their column keeps the mapped layout rather
+    /// than being rebuilt differently.
+    #[test]
+    fn non_writer_ddsketch_views_have_no_compact_form() {
+        let spread: Vec<f64> = (0..5).map(|i| 1.5f64.powi(i * 3)).collect();
+        let view = dd(0.02, &spread);
+        assert_eq!(view[68], 1, "a sparse store");
+        assert!(dd_contents(&view).is_some());
+        let mut swapped = view.clone();
+        // Swap the second and third sparse keys.
+        let (a, b) = (DD_HEAD_BYTES + 4, DD_HEAD_BYTES + 8);
+        let key = swapped[a..a + 4].to_vec();
+        swapped.copy_within(b..b + 4, a);
+        swapped[b..b + 4].copy_from_slice(&key);
+        assert!(dd_contents(&swapped).is_none());
+        let mut padding = view.clone();
+        *padding.last_mut().unwrap() = 1;
+        assert!(dd_contents(&padding).is_none());
     }
 
     fn words(words: &[u64]) -> Vec<u8> {
