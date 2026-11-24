@@ -806,11 +806,14 @@ impl WindowSlot {
         }
     }
 
-    /// Bytes held in memory outside the cache: `Pending` and `Pinned`.
-    fn heap_bytes(&self) -> u64 {
-        match self.lock().0 {
-            SlotState::Pending(_) | SlotState::Pinned(_) => self.bytes,
-            SlotState::Stored(_) => 0,
+    /// What it holds in memory outside the cache.
+    fn resident(&self) -> Resident {
+        match &self.lock().0 {
+            SlotState::Pending(_) | SlotState::Pinned(_) => Resident::Batches(self.bytes),
+            SlotState::Stored(location) => {
+                let (segment, bytes) = location.segment_dictionary();
+                Resident::SegmentDictionary { segment, bytes }
+            }
         }
     }
 
@@ -840,10 +843,20 @@ impl WindowSlot {
                 tier.cold_reads.fetch_add(1, Ordering::Relaxed);
                 tier.cold_read_bytes
                     .fetch_add(location.read_bytes(), Ordering::Relaxed);
-                let bytes = batch.memory_bytes() as u64;
+                let bytes = window_batch_bytes(&batch) as u64;
                 Ok((Arc::new(vec![batch]), bytes))
             })
     }
+}
+
+/// What a window holds in memory outside the window cache.
+enum Resident {
+    /// Its batches (`Pending` or `Pinned`), of these bytes.
+    Batches(u64),
+    /// Nothing of its own (`Stored`: cached or not, the cache counts it),
+    /// but the text dictionary of its segment (by address), shared by
+    /// every window read from the segment, of these bytes.
+    SegmentDictionary { segment: usize, bytes: usize },
 }
 
 /// The texts of one text column of one view, each stored once: every
@@ -1210,7 +1223,9 @@ impl ViewStore {
 
     /// Bytes of the stored rows: each window as counted when it was
     /// appended (states included, whether or not a run has read them
-    /// since), plus each view's shared texts once.
+    /// since) or read back ([`window_batch_bytes`]), plus each view's
+    /// shared texts once and, for windows read back, each segment's text
+    /// dictionary once.
     pub fn bytes(&self) -> usize {
         let windows: usize = match &self.tier {
             None => self
@@ -1220,13 +1235,20 @@ impl ViewStore {
                 .map(|window| window.slot.bytes as usize)
                 .sum(),
             Some(tier) => {
-                let heap: u64 = self
-                    .by_view
-                    .values()
-                    .flatten()
-                    .map(|window| window.slot.heap_bytes())
-                    .sum();
-                (heap + tier.cache.stats().bytes) as usize
+                let mut heap = 0;
+                let mut dictionaries = 0;
+                let mut segments = BTreeSet::new();
+                for window in self.by_view.values().flatten() {
+                    match window.slot.resident() {
+                        Resident::Batches(bytes) => heap += bytes as usize,
+                        Resident::SegmentDictionary { segment, bytes } => {
+                            if segments.insert(segment) {
+                                dictionaries += bytes;
+                            }
+                        }
+                    }
+                }
+                heap + dictionaries + tier.cache.stats().bytes as usize
             }
         };
         let texts: usize = self
@@ -1308,9 +1330,12 @@ impl ViewStore {
     }
 }
 
-/// A stored window batch's bytes apart from its shared texts: its own
-/// buffers and states ([`Batch::memory_bytes`]) less each text column's
-/// values array, which the view's [`SharedTexts`] counts once.
+/// A window batch's bytes apart from its shared texts: its own buffers and
+/// states ([`Batch::memory_bytes`]) less each text column's values array,
+/// which is shared and counted once by its owner: the view's
+/// [`SharedTexts`] for a window as appended, its segment's dictionary for
+/// a window read back from its file. The charge of a window whichever way
+/// it is in memory.
 fn window_batch_bytes(batch: &Batch) -> usize {
     let shared: usize = (0..batch.schema().fields.len())
         .filter(|&index| batch.state_column(index).is_none())

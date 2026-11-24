@@ -454,6 +454,16 @@ impl Segment {
             .map_err(|e| Error::Invalid(format!("mapping {}: {e}", self.path.display())))
     }
 
+    /// Bytes of its text dictionary, once built: one array shared by every
+    /// window read from the segment, so counted once for the segment.
+    fn dictionary_bytes(&self) -> usize {
+        self.dictionary
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or(0, |values| values.get_array_memory_size())
+    }
+
     /// The texts with keys below `needed`, as one array shared by the
     /// windows read from the segment.
     fn dictionary(&self, needed: usize) -> Result<ArrayRef, Error> {
@@ -616,6 +626,16 @@ impl WindowLocation {
         };
         let bytes = self.bytes((self.offset, self.len), how)?;
         decode_fragment(&bytes, schema, &self.segment, &grids)
+    }
+
+    /// Its segment's text dictionary, which every window read from the
+    /// segment shares: the segment's address (to count it once) and the
+    /// dictionary's bytes (0 until a window of the segment is read).
+    pub(crate) fn segment_dictionary(&self) -> (usize, usize) {
+        (
+            Arc::as_ptr(&self.segment) as usize,
+            self.segment.dictionary_bytes(),
+        )
     }
 
     /// The fragment's length, for counting bytes read.
