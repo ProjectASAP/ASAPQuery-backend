@@ -128,24 +128,26 @@ pub fn decode(body: &[u8], limits: &Limits) -> Result<WriteRequest, RemoteWriteE
 pub fn decode_samples(body: &[u8], limits: &Limits) -> Result<Vec<RawSample>, RemoteWriteError> {
     DECOMPRESSED.with(|buffer| {
         let mut buffer = buffer.borrow_mut();
-        let decoded = decompress_into(body, limits, &mut buffer)?;
-        // Room for one sample per 40 encoded bytes: a sender's one-sample
-        // series take 60 to 150, so this grows only for tiny label sets.
-        let mut samples = Vec::with_capacity(decoded.len() / 40);
-        let mut request = Reader::new(decoded);
-        let walked = (|| {
+        let decoded = (|| {
+            let decoded = decompress_into(body, limits, &mut buffer)?;
+            // Room for one sample per 40 encoded bytes: a sender's one-sample
+            // series take 60 to 150, so this grows only for tiny label sets.
+            let mut samples = Vec::with_capacity(decoded.len() / 40);
+            let mut request = Reader::new(decoded);
             while let Some((field, value)) = request.field()? {
                 if let (1, Value::Bytes(series)) = (field, value) {
                     decode_series(series, &mut samples, limits)?;
                 }
             }
-            Ok(())
+            Ok(samples)
         })();
-        // An unusually large request's buffer is not kept.
+        // An unusually large request's buffer is not kept, whether or not the
+        // request decoded: a short body claiming a large size and then failing
+        // to decompress must not leave the thread holding that buffer.
         if buffer.len() > KEPT_DECOMPRESSED_BYTES {
             *buffer = Vec::new();
         }
-        walked.map(|()| samples)
+        decoded
     })
 }
 
@@ -177,7 +179,12 @@ fn decompress_into<'a>(
             limits.max_decompressed_bytes,
         ));
     }
-    if buffer.len() < len {
+    if len > KEPT_DECOMPRESSED_BYTES {
+        // Not kept after this request (see `decode_samples`): a fresh zeroed
+        // allocation, whose pages are only touched as snappy writes them,
+        // rather than growing and zeroing the kept buffer.
+        *buffer = vec![0; len];
+    } else if buffer.len() < len {
         buffer.resize(len, 0);
     }
     let written = snap::raw::Decoder::new()
@@ -552,6 +559,28 @@ pub fn encode(request: &WriteRequest) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_large_body_that_fails_to_decompress_leaves_no_buffer_behind() {
+        // A 6-byte body: a snappy header claiming 120 MiB, then a literal cut short.
+        let claimed = 120usize << 20;
+        let mut body = Vec::new();
+        let mut n = claimed;
+        while n >= 0x80 {
+            body.push((n as u8) | 0x80);
+            n >>= 7;
+        }
+        body.push(n as u8);
+        body.extend_from_slice(&[0xf0, 0x00]);
+        let limits = super::Limits::default();
+        assert!(claimed <= limits.max_decompressed_bytes);
+        assert!(matches!(
+            super::decode_samples(&body, &limits),
+            Err(super::RemoteWriteError::Snappy(_))
+        ));
+        super::DECOMPRESSED
+            .with(|buffer| assert!(buffer.borrow().capacity() <= super::KEPT_DECOMPRESSED_BYTES));
+    }
+
     use super::*;
     use std::collections::BTreeMap;
 

@@ -1174,6 +1174,9 @@ async fn memory_reservations_wait_then_fail_only_a_lone_window() {
     for body in large {
         assert_eq!(post(&app, body).await, StatusCode::NO_CONTENT);
     }
+    // Every shard has folded the large window's requests before any opens the
+    // next one, so a newer open window never counts as an older one.
+    barrier(&app, 20_000).await;
     for second in 21..=30i64 {
         assert_eq!(
             post(&app, body(&["data"], 0..200, &[second * 1000])).await,
