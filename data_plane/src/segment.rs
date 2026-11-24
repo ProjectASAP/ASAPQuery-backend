@@ -301,6 +301,19 @@ impl Segment {
                 let Some((head, added)) = (kind == RECORD_FRAME)
                     .then(|| record_head(&payload))
                     .flatten()
+                    .filter(|head| {
+                        // Every range the head names lies in this frame.
+                        let frame = offset + 8..=offset + 8 + length;
+                        let inside = |(at, len): (u64, u32)| {
+                            frame.contains(&at)
+                                && at
+                                    .checked_add(u64::from(len))
+                                    .is_some_and(|end| frame.contains(&end))
+                        };
+                        inside(head.texts)
+                            && (head.grids.1 == 0 || inside(head.grids))
+                            && head.views.iter().all(|&(_, at, len)| inside((at, len)))
+                    })
                     .and_then(|head| {
                         let start = usize::try_from(head.texts.0.checked_sub(offset + 8)?).ok()?;
                         let bytes =
@@ -590,7 +603,10 @@ impl WindowLocation {
     /// `len` bytes at `offset` of the segment.
     fn bytes(&self, (offset, len): (u64, u32), how: ViewRead) -> Result<Bytes, Error> {
         let len = len as usize;
-        if offset + len as u64 > self.segment.len() {
+        if offset
+            .checked_add(len as u64)
+            .is_none_or(|end| end > self.segment.len())
+        {
             return Err(Error::Invalid(format!(
                 "{}: a fragment past the segment's end",
                 self.segment.path.display()
@@ -915,7 +931,13 @@ fn decode_fragment(
     let header = word(bytes, 0)?;
     let rows = (header & 0xffff_ffff) as usize;
     let columns = (header >> 32) as usize;
-    if columns != schema.fields.len() || 8 + columns * DESCRIPTOR_BYTES > bytes.len() {
+    // Every row takes at least a bit of the fragment (a constant column
+    // alone takes none, but no view is one): a larger count is damage, and
+    // would allocate without bound.
+    if columns != schema.fields.len()
+        || 8 + columns * DESCRIPTOR_BYTES > bytes.len()
+        || rows > bytes.len() * 8
+    {
         return Err(damaged());
     }
     // The Arrow layout of each plain column, as the executor builds it.
@@ -1081,4 +1103,55 @@ fn one_column(
     let schema = Arc::new(Schema::new(vec![field.clone()]));
     let batch = Batch::try_new(schema, rows)?;
     Ok((batch.column(0).clone(), batch.state_column(0).cloned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use asap_executor::planner::ir::schema::Field;
+
+    /// A fragment or record range read from disk that is out of bounds
+    /// (an overflowing offset, a row count no fragment of its length can
+    /// hold) is an error, not a panic or a huge allocation.
+    #[test]
+    fn out_of_bounds_heads_are_errors() {
+        let dir = std::env::temp_dir().join(format!("asap-segment-heads-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let header = SegmentHeader {
+            plan_hash: 7,
+            group: 0,
+            version: FORMAT_VERSION,
+        };
+        let segment = Segment::create_new(&dir, 10, &header).unwrap();
+        let schema = Arc::new(Schema::with_time_index(
+            vec![Field::plain("ts", DataType::Timestamp, false)],
+            0,
+            vec![],
+        ));
+        let location = WindowLocation::new(segment, (u64::MAX - 2, 10), (0, 0));
+        assert!(location.read(&schema, ViewRead::Pread).is_err());
+
+        // u32::MAX rows of one constant timestamp, in 56 bytes.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&((1u64 << 32) | u64::from(u32::MAX)).to_le_bytes());
+        for word in [
+            (u64::from(CONSTANT) << 32) | u64::from(TIMESTAMP),
+            48,
+            8,
+            0,
+            0,
+        ] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes.extend_from_slice(&10i64.to_le_bytes());
+        let len = bytes.len();
+        let mut words = vec![0u64; len.div_ceil(8)];
+        // SAFETY: `words` is at least `len` writable bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), words.as_mut_ptr().cast::<u8>(), len)
+        };
+        let segment = Segment::create_new(&dir, 20, &header).unwrap();
+        assert!(decode_fragment(&Bytes::Owned(words, len), &schema, &segment, &[]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
