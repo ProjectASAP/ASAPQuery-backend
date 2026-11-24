@@ -95,7 +95,7 @@ fn main() {
             }
             let started = Instant::now();
             for location in &locations {
-                std::hint::black_box(location.read(&schema, how).unwrap());
+                std::hint::black_box(location.read(&schema, how).unwrap().0);
             }
             let ns = started.elapsed().as_nanos() as f64;
             println!(

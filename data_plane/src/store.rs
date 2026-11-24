@@ -737,9 +737,10 @@ enum SlotState {
 pub struct WindowSlot {
     key: WindowKey,
     schema: SchemaRef,
-    /// Its rows' bytes when decoded, counted when appended (a run that
+    /// Its charge when appended ([`window_batch_bytes`]: its buffers and
+    /// states, less the view's shared texts), kept although a run that
     /// later reads its states marks them held outside the run, after which
-    /// [`Batch::memory_bytes`] no longer counts them).
+    /// [`Batch::memory_bytes`] no longer counts them.
     bytes: u64,
     /// Its state, and whether the window left the store (past retention).
     state: Mutex<(SlotState, bool)>,
@@ -806,14 +807,6 @@ impl WindowSlot {
         }
     }
 
-    /// Bytes held in memory outside the cache: `Pending` and `Pinned`.
-    fn heap_bytes(&self) -> u64 {
-        match self.lock().0 {
-            SlotState::Pending(_) | SlotState::Pinned(_) => self.bytes,
-            SlotState::Stored(_) => 0,
-        }
-    }
-
     /// The window's batches: from memory, the cache, or its fragment.
     fn batches(&self) -> Result<Arc<Vec<Batch>>, Error> {
         let location = match &self.lock().0 {
@@ -830,17 +823,18 @@ impl WindowSlot {
                     std::thread::sleep(tier.decode_delay);
                 }
                 let timer = Timer::start();
-                let batch = location.read(&self.schema, tier.read).map_err(|error| {
-                    Error::Invalid(format!(
-                        "materialized view {} window ending {}: {error}",
-                        self.key.view, self.key.end_ms
-                    ))
-                })?;
+                let (batch, mapped_state_bytes) =
+                    location.read(&self.schema, tier.read).map_err(|error| {
+                        Error::Invalid(format!(
+                            "materialized view {} window ending {}: {error}",
+                            self.key.view, self.key.end_ms
+                        ))
+                    })?;
                 tier.decode.record(timer);
                 tier.cold_reads.fetch_add(1, Ordering::Relaxed);
                 tier.cold_read_bytes
                     .fetch_add(location.read_bytes(), Ordering::Relaxed);
-                let bytes = batch.memory_bytes() as u64;
+                let bytes = (window_batch_bytes(&batch) + mapped_state_bytes) as u64;
                 Ok((Arc::new(vec![batch]), bytes))
             })
     }
@@ -1208,9 +1202,12 @@ impl ViewStore {
             .map(|window| window.time_range_ms.1)
     }
 
-    /// Bytes of the stored rows: each window as counted when it was
-    /// appended (states included, whether or not a run has read them
-    /// since), plus each view's shared texts once.
+    /// Bytes of the stored rows: each window in memory as counted when it
+    /// was appended (states included, whether or not a run has read them
+    /// since), each cached window as the cache charges it, each view's
+    /// shared texts once, and each live text dictionary of the segments
+    /// holding stored windows once (built when one of their windows is read
+    /// back).
     pub fn bytes(&self) -> usize {
         let windows: usize = match &self.tier {
             None => self
@@ -1220,13 +1217,22 @@ impl ViewStore {
                 .map(|window| window.slot.bytes as usize)
                 .sum(),
             Some(tier) => {
-                let heap: u64 = self
-                    .by_view
-                    .values()
-                    .flatten()
-                    .map(|window| window.slot.heap_bytes())
-                    .sum();
-                (heap + tier.cache.stats().bytes) as usize
+                let mut pending_and_pinned_bytes = 0;
+                let mut dictionary_bytes = 0;
+                let mut segments_counted = BTreeSet::new();
+                for window in self.by_view.values().flatten() {
+                    match &window.slot.lock().0 {
+                        SlotState::Pending(_) | SlotState::Pinned(_) => {
+                            pending_and_pinned_bytes += window.slot.bytes as usize
+                        }
+                        SlotState::Stored(location) => {
+                            if segments_counted.insert(Arc::as_ptr(location.segment())) {
+                                dictionary_bytes += location.segment().dictionary_bytes();
+                            }
+                        }
+                    }
+                }
+                pending_and_pinned_bytes + dictionary_bytes + tier.cache.stats().bytes as usize
             }
         };
         let texts: usize = self
@@ -1308,9 +1314,13 @@ impl ViewStore {
     }
 }
 
-/// A stored window batch's bytes apart from its shared texts: its own
-/// buffers and states ([`Batch::memory_bytes`]) less each text column's
-/// values array, which the view's [`SharedTexts`] counts once.
+/// A window batch's bytes apart from its shared texts: its own buffers and
+/// states ([`Batch::memory_bytes`]) less each text column's values array,
+/// which is shared and counted once by its owner: the view's
+/// [`SharedTexts`] for a window as appended, its segment's dictionary for
+/// a window read back from its file. A window's cache charge both when
+/// appended and when read back (plus, read back, its mapped state columns:
+/// [`WindowLocation::read`]).
 fn window_batch_bytes(batch: &Batch) -> usize {
     let shared: usize = (0..batch.schema().fields.len())
         .filter(|&index| batch.state_column(index).is_none())

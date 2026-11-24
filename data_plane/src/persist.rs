@@ -1321,13 +1321,13 @@ mod tests {
                 !location.is_sealed(),
                 "{what}: the newest segment is active"
             );
-            let active = location.read(batch.schema(), ViewRead::Mmap).unwrap();
+            let active = location.read(batch.schema(), ViewRead::Mmap).unwrap().0;
             assert_same_rows(&batch, &active, &format!("{what}, active segment"));
             files.seal(0).unwrap();
             assert!(location.is_sealed(), "{what}");
-            let mapped = location.read(batch.schema(), ViewRead::Mmap).unwrap();
+            let mapped = location.read(batch.schema(), ViewRead::Mmap).unwrap().0;
             assert_same_rows(&batch, &mapped, &format!("{what}, mapped"));
-            let pread = location.read(batch.schema(), ViewRead::Pread).unwrap();
+            let pread = location.read(batch.schema(), ViewRead::Pread).unwrap().0;
             assert_same_rows(&batch, &pread, &format!("{what}, pread"));
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -1348,11 +1348,11 @@ mod tests {
             .unwrap();
         let location = location_of(&written, 1);
         for how in [ViewRead::Pread, ViewRead::Mmap] {
-            assert_eq!(location.read(empty.schema(), how).unwrap().num_rows(), 0);
+            assert_eq!(location.read(empty.schema(), how).unwrap().0.num_rows(), 0);
         }
         files.seal(0).unwrap();
         for how in [ViewRead::Pread, ViewRead::Mmap] {
-            assert_eq!(location.read(empty.schema(), how).unwrap().num_rows(), 0);
+            assert_eq!(location.read(empty.schema(), how).unwrap().0.num_rows(), 0);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1381,7 +1381,9 @@ mod tests {
         drop(file);
         for (i, batch) in batches.iter().enumerate() {
             let view = i as PhysicalASAPNodeId + 1;
-            let read = location_of(&written, view).read(batch.schema(), ViewRead::Mmap);
+            let read = location_of(&written, view)
+                .read(batch.schema(), ViewRead::Mmap)
+                .map(|(batch, _)| batch);
             if view == 2 {
                 assert!(read.is_err(), "a damaged fragment must not decode");
             } else {
@@ -1419,8 +1421,8 @@ mod tests {
             .unwrap();
         files.seal(0).unwrap();
         let (l1, l2) = (location_of(&w1, 1), location_of(&w2, 1));
-        let r1 = l1.read(first.schema(), ViewRead::Mmap).unwrap();
-        let r2 = l2.read(second.schema(), ViewRead::Mmap).unwrap();
+        let r1 = l1.read(first.schema(), ViewRead::Mmap).unwrap().0;
+        let r2 = l2.read(second.schema(), ViewRead::Mmap).unwrap().0;
         assert_same_rows(&first, &r1, "mapped");
         let identity = |batch: &Batch| {
             batch
@@ -1449,8 +1451,14 @@ mod tests {
             Arc::ptr_eq(identity(&r1).values(), identity(&r2).values()),
             "one dictionary per segment"
         );
-        let copied = l1.read(first.schema(), ViewRead::Pread).unwrap();
+        let copied = l1.read(first.schema(), ViewRead::Pread).unwrap().0;
         assert_same_rows(&first, &copied, "pread");
+        // The mapped states' bytes, which the batch does not count, are
+        // reported for the window's charge, mapped or copied alike.
+        let (_, mapped_state_bytes) = l1.read(first.schema(), ViewRead::Mmap).unwrap();
+        let (_, copied_state_bytes) = l1.read(first.schema(), ViewRead::Pread).unwrap();
+        assert!(mapped_state_bytes > (first.num_rows() + 1) * 4);
+        assert_eq!(mapped_state_bytes, copied_state_bytes);
         assert!(!l1.maps(identity(&copied).keys().values().as_ptr() as usize));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1468,9 +1476,9 @@ mod tests {
             .unwrap();
         files.seal(0).unwrap();
         let location = location_of(&written, 1);
-        let before = location.read(batch.schema(), ViewRead::Mmap).unwrap();
+        let before = location.read(batch.schema(), ViewRead::Mmap).unwrap().0;
         std::fs::remove_file(location.segment_path()).unwrap();
-        let after = location.read(batch.schema(), ViewRead::Mmap).unwrap();
+        let after = location.read(batch.schema(), ViewRead::Mmap).unwrap().0;
         assert_same_rows(&before, &after, "after unlink");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1560,7 +1568,7 @@ mod tests {
         assert!(!oldest_short.segment_path().exists());
         assert!(oldest_long.segment_path().exists());
         assert!(files.bytes() < bytes_before);
-        let read = oldest_long.read(batch.schema(), ViewRead::Mmap).unwrap();
+        let read = oldest_long.read(batch.schema(), ViewRead::Mmap).unwrap().0;
         assert_same_rows(&batch, &read, "the long-retention view's oldest window");
         let left: Vec<PathBuf> = segment_files(&dir);
         assert_eq!(left.len(), 5, "short: (60, 80]; long: four segments");
@@ -1604,7 +1612,7 @@ mod tests {
         files.seal(0).unwrap();
         assert!(locations[4].is_cold(), "sealing (60, 80] cools (40, 60]");
         assert!(!locations[6].is_cold());
-        let read = locations[0].read(batch.schema(), ViewRead::Mmap).unwrap();
+        let read = locations[0].read(batch.schema(), ViewRead::Mmap).unwrap().0;
         assert_same_rows(&batch, &read, "a cold segment");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1652,7 +1660,7 @@ mod tests {
         for (_, location) in &index[&1] {
             assert_same_rows(
                 &batch,
-                &location.read(batch.schema(), ViewRead::Mmap).unwrap(),
+                &location.read(batch.schema(), ViewRead::Mmap).unwrap().0,
                 "after the cut",
             );
         }
@@ -1796,7 +1804,7 @@ mod tests {
         for (_, location) in &index[&2] {
             assert_same_rows(
                 &batch,
-                &location.read(batch.schema(), ViewRead::Mmap).unwrap(),
+                &location.read(batch.schema(), ViewRead::Mmap).unwrap().0,
                 "old layout",
             );
         }
