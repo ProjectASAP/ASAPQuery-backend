@@ -159,11 +159,12 @@ async fn another_plans_view_files_are_not_loaded() {
         common::metric(&state, "asap_view_windows_loaded_total"),
         0.0
     );
-    assert!(std::fs::read_dir(&dir).unwrap().any(|entry| entry
+    // The earlier plan's segments are set aside where they are, in their
+    // group's retention directory.
+    assert!(std::fs::read_dir(dir.join("group-0"))
         .unwrap()
-        .path()
-        .to_string_lossy()
-        .ends_with(".stale")));
+        .flat_map(|entry| std::fs::read_dir(entry.unwrap().path()).unwrap())
+        .any(|entry| entry.unwrap().path().to_string_lossy().ends_with(".stale")));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

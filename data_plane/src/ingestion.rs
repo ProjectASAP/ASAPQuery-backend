@@ -14,7 +14,8 @@
 //! The first window a group sees may have started before the data plane
 //! did, so it is never refreshed and queries that read it are not
 //! answered, unless the producer declares where its stream starts
-//! (`stream_start_ms`): a window starting at or after it is complete.
+//! (`stream_start_ms`): nothing arrives before it, so the window holding it
+//! is complete and is the group's first.
 //! When the watermark jumps past a view's retention, the windows that would
 //! already be dropped are skipped.
 //!
@@ -90,6 +91,9 @@ pub struct IngestionStats {
     pub samples_dropped_future: u64,
     /// Samples of a metric no `Scan` reads.
     pub samples_unrouted: u64,
+    /// Samples accepted after every window of every group scanning their
+    /// metric that holds them was closed: in no view.
+    pub samples_late_for_views: u64,
     /// Ingestion runs that refreshed a group's window and stored its rows.
     pub windows_refreshed: u64,
     /// Ingestion runs that failed; their window is not stored.
@@ -186,6 +190,9 @@ pub struct Ingestion {
     newest_clock_ms: Option<i64>,
     /// The newest event-time barrier a producer declared.
     barrier_ms: Option<i64>,
+    /// Groups whose windows the ingest shards build by push: they read no
+    /// raw data, so they keep none.
+    push_groups: Vec<bool>,
     pub stats: IngestionStats,
 }
 
@@ -338,6 +345,7 @@ impl Ingestion {
             newest_sample_ms: None,
             newest_clock_ms: None,
             barrier_ms: None,
+            push_groups: Vec::new(),
             stats: IngestionStats::default(),
         };
         // Each view's readers: the groups whose runs read it.
@@ -372,9 +380,56 @@ impl Ingestion {
     }
 
     /// An empty raw store for the metrics the plan scans, in this
-    /// ingestion's panes.
+    /// ingestion's panes: with push groups, only the metrics a query-time
+    /// `Scan` or a group built from raw data reads.
     pub fn raw_data(&self) -> RawData {
-        RawData::for_metrics(self.scanned_metrics.iter(), self.pane_width_ms)
+        let kept: Vec<&String> = self
+            .scanned_metrics
+            .iter()
+            .filter(|metric| {
+                self.query_time_lookback_ms.contains_key(*metric)
+                    || self
+                        .groups
+                        .iter()
+                        .enumerate()
+                        .any(|(index, g)| !self.is_push(index) && g.metrics.contains(*metric))
+            })
+            .collect();
+        RawData::for_metrics(kept, self.pane_width_ms)
+    }
+
+    /// Builds groups `push` (by index) by push: their windows read no raw
+    /// data. Call before [`Self::raw_data`].
+    pub fn set_push_groups(&mut self, push: Vec<bool>) {
+        self.push_groups = push;
+    }
+
+    fn is_push(&self, group: usize) -> bool {
+        self.push_groups.get(group).copied().unwrap_or(false)
+    }
+
+    /// Each group's window width and phase.
+    pub fn group_windows(&self) -> Vec<(i64, i64)> {
+        self.groups
+            .iter()
+            .map(|g| (g.width_ms, g.phase_ms))
+            .collect()
+    }
+
+    /// Each group's metrics.
+    pub fn group_metrics(&self) -> Vec<BTreeSet<String>> {
+        self.groups.iter().map(|g| g.metrics.clone()).collect()
+    }
+
+    /// Each group's newest window closed or skipped.
+    pub fn refreshed_through(&self) -> Vec<Option<i64>> {
+        self.groups.iter().map(|g| g.refreshed_through).collect()
+    }
+
+    /// Whether a query run reads raw samples (a query-time `Scan`); if not,
+    /// only the refresh windows read them.
+    pub fn queries_read_raw_data(&self) -> bool {
+        !self.query_time_lookback_ms.is_empty()
     }
 
     /// The raw-data pane width.
@@ -412,7 +467,8 @@ impl Ingestion {
     /// (kept in the result cache and the query-time results), so a sample
     /// it did not see must not change what a later run answers. Any other
     /// metric is late at or before its eviction cutoff (only windows still
-    /// to be closed read it).
+    /// to be closed read it), unless a push group scans it: push shards
+    /// drop the samples of sealed windows themselves.
     pub fn routing(&self) -> Routing {
         let cutoffs: HashMap<String, Option<i64>> = self
             .scanned_metrics
@@ -423,6 +479,15 @@ impl Ingestion {
         let late_through = cutoffs
             .iter()
             .map(|(metric, &cutoff)| {
+                // A push group's open windows still read samples the
+                // eviction cutoff (window-path groups only) has passed;
+                // its shards drop the samples of its sealed windows.
+                let pushed = self
+                    .groups
+                    .iter()
+                    .enumerate()
+                    .any(|(index, g)| self.is_push(index) && g.metrics.contains(metric));
+                let cutoff = if pushed { None } else { cutoff };
                 let late = if self.query_time_lookback_ms.contains_key(metric) {
                     cutoff.max(watermark_ms)
                 } else {
@@ -437,6 +502,20 @@ impl Ingestion {
             cutoffs,
             late_through,
             groups_waiting: self.groups.iter().any(|g| g.refreshed_through.is_none()),
+            views_closed_through: self
+                .scanned_metrics
+                .iter()
+                .map(|metric| {
+                    let closed = self
+                        .groups
+                        .iter()
+                        .filter(|g| g.metrics.contains(metric))
+                        .map(|g| g.refreshed_through)
+                        .min()
+                        .flatten();
+                    (metric.clone(), closed)
+                })
+                .collect(),
         }
     }
 
@@ -509,10 +588,11 @@ impl Ingestion {
             }
             let first_end = group.window_end(timestamp_ms);
             group.refreshed_through = Some(match self.options.stream_start_ms {
-                // The first window starting at or after the stream start.
-                Some(start) => {
-                    group.window_end(start.saturating_add(group.width_ms)) - group.width_ms
-                }
+                // The window holding the stream start: nothing arrives
+                // before it, so that window is complete too, and every
+                // group (each level of a window chain included) starts at
+                // the same instant.
+                Some(start) => group.window_end(start) - group.width_ms,
                 None => {
                     self.stats.windows_skipped_first += 1;
                     first_end
@@ -535,7 +615,12 @@ impl Ingestion {
             });
             true
         };
-        for group in self.groups.iter().filter(|g| g.metrics.contains(metric)) {
+        for (_, group) in self
+            .groups
+            .iter()
+            .enumerate()
+            .filter(|(index, g)| !self.is_push(*index) && g.metrics.contains(metric))
+        {
             // A group not started yet needs every sample.
             if !lower(group.refreshed_through) {
                 return None;
@@ -626,11 +711,14 @@ pub struct Routing {
     /// Each scanned metric's eviction cutoff (`None`: all are kept).
     cutoffs: HashMap<String, Option<i64>>,
     /// Each scanned metric's samples at or before this are late (`None`:
-    /// none are); at or after its eviction cutoff.
+    /// none are).
     late_through: HashMap<String, Option<i64>>,
     /// Some group has not seen its first sample: report each metric's
     /// first sample.
     groups_waiting: bool,
+    /// Each scanned metric's samples at or before this are in a window
+    /// every group scanning it has closed (`None`: no group closed one).
+    views_closed_through: HashMap<String, Option<i64>>,
 }
 
 /// One batch of samples routed by a shard.
@@ -701,6 +789,15 @@ impl Routing {
                 continue;
             }
             routed.newest_ms = routed.newest_ms.max(Some(sample.timestamp_ms));
+            if self
+                .views_closed_through
+                .get(&**metric)
+                .copied()
+                .flatten()
+                .is_some_and(|closed| sample.timestamp_ms <= closed)
+            {
+                routed.stats.samples_late_for_views += 1;
+            }
             routed.accepted.push(sample);
             routed.stats.samples_accepted += 1;
         }
@@ -890,14 +987,26 @@ impl Precompute {
             let outputs = block_on(instance.execute_ingestion(group.compiled.roots(), context)?)?;
             outputs
         };
-        let mut by_root: BTreeMap<u64, Vec<_>> = group
+        Ok(self.computed(window.group, missing, outputs))
+    }
+
+    /// The rows of views `missing` (by index in the group) from a run's
+    /// outputs, one per root.
+    fn computed<B: std::ops::Deref<Target = Batch>>(
+        &self,
+        group: usize,
+        missing: Vec<usize>,
+        outputs: impl IntoIterator<Item = Vec<B>>,
+    ) -> Computed {
+        let group = &self.runs[group];
+        let mut by_root: BTreeMap<u64, Vec<B>> = group
             .compiled
             .roots()
             .iter()
             .copied()
             .zip(outputs)
             .collect();
-        Ok(Computed::Ran(
+        Computed::Ran(
             missing
                 .into_iter()
                 .map(|index| {
@@ -908,7 +1017,60 @@ impl Precompute {
                     (index, batches)
                 })
                 .collect(),
-        ))
+        )
+    }
+
+    /// A push run of group `group`'s window (`context`'s), over `store`,
+    /// whose raw data slots are fed as samples arrive: it finishes once
+    /// every slot's stream ends (the window is sealed), with the rows of
+    /// every view of the group.
+    pub fn push_run(
+        self: &Arc<Self>,
+        group: usize,
+        store: Arc<dyn asap_executor::sources::DataStore>,
+        context: RunContext,
+    ) -> impl std::future::Future<Output = Result<Computed, asap_executor::Error>> + 'static {
+        let this = self.clone();
+        async move {
+            let run = &this.runs[group];
+            let instance = run.compiled.instantiate(store)?;
+            let outputs = instance
+                .execute_ingestion(run.compiled.roots(), context)?
+                .await?;
+            Ok(this.computed(group, (0..run.views.len()).collect(), outputs))
+        }
+    }
+
+    /// A pushed window's rows less those of views that already store the
+    /// window (loaded from files at startup).
+    pub fn missing_only(
+        &self,
+        window: ClosedWindow,
+        computed: Computed,
+        views: &ViewStore,
+    ) -> Computed {
+        let Computed::Ran(rows) = computed else {
+            return computed;
+        };
+        let group = &self.runs[window.group];
+        let rows: Vec<_> = rows
+            .into_iter()
+            .filter(|(index, _)| {
+                views
+                    .stored_through(group.views[*index].node_id)
+                    .is_none_or(|stored| stored < window.end_ms)
+            })
+            .collect();
+        if rows.is_empty() {
+            Computed::AlreadyStored
+        } else {
+            Computed::Ran(rows)
+        }
+    }
+
+    /// The run limits.
+    pub fn limits(&self) -> &Limits {
+        &self.limits
     }
 
     /// The whole run of a window split by series, from its parts' runs: each

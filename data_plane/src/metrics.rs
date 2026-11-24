@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::ingestion::IngestionStats;
@@ -180,8 +180,113 @@ pub struct QueryMetrics {
     pub range_steps_cached: AtomicU64,
 }
 
+/// Push precompute's measurements, by refresh group and ingest shard.
+pub struct PushMetrics {
+    /// Folding one morsel into a group's open windows on a shard.
+    pub push: Vec<Vec<PhaseStats>>,
+    /// Sealing a window of a group on a shard.
+    pub seal: Vec<Vec<PhaseStats>>,
+    /// Combining a window's partials, by group.
+    pub combine: Vec<PhaseStats>,
+    /// Committing pushed windows.
+    pub commit: PhaseStats,
+    /// Bytes of open-window state, by group and shard.
+    pub state_bytes: Vec<Vec<AtomicU64>>,
+    /// Open instances by shard.
+    pub open_instances: Vec<AtomicU64>,
+    /// By shard: some group has more than one window open there.
+    pub older_window_open: Vec<AtomicBool>,
+    /// From the newest committed window's end to its commit.
+    pub commit_lag_ms: AtomicI64,
+}
+
+impl PushMetrics {
+    pub fn new(groups: usize, shards: usize) -> Self {
+        let grid = || {
+            (0..groups)
+                .map(|_| (0..shards).map(|_| PhaseStats::default()).collect())
+                .collect()
+        };
+        Self {
+            push: grid(),
+            seal: grid(),
+            combine: (0..groups).map(|_| PhaseStats::default()).collect(),
+            commit: PhaseStats::default(),
+            state_bytes: (0..groups)
+                .map(|_| (0..shards).map(|_| AtomicU64::new(0)).collect())
+                .collect(),
+            open_instances: (0..shards).map(|_| AtomicU64::new(0)).collect(),
+            older_window_open: (0..shards).map(|_| AtomicBool::new(false)).collect(),
+            commit_lag_ms: AtomicI64::new(0),
+        }
+    }
+
+    /// Open-window state over every group and shard.
+    pub fn total_state_bytes(&self) -> u64 {
+        self.state_bytes
+            .iter()
+            .flatten()
+            .map(|b| b.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    fn render(&self, out: &mut String) {
+        for (group, shards) in self.push.iter().enumerate() {
+            for (shard, stats) in shards.iter().enumerate() {
+                stats.render(
+                    out,
+                    &format!("phase=\"precompute_push\",group=\"{group}\",shard=\"{shard}\""),
+                );
+            }
+        }
+        for (group, shards) in self.seal.iter().enumerate() {
+            for (shard, stats) in shards.iter().enumerate() {
+                stats.render(
+                    out,
+                    &format!("phase=\"precompute_seal\",group=\"{group}\",shard=\"{shard}\""),
+                );
+            }
+        }
+        for (group, stats) in self.combine.iter().enumerate() {
+            stats.render(
+                out,
+                &format!("phase=\"precompute_combine\",group=\"{group}\""),
+            );
+        }
+        self.commit.render(out, "phase=\"precompute_commit\"");
+    }
+
+    fn render_gauges(&self, out: &mut String) {
+        let _ = writeln!(out, "# HELP asap_precompute_state_bytes Bytes of open push-window state.\n# TYPE asap_precompute_state_bytes gauge");
+        for (group, shards) in self.state_bytes.iter().enumerate() {
+            for (shard, bytes) in shards.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "asap_precompute_state_bytes{{group=\"{group}\",shard=\"{shard}\"}} {}",
+                    bytes.load(Ordering::Relaxed)
+                );
+            }
+        }
+        let _ = writeln!(out, "# HELP asap_precompute_open_instances Open push windows per shard.\n# TYPE asap_precompute_open_instances gauge");
+        for (shard, open) in self.open_instances.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "asap_precompute_open_instances{{shard=\"{shard}\"}} {}",
+                open.load(Ordering::Relaxed)
+            );
+        }
+        let _ = writeln!(
+            out,
+            "# HELP asap_window_commit_lag_seconds From the newest committed window's end to its commit.\n# TYPE asap_window_commit_lag_seconds gauge\nasap_window_commit_lag_seconds {}",
+            self.commit_lag_ms.load(Ordering::Relaxed) as f64 / 1e3
+        );
+    }
+}
+
 /// Every measurement the engine's threads record.
 pub struct Metrics {
+    /// Push precompute's measurements (push mode only).
+    pub push: Option<PushMetrics>,
     /// Remote Write decode and series interning, on the HTTP threads.
     pub remote_write_decode: PhaseStats,
     /// Storing one ingest command's samples on the ingest thread: routing,
@@ -212,7 +317,13 @@ pub struct Metrics {
     /// View windows loaded from the files at startup.
     pub view_windows_loaded: AtomicU64,
     /// Time the precompute thread waited for room in the persist backlog.
-    pub view_persist_wait_ns: AtomicU64,
+    pub view_persist_over_bound: AtomicU64,
+    /// Bytes of the view files (segments) held.
+    pub view_file_bytes: AtomicU64,
+    /// View segments whose pages were advised cold.
+    pub view_segments_marked_cold: AtomicU64,
+    /// The views' cold tier, when they are persisted.
+    pub view_tier: std::sync::OnceLock<std::sync::Arc<crate::store::ViewTier>>,
 }
 
 impl Metrics {
@@ -220,6 +331,7 @@ impl Metrics {
     /// and view ids) and the planned `queries`.
     pub fn new(groups: &[(i64, Vec<String>)], queries: &[String]) -> Self {
         Self {
+            push: None,
             remote_write_decode: PhaseStats::default(),
             append: PhaseStats::default(),
             precompute: groups
@@ -249,7 +361,10 @@ impl Metrics {
             view_sync_ns: AtomicU64::new(0),
             view_windows_not_persisted: AtomicU64::new(0),
             view_windows_loaded: AtomicU64::new(0),
-            view_persist_wait_ns: AtomicU64::new(0),
+            view_persist_over_bound: AtomicU64::new(0),
+            view_file_bytes: AtomicU64::new(0),
+            view_segments_marked_cold: AtomicU64::new(0),
+            view_tier: std::sync::OnceLock::new(),
         }
     }
 
@@ -301,8 +416,14 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
         .remote_write_decode
         .render(&mut out, "phase=\"remote_write_decode\"");
     metrics.append.render(&mut out, "phase=\"append\"");
+    if let Some(tier) = metrics.view_tier.get() {
+        tier.decode.render(&mut out, "phase=\"view_decode\"");
+    }
     for (labels, stats) in &metrics.precompute {
         stats.render(&mut out, labels);
+    }
+    if let Some(push) = &metrics.push {
+        push.render(&mut out);
     }
     for (query, query_metrics) in &metrics.queries {
         let labels = format!("phase=\"query\",query=\"{}\"", escape(query));
@@ -370,8 +491,12 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
         ("dropped_late", stats.samples_dropped_late),
         ("dropped_future", stats.samples_dropped_future),
         ("unrouted", stats.samples_unrouted),
+        ("late_for_views", stats.samples_late_for_views),
     ] {
         let _ = writeln!(out, "asap_samples_total{{outcome=\"{outcome}\"}} {count}");
+    }
+    if let Some(push) = &metrics.push {
+        push.render_gauges(&mut out);
     }
     family(
         &mut out,
@@ -453,6 +578,68 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
         "Bytes of materialized view rows held.",
         load(&metrics.view_bytes),
     );
+    if let Some(tier) = metrics.view_tier.get() {
+        let cache = tier.cache.stats();
+        for (name, help, value) in [
+            (
+                "asap_view_cache_bytes",
+                "Bytes of decoded view windows in the window cache.",
+                cache.bytes as f64,
+            ),
+            (
+                "asap_view_cache_entries",
+                "View windows in the window cache.",
+                cache.entries as f64,
+            ),
+            (
+                "asap_view_pending_bytes",
+                "Bytes of view windows committed and not yet written to the view files.",
+                load(&tier.pending_bytes),
+            ),
+            (
+                "asap_view_pinned_bytes",
+                "Bytes of view windows that cannot be written, kept in memory.",
+                load(&tier.pinned_bytes),
+            ),
+            (
+                "asap_view_file_bytes",
+                "Bytes of the view files (segments) held.",
+                load(&metrics.view_file_bytes),
+            ),
+        ] {
+            gauge(&mut out, name, help, value);
+        }
+        for (name, help, value) in [
+            (
+                "asap_view_cache_hits_total",
+                "View window reads the window cache answered.",
+                cache.hits,
+            ),
+            (
+                "asap_view_cache_misses_total",
+                "View window reads the window cache did not answer.",
+                cache.misses,
+            ),
+            (
+                "asap_view_cache_evictions_total",
+                "View windows evicted from the window cache.",
+                cache.evictions,
+            ),
+            (
+                "asap_view_cold_reads_total",
+                "View windows decoded from the view files.",
+                load(&tier.cold_reads) as u64,
+            ),
+            (
+                "asap_view_cold_read_bytes_total",
+                "Bytes of the view files decoded.",
+                load(&tier.cold_read_bytes) as u64,
+            ),
+        ] {
+            family(&mut out, name, "counter", help);
+            let _ = writeln!(out, "{name} {value}");
+        }
+    }
     for (name, help, value) in [
         (
             "asap_view_persisted_bytes_total",
@@ -470,9 +657,14 @@ pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
             load(&metrics.view_windows_not_persisted),
         ),
         (
-            "asap_view_persist_wait_seconds_total",
-            "Time the precompute thread waited for room in the persist queue.",
-            load(&metrics.view_persist_wait_ns) / 1e9,
+            "asap_view_segments_marked_cold_total",
+            "View segments whose pages were advised cold (MADV_COLD, POSIX_FADV_DONTNEED) once a newer sealed segment of their refresh group existed.",
+            load(&metrics.view_segments_marked_cold),
+        ),
+        (
+            "asap_view_persist_over_bound_total",
+            "Windows queued for the view files while the queue held more than --max-persist-backlog-bytes (the data plane does not wait for its disk).",
+            load(&metrics.view_persist_over_bound),
         ),
         (
             "asap_view_windows_loaded_total",

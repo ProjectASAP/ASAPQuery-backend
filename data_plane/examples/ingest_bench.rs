@@ -23,6 +23,12 @@
 //! prints the time from a window's end to its commit (for a paced run,
 //! counted from when the scrape at the window's end was sent), split into
 //! the precompute queue wait, compute and commit wait.
+//! `PUSH_BATCH_SAMPLES` / `PUSH_BATCH_MAX_MS` set push mode's morsel
+//! batching. `PRECOMPUTE_MODE=push` builds views by push pipelines instead of one
+//! ingestion run per closed window (B1: dashboard and seed-862-01, raw data
+//! not kept, 1k/10k/100k series, K = 1, 2, 4, 8, paced then unpaced). With
+//! `PACED=1` it also samples the newest window's commit lag every second
+//! and prints its median and max (B2).
 //!
 //! `cargo run --release -p data_plane --example ingest_bench -- SERIES SECONDS [PLAN] [REQUESTS] [PERSIST]`
 
@@ -36,7 +42,7 @@ use std::time::Instant;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use control_plane::{plan_workload, DeploymentInputs};
-use data_plane::engine::EngineOptions;
+use data_plane::engine::{EngineOptions, PrecomputeMode};
 use data_plane::ingestion::IngestionOptions;
 use data_plane::metrics::thread_cpu_seconds;
 use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
@@ -119,6 +125,20 @@ async fn main() {
             .map_or(EngineOptions::default().ingest_threads, |n| {
                 n.parse().unwrap()
             }),
+        push_batching: data_plane::push::MorselBatching {
+            max_samples: std::env::var("PUSH_BATCH_SAMPLES").map_or(
+                data_plane::push::MorselBatching::default().max_samples,
+                |n| n.parse().unwrap(),
+            ),
+            max_age_ms: std::env::var("PUSH_BATCH_MAX_MS").map_or(
+                data_plane::push::MorselBatching::default().max_age_ms,
+                |n| n.parse().unwrap(),
+            ),
+        },
+        precompute_mode: std::env::var("PRECOMPUTE_MODE").map_or(PrecomputeMode::Window, |mode| {
+            <PrecomputeMode as clap::ValueEnum>::from_str(&mode, false)
+                .unwrap_or_else(|error| panic!("PRECOMPUTE_MODE: {error}"))
+        }),
         precompute_threads: std::env::var("PRECOMPUTE_THREADS")
             .ok()
             .map_or(EngineOptions::default().precompute_threads, |n| {
@@ -204,6 +224,7 @@ async fn main() {
         - start_ms;
     let mut retries = 0u64;
     let (mut max_precompute_backlog, mut max_persist_backlog) = (0u64, 0f64);
+    let mut commit_lags: Vec<f64> = Vec::new();
     for (index, body) in bodies.into_iter().enumerate() {
         if paced && index % requests_per_second == 0 {
             let due = std::time::Duration::from_millis(
@@ -221,6 +242,15 @@ async fn main() {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.0);
             max_persist_backlog = f64::max(max_persist_backlog, persist);
+            if let Some(lag) = state
+                .engine
+                .render_metrics()
+                .lines()
+                .find_map(|l| l.strip_prefix("asap_window_commit_lag_seconds "))
+                .and_then(|v| v.parse::<f64>().ok())
+            {
+                commit_lags.push(lag);
+            }
         }
         loop {
             let response = app
@@ -272,6 +302,22 @@ async fn main() {
             "  paced: largest precompute backlog {max_precompute_backlog} windows, largest persist queue {:.0} bytes",
             max_persist_backlog
         );
+        commit_lags.sort_by(f64::total_cmp);
+        match (commit_lags.get(commit_lags.len() / 2), commit_lags.last()) {
+            (Some(median), Some(max)) => {
+                println!("  newest-window commit lag: median {median:.3} s, max {max:.3} s")
+            }
+            _ => println!("  newest-window commit lag: not exported"),
+        }
+    }
+    let text = state.engine.render_metrics();
+    for line in text.lines().filter(|l| {
+        l.starts_with("asap_phase_")
+            && (l.contains("phase=\"precompute") || l.contains("phase=\"append"))
+            || l.starts_with("asap_precompute_state_bytes")
+            || l.starts_with("asap_raw_data_bytes")
+    }) {
+        println!("  {line}");
     }
     let mut total = 0.0;
     for (name, after) in &cpu_after {

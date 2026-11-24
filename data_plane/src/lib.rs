@@ -11,14 +11,18 @@
 
 pub mod engine;
 pub mod ingestion;
+pub mod memory_budget;
 pub mod metrics;
 pub mod persist;
 pub mod prometheus;
+pub mod push;
 pub mod query;
 pub mod remote_write;
 pub mod result_cache;
+pub mod segment;
 pub mod series_ids;
 pub mod store;
+pub mod window_cache;
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -328,8 +332,15 @@ async fn query_range(
         }
     };
     let reason = match answer_range(&state, range).await {
-        Ok(response) => {
-            let mut response = axum::Json(response).into_response();
+        Ok(body) => {
+            let mut response = (
+                [(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                )],
+                body,
+            )
+                .into_response();
             response
                 .headers_mut()
                 .insert(EXECUTION_HEADER, HeaderValue::from_static("plan"));
@@ -351,10 +362,7 @@ async fn query_range(
 
 /// Runs a planned query at every step of `range`, the steps in parallel on
 /// the query workers; unanswered if any step is.
-async fn answer_range(
-    state: &DataPlane,
-    range: RangeQuery,
-) -> Result<prometheus::MatrixResponse, Unanswered> {
+async fn answer_range(state: &DataPlane, range: RangeQuery) -> Result<Vec<u8>, Unanswered> {
     use futures::StreamExt;
     let started = std::time::Instant::now();
     let query = &range.query;
@@ -407,7 +415,19 @@ async fn answer_range(
             .range_steps
             .fetch_add(steps.len() as u64, Ordering::Relaxed);
     }
-    Ok(prometheus::MatrixResponse::new(&steps))
+    // Grouping every step's answer by series and writing the JSON takes
+    // long for a long range of many series (241 steps of 2,800 series:
+    // about 0.85 s), all of it without an await, even when every step is
+    // cached. On a runtime worker it would hold up the connections queued
+    // on that worker, instant queries and Remote Write included, and with
+    // every worker so busy no timer or socket is polled: built on the
+    // blocking pool instead.
+    tokio::task::spawn_blocking(move || {
+        prometheus::range_response_body(&steps)
+            .map_err(|error| Unanswered::Execution(format!("the range response: {error}")))
+    })
+    .await
+    .map_err(|error| Unanswered::Execution(format!("building the range response: {error}")))?
 }
 
 /// With `--no-forward`, the answer to a query the plan does not answer: a

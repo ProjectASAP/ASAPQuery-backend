@@ -311,6 +311,15 @@ pub struct Snapshot {
     raw_reads: Arc<RawReads>,
 }
 
+impl Snapshot {
+    /// Every stored view's rows: per view, each window's `(start, end]`
+    /// and batches, oldest first (for comparing two engines' views).
+    #[doc(hidden)]
+    pub fn view_rows(&self) -> crate::store::ViewRowsByView {
+        self.views.rows()
+    }
+}
+
 /// Whether `node`'s run, and every shared node's run it reads, compiled.
 fn runnable(
     node: PhysicalASAPNodeId,

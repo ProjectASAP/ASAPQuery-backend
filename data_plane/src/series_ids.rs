@@ -6,7 +6,10 @@
 //! label map per sample.
 //!
 //! The interner is process-wide: ids are the same for a label set whichever
-//! request, worker or query thread meets it. It never forgets a series.
+//! request, worker or query thread meets it. It never forgets a series, so
+//! a series is a `&'static Series`: holding or passing one on (once per
+//! sample, from decode through ingestion to the raw store) writes no
+//! reference count shared between threads.
 
 use std::collections::BTreeMap;
 use std::hash::{BuildHasher, Hasher};
@@ -82,7 +85,7 @@ struct Interner {
     /// Series ids by identity text, for reading a query result's series
     /// back without parsing its JSON.
     by_identity: ahash::HashMap<Arc<str>, u32>,
-    series: Vec<Arc<Series>>,
+    series: Vec<&'static Series>,
 }
 
 fn interner() -> &'static RwLock<Interner> {
@@ -110,7 +113,7 @@ fn hash_sorted<'a>(pairs: impl Iterator<Item = (&'a str, &'a str)>) -> u64 {
 
 /// The series of the label pairs `pairs`, in any order (Remote Write sends
 /// them sorted by name); interned on first sight.
-pub fn intern_pairs<N: AsRef<str>, V: AsRef<str>>(pairs: &[(N, V)]) -> Arc<Series> {
+pub fn intern_pairs<N: AsRef<str>, V: AsRef<str>>(pairs: &[(N, V)]) -> &'static Series {
     let mut sorted: Vec<(&str, &str)> = pairs
         .iter()
         .map(|(n, v)| (n.as_ref(), v.as_ref()))
@@ -130,17 +133,17 @@ pub fn intern_pairs<N: AsRef<str>, V: AsRef<str>>(pairs: &[(N, V)]) -> Arc<Serie
     {
         let interner = interner().read().expect("interner lock");
         for &id in interner.by_hash.get(&hash).into_iter().flatten() {
-            let series = &interner.series[id as usize];
+            let series = interner.series[id as usize];
             if matches(series) {
-                return series.clone();
+                return series;
             }
         }
     }
     let mut interner = interner().write().expect("interner lock");
     for &id in interner.by_hash.get(&hash).into_iter().flatten() {
-        let series = &interner.series[id as usize];
+        let series = interner.series[id as usize];
         if matches(series) {
-            return series.clone();
+            return series;
         }
     }
     let labels: BTreeMap<String, String> = sorted
@@ -148,15 +151,16 @@ pub fn intern_pairs<N: AsRef<str>, V: AsRef<str>>(pairs: &[(N, V)]) -> Arc<Serie
         .map(|(n, v)| (n.to_string(), v.to_string()))
         .collect();
     let id = u32::try_from(interner.series.len()).expect("fewer than 2^32 series");
-    let series = Arc::new(Series {
+    // Never freed: the interner keeps every series.
+    let series: &'static Series = Box::leak(Box::new(Series {
         id,
         metric: labels.get("__name__").map_or("", String::as_str).into(),
         identity: serde_json::to_string(&labels)
             .expect("labels serialize")
             .into(),
         labels: Arc::new(labels),
-    });
-    interner.series.push(series.clone());
+    }));
+    interner.series.push(series);
     interner.by_hash.entry(hash).or_default().push(id);
     interner.by_identity.insert(series.identity.clone(), id);
     series
@@ -165,10 +169,10 @@ pub fn intern_pairs<N: AsRef<str>, V: AsRef<str>>(pairs: &[(N, V)]) -> Arc<Serie
 /// The interned series whose identity text is `identity`, if one is: a
 /// query result row of an input series, rather than one whose labels the
 /// query changed.
-pub fn by_identity(identity: &str) -> Option<Arc<Series>> {
+pub fn by_identity(identity: &str) -> Option<&'static Series> {
     let interner = interner().read().expect("interner lock");
     let id = *interner.by_identity.get(identity)?;
-    Some(interner.series[id as usize].clone())
+    Some(interner.series[id as usize])
 }
 
 /// A series' label set, shared by every row and answer that carries it.

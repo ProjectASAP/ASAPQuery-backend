@@ -19,8 +19,9 @@ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[export_name = "_rjem_malloc_conf"]
 static malloc_conf: &[u8] =
     b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0,narenas:8\0";
-use data_plane::engine::EngineOptions;
+use data_plane::engine::{EngineOptions, PrecomputeMode};
 use data_plane::ingestion::IngestionOptions;
+use data_plane::persist::ViewRead;
 use data_plane::{router, DataPlane, DEFAULT_FORWARD_TIMEOUT};
 
 /// Serve Remote Write ingestion and the Prometheus query API for a plan.
@@ -65,6 +66,23 @@ struct Args {
     /// series hashed to it. Default: a quarter of the cores, at least 1.
     #[arg(long, default_value_t = EngineOptions::default().ingest_threads)]
     ingest_threads: usize,
+    /// How the views of a closed window are built: `push` (each ingest
+    /// shard folds its samples into the open windows' pipelines as they
+    /// arrive; groups that cannot be pushed, such as wider levels of a
+    /// window chain, keep the window path) or `window` (one ingestion run
+    /// per closed window over buffered raw samples).
+    #[arg(long, value_enum, default_value_t = PrecomputeMode::Push)]
+    precompute_mode: PrecomputeMode,
+    /// Push mode: bytes of open-window state all shards may hold together.
+    #[arg(long)]
+    precompute_memory_budget_bytes: Option<u64>,
+    /// Push mode: a shard folds its pending samples once this many are
+    /// pending (0: fold every request's samples at once).
+    #[arg(long, default_value_t = data_plane::push::MorselBatching::default().max_samples)]
+    push_batch_samples: usize,
+    /// Push mode: ... or once the oldest pending sample is this old.
+    #[arg(long, default_value_t = data_plane::push::MorselBatching::default().max_age_ms)]
+    push_batch_max_ms: u64,
     /// Threads computing closed refresh windows at once: windows of
     /// different refresh groups, and of one group, run in parallel and are
     /// stored in window order. 1 computes one window at a time. Default: a
@@ -76,7 +94,7 @@ struct Args {
     #[arg(long, default_value_t = EngineOptions::default().persist_threads)]
     persist_threads: usize,
     /// Bytes of refreshed windows queued for the persist threads beyond
-    /// which refreshes wait.
+    /// which further windows are counted; refreshes never wait for the disk.
     #[arg(long, default_value_t = EngineOptions::default().max_persist_backlog_bytes)]
     max_persist_backlog_bytes: u64,
     /// Never forward a query to Prometheus: refuse a plan with a query the
@@ -107,8 +125,9 @@ struct Args {
     /// The most bytes of final query answers the result cache keeps.
     #[arg(long, default_value_t = EngineOptions::default().result_cache_max_bytes)]
     result_cache_bytes: usize,
-    /// Where the materialized views are persisted (one file per refresh
-    /// group) and loaded from at startup.
+    /// Where the materialized views are persisted (time segments per
+    /// refresh group and retention) and read back from: at startup, and for
+    /// windows evicted from memory.
     #[arg(long, default_value = "asap-views")]
     view_dir: PathBuf,
     /// Keep the materialized views in memory only.
@@ -119,6 +138,24 @@ struct Args {
     /// VictoriaMetrics' default -inmemoryDataFlushInterval.
     #[arg(long, default_value_t = EngineOptions::default().view_sync_interval_ms)]
     view_sync_interval_ms: u64,
+    /// Bytes of decoded view windows kept in memory; the other windows are
+    /// read from the view files (mapped segments, states read in place).
+    /// 0: every read is served from the files. Default: from the cgroup's
+    /// memory.max, or no limit. Needs view persistence.
+    #[arg(long)]
+    view_cache_max_bytes: Option<u64>,
+    /// A decoded window not read for this long leaves memory (0: never).
+    /// Default: 60 s.
+    #[arg(long)]
+    view_cache_idle_ms: Option<u64>,
+    /// Milliseconds of windows per view file segment; segments past every
+    /// view's retention are deleted.
+    #[arg(long, default_value_t = EngineOptions::default().view_segment_ms)]
+    view_segment_ms: i64,
+    /// How cold view windows are read: `mmap` (sealed segments mapped) or
+    /// `pread`.
+    #[arg(long, value_enum, default_value_t = ViewRead::Mmap)]
+    view_read: ViewRead,
 }
 
 #[tokio::main]
@@ -155,6 +192,16 @@ async fn main() -> anyhow::Result<()> {
                 result_cache_max_bytes: args.result_cache_bytes,
                 view_dir: (!args.no_view_persistence).then_some(args.view_dir),
                 view_sync_interval_ms: args.view_sync_interval_ms,
+                view_cache_max_bytes: args.view_cache_max_bytes,
+                view_cache_idle_ms: args.view_cache_idle_ms,
+                view_segment_ms: args.view_segment_ms,
+                view_read: args.view_read,
+                precompute_mode: args.precompute_mode,
+                precompute_memory_budget_bytes: args.precompute_memory_budget_bytes,
+                push_batching: data_plane::push::MorselBatching {
+                    max_samples: args.push_batch_samples,
+                    max_age_ms: args.push_batch_max_ms,
+                },
                 ..EngineOptions::default()
             },
         )?

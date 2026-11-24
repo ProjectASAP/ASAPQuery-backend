@@ -165,10 +165,23 @@ HTTP queries ─► query workers: one query run per worker thread over
   cutoff falls in answers as the row store did.
 - A read returns one batch per chunk of the panes overlapping its range;
   only a chunk straddling the range is filtered. A query-time `Scan` that
-  reads the open pane reads the chunks published so far, the same way:
-  every shard reports its raw data after every request (copy on write: the
-  per-pane chunk lists are copied, never the chunks), and a read takes the
-  union over the shards.
+  reads the open pane reads the chunks published as of the coordinator's
+  last flush, the same way, and takes the union over the shards.
+- The coordinator's work does not grow with the request rate. A shard
+  drains every batch already queued to it and sends one report (sample
+  times, counts, first samples), so a coordinator pass takes the batches
+  of many requests. A shard sends its raw data only with its answer to a
+  flush (copy on write: the per-pane chunk lists are copied, never the
+  chunks), and eviction sends no report, so it starts no pass. When no
+  query reads raw samples (no query-time `Scan`), the coordinator lets
+  each pass's snapshot go once the windows it closed are queued: a
+  shard's next append then owns its raw data again instead of copying
+  its pane lists; only a queued refresh still holds them, until it runs.
+  On two 40-vCPU hosts (engine and Remote Write senders, 32 shards,
+  200,000 series of the 10 Hz dashboard), the coordinator went from one
+  busy core at 0.16M samples/s to 0.45 cores at 8M samples/s offered as
+  fast as accepted; paced at 3M and 4M samples/s (samples stamped at the
+  wall clock) every sample is accepted, none late.
 - An `ingest` coordinator thread keeps the watermark over the shards: it
   follows the newest sample any shard holds, and before it moves the
   coordinator flushes every shard (each runs the samples queued to it and
@@ -245,6 +258,12 @@ HTTP queries ─► query workers: one query run per worker thread over
     level) needs those chains' windows back 21 min. A reader of a group
     that still skipped further skips as far, to its own next boundary, so
     it never builds a window from windows never built.
+- Push precompute is the default (`--precompute-mode push`): each ingest
+  shard folds its samples into the open windows' pipelines as they arrive,
+  and a window's shard partials are combined and committed at its close
+  ([parallel-precompute.md](parallel-precompute.md)). Groups that cannot
+  be pushed, and every group under `--precompute-mode window`, run on the
+  precompute task pool below.
 - Precompute task pool (`--precompute-threads`, default a quarter of the
   cores, 1 to 4). Each closed refresh window is a task. Windows of
   different refresh groups compute in parallel, and so do consecutive
@@ -666,22 +685,26 @@ metric, a sample every 15 s, four panels each a 1 h range at 15 s steps,
 
 ### Persisting views
 
-Each refresh group has one append-only file in `--view-dir` (default
-`asap-views`; `--no-view-persistence` keeps views in memory only): a header
-naming the plan (a hash of the plan file) and the group, then one record
-per refreshed window, a length and a MessagePack payload holding
-`(start, end]` and the rows of each view appended. A text (a label value or
-a series identity) is stored once per file: a record carries the texts it
-adds to the file's dictionary, and rows hold indices. Persisting runs in
+Views are written to `--view-dir` (default `asap-views`;
+`--no-view-persistence` keeps views in memory only), per refresh group and
+per retention of its views, as a directory `group-<index>/retention-<ms>/`
+of time segments (`<first window end ms>.seg`, `--view-segment-ms` of
+windows each). A segment starts with a header naming the plan (a hash of
+the plan file), the group and the format version, then holds one record per
+refreshed window: its `(start, end]` and one columnar fragment per view
+appended. The segments are both the views' recovery and their cold tier: a
+window evicted from memory is read back from its fragment
+([tiered view storage](tiered-view-storage.md) describes the format, the
+read path and the memory policy). Persisting runs in
 the background: the precompute committer publishes a refreshed window first
 and then queues its rows for a pool of `--persist-threads` threads
 (`persist-N`; default a quarter of the cores, 1 to 4), which encode, write
 and sync. Refresh group `g` goes to thread `g % n`, so each file has
-exactly one writer and its records stay in window order. The queue is
-bounded by bytes (`--max-persist-backlog-bytes`, default 256 MiB;
-`asap_persist_backlog_bytes`, `asap_persist_backlog_windows`); only when
-it is full does the committer wait, and the wait is exported
-(`asap_view_persist_wait_seconds_total`). An event-time barrier answers
+exactly one writer and its records stay in window order. The committer
+never waits for the disk (see [tiered view storage](tiered-view-storage.md));
+windows queued past `--max-persist-backlog-bytes` (default 256 MiB) are
+counted (`asap_view_persist_over_bound_total`; the queue is
+`asap_persist_backlog_bytes`, `asap_persist_backlog_windows`). An event-time barrier answers
 once the windows before it are written, without the committer
 waiting. Each persist thread syncs its files (`fdatasync`) every
 `--view-sync-interval-ms` on its own timer, also when no window arrives,
@@ -692,11 +715,12 @@ of in-memory data to disk ... (default 5s)"). A refreshed window is
 therefore durable within that interval, the same class of guarantee
 VictoriaMetrics gives: after a crash, the windows of the last interval may
 be lost and are left missing (their raw samples are not persisted). 0
-syncs after every window. A file of another plan or
-group is renamed `*.stale` and never loaded. At startup the records within
-each view's retention of its newest one are loaded back, oldest first; a
-torn or oversized record at a file's end (a crash while writing) is cut
-off, so later records stay aligned. A view that already stores a window is
+syncs after every window. A segment of another plan, group or format
+version, and a version 1 file (`group-<index>.log`), is renamed `*.stale`
+and never read. At startup the segments are indexed from their record
+heads, without decoding any fragment; a torn record at a segment's end (a
+crash while writing), or the first record that does not decode and
+everything after it, is cut off, so later records' text keys stay aligned. A view that already stores a window is
 not appended to again, while the group's other views are. Raw samples are
 not persisted, so after a restart that loaded views, windows whose samples
 arrived before the restart stay missing: a declared stream start no longer
@@ -716,8 +740,8 @@ the rows. A UnivMon whose heaps mix key types has no ASAPv1 encoding
 `asap_view_windows_not_persisted_total` and the refresh is unaffected.
 UnivMon merges break heap ties in a nondeterministic order (also in
 `asap_sketchlib`), so a
-merge after reload may differ slightly from one before. Files are not compacted while running; records past
-retention are skipped at load.
+merge after reload may differ slightly from one before. A segment is
+deleted once every window in it is past its views' retention.
 
 ### Measurements
 
