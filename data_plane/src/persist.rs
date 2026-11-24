@@ -1088,7 +1088,7 @@ mod tests {
 
     // ── Tiered view storage: segments and columnar fragments ──────────
     // docs/design/tiered-view-storage.md, tests V2, V3, V9, V12, V13,
-    // V18, V19. They fail until the segment format is implemented.
+    // V18, V19.
 
     use asap_executor::arrow::array::{DictionaryArray, Float64Array};
     use asap_executor::arrow::datatypes::UInt32Type;
@@ -1242,7 +1242,7 @@ mod tests {
             .iter()
             .find(|(v, _)| *v == view)
             .map(|(_, location)| location.clone())
-            .unwrap_or_else(|| panic!("no location for view {view}: segments are not implemented"))
+            .unwrap_or_else(|| panic!("no location for view {view}"))
     }
 
     /// One window per state family a view column can hold, plus exact

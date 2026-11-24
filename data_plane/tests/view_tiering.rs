@@ -4,8 +4,7 @@
 //! the HTTP API; the parity test V1 is in `planner_executor_parity.rs` and
 //! the unit tests are next to the code (`persist.rs`, `window_cache.rs`,
 //! `memory_budget.rs`). Each compares a tiered data plane with one that
-//! keeps every window in memory (the control). They fail until tiering is
-//! implemented: install refuses the tiering options today.
+//! keeps every window in memory (the control).
 
 mod common;
 

@@ -5,9 +5,8 @@
 //! window order.
 //!
 //! Each test first runs its fixture in window mode, the reference, then
-//! the same in push mode. Until push mode is implemented, install refuses
-//! it, so every push-mode test fails at install; the guards (T8, T9) and
-//! the window-mode references pass.
+//! the same in push mode; T8 and T9 guard properties the window path has
+//! by construction.
 //!
 //! T1 and T2 (every parity workload) are in `planner_executor_parity.rs`.
 
@@ -129,7 +128,7 @@ fn options(mode: PrecomputeMode, shards: usize) -> EngineOptions {
     }
 }
 
-/// Installs `plan`; panics if install refuses it (push mode, today).
+/// Installs `plan`; panics if install refuses it.
 fn install(plan: &InstallablePlan, options: EngineOptions) -> (Router, Arc<DataPlane>) {
     let mode = options.precompute_mode;
     let state = Arc::new(

@@ -103,8 +103,7 @@ pub fn monitored_target(
 
 #[cfg(test)]
 mod tests {
-    //! Test V14 of docs/design/tiered-view-storage.md; fails until the
-    //! budget is implemented.
+    //! Test V14 of docs/design/tiered-view-storage.md.
     use super::*;
 
     const GIB: u64 = 1 << 30;

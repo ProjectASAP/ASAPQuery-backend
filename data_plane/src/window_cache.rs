@@ -313,8 +313,7 @@ impl WindowCache {
 
 #[cfg(test)]
 mod tests {
-    //! Tests V4, V5 and V6 of docs/design/tiered-view-storage.md; they fail
-    //! until the cache is implemented.
+    //! Tests V4, V5 and V6 of docs/design/tiered-view-storage.md.
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
