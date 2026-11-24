@@ -7,7 +7,7 @@
 //! One lock guards the map; it is held only for lookups and bookkeeping,
 //! never while a window is decoded.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -55,6 +55,9 @@ struct Inner {
     /// The bytes the cache may hold now (`None`: unbounded).
     target: Option<u64>,
     loading: HashMap<WindowKey, Loading>,
+    /// Keys removed while their decode was in flight: not inserted when it
+    /// finishes.
+    removed_while_loading: HashSet<WindowKey>,
 }
 
 /// Decoded view windows, shared by every query.
@@ -238,7 +241,8 @@ impl WindowCache {
         {
             let mut inner = self.lock();
             inner.loading.remove(&key);
-            if let Ok((batches, bytes)) = &loaded {
+            let removed = inner.removed_while_loading.remove(&key);
+            if let (Ok((batches, bytes)), false) = (&loaded, removed) {
                 inner.insert(key, batches.clone(), *bytes, now, &self.evictions);
                 if let Some(entry) = inner.entries.get_mut(&key) {
                     entry.referenced = true;
@@ -293,6 +297,10 @@ impl WindowCache {
         let mut inner = self.lock();
         if let Some(entry) = inner.entries.remove(&key) {
             inner.bytes -= entry.bytes;
+            inner.ring.retain(|k| *k != key);
+        }
+        if inner.loading.contains_key(&key) {
+            inner.removed_while_loading.insert(key);
         }
     }
 
@@ -347,6 +355,31 @@ mod tests {
         assert!(cache.get(key(3), now).is_none(), "an idle entry stayed");
         assert_eq!(cache.stats().entries, 2);
         assert_eq!(cache.stats().bytes, 200);
+    }
+
+    /// A window removed (past retention) while its decode is in flight is
+    /// not inserted when the decode finishes, and a removed key leaves the
+    /// CLOCK ring.
+    #[test]
+    fn a_remove_during_a_load_is_not_undone() {
+        let cache = WindowCache::new(None, None);
+        let t0 = Instant::now();
+        cache
+            .get_or_load(key(0), t0, || {
+                cache.remove(key(0));
+                Ok((batches(), 100))
+            })
+            .unwrap();
+        assert_eq!(cache.stats().entries, 0);
+        assert_eq!(cache.stats().bytes, 0);
+        cache.insert(key(1), batches(), 100, t0);
+        cache.remove(key(1));
+        assert!(cache.lock().ring.is_empty());
+        // Loaded again later, it is kept.
+        cache
+            .get_or_load(key(0), t0, || Ok((batches(), 100)))
+            .unwrap();
+        assert_eq!(cache.stats().entries, 1);
     }
 
     /// V4. With no idle time, nothing leaves for being idle.
