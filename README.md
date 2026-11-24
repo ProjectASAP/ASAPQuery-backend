@@ -54,9 +54,15 @@ answer queries, each over the newest published snapshot of the store. See
 group (`InstallablePlan::ingestion_refresh_groups`): views with one window
 width `W` and phase `p`. A group's window `(e - W, e]`, `e = p (mod W)`,
 closes when the watermark reaches `e`: the newest sample of a scanned metric,
-capped at the wall clock, minus `--allowed-lateness-ms` (default 15 s). The
-data plane then runs the group's views in one ingestion run over that window
-and appends each view's rows. A window without samples is stored empty, not
+capped at the wall clock, minus `--allowed-lateness-ms` (default 15 s). By
+default (`--precompute-mode push`) the ingest shards fold samples into the
+open windows' pipelines as they arrive, in batches of up to
+`--push-batch-samples` (default 32,768) or `--push-batch-max-ms` (default
+1 s), with open-window state under `--precompute-memory-budget-bytes`
+(default: no limit); at the window's close the shards' partials are combined
+and each view's rows appended. Groups that cannot be pushed, and all groups
+under `--precompute-mode window`, run one ingestion run per closed window
+over the buffered raw samples. A window without samples is stored empty, not
 missing. The first window of each group may have started before the data
 plane did, so it is skipped, unless `--stream-start-ms` says where the
 producers' stream starts. Windows that would already be dropped when the
@@ -115,7 +121,12 @@ the thread CPU and wall time of each phase
 `append`, `precompute` per refresh group, `query` per query text), query
 latency, sample and window counters, the backlogs, the watermark lag, the
 bytes held by raw panes and views, RSS, and each thread's CPU time by
-name. `scripts/profile.sh` records a flamegraph of a running data plane;
+name; the view tier and push precompute add `asap_view_cache_*`,
+`asap_view_{pending,pinned,file}_bytes`, `asap_view_cold_reads_total`,
+`asap_view_cold_read_bytes_total`, `asap_view_segments_marked_cold_total`,
+`phase="view_decode"`, `asap_precompute_state_bytes`,
+`asap_precompute_open_instances`, `asap_window_commit_lag_seconds` and
+`asap_samples_total{outcome="late_for_views"}`. `scripts/profile.sh` records a flamegraph of a running data plane;
 `cargo run --release -p data_plane --example ingest_bench -- 10000 300`
 measures ingest throughput in process.
 
@@ -139,8 +150,8 @@ per refresh group and per retention of its views, a directory
 window with one columnar fragment per view. A segment is deleted once
 every window in it is past its views' retention. The files are both the
 views' recovery and their cold tier: decoded windows stay in memory up to
-`--view-cache-max-bytes` (default from the cgroup's `memory.max`, else no
-limit) and leave it after `--view-cache-idle-ms` (default 60 s) without a
+`--view-cache-max-bytes` (default: `memory.max` less the other bounded
+pools and 10 % headroom; no limit outside a cgroup) and leave it after `--view-cache-idle-ms` (default 60 s) without a
 read; an evicted window is read back from its fragment, by `mmap` of sealed
 segments or `pread` (`--view-read`), with states read in place. Encoding,
 writing and syncing run on `--persist-threads` `persist-N` threads (default
@@ -221,5 +232,6 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-The Planner revision is pinned in `Cargo.toml` (ASAPPlanner `846a70a`); see
+The Planner revision is pinned in `Cargo.toml` (ASAPPlanner `90a6e86`; `asap_sketchlib` patched
+to `355093f`); see
 [scripts/ci/README.md](scripts/ci/README.md).
