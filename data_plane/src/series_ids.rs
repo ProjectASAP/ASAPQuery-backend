@@ -197,3 +197,13 @@ pub fn result_labels(identity: &str) -> Result<Labels, serde_json::Error> {
         .or_insert(labels)
         .clone())
 }
+
+/// The labels of the series whose identity text is `identity`: an
+/// interned series' own (no parse), else parsed once ([`result_labels`]);
+/// `None` when `identity` is not a label set's JSON.
+pub fn labels_of_identity(identity: &str) -> Option<Arc<BTreeMap<String, String>>> {
+    match by_identity(identity) {
+        Some(series) => Some(series.labels().clone()),
+        None => result_labels(identity).ok(),
+    }
+}

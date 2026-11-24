@@ -204,7 +204,7 @@ it is deleted whole. A segment holds the existing framing (a little-endian
 8-byte boundary (zero padding) so fixed-width columns can be borrowed in
 place:
 
-- a header frame (MessagePack): plan hash, group, **format version 2**,
+- a header frame (MessagePack): plan hash, group, **format version 3**,
   and the segment start;
 - one record frame per refreshed window. Its head is a small MessagePack
   map, followed by the parts it points at:
@@ -221,8 +221,11 @@ laid out by column (all offsets relative to the fragment, every section
 8-byte aligned):
 
 ```
-Fragment = { rows: u32, columns: [(kind, offset, len)] }
+Fragment = { rows: u32, columns: [(kind, flags, offset, len)] }
   text column       u32 keys into the segment's dictionary (+ validity bitmap)
+  identity label    nothing: a text column whose every row holds its series
+                    identity's label of the column's name ("" without it);
+                    read back from the identity column (its index in flags)
   timestamp column  i64 per row, or one i64 when every row has the same value
                     (the window end, today stored once per row)
   plain column      f64 / i64 / u64 / bool per row (+ validity bitmap)
@@ -244,6 +247,17 @@ stored once per segment: a record's `texts` part is a string column
 segment, and a segment's first use of a text writes it again. Deleting an
 old segment then never strands a later one's keys. At 10k series and about
 96 B per identity this costs about 1–2 MB per segment.
+
+**Label columns from the series identity.** A text column whose every row
+holds its series' label of the column's name (the `job`, `region`, …
+columns a per-series view carries) is not written: the fragment marks it
+`identity label`, and its label values are not added to the segment's
+texts. A read takes the identity column's keys as its keys, into a
+per-segment array per label name holding that label of each segment text
+taken as a series identity (from the interned series, else parsed from the
+identity's JSON once per label name per segment). At 10k series that array is about
+100–150 KB per label name per segment, counted with the segment's
+dictionary; on disk it saves 4 B per row per label column.
 
 Index: `WindowLocation { segment: Arc<Segment>, offset: u64, len: u32 }`
 points at a view's fragment. It lives in the `ViewWindow` in memory (about
@@ -649,7 +663,8 @@ here changes the Planner.
   `pread` only for the active segment and as a fallback option. B3 still
   compares the two.
 - **Hot policy:** recency (CLOCK, idle time, byte budget).
-- **Fragment encoding:** columnar, with format version 2.
+- **Fragment encoding:** columnar, with format version 3; label columns
+  are read back from the series identity, not stored.
 - **No cgroup limit:** no budget, plus idle eviction.
 - **Old view files:** renamed `*.stale`.
 - **Zero-copy revision:** states are used from the mapping
