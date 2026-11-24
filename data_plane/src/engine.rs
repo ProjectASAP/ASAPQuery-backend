@@ -251,6 +251,14 @@ pub struct SlowRefresh {
     pub per_series: bool,
 }
 
+impl SlowRefresh {
+    /// Whether it delays `window` (any part of it).
+    fn matches(&self, window: ClosedWindow) -> bool {
+        self.group.is_none_or(|g| g == window.group)
+            && self.end_ms.is_none_or(|e| e == window.end_ms)
+    }
+}
+
 type Reply<T> = oneshot::Sender<Result<T, Unanswered>>;
 
 /// What the ingest coordinator does next.
@@ -1401,6 +1409,7 @@ fn queue_refreshes(
 }
 
 /// How the precompute task pool runs.
+#[derive(Clone)]
 struct PoolOptions {
     threads: usize,
     slow_refreshes: Vec<SlowRefresh>,
@@ -1495,13 +1504,7 @@ fn spawn_precompute(
                 run_receiver.clone(),
                 events.clone(),
             );
-            let checks = PoolOptions {
-                threads: options.threads,
-                slow_refreshes: options.slow_refreshes.clone(),
-                check_task_inputs: options.check_task_inputs,
-                push_parts: options.push_parts,
-                panic_in_combine_of_window_end_ms: options.panic_in_combine_of_window_end_ms,
-            };
+            let checks = options.clone();
             std::thread::Builder::new()
                 .name(format!("precompute-{index}"))
                 .spawn(move || loop {
@@ -1626,8 +1629,7 @@ fn compute_window(
     let delay_ms: u64 = options
         .slow_refreshes
         .iter()
-        .filter(|s| s.group.is_none_or(|g| g == window.group))
-        .filter(|s| s.end_ms.is_none_or(|e| e == window.end_ms))
+        .filter(|s| s.matches(window))
         .filter(|s| {
             s.part
                 .is_none_or(|part| partition.is_none_or(|p| p.index == part))
@@ -1889,8 +1891,7 @@ fn commit_window(
                 let delay_ms: u64 = options
                     .slow_refreshes
                     .iter()
-                    .filter(|s| s.group.is_none_or(|g| g == window.group))
-                    .filter(|s| s.end_ms.is_none_or(|e| e == window.end_ms))
+                    .filter(|s| s.matches(window))
                     .map(|s| s.delay_ms)
                     .sum();
                 if delay_ms > 0 {
