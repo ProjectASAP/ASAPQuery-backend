@@ -58,9 +58,10 @@ use asap_executor::values::Batch;
 
 /// How the views of a closed refresh window are built
 /// (docs/design/parallel-precompute.md). The `data_plane` binary defaults
-/// to `Push`; the library default stays `Window`, which the window-path
-/// tests build on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// to `Push`, the faster mode for a running server. The library default
+/// stays `Window`: it is the reference path every push test compares
+/// against, so tests and other callers get it unless they ask for push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PrecomputeMode {
     /// One ingestion run per closed window, over the raw samples the
     /// shards buffered for it (`--precompute-mode=window`).

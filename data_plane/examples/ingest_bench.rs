@@ -135,10 +135,10 @@ async fn main() {
                 |n| n.parse().unwrap(),
             ),
         },
-        precompute_mode: match std::env::var("PRECOMPUTE_MODE").as_deref() {
-            Ok("push") => PrecomputeMode::Push,
-            _ => PrecomputeMode::Window,
-        },
+        precompute_mode: std::env::var("PRECOMPUTE_MODE").map_or(PrecomputeMode::Window, |mode| {
+            <PrecomputeMode as clap::ValueEnum>::from_str(&mode, false)
+                .unwrap_or_else(|error| panic!("PRECOMPUTE_MODE: {error}"))
+        }),
         precompute_threads: std::env::var("PRECOMPUTE_THREADS")
             .ok()
             .map_or(EngineOptions::default().precompute_threads, |n| {

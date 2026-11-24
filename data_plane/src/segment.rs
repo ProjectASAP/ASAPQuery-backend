@@ -69,7 +69,7 @@ const CONSTANT: u32 = 1;
 const DESCRIPTOR_BYTES: usize = 40;
 
 /// How a cold window's fragment is read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum ViewRead {
     /// Sealed segments mapped and decoded in place; the active segment
     /// read with `pread`.

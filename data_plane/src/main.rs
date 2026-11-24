@@ -71,8 +71,8 @@ struct Args {
     /// arrive; groups that cannot be pushed, such as wider levels of a
     /// window chain, keep the window path) or `window` (one ingestion run
     /// per closed window over buffered raw samples).
-    #[arg(long, default_value = "push", value_parser = ["window", "push"])]
-    precompute_mode: String,
+    #[arg(long, value_enum, default_value_t = PrecomputeMode::Push)]
+    precompute_mode: PrecomputeMode,
     /// Push mode: bytes of open-window state all shards may hold together.
     #[arg(long)]
     precompute_memory_budget_bytes: Option<u64>,
@@ -154,8 +154,8 @@ struct Args {
     view_segment_ms: i64,
     /// How cold view windows are read: `mmap` (sealed segments mapped) or
     /// `pread`.
-    #[arg(long, default_value = "mmap", value_parser = ["mmap", "pread"])]
-    view_read: String,
+    #[arg(long, value_enum, default_value_t = ViewRead::Mmap)]
+    view_read: ViewRead,
 }
 
 #[tokio::main]
@@ -195,14 +195,8 @@ async fn main() -> anyhow::Result<()> {
                 view_cache_max_bytes: args.view_cache_max_bytes,
                 view_cache_idle_ms: args.view_cache_idle_ms,
                 view_segment_ms: args.view_segment_ms,
-                view_read: match args.view_read.as_str() {
-                    "pread" => ViewRead::Pread,
-                    _ => ViewRead::Mmap,
-                },
-                precompute_mode: match args.precompute_mode.as_str() {
-                    "push" => PrecomputeMode::Push,
-                    _ => PrecomputeMode::Window,
-                },
+                view_read: args.view_read,
+                precompute_mode: args.precompute_mode,
                 precompute_memory_budget_bytes: args.precompute_memory_budget_bytes,
                 push_batching: data_plane::push::MorselBatching {
                     max_samples: args.push_batch_samples,
