@@ -266,7 +266,7 @@ pub fn range_response_body(steps: &[(i64, Answer)]) -> Result<Vec<u8>, serde_jso
     Ok(out)
 }
 
-/// A value as [`format_value`] writes it, without allocating: shortest
+/// Prometheus' sample value format, written without allocating: shortest
 /// round-trip digits, never an exponent, as Rust's `Display` writes them,
 /// built from `ryu`'s digits at a fraction of the formatting machinery's
 /// cost (most of a long range's body is values). Where two shortest
@@ -366,7 +366,10 @@ struct Point(f64, f64);
 
 impl Serialize for Point {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        (self.0, format_value(self.1)).serialize(serializer)
+        let mut value = Vec::with_capacity(24);
+        write_value(&mut value, self.1).map_err(serde::ser::Error::custom)?;
+        let value = std::str::from_utf8(&value).map_err(serde::ser::Error::custom)?;
+        (self.0, value).serialize(serializer)
     }
 }
 
@@ -386,7 +389,9 @@ impl Serialize for VectorResult<'_> {
     }
 }
 
-/// Prometheus' sample value format.
+/// Prometheus' sample value format through `Display`: the reference
+/// [`write_value`] is tested against.
+#[cfg(test)]
 fn format_value(value: f64) -> String {
     match value {
         v if v.is_nan() => "NaN".into(),
