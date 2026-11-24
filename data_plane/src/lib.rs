@@ -14,7 +14,6 @@ pub mod ingestion;
 pub mod memory_budget;
 pub mod metrics;
 pub mod persist;
-pub mod pipelines;
 pub mod prometheus;
 pub mod push;
 pub mod query;

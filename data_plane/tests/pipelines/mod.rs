@@ -1,7 +1,7 @@
-//! Push precompute's pipelines (docs/design/parallel-precompute.md,
-//! "Combine rules"): each ingestion-time breaker's combine rule, chosen at
-//! install from the plan node alone. Interface only: the rules are not
-//! implemented yet, so every call fails.
+//! Push precompute's combine rules (docs/design/parallel-precompute.md,
+//! "Combine rules"): each ingestion-time breaker's rule, from the plan node
+//! alone. The tests check the design's table here; the data plane decides
+//! which groups are pushed by its install probe (`data_plane::push::probe`).
 
 use asap_executor::planner::plan::physical_asap_dag::{PhysicalASAPDAGNode, PhysicalASAPNodeId};
 use asap_planner::InstallablePlan;
@@ -24,8 +24,7 @@ pub enum CombineRule {
     WindowPath,
 }
 
-/// One breaker's rule, as the install log and `/api/v1/status/asap`
-/// (`ingestion.pipelines`) report it.
+/// One breaker's rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BreakerRule {
     /// Index of the refresh group in `InstallablePlan::ingestion_refresh_groups`.

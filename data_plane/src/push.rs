@@ -22,8 +22,8 @@
 //! does. Every shard seals every window, idle ones with an empty run.
 //!
 //! A group is built by push when a window's run may be split by series
-//! (every node computes each series alone; [`crate::pipelines`] gives its
-//! breakers the `Concatenate` rule), carries no state across windows,
+//! (every node computes each series alone, so its breakers' partials are
+//! concatenated), carries no state across windows,
 //! reads no other group's views, and its `Scan`s read exactly the window
 //! (checked once at install by a probe run). Other groups keep the window
 //! path.

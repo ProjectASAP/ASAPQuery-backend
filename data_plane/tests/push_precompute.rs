@@ -12,6 +12,7 @@
 //! T1 and T2 (every parity workload) are in `planner_executor_parity.rs`.
 
 mod common;
+mod pipelines;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -25,10 +26,10 @@ use axum::Router;
 use control_plane::plan_workload;
 use data_plane::engine::{EngineOptions, PrecomputeMode, SlowRefresh};
 use data_plane::ingestion::IngestionOptions;
-use data_plane::pipelines::{combine_rules, CombineRule};
 use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use data_plane::{router, DataPlane};
 use http_body_util::BodyExt;
+use pipelines::{combine_rules, CombineRule};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -576,7 +577,7 @@ async fn reduce_breakers_merge_to_one_state_per_group() {
 #[tokio::test(flavor = "multi_thread")]
 async fn non_mergeable_breakers_run_on_one_partition_or_the_window_path() {
     use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPDAGNode;
-    use data_plane::pipelines::combine_rule;
+    use pipelines::combine_rule;
 
     // Exact: no accuracy requirement, raw data kept.
     let workload = serde_json::from_value(json!({
@@ -653,7 +654,7 @@ async fn non_mergeable_breakers_run_on_one_partition_or_the_window_path() {
 #[test]
 fn combine_rules_follow_the_table_and_refuse_unknown_breakers() {
     use asap_executor::planner::ir::{ASAPOp, NonASAPOp, Operator};
-    use data_plane::pipelines::combine_rule;
+    use pipelines::combine_rule;
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut seen: Vec<CombineRule> = Vec::new();
