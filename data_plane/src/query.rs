@@ -314,6 +314,7 @@ pub struct Snapshot {
 impl Snapshot {
     /// Every stored view's rows: per view, each window's `(start, end]`
     /// and batches, oldest first (for comparing two engines' views).
+    #[doc(hidden)]
     pub fn view_rows(&self) -> crate::store::ViewRowsByView {
         self.views.rows()
     }

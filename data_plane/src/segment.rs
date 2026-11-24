@@ -565,7 +565,8 @@ impl WindowLocation {
     }
 
     /// The fragment's byte offset in its segment.
-    pub fn offset(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn offset(&self) -> u64 {
         self.offset
     }
 
@@ -580,17 +581,20 @@ impl WindowLocation {
     }
 
     /// Whether its segment is sealed (and so read through a mapping).
-    pub fn is_sealed(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_sealed(&self) -> bool {
         self.segment.is_sealed()
     }
 
     /// Whether its segment's pages were advised cold.
-    pub fn is_cold(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_cold(&self) -> bool {
         self.segment.is_cold()
     }
 
     /// Whether `address` lies inside its segment's mapping.
-    pub fn maps(&self, address: usize) -> bool {
+    #[cfg(test)]
+    pub(crate) fn maps(&self, address: usize) -> bool {
         match self.segment.mapping.get() {
             Some(Ok(mapping)) => {
                 let start = mapping.ptr.as_ptr() as usize;

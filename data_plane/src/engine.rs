@@ -188,10 +188,6 @@ pub struct EngineOptions {
     pub panic_in_combine_of_window_end_ms: Option<i64>,
 }
 
-/// The default `view_segment_ms`: 15 minutes, about five segments per hour
-/// of retention.
-pub const DEFAULT_VIEW_SEGMENT_MS: i64 = crate::persist::DEFAULT_SEGMENT_MS;
-
 /// The default `view_cache_idle_ms`: a minute, four 15 s dashboard
 /// refreshes (the plan does not carry its queries' intervals).
 pub const DEFAULT_VIEW_CACHE_IDLE_MS: u64 = 60_000;
@@ -227,7 +223,7 @@ impl Default for EngineOptions {
             view_sync_interval_ms: 5_000,
             view_cache_max_bytes: None,
             view_cache_idle_ms: None,
-            view_segment_ms: DEFAULT_VIEW_SEGMENT_MS,
+            view_segment_ms: crate::persist::DEFAULT_SEGMENT_MS,
             view_read: ViewRead::Mmap,
             cold_decode_delay_ms: 0,
             unpersistable_views: Vec::new(),
