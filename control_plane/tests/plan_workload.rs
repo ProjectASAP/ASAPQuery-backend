@@ -110,8 +110,8 @@ fn plans_no_view_refreshed_on_first_read() {
 
 /// A workload is planned whole or refused: when one query has no plan the
 /// data plane can execute (here a raw instant selector, without raw data at
-/// query time), no plan is written, so no query is left for Prometheus to
-/// compute.
+/// query time and without compressed-sample windows), no plan is written,
+/// so no query is left for Prometheus to compute.
 #[test]
 fn refuses_a_workload_with_a_query_it_cannot_plan() {
     let mut workload = example("example4b");
@@ -119,16 +119,15 @@ fn refuses_a_workload_with_a_query_it_cannot_plan() {
     let mut unplannable = queries[0].clone();
     unplannable.query = serde_json::from_value(serde_json::json!("latency_ms")).unwrap();
     queries.push(unplannable);
-    let mut inputs = DeploymentInputs::default();
-    inputs.deployment_capabilities.raw_data_retained = false;
+    let inputs = without_raw_data_or_compressed_samples();
     let error = plan_workload(&workload, &inputs).unwrap_err();
     assert!(matches!(error, PlanError::Planning(_)), "{error}");
 }
 
 /// The MVP benchmark's p99 query over a gauge not declared non-negative:
-/// without raw data, every candidate fails a check (the exact ones scan raw
-/// samples at query time, the merged DDSketch panes carry no bound through
-/// `avg`), so planning fails. With `ignore_accuracy_guarantees` the
+/// without raw data and without compressed-sample windows, every candidate
+/// fails a check (the exact ones scan raw samples at query time, the merged
+/// DDSketch panes carry no bound through `avg`), so planning fails. With `ignore_accuracy_guarantees` the
 /// cheapest sketch plan is selected: tumbling windows kept at ingestion.
 #[test]
 fn ignoring_accuracy_guarantees_plans_the_undeclared_p99_query() {
@@ -144,12 +143,22 @@ fn ignoring_accuracy_guarantees_plans_the_undeclared_p99_query() {
                   "sample_interval": 100}}}}"#,
     )
     .unwrap();
-    let mut inputs = DeploymentInputs::default();
-    inputs.deployment_capabilities.raw_data_retained = false;
+    let mut inputs = without_raw_data_or_compressed_samples();
     let error = plan_workload(&workload, &inputs).unwrap_err();
     assert!(matches!(error, PlanError::Planning(_)), "{error}");
 
     inputs.ignore_accuracy_guarantees = true;
     let plan = plan(&workload, &inputs);
     assert!(!plan.materialized_views().unwrap().is_empty());
+}
+
+/// A backend that keeps neither raw samples nor compressed-sample windows:
+/// an exact range read then has no producer.
+fn without_raw_data_or_compressed_samples() -> DeploymentInputs {
+    let mut inputs = DeploymentInputs::default();
+    inputs.deployment_capabilities.raw_data_retained = false;
+    inputs.deployment_capabilities.excluded_candidates =
+        serde_json::from_value(serde_json::json!([{"summary_family": "compressed_samples"}]))
+            .unwrap();
+    inputs
 }

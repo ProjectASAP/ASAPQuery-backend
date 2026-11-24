@@ -138,7 +138,10 @@ async fn kll_views_answer_alike_after_a_restart() {
           "sources": {"data": {"series_count": 1000, "sample_interval": 1000}}},
     }))
     .unwrap();
-    let plan = plan_workload(&workload, &common::inputs(false)).unwrap().0;
+    // No compressed-sample windows: the test is about KLL's stored state.
+    let plan = plan_workload(&workload, &common::inputs_without_compressed_samples(false))
+        .unwrap()
+        .0;
     let plan = serde_json::to_string(&plan).unwrap();
     assert!(plan.contains("Kll"), "the plan builds no KLL");
     answers_alike_after_a_restart("kll", query, &plan).await;

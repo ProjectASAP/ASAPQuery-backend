@@ -27,12 +27,14 @@
 //! shifted.
 //!
 //! A state is stored by its existing form: an exact state by its serde
-//! form, and a sketch state by `asap_sketchlib`'s ASAPv1 bytes with the
+//! form, a sketch state by `asap_sketchlib`'s ASAPv1 bytes with the
 //! kernel it rebuilds, through each kernel's `sketch()` and
-//! `restore_from_disk`. A Hydra-Count-Min grid, shared by every group of a
-//! build, is stored once per record. A UnivMon whose heaps mix key types
-//! has no ASAPv1 encoding, so a view holding one is not persisted (counted
-//! in `asap_view_windows_not_persisted_total`) and stays in memory.
+//! `restore_from_disk`, and a compressed-samples state by its sealed
+//! sample block, verbatim ([`crate::sample_blocks`]). A Hydra-Count-Min
+//! grid, shared by every group of a build, is stored once per record. A
+//! UnivMon whose heaps mix key types has no ASAPv1 encoding, so a view
+//! holding one is not persisted (counted in
+//! `asap_view_windows_not_persisted_total`) and stays in memory.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -45,9 +47,9 @@ use asap_executor::summary_kernels::exact::ExactAccumulator;
 use asap_executor::summary_kernels::univmon::UnivMonAccumulator;
 use asap_executor::summary_kernels::weighted_frequency::{FrequencySketch, WeightedFrequency};
 use asap_executor::summary_kernels::{
-    CountMinSketchAccumulator, DDSketchAccumulator, DatasketchesKLLAccumulator, HllRegisters,
-    HllSketchAccumulator, HydraCms, HydraCmsGroup, HydraKllSketchAccumulator, IncreaseAccumulator,
-    KmvAccumulator,
+    CompressedSamplesAccumulator, CountMinSketchAccumulator, DDSketchAccumulator,
+    DatasketchesKLLAccumulator, HllRegisters, HllSketchAccumulator, HydraCms, HydraCmsGroup,
+    HydraKllSketchAccumulator, IncreaseAccumulator, KmvAccumulator,
 };
 use asap_executor::values::{Batch, SchemaRef, Value};
 use asap_executor::AggregateCore;
@@ -58,6 +60,7 @@ use asap_sketchlib::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::sample_blocks::{self, CompressedSamples};
 use crate::segment::{encode_fragment, RecordHead, Segment, SegmentHeader, SegmentTexts};
 pub use crate::segment::{ViewRead, WindowLocation, FORMAT_VERSION};
 
@@ -104,6 +107,9 @@ pub(crate) enum StoredValue {
         grid: u32,
         group: String,
     },
+    /// A compressed-samples state: its sealed sample block, as the data
+    /// plane's codec wrote it.
+    CompressedSamples(#[serde(with = "serde_bytes")] Vec<u8>),
 }
 
 /// What persisting one window wrote.
@@ -659,6 +665,9 @@ pub(crate) fn decode_stored_state(
             grid: grids.get(grid as usize)?.clone()?,
             group,
         }),
+        StoredValue::CompressedSamples(block) => Arc::new(
+            CompressedSamplesAccumulator::restore_from_disk(block, sample_blocks::codec()).ok()?,
+        ),
     })
 }
 
@@ -785,9 +794,25 @@ pub(crate) fn encode_state(state: &dyn AggregateCore, grids: &mut Grids) -> Opti
             grid: grids.index(&group.grid)?,
             group: group.group.clone(),
         })
+    } else if let Some(samples) = any.downcast_ref::<CompressedSamplesAccumulator>() {
+        Some(StoredValue::CompressedSamples(sample_block_bytes(samples)?))
     } else {
         None
     }
+}
+
+/// The bytes the data plane's codec reads for `samples`: its block as it
+/// is when the data plane's codec wrote it, else re-encoded from the
+/// samples its own codec decodes (a state built by another run's codec).
+fn sample_block_bytes(samples: &CompressedSamplesAccumulator) -> Option<Vec<u8>> {
+    if CompressedSamples::from_bytes(samples.block()).is_ok() {
+        return Some(samples.block().to_vec());
+    }
+    let mut block = sample_blocks::codec().new_block();
+    for (t, value) in samples.codec().decode(samples.block()).ok()? {
+        block.append(t, value);
+    }
+    Some(block.seal())
 }
 
 /// The kernel state `kernel` rebuilds from `asapv1`.
@@ -1083,6 +1108,39 @@ mod tests {
                     grid.point(&group, item).unwrap()
                 );
             }
+        }
+    }
+
+    /// A compressed-samples state is stored as its sealed block, verbatim
+    /// when the data plane's codec wrote it, and re-encoded with that codec
+    /// when another codec did (a state built by a run without the data
+    /// plane's codec); either way it reads back to the same samples, and
+    /// the record's MessagePack form round-trips.
+    #[test]
+    fn compressed_samples_are_stored_as_their_sealed_block() {
+        use asap_executor::summary_kernels::{PlainSampleBlockCodec, SampleBlockCodec};
+        let samples: Vec<(i64, f64)> = (0..60).map(|i| (i * 1_000, i as f64 / 4.0)).collect();
+        let seal = |codec: Arc<dyn SampleBlockCodec>| {
+            let mut block = codec.new_block();
+            for &(t, v) in &samples {
+                block.append(t, v);
+            }
+            CompressedSamplesAccumulator::restore_from_disk(block.seal(), codec).unwrap()
+        };
+        let ours = seal(sample_blocks::codec());
+        let plain = seal(Arc::new(PlainSampleBlockCodec));
+        for state in [&ours, &plain] {
+            let stored = encode_state(state, &mut Grids::default()).unwrap();
+            let bytes = rmp_serde::to_vec(&stored).unwrap();
+            let StoredValue::CompressedSamples(block) = rmp_serde::from_slice(&bytes).unwrap()
+            else {
+                panic!("not a compressed-samples value");
+            };
+            assert_eq!(block, ours.block());
+            let restored =
+                CompressedSamplesAccumulator::restore_from_disk(block, sample_blocks::codec())
+                    .unwrap();
+            assert_eq!(restored.samples_in(i64::MIN, i64::MAX).unwrap(), samples);
         }
     }
 
