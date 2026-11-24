@@ -640,10 +640,14 @@ impl EngineHandle {
             return Err(IngestError::Stopped);
         }
         // Each series' samples go to one shard, in order.
-        let mut by_shard: Vec<Vec<RawSample>> = vec![Vec::new(); self.shards.len()];
+        let mut by_shard: Vec<Vec<RawSample>> = Vec::new();
         if self.shards.len() == 1 {
-            by_shard[0] = samples;
+            by_shard.push(samples);
         } else {
+            // Room for a fair share and a quarter more, so a request rarely
+            // grows a shard's vector.
+            let room = samples.len() / self.shards.len() * 5 / 4 + 1;
+            by_shard.resize_with(self.shards.len(), || Vec::with_capacity(room));
             for sample in samples {
                 by_shard[sample.labels.id as usize % self.shards.len()].push(sample);
             }

@@ -46,8 +46,10 @@ read views (and, for query-time scans, the raw panes), never the raw stream.
 
 ## 3. Ingest
 
-- Remote Write is decoded in place, with a per-thread series cache
-  (about 0.38 µs per sample).
+- Remote Write is decoded in place, into a per-thread decompression
+  buffer, with a per-thread series cache that predicts each series from
+  the sender's order (about 0.15 µs per sample on captured demo
+  requests, 0.21 µs in the server).
 - Samples are sharded by series hash across N ingest threads, each
   appending to columnar raw panes.
 - A single coordinator collects shard reports, sends flushes and advances

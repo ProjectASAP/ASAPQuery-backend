@@ -9,6 +9,9 @@ asap-executor.workspace = true
 asap_sketchlib.workspace = true
 serde_bytes = "0.11"
 ahash = "0.8"
+# The per-thread series cache of the Remote Write decoder (a table of
+# indices hashed by the keys they point to).
+hashbrown = "0.15"
 # Shortest round-trip float digits for range responses (prometheus.rs).
 ryu = "1"
 libc = "0.2"
