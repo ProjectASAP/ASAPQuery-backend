@@ -624,20 +624,11 @@ impl WindowLocation {
         Ok(Bytes::Owned(words, len))
     }
 
-    /// The fragment's rows as one batch of `schema`.
-    pub fn read(&self, schema: &SchemaRef, how: ViewRead) -> Result<Batch, Error> {
-        self.read_counted(schema, how).map(|(batch, _)| batch)
-    }
-
-    /// [`Self::read`], with the bytes of its state columns read in the
-    /// executor's mapped layout, which [`Batch::memory_bytes`] does not
-    /// count (`StateColumn::from_mapped`): borrowed from the mapping, or
-    /// copied to the heap by `pread`.
-    pub(crate) fn read_counted(
-        &self,
-        schema: &SchemaRef,
-        how: ViewRead,
-    ) -> Result<(Batch, usize), Error> {
+    /// The fragment's rows as one batch of `schema`, and the bytes of its
+    /// state columns in the executor's mapped layout, which
+    /// [`Batch::memory_bytes`] does not count (`StateColumn::from_mapped`):
+    /// borrowed from the mapping, or copied to the heap by `pread`.
+    pub fn read(&self, schema: &SchemaRef, how: ViewRead) -> Result<(Batch, usize), Error> {
         let grids: Vec<Option<Arc<HydraCms>>> = if self.grids.1 == 0 {
             Vec::new()
         } else {
@@ -922,7 +913,7 @@ fn primitive<T: ArrowPrimitiveType>(
 }
 
 /// The fragment in `source` as one batch of `schema`, and the bytes of its
-/// mapped state columns ([`WindowLocation::read_counted`]).
+/// mapped state columns ([`WindowLocation::read`]).
 fn decode_fragment(
     source: &Bytes,
     schema: &SchemaRef,
