@@ -1551,6 +1551,18 @@ mod tests {
             let active = location.read(batch.schema(), ViewRead::Mmap).unwrap().0;
             assert_same_rows(batch, &active, &format!("{what}, active segment"));
         }
+        // A later window with series new to the active segment: the label
+        // values built for the first read are extended by the new texts.
+        let later = labeled_window(20, series + 50, true);
+        let later_written = files
+            .append(0, (10, 20), &[(1, std::slice::from_ref(&later))])
+            .unwrap();
+        let l3 = location_of(&later_written, 1);
+        assert!(!l3.is_sealed());
+        let read = l3.read(later.schema(), ViewRead::Mmap).unwrap().0;
+        assert_same_rows(&later, &read, "labels, extended values");
+        let read = l1.read(labeled.schema(), ViewRead::Mmap).unwrap().0;
+        assert_same_rows(&labeled, &read, "labels, first window after the extension");
         files.seal(0).unwrap();
         for how in [ViewRead::Mmap, ViewRead::Pread] {
             for (location, batch, what) in [(&l1, &labeled, "labels"), (&l2, &other, "other")] {

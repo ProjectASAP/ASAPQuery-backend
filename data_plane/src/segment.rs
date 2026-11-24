@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use asap_executor::arrow::array::{
-    Array, ArrayRef, DictionaryArray, PrimitiveArray, StringArray, UInt32Array,
+    Array, ArrayRef, DictionaryArray, PrimitiveArray, StringArray, StringBuilder, UInt32Array,
 };
 use asap_executor::arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use asap_executor::arrow::datatypes::{
@@ -513,35 +513,30 @@ impl Segment {
     }
 }
 
-/// Each segment text's labels taken as a series identity, and per label
-/// name one value per text: the dictionary of every [`IDENTITY_LABEL`]
-/// column of that name, indexed by the rows' identity keys.
+/// Per label name, one value per segment text: that label of the text
+/// taken as a series identity (`""` without it, or for a text that is no
+/// identity). The dictionary of every [`IDENTITY_LABEL`] column of that
+/// name, indexed by the rows' identity keys.
 #[derive(Default)]
 struct IdentityLabelValues {
-    /// By text key: the labels of the text taken as a series identity;
-    /// `None` for a text that is no identity. Extended as texts are added.
-    labels_by_text: Vec<Option<Arc<BTreeMap<String, String>>>>,
-    /// By label name: per text key, that label (`""` without it, or for a
-    /// text that is no identity). Rebuilt when a read needs a key past it.
     values_by_label: HashMap<String, ArrayRef>,
 }
 
 impl Segment {
     /// The values of `label` for the texts with keys below `needed` taken
     /// as series identities, as one array shared by the windows read from
-    /// the segment ([`IdentityLabelValues`]).
+    /// the segment ([`IdentityLabelValues`]); extended by the texts added
+    /// since it was built, each parsed once per label.
     fn label_values(&self, label: &str, needed: usize) -> Result<ArrayRef, Error> {
         let mut identity = self
             .identity_label_values
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(values) = identity
-            .values_by_label
-            .get(label)
-            .filter(|v| v.len() >= needed)
-        {
+        let built = identity.values_by_label.get(label).cloned();
+        if let Some(values) = built.as_ref().filter(|v| v.len() >= needed) {
             return Ok(values.clone());
         }
+        let built_len = built.as_ref().map_or(0, |values| values.len());
         // The texts added since, copied out so appends do not wait for
         // their parsing.
         let added: Vec<Arc<str>> = {
@@ -552,19 +547,32 @@ impl Segment {
                     self.path.display()
                 )));
             }
-            texts[identity.labels_by_text.len()..].to_vec()
+            texts[built_len..].to_vec()
         };
-        identity
-            .labels_by_text
-            .extend(added.iter().map(|text| parse_identity(text)));
-        let values: ArrayRef = Arc::new(StringArray::from_iter_values(
-            identity.labels_by_text.iter().map(|labels| {
-                labels
-                    .as_ref()
-                    .and_then(|labels| labels.get(label))
-                    .map_or("", String::as_str)
-            }),
-        ));
+        let built = built
+            .as_ref()
+            .map(|values| values.as_any().downcast_ref::<StringArray>())
+            .unwrap_or_default();
+        let added: Vec<String> = added
+            .iter()
+            .map(|text| {
+                parse_identity(text)
+                    .and_then(|labels| labels.get(label).cloned())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let mut builder = StringBuilder::with_capacity(
+            built_len + added.len(),
+            built.map_or(0, |built| built.value_data().len())
+                + added.iter().map(String::len).sum::<usize>(),
+        );
+        for value in built.into_iter().flat_map(|built| built.iter()) {
+            builder.append_value(value.unwrap_or_default());
+        }
+        for value in &added {
+            builder.append_value(value);
+        }
+        let values: ArrayRef = Arc::new(builder.finish());
         identity
             .values_by_label
             .insert(label.to_string(), values.clone());
@@ -577,8 +585,9 @@ impl Segment {
 }
 
 /// The labels of the series whose identity text is `text`: an interned
-/// series' own, else parsed (not kept beyond the segment); `None` for a
-/// text that is no label set's JSON.
+/// series' own, else parsed (and not kept); `None` for a text that is no
+/// label set's JSON. The labels the writer's `labels_of_identity` gives,
+/// without its process-wide cache (a segment's texts outlive no reader).
 fn parse_identity(text: &str) -> Option<Arc<BTreeMap<String, String>>> {
     match crate::series_ids::by_identity(text) {
         Some(series) => Some(series.labels().clone()),
@@ -823,7 +832,10 @@ pub(crate) fn encode_fragment(
         // The identity column, when this column holds its series' label.
         let label_of_identity_column = identity_labels
             .as_ref()
-            .filter(|labels| labels.holds_label(rows, column, &field.name))
+            .filter(|labels| {
+                field.dtype == FieldDataType::Plain(DataType::Utf8)
+                    && labels.holds_label(rows, column, &field.name)
+            })
             .map(|labels| labels.column as u32);
         let (kind, mut flags, data): (u32, u32, Vec<u8>) = if let Some(identity_column) =
             label_of_identity_column
@@ -1147,13 +1159,11 @@ fn decode_fragment(
                 // The identity column's keys, as this column's keys into
                 // the label's values by text.
                 let identity_column = flags as usize;
+                if identity_column >= columns {
+                    return Err(damaged());
+                }
                 let identity = descriptor(bytes, identity_column)?;
-                if identity_column >= columns
-                    || identity.kind != TEXT
-                    || identity.valid.1 != 0
-                    || data.1 != 0
-                    || valid.1 != 0
-                {
+                if identity.kind != TEXT || identity.valid.1 != 0 || data.1 != 0 || valid.1 != 0 {
                     return Err(damaged());
                 }
                 let keys = primitive::<UInt32Type>(source, identity.data, rows, None)?;

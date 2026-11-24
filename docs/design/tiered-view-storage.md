@@ -255,7 +255,7 @@ columns a per-series view carries) is not written: the fragment marks it
 texts. A read takes the identity column's keys as its keys, into a
 per-segment array per label name holding that label of each segment text
 taken as a series identity (from the interned series, else parsed from the
-identity's JSON once per segment). At 10k series that array is about
+identity's JSON once per label name per segment). At 10k series that array is about
 100–150 KB per label name per segment, counted with the segment's
 dictionary; on disk it saves 4 B per row per label column.
 
