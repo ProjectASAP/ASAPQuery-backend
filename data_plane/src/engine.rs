@@ -2654,4 +2654,65 @@ mod tests {
         assert!(thread.join().is_err());
         assert!(!running.load(Ordering::SeqCst));
     }
+    /// A metric read by a pushed 60 s group and a window-path 10 s group:
+    /// once the 10 s group closed (10, 20], a sample at 15 s is still in
+    /// the pushed group's open window (0, 60], so it is not late.
+    #[test]
+    fn a_pushed_groups_open_window_keeps_samples_another_group_closed() {
+        let workload = serde_json::from_value(serde_json::json!({
+            "query_workload": {"language": "promql", "repeating_queries": [
+                {
+                    "query": "sum_over_time(m_engine_push_late[60s])",
+                    "demand": {"fixed_interval_at": {"interval": 60000, "evaluation_phase": 0}},
+                    "requirements": {"accuracy": {"max_error": 0.05, "failure_probability": 0.01,
+                        "accuracy_scope": "whole_result"}},
+                    "predictability": {"predictable": {"known_at": null}},
+                },
+                {
+                    "query": "sum by (job) (sum_over_time(m_engine_push_late[10s]))",
+                    "demand": {"fixed_interval_at": {"interval": 10000, "evaluation_phase": 0}},
+                    "requirements": {},
+                    "predictability": {"predictable": {"known_at": null}},
+                },
+            ]},
+            "data_workload": {"arrival": {"ingesting": {"rows_per_second": 1.0}},
+              "sources": {"m_engine_push_late": {"series_count": 1, "sample_interval": 1000,
+                  "metric_type": "gauge", "column_signs": {"value": "non_negative"}}}},
+        }))
+        .unwrap();
+        let mut inputs = control_plane::DeploymentInputs::default();
+        inputs.deployment_capabilities.raw_data_retained = false;
+        let plan = control_plane::plan_workload(&workload, &inputs).unwrap().0;
+        let options = EngineOptions {
+            no_forward: true,
+            ingestion: crate::ingestion::IngestionOptions {
+                allowed_lateness_ms: 0,
+                stream_start_ms: Some(0),
+                ..Default::default()
+            },
+            ..EngineOptions::default()
+        };
+        let (mut ingestion, ..) =
+            install(&serde_json::to_string(&plan).unwrap(), &options).unwrap();
+        let widths: Vec<i64> = ingestion.group_windows().iter().map(|w| w.0).collect();
+        assert_eq!(widths, [60_000, 10_000]);
+        ingestion.set_push_groups(vec![true, false]);
+        let series = crate::series_ids::intern_pairs(&[("__name__", "m_engine_push_late")]);
+        ingestion.observe(&[(series.metric.clone(), 1_000)]);
+        ingestion.advance_newest_sample(Some(25_000));
+        ingestion.advance_clock(25_000);
+        let closed: Vec<(usize, i64)> = ingestion
+            .close()
+            .iter()
+            .map(|w| (w.group, w.end_ms))
+            .collect();
+        assert_eq!(closed, [(0, 0), (1, 0), (1, 10_000), (1, 20_000)]);
+        let sample = RawSample {
+            labels: series,
+            timestamp_ms: 15_000,
+            value: 1.0,
+        };
+        let routed = ingestion.routing().route(vec![sample], 25_000);
+        assert_eq!(routed.accepted.len(), 1, "{:?}", routed.stats);
+    }
 }

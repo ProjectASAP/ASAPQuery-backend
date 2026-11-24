@@ -467,7 +467,8 @@ impl Ingestion {
     /// (kept in the result cache and the query-time results), so a sample
     /// it did not see must not change what a later run answers. Any other
     /// metric is late at or before its eviction cutoff (only windows still
-    /// to be closed read it).
+    /// to be closed read it), unless a push group scans it: push shards
+    /// drop the samples of sealed windows themselves.
     pub fn routing(&self) -> Routing {
         let cutoffs: HashMap<String, Option<i64>> = self
             .scanned_metrics
@@ -478,6 +479,15 @@ impl Ingestion {
         let late_through = cutoffs
             .iter()
             .map(|(metric, &cutoff)| {
+                // A push group's open windows still read samples the
+                // eviction cutoff (window-path groups only) has passed;
+                // its shards drop the samples of its sealed windows.
+                let pushed = self
+                    .groups
+                    .iter()
+                    .enumerate()
+                    .any(|(index, g)| self.is_push(index) && g.metrics.contains(metric));
+                let cutoff = if pushed { None } else { cutoff };
                 let late = if self.query_time_lookback_ms.contains_key(metric) {
                     cutoff.max(watermark_ms)
                 } else {
@@ -701,7 +711,7 @@ pub struct Routing {
     /// Each scanned metric's eviction cutoff (`None`: all are kept).
     cutoffs: HashMap<String, Option<i64>>,
     /// Each scanned metric's samples at or before this are late (`None`:
-    /// none are); at or after its eviction cutoff.
+    /// none are).
     late_through: HashMap<String, Option<i64>>,
     /// Some group has not seen its first sample: report each metric's
     /// first sample.
