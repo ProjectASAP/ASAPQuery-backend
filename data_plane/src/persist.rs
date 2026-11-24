@@ -129,6 +129,9 @@ pub type ViewIndex = BTreeMap<PhysicalASAPNodeId, Vec<((i64, i64), WindowLocatio
 struct ActiveSegment {
     segment: Arc<Segment>,
     texts: HashMap<Arc<str>, u32>,
+    /// The labels of each series identity its records held, looked up once
+    /// per segment ([`SegmentTexts::identity_labels`]).
+    labels_by_identity: crate::segment::LabelsByIdentity,
     /// The start of its first window: it rolls once a window starts
     /// `segment_ms` or more after it.
     first_start_ms: i64,
@@ -415,15 +418,25 @@ impl ViewFiles {
             written.segments_marked_cold = files.cool();
         }
         let no_texts = HashMap::new();
-        let mut texts = match &files.active {
-            Some(active) => SegmentTexts {
-                known: &active.texts,
-                base: active.segment.text_count() as u32,
+        // The segment is created only once a fragment is encoded; until then
+        // the identities' labels go to a map that becomes the new segment's.
+        let mut no_labels = crate::segment::LabelsByIdentity::new();
+        let mut texts = match files.active.as_mut() {
+            Some(ActiveSegment {
+                segment,
+                texts,
+                labels_by_identity,
+                ..
+            }) => SegmentTexts {
+                known: texts,
+                labels_by_identity,
+                base: segment.text_count() as u32,
                 new: Vec::new(),
                 new_index: HashMap::new(),
             },
             None => SegmentTexts {
                 known: &no_texts,
+                labels_by_identity: &mut no_labels,
                 base: 0,
                 new: Vec::new(),
                 new_index: HashMap::new(),
@@ -455,6 +468,7 @@ impl ViewFiles {
             files.active = Some(ActiveSegment {
                 segment: Segment::create_new(&dir, end_ms, &header)?,
                 texts: HashMap::new(),
+                labels_by_identity: no_labels,
                 first_start_ms: start_ms,
             });
             written.bytes += files.active.as_ref().expect("set").segment.len();
@@ -571,7 +585,13 @@ impl ViewFiles {
             let mut by_view = ViewIndex::new();
             for (retention_ms, _, path) in paths {
                 let Some((segment, heads)) = Segment::open(&path, &expected)? else {
-                    set_aside(&path, "a segment of another plan, group or version")?;
+                    set_aside(
+                        &path,
+                        &format!(
+                            "a segment of another plan, group or format version (this data \
+                             plane reads version {FORMAT_VERSION})"
+                        ),
+                    )?;
                     continue;
                 };
                 for head in heads {
@@ -1090,12 +1110,13 @@ mod tests {
     // docs/design/tiered-view-storage.md, tests V2, V3, V9, V12, V13,
     // V18, V19.
 
-    use asap_executor::arrow::array::{DictionaryArray, Float64Array};
+    use asap_executor::arrow::array::DictionaryArray;
     use asap_executor::arrow::datatypes::UInt32Type;
     use asap_executor::planner::ir::schema::{
         DataType, Field, FieldDataType, Schema, PROMQL_SERIES_IDENTITY,
     };
     use asap_executor::planner::summary_type::{ExactKind, ExactParams, SketchAlgorithm};
+    use asap_executor::values::state_view_bytes;
 
     /// A fresh directory for one test's segments.
     fn segment_dir(test: &str) -> PathBuf {
@@ -1299,6 +1320,59 @@ mod tests {
         out
     }
 
+    /// One 1 s pane of 1,000 series, ten samples each, in a DDSketch at
+    /// alpha 0.02 (the demo's finest quantile view): the window's stored
+    /// fragment, with its series and label columns.
+    fn ten_sample_ddsketch_window() -> Batch {
+        // Samples uniform in [50, 100), full precision (xorshift).
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut sample = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            50.0 + 50.0 * (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let states = (0..1000)
+            .map(|_| {
+                let mut sketch = DdSketch::new(0.02);
+                for _ in 0..10 {
+                    sketch.add(&sample());
+                }
+                Arc::new(DDSketchAccumulator::restore_from_disk(sketch).unwrap())
+                    as Arc<dyn AggregateCore>
+            })
+            .collect();
+        window_batch(
+            1_000,
+            FieldDataType::Sketch(SketchAlgorithm::DDSketch),
+            states,
+        )
+    }
+
+    /// The window of [`ten_sample_ddsketch_window`] takes 30.2 kB on disk
+    /// (30 B a series, most of it the full-precision sum, min and max), not
+    /// the 126 kB of the mapped layout (106 kB of DDSketch views alone).
+    #[test]
+    fn a_ten_sample_ddsketch_window_is_stored_compact() {
+        let dir = segment_dir("dd-bytes");
+        let batch = ten_sample_ddsketch_window();
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
+        let written = files
+            .append(0, (0, 1_000), &[(1, std::slice::from_ref(&batch))])
+            .unwrap();
+        let views: usize = batch
+            .to_rows()
+            .iter()
+            .map(|row| match &row[4] {
+                Value::Summary { state, .. } => state_view_bytes(state.as_ref()).unwrap().len(),
+                _ => unreachable!(),
+            })
+            .sum();
+        assert_eq!(views, 106_176);
+        assert_eq!(location_of(&written, 1).len(), 30_196);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// V2. A cold window decodes, from its columnar fragment, to the rows
     /// that were committed, read from the active segment (by `pread`) and
     /// again once the segment is sealed (mapped), and with `ViewRead::Pread`.
@@ -1317,13 +1391,13 @@ mod tests {
                 !location.is_sealed(),
                 "{what}: the newest segment is active"
             );
-            let active = location.read(batch.schema(), ViewRead::Mmap).unwrap();
+            let active = location.read(batch.schema(), ViewRead::Mmap).unwrap().0;
             assert_same_rows(&batch, &active, &format!("{what}, active segment"));
             files.seal(0).unwrap();
             assert!(location.is_sealed(), "{what}");
-            let mapped = location.read(batch.schema(), ViewRead::Mmap).unwrap();
+            let mapped = location.read(batch.schema(), ViewRead::Mmap).unwrap().0;
             assert_same_rows(&batch, &mapped, &format!("{what}, mapped"));
-            let pread = location.read(batch.schema(), ViewRead::Pread).unwrap();
+            let pread = location.read(batch.schema(), ViewRead::Pread).unwrap().0;
             assert_same_rows(&batch, &pread, &format!("{what}, pread"));
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -1344,11 +1418,11 @@ mod tests {
             .unwrap();
         let location = location_of(&written, 1);
         for how in [ViewRead::Pread, ViewRead::Mmap] {
-            assert_eq!(location.read(empty.schema(), how).unwrap().num_rows(), 0);
+            assert_eq!(location.read(empty.schema(), how).unwrap().0.num_rows(), 0);
         }
         files.seal(0).unwrap();
         for how in [ViewRead::Pread, ViewRead::Mmap] {
-            assert_eq!(location.read(empty.schema(), how).unwrap().num_rows(), 0);
+            assert_eq!(location.read(empty.schema(), how).unwrap().0.num_rows(), 0);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1377,7 +1451,9 @@ mod tests {
         drop(file);
         for (i, batch) in batches.iter().enumerate() {
             let view = i as PhysicalASAPNodeId + 1;
-            let read = location_of(&written, view).read(batch.schema(), ViewRead::Mmap);
+            let read = location_of(&written, view)
+                .read(batch.schema(), ViewRead::Mmap)
+                .map(|(batch, _)| batch);
             if view == 2 {
                 assert!(read.is_err(), "a damaged fragment must not decode");
             } else {
@@ -1387,25 +1463,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// V18. Reading a sealed segment borrows the text keys and plain
-    /// columns from the mapping, and every window of the segment shares one
-    /// dictionary; `ViewRead::Pread` copies them and reads the same rows.
+    /// A cold read rebuilds a KLL column (no compact form) in the mapped
+    /// layout in buffers of its own and reports their bytes, which the
+    /// batch's own memory count leaves out; every window of a segment
+    /// shares one dictionary of texts; `ViewRead::Pread` reads the same rows.
     #[test]
-    fn mapped_reads_borrow_fixed_width_columns() {
-        let dir = segment_dir("borrow");
+    fn cold_reads_report_state_bytes_and_share_one_dictionary() {
+        let dir = segment_dir("cold-read");
         let (_, a, b) = states().remove(1);
         let (a, b): (Arc<dyn AggregateCore>, Arc<dyn AggregateCore>) = (Arc::from(a), Arc::from(b));
         let kll = FieldDataType::Sketch(SketchAlgorithm::Kll);
-        let rows = |end| {
-            window_batch(
-                end,
-                kll.clone(),
-                (0..1000)
-                    .map(|i| if i % 2 == 0 { a.clone() } else { b.clone() })
-                    .collect(),
-            )
-        };
-        let (first, second) = (rows(10), rows(20));
+        let states: Vec<Arc<dyn AggregateCore>> = (0..1000)
+            .map(|i| if i % 2 == 0 { a.clone() } else { b.clone() })
+            .collect();
+        let held = 4 * (states.len() + 1)
+            + states
+                .iter()
+                .map(|s| state_view_bytes(s.as_ref()).unwrap().len().div_ceil(8) * 8)
+                .sum::<usize>();
+        let (first, second) = (
+            window_batch(10, kll.clone(), states.clone()),
+            window_batch(20, kll, states),
+        );
         let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
         let w1 = files
             .append(0, (0, 10), &[(1, std::slice::from_ref(&first))])
@@ -1415,9 +1494,11 @@ mod tests {
             .unwrap();
         files.seal(0).unwrap();
         let (l1, l2) = (location_of(&w1, 1), location_of(&w2, 1));
-        let r1 = l1.read(first.schema(), ViewRead::Mmap).unwrap();
-        let r2 = l2.read(second.schema(), ViewRead::Mmap).unwrap();
+        let (r1, state_bytes) = l1.read(first.schema(), ViewRead::Mmap).unwrap();
+        let (r2, _) = l2.read(second.schema(), ViewRead::Mmap).unwrap();
         assert_same_rows(&first, &r1, "mapped");
+        assert_eq!(state_bytes, held);
+        assert_eq!(r1.state_column(4).unwrap().state_memory_bytes(), 0);
         let identity = |batch: &Batch| {
             batch
                 .column(1)
@@ -1426,28 +1507,190 @@ mod tests {
                 .expect("a cold text column is a dictionary over the segment's texts")
                 .clone()
         };
-        let keys = identity(&r1).keys().values().as_ptr() as usize;
-        assert!(l1.maps(keys), "text keys are copied, not borrowed");
-        let values = r1
-            .column(3)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap();
-        assert!(
-            l1.maps(values.values().as_ptr() as usize),
-            "values are copied, not borrowed"
-        );
-        // The KLL states are read in place (a mapped column, charged
-        // nothing), not rebuilt as objects.
-        let states = r1.state_column(4).expect("a state column");
-        assert_eq!(states.state_memory_bytes(), 0);
         assert!(
             Arc::ptr_eq(identity(&r1).values(), identity(&r2).values()),
             "one dictionary per segment"
         );
-        let copied = l1.read(first.schema(), ViewRead::Pread).unwrap();
+        let (copied, copied_state_bytes) = l1.read(first.schema(), ViewRead::Pread).unwrap();
         assert_same_rows(&first, &copied, "pread");
-        assert!(!l1.maps(identity(&copied).keys().values().as_ptr() as usize));
+        // The rebuilt states' bytes, which the batch does not count, are
+        // reported for the window's charge, mapped or copied alike.
+        assert_eq!(copied_state_bytes, state_bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A view of `series` series with the series identity, three label
+    /// columns and the value. `labels_match`: each label column holds its
+    /// series' label (`zone` is no label, so `""`); otherwise `job` holds
+    /// another text. Odd series are no input series (no `__name__`, as a
+    /// `rate` result): their identities are never interned.
+    fn labeled_window(end_ms: i64, series: usize, labels_match: bool) -> Batch {
+        let schema = Arc::new(Schema::with_time_index(
+            vec![
+                Field::plain("ts", DataType::Timestamp, false),
+                Field::plain(PROMQL_SERIES_IDENTITY, DataType::Utf8, false),
+                Field::plain("job", DataType::Utf8, false),
+                Field::plain("region", DataType::Utf8, false),
+                Field::plain("zone", DataType::Utf8, false),
+                Field::plain("v", DataType::Float64, false),
+            ],
+            0,
+            vec![],
+        ));
+        let rows = (0..series)
+            .map(|s| {
+                let mut labels: BTreeMap<String, String> = [
+                    ("job".to_string(), format!("job-{}", s % 7)),
+                    ("region".to_string(), format!("region-{}", s % 3)),
+                    ("series".to_string(), format!("series-{s}")),
+                ]
+                .into();
+                let identity: Arc<str> = if s % 2 == 0 {
+                    labels.insert("__name__".into(), "data".into());
+                    crate::series_ids::intern_pairs(&labels.iter().collect::<Vec<_>>())
+                        .identity
+                        .clone()
+                } else {
+                    labels.insert("series".into(), format!("never-interned-{s}"));
+                    serde_json::to_string(&labels).unwrap().into()
+                };
+                let job = if labels_match {
+                    labels["job"].clone()
+                } else {
+                    format!("other-{}", s % 7)
+                };
+                vec![
+                    Value::Timestamp(end_ms),
+                    Value::Utf8(identity),
+                    Value::Utf8(job.into()),
+                    Value::Utf8(labels["region"].clone().into()),
+                    Value::Utf8("".into()),
+                    Value::Float64(s as f64),
+                ]
+            })
+            .collect();
+        Batch::try_new(schema, rows).unwrap()
+    }
+
+    /// A text column holding its series' label is not stored: it reads
+    /// back, from the active segment and once sealed, from the series
+    /// identity, saving its 4-byte key per row; a text column that is not
+    /// its series' label is stored as before.
+    #[test]
+    fn label_columns_are_read_back_from_the_series_identity() {
+        let dir = segment_dir("identity-labels");
+        let series = 300;
+        let (labeled, other) = (
+            labeled_window(10, series, true),
+            labeled_window(10, series, false),
+        );
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
+        let written = files
+            .append(
+                0,
+                (0, 10),
+                &[
+                    (1, std::slice::from_ref(&labeled)),
+                    (2, std::slice::from_ref(&other)),
+                ],
+            )
+            .unwrap();
+        let (l1, l2) = (location_of(&written, 1), location_of(&written, 2));
+        // `job` (other) is stored in view 2 only; `region` and `zone` in
+        // neither.
+        // (Fragments are compressed: only the order of their lengths is
+        // fixed.)
+        assert!(l2.len() > l1.len());
+        for (location, batch, what) in [(&l1, &labeled, "labels"), (&l2, &other, "other")] {
+            let active = location.read(batch.schema(), ViewRead::Mmap).unwrap().0;
+            assert_same_rows(batch, &active, &format!("{what}, active segment"));
+        }
+        // A later window with series new to the active segment: the label
+        // values built for the first read are extended by the new texts.
+        let later = labeled_window(20, series + 50, true);
+        let later_written = files
+            .append(0, (10, 20), &[(1, std::slice::from_ref(&later))])
+            .unwrap();
+        let l3 = location_of(&later_written, 1);
+        assert!(!l3.is_sealed());
+        let read = l3.read(later.schema(), ViewRead::Mmap).unwrap().0;
+        assert_same_rows(&later, &read, "labels, extended values");
+        let read = l1.read(labeled.schema(), ViewRead::Mmap).unwrap().0;
+        assert_same_rows(&labeled, &read, "labels, first window after the extension");
+        files.seal(0).unwrap();
+        for how in [ViewRead::Mmap, ViewRead::Pread] {
+            for (location, batch, what) in [(&l1, &labeled, "labels"), (&l2, &other, "other")] {
+                let read = location.read(batch.schema(), how).unwrap().0;
+                assert_same_rows(batch, &read, &format!("{what}, sealed, {how:?}"));
+            }
+        }
+        // After a restart: the segment indexed from its file.
+        drop((written, l1, l2));
+        drop(files);
+        let view = |id: u64| -> MaterializedView {
+            serde_json::from_value(serde_json::json!({
+                "node_id": id,
+                "refresh": "at_ingestion",
+                "coverage": {"definition_id": format!("v{id}"), "selection": []},
+                "inputs": {"materialized_views": []},
+                "retention_ms": 1_000_000,
+            }))
+            .unwrap()
+        };
+        let groups = vec![vec![
+            (view(1), labeled.schema().clone()),
+            (view(2), other.schema().clone()),
+        ]];
+        let index = ViewFiles::open(&dir, 7, Duration::ZERO)
+            .unwrap()
+            .index(&groups)
+            .unwrap();
+        for (id, batch, what) in [(1, &labeled, "labels"), (2, &other, "other")] {
+            let location = &index[&id][0].1;
+            let read = location.read(batch.schema(), ViewRead::Mmap).unwrap().0;
+            assert_same_rows(batch, &read, &format!("{what}, indexed at startup"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A segment of an older format version is set aside at startup, not
+    /// read: its label columns are stored, not rebuilt.
+    #[test]
+    fn an_older_format_version_segment_is_set_aside() {
+        let dir = segment_dir("version");
+        let batch = labeled_window(10, 3, true);
+        let view: MaterializedView = serde_json::from_value(serde_json::json!({
+            "node_id": 1,
+            "refresh": "at_ingestion",
+            "coverage": {"definition_id": "v", "selection": []},
+            "inputs": {"materialized_views": []},
+            "retention_ms": 1_000_000,
+        }))
+        .unwrap();
+        let groups = vec![vec![(view, batch.schema().clone())]];
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
+        let written = files
+            .append(0, (0, 10), &[(1, std::slice::from_ref(&batch))])
+            .unwrap();
+        let path = location_of(&written, 1).segment_path().to_path_buf();
+        drop(written);
+        drop(files);
+        // The header frame's payload ends with the version (a MessagePack
+        // fixint): rewrite it as the previous one.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let header_len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        assert_eq!(u32::from(bytes[8 + header_len - 1]), FORMAT_VERSION);
+        bytes[8 + header_len - 1] = (FORMAT_VERSION - 1) as u8;
+        std::fs::write(&path, bytes).unwrap();
+        let index = ViewFiles::open(&dir, 7, Duration::ZERO)
+            .unwrap()
+            .index(&groups)
+            .unwrap();
+        assert!(index.get(&1).is_none_or(Vec::is_empty));
+        assert!(!path.exists());
+        let mut stale = path.into_os_string();
+        stale.push(".stale");
+        assert!(PathBuf::from(stale).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1464,9 +1707,9 @@ mod tests {
             .unwrap();
         files.seal(0).unwrap();
         let location = location_of(&written, 1);
-        let before = location.read(batch.schema(), ViewRead::Mmap).unwrap();
+        let before = location.read(batch.schema(), ViewRead::Mmap).unwrap().0;
         std::fs::remove_file(location.segment_path()).unwrap();
-        let after = location.read(batch.schema(), ViewRead::Mmap).unwrap();
+        let after = location.read(batch.schema(), ViewRead::Mmap).unwrap().0;
         assert_same_rows(&before, &after, "after unlink");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1556,7 +1799,7 @@ mod tests {
         assert!(!oldest_short.segment_path().exists());
         assert!(oldest_long.segment_path().exists());
         assert!(files.bytes() < bytes_before);
-        let read = oldest_long.read(batch.schema(), ViewRead::Mmap).unwrap();
+        let read = oldest_long.read(batch.schema(), ViewRead::Mmap).unwrap().0;
         assert_same_rows(&batch, &read, "the long-retention view's oldest window");
         let left: Vec<PathBuf> = segment_files(&dir);
         assert_eq!(left.len(), 5, "short: (60, 80]; long: four segments");
@@ -1600,7 +1843,7 @@ mod tests {
         files.seal(0).unwrap();
         assert!(locations[4].is_cold(), "sealing (60, 80] cools (40, 60]");
         assert!(!locations[6].is_cold());
-        let read = locations[0].read(batch.schema(), ViewRead::Mmap).unwrap();
+        let (read, _) = locations[0].read(batch.schema(), ViewRead::Mmap).unwrap();
         assert_same_rows(&batch, &read, "a cold segment");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1648,7 +1891,7 @@ mod tests {
         for (_, location) in &index[&1] {
             assert_same_rows(
                 &batch,
-                &location.read(batch.schema(), ViewRead::Mmap).unwrap(),
+                &location.read(batch.schema(), ViewRead::Mmap).unwrap().0,
                 "after the cut",
             );
         }
@@ -1690,7 +1933,7 @@ mod tests {
         for (_, location) in &recovered[&1] {
             assert_same_rows(
                 &batch,
-                &location.read(batch.schema(), ViewRead::Mmap).unwrap(),
+                &location.read(batch.schema(), ViewRead::Mmap).unwrap().0,
                 "recovered",
             );
         }

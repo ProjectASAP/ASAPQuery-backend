@@ -8,6 +8,8 @@ asap-planner.workspace = true
 asap-executor.workspace = true
 asap_sketchlib.workspace = true
 serde_bytes = "0.11"
+# Each view fragment is compressed (segment.rs).
+zstd = "0.13"
 ahash = "0.8"
 # The per-thread series cache of the Remote Write decoder (a table of
 # indices hashed by the keys they point to).
