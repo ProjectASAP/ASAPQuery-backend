@@ -226,8 +226,9 @@ pub struct Partial {
 
 /// Which groups are built by push: those `candidates` (split by series,
 /// not serial, reading no view) whose probe run over the window
-/// `(phase, phase + W]` opens only `Scan`s reading exactly that window and
-/// finishes once they end. `None` for a group kept on the window path.
+/// `(phase, phase + W]` opens only `Scan`s reading exactly that window, all
+/// before its first stall, and finishes once they end. `None` for a group
+/// kept on the window path.
 pub fn probe(
     precompute: &Arc<Precompute>,
     candidates: &[bool],
@@ -274,10 +275,13 @@ pub fn probe(
             for range in feed.ranges.borrow().iter() {
                 exact &= *range == Some((end - width_ms, end));
             }
+            let probed = feed.readers.borrow().len();
             feed.seal();
             pool.run_until_stalled();
             let finished = matches!(slot.borrow().as_ref(), Some(Ok(_)));
-            let pushable = exact && finished && !reads.is_empty();
+            // A `Scan` opened only after the seal would get no samples.
+            let all_opened_before_seal = feed.readers.borrow().len() == probed;
+            let pushable = exact && finished && all_opened_before_seal && !reads.is_empty();
             tracing::info!(group, pushable, ?reads, "push probe");
             pushable.then(|| PushGroup {
                 width_ms,
