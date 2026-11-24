@@ -21,24 +21,29 @@ pub struct InstantQuery {
 /// a time it cannot represent. Leaves room for any window offset.
 pub const MAX_TIME_MS: i64 = i64::MAX / 4;
 
-/// Why an instant query's parameters are refused (400, `bad_data`).
+/// Why a query's parameters are refused (400, `bad_data`): the error text.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
-pub struct BadTime(pub String);
+pub struct BadParameter(pub String);
 
 impl InstantQuery {
-    /// Reads `query` and `time` ([`parse_time_ms`]). `Ok(None)` if `query`
-    /// is missing (the request is then forwarded); `Err` if `time` is no
-    /// time or one beyond [`MAX_TIME_MS`].
-    pub fn parse(url_query: Option<&str>, form: &[u8]) -> Result<Option<Self>, BadTime> {
+    /// Reads `query` and `time` ([`parse_time_ms`]; empty or missing:
+    /// now). `Ok(None)` if `query` is missing or `time` is Prometheus' min
+    /// or max time (the request is then forwarded, or refused without
+    /// forwarding); `Err` if `time` is not a parsable time or is beyond
+    /// [`MAX_TIME_MS`].
+    pub fn parse(url_query: Option<&str>, form: &[u8]) -> Result<Option<Self>, BadParameter> {
         let params: BTreeMap<String, String> =
             form_urlencoded::parse(url_query.unwrap_or_default().as_bytes())
                 .chain(form_urlencoded::parse(form))
                 .map(|(k, v)| (k.into_owned(), v.into_owned()))
                 .collect();
-        let time_ms = match params.get("time") {
+        let time_ms = match params.get("time").filter(|time| !time.is_empty()) {
             None => None,
-            Some(time) => Some(parse_time_ms("time", time).map_err(BadTime)?),
+            Some(time) => match parse_time_ms("time", time)? {
+                Some(ms) => Some(ms),
+                None => return Ok(None),
+            },
         };
         let Some(query) = params.get("query") else {
             return Ok(None);
@@ -63,19 +68,15 @@ pub struct RangeQuery {
     pub step_ms: i64,
 }
 
-/// Why a range query's parameters are refused (400, `bad_data`).
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{0}")]
-pub struct BadRange(pub String);
-
 impl RangeQuery {
     /// Reads `query`, `start` and `end` ([`parse_time_ms`]) and `step`
     /// (seconds or a Prometheus duration such as `15s` or `1m30s`).
-    /// `Ok(None)` if one is missing (the request is then forwarded); `Err`
-    /// if they cannot be evaluated: no time or one beyond [`MAX_TIME_MS`],
-    /// a step that is not positive, an end before the start, or more than
-    /// [`MAX_RANGE_STEPS`] steps.
-    pub fn parse(url_query: Option<&str>, form: &[u8]) -> Result<Option<Self>, BadRange> {
+    /// `Ok(None)` if one is missing or a time is Prometheus' min or max
+    /// time (the request is then forwarded, or refused without
+    /// forwarding); `Err` if they cannot be evaluated: a time that is not
+    /// parsable or is beyond [`MAX_TIME_MS`], a step that is not positive,
+    /// an end before the start, or more than [`MAX_RANGE_STEPS`] steps.
+    pub fn parse(url_query: Option<&str>, form: &[u8]) -> Result<Option<Self>, BadParameter> {
         let params: BTreeMap<String, String> =
             form_urlencoded::parse(url_query.unwrap_or_default().as_bytes())
                 .chain(form_urlencoded::parse(form))
@@ -89,21 +90,24 @@ impl RangeQuery {
         ) else {
             return Ok(None);
         };
-        let start_ms = parse_time_ms("start", start).map_err(BadRange)?;
-        let end_ms = parse_time_ms("end", end).map_err(BadRange)?;
+        let (Some(start_ms), Some(end_ms)) =
+            (parse_time_ms("start", start)?, parse_time_ms("end", end)?)
+        else {
+            return Ok(None);
+        };
         let step_ms = step_ms(step).filter(|&ms| ms > 0).ok_or_else(|| {
-            BadRange(format!(
+            BadParameter(format!(
                 "invalid parameter \"step\": {step:?} is not a positive duration"
             ))
         })?;
         if end_ms < start_ms {
-            return Err(BadRange(
+            return Err(BadParameter(
                 "invalid parameter \"end\": end timestamp must not be before start time".into(),
             ));
         }
         // As Prometheus: refused when (end - start) / step exceeds it.
         if (end_ms - start_ms) / step_ms > MAX_RANGE_STEPS {
-            return Err(BadRange(format!(
+            return Err(BadParameter(format!(
                 "exceeded maximum resolution of {MAX_RANGE_STEPS} points per timeseries. Try decreasing the query resolution (?step=XX)"
             )));
         }
@@ -155,43 +159,55 @@ fn step_ms(text: &str) -> Option<i64> {
     (!text.is_empty()).then_some(total)
 }
 
-/// Query parameter `name`'s time `text` in milliseconds since the epoch,
-/// read as the Prometheus HTTP API reads it: Unix seconds with an optional
-/// fraction (rounded to the millisecond), or RFC 3339 with optional
-/// fractional seconds and a `Z` or `±hh:mm` offset (truncated to the
-/// millisecond). `Err` is the 400 error text: Prometheus' for no time, or
-/// a time beyond [`MAX_TIME_MS`].
-pub fn parse_time_ms(name: &str, text: &str) -> Result<i64, String> {
-    let ms = match text.parse::<f64>() {
-        Ok(seconds) => checked_seconds_to_ms(seconds),
-        Err(_) => Some(rfc3339_ms(text).ok_or_else(|| {
-            format!("invalid parameter \"{name}\": cannot parse {text:?} to a valid timestamp")
-        })?)
-        .filter(|ms| ms.abs() <= MAX_TIME_MS),
-    };
-    ms.ok_or_else(|| {
-        format!("invalid parameter \"{name}\": {text} is not a time the data plane can evaluate at")
-    })
+/// Prometheus' smallest and largest times, as its clients send them for
+/// "no bound" (`v1.MinTime` and `v1.MaxTime` formatted as RFC 3339).
+const PROMETHEUS_MIN_TIME: &str = "-292273086-05-16T16:47:06Z";
+const PROMETHEUS_MAX_TIME: &str = "292277025-08-17T07:12:55.999999999Z";
+
+/// Query parameter `name`'s time `text` in milliseconds since the epoch, as
+/// the Prometheus HTTP API reads it: Unix seconds with an optional fraction
+/// (rounded to the millisecond), else RFC 3339 ([`rfc3339_ms`]). `Ok(None)`
+/// for Prometheus' min or max time, which the data plane does not evaluate
+/// at. `Err` is the 400 error text: Prometheus' for a value in neither
+/// form, or a time beyond [`MAX_TIME_MS`].
+pub fn parse_time_ms(name: &str, text: &str) -> Result<Option<i64>, BadParameter> {
+    if text == PROMETHEUS_MIN_TIME || text == PROMETHEUS_MAX_TIME {
+        return Ok(None);
+    }
+    match text.parse::<f64>() {
+        Ok(seconds) => checked_seconds_to_ms(seconds).map(Some).ok_or_else(|| {
+            BadParameter(format!(
+                "invalid parameter \"{name}\": {text} is not a time the data plane can evaluate at"
+            ))
+        }),
+        Err(_) => rfc3339_ms(text).map(Some).ok_or_else(|| {
+            BadParameter(format!(
+                "invalid parameter \"{name}\": cannot parse {text:?} to a valid timestamp"
+            ))
+        }),
+    }
 }
 
 /// An RFC 3339 time (`2026-11-24T05:00:00Z`, `2026-11-24T05:00:00.25+01:00`)
-/// in milliseconds since the epoch, as Go's `time.RFC3339Nano` layout
-/// parses it: a four-digit year, `T`, up to nine fraction digits.
+/// in milliseconds since the epoch (fraction truncated, as Prometheus
+/// truncates a parsed time), as Go's `time.Parse(time.RFC3339Nano, ..)`
+/// accepts it: a four-digit year, `T`, a one- or two-digit hour, a fraction
+/// of any length after `.` or `,`, and `Z` or a `±hh:mm` offset of at most
+/// 24 hours and 60 minutes.
 fn rfc3339_ms(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
-    let number = |range: std::ops::Range<usize>| -> Option<i64> {
-        let digits = bytes.get(range)?;
-        digits
-            .iter()
-            .all(u8::is_ascii_digit)
-            .then(|| digits.iter().fold(0, |n, d| n * 10 + i64::from(d - b'0')))
-    };
-    let separators = [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':')];
-    if separators.iter().any(|&(at, c)| bytes.get(at) != Some(&c)) {
-        return None;
-    }
-    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
-    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
+    let mut at = 0;
+    let year = digits(bytes, &mut at, 4, 4)?;
+    separator(bytes, &mut at, b'-')?;
+    let month = digits(bytes, &mut at, 2, 2)?;
+    separator(bytes, &mut at, b'-')?;
+    let day = digits(bytes, &mut at, 2, 2)?;
+    separator(bytes, &mut at, b'T')?;
+    let hour = digits(bytes, &mut at, 1, 2)?;
+    separator(bytes, &mut at, b':')?;
+    let minute = digits(bytes, &mut at, 2, 2)?;
+    separator(bytes, &mut at, b':')?;
+    let second = digits(bytes, &mut at, 2, 2)?;
     let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     let days_in_month = match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -203,26 +219,31 @@ fn rfc3339_ms(text: &str) -> Option<i64> {
     if !(1..=days_in_month).contains(&day) || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
-    // Fractional seconds: a dot and one to nine digits.
-    let mut at = 19;
+    // Fractional seconds: `.` or `,` and one or more digits, the first
+    // three kept.
     let mut fraction_ms = 0;
-    if bytes.get(at) == Some(&b'.') {
-        let digits = bytes[at + 1..]
+    if matches!(bytes.get(at), Some(b'.' | b',')) {
+        let count = bytes[at + 1..]
             .iter()
             .take_while(|b| b.is_ascii_digit())
             .count();
-        if !(1..=9).contains(&digits) {
+        if count == 0 {
             return None;
         }
-        let first_three = number(at + 1..at + 1 + digits.min(3))?;
-        fraction_ms = first_three * 10_i64.pow(3 - digits.min(3) as u32);
-        at += 1 + digits;
+        fraction_ms = bytes[at + 1..at + 1 + count.min(3)]
+            .iter()
+            .fold(0, |n, d| n * 10 + i64::from(d - b'0'))
+            * 10_i64.pow(3 - count.min(3) as u32);
+        at += 1 + count;
     }
     let offset_s = match &bytes[at..] {
         b"Z" => 0,
-        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
-            let (hours, minutes) = (number(at + 1..at + 3)?, number(at + 4..at + 6)?);
-            if hours > 23 || minutes > 59 {
+        [sign @ (b'+' | b'-'), h1, h2, b':', m1, m2]
+            if [h1, h2, m1, m2].iter().all(|b| b.is_ascii_digit()) =>
+        {
+            let hours = i64::from((h1 - b'0') * 10 + (h2 - b'0'));
+            let minutes = i64::from((m1 - b'0') * 10 + (m2 - b'0'));
+            if hours > 24 || minutes > 60 {
                 return None;
             }
             let offset = hours * 3600 + minutes * 60;
@@ -245,10 +266,38 @@ fn rfc3339_ms(text: &str) -> Option<i64> {
     Some(seconds * 1000 + fraction_ms)
 }
 
+/// The number in `min..=max` digits at `*at` of `bytes`, moving `*at` past
+/// them.
+fn digits(bytes: &[u8], at: &mut usize, min: usize, max: usize) -> Option<i64> {
+    let count = bytes[*at..]
+        .iter()
+        .take(max)
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    if count < min {
+        return None;
+    }
+    let value = bytes[*at..*at + count]
+        .iter()
+        .fold(0, |n, d| n * 10 + i64::from(d - b'0'));
+    *at += count;
+    Some(value)
+}
+
+/// Byte `c` at `*at` of `bytes`, moving `*at` past it.
+fn separator(bytes: &[u8], at: &mut usize, c: u8) -> Option<()> {
+    (bytes.get(*at) == Some(&c)).then(|| *at += 1)
+}
+
 /// `seconds` in milliseconds, if finite and within [`MAX_TIME_MS`].
+/// As Prometheus: the whole seconds, plus the fraction rounded to the
+/// millisecond (which keeps a sub-millisecond fraction exact at large
+/// times, where `seconds * 1000` would not).
 fn checked_seconds_to_ms(seconds: f64) -> Option<i64> {
-    let ms = (seconds * 1000.0).round();
-    (ms.is_finite() && ms.abs() <= MAX_TIME_MS as f64).then_some(ms as i64)
+    if !seconds.is_finite() || seconds.abs() > (MAX_TIME_MS / 1000) as f64 {
+        return None;
+    }
+    Some(seconds.trunc() as i64 * 1000 + (seconds.fract() * 1000.0).round() as i64)
 }
 
 /// A Prometheus `bad_data` error response body.
@@ -469,7 +518,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    /// Parameters come from the URL or the form body; times are Unix seconds.
+    /// Parameters come from the URL or the form body; `time` is Unix
+    /// seconds or RFC 3339, an empty one is now.
     #[test]
     fn parses_instant_query_parameters() {
         let q = InstantQuery::parse(Some("query=up&time=1.5"), b"")
@@ -486,6 +536,15 @@ mod tests {
             .unwrap();
         assert_eq!(q.time_ms, Some(1_767_225_600_000));
         assert!(InstantQuery::parse(Some("query=up&time=tomorrow"), b"").is_err());
+        let q = InstantQuery::parse(Some("query=up&time="), b"")
+            .unwrap()
+            .unwrap();
+        assert_eq!(q.time_ms, None);
+        // Prometheus' min and max times: forwarded.
+        for time in [PROMETHEUS_MIN_TIME, PROMETHEUS_MAX_TIME] {
+            let url = format!("query=up&time={time}");
+            assert!(InstantQuery::parse(Some(&url), b"").unwrap().is_none());
+        }
         for time in ["-1e300", "1e300", "NaN", "inf"] {
             let url = format!("query=up&time={time}");
             assert!(InstantQuery::parse(Some(&url), b"").is_err(), "{time}");
@@ -528,9 +587,9 @@ mod tests {
         }
     }
 
-    /// RFC 3339 times as Go's `time.RFC3339Nano` reads them, in
-    /// milliseconds since the epoch (fractions truncated, as Prometheus
-    /// truncates a parsed time to the millisecond).
+    /// RFC 3339 times as Go's `time.Parse(time.RFC3339Nano, ..)` accepts
+    /// them, in milliseconds since the epoch (fractions truncated, as
+    /// Prometheus truncates a parsed time to the millisecond).
     #[test]
     fn parses_rfc3339_times() {
         for (text, ms) in [
@@ -543,6 +602,12 @@ mod tests {
             ("2024-02-29T00:00:00Z", 1_709_164_800_000),
             ("1969-12-31T23:59:59.999Z", -1),
             ("0001-01-01T00:00:00Z", -62_135_596_800_000),
+            // Go's lenient forms: a long fraction, a comma, a one-digit
+            // hour, a 24-hour offset.
+            ("2026-11-24T05:00:00.1234567890123Z", 1_795_496_400_123),
+            ("2026-11-24T05:00:00,5Z", 1_795_496_400_500),
+            ("2026-11-24T5:00:00Z", 1_795_496_400_000),
+            ("2026-11-25T05:00:00+24:00", 1_795_496_400_000),
         ] {
             assert_eq!(rfc3339_ms(text), Some(ms), "{text}");
         }
@@ -551,23 +616,28 @@ mod tests {
             "2026-11-24t05:00:00Z",
             "2026-11-24 05:00:00Z",
             "2026-11-24T05:00:00.Z",
-            "2026-11-24T05:00:00.1234567890Z",
             "2026-11-24T05:00Z",
             "2023-02-29T00:00:00Z",
             "2026-04-31T00:00:00Z",
             "2026-11-24T05:00:60Z",
             "2026-11-24T05:00:00+0100",
-            "2026-11-24T05:00:00+24:00",
+            "2026-11-24T05:00:00+25:00",
+            "2026-11-24T05:00:00+01:61",
             "+2026-11-24T05:00:00Z",
             "2026-11-24T05:00:00Z ",
         ] {
             assert_eq!(rfc3339_ms(text), None, "{text}");
         }
         assert_eq!(
-            parse_time_ms("time", "x").unwrap_err(),
+            parse_time_ms("time", "x").unwrap_err().0,
             "invalid parameter \"time\": cannot parse \"x\" to a valid timestamp"
         );
-        assert_eq!(parse_time_ms("end", "1.0015"), Ok(1_002));
+        assert_eq!(parse_time_ms("end", "1.0015"), Ok(Some(1_002)));
+        // The fraction rounded on its own, as Prometheus rounds it.
+        assert_eq!(
+            parse_time_ms("time", "1763408220.0665"),
+            Ok(Some(1_763_408_220_066))
+        );
     }
 
     /// Range results use Prometheus' matrix shape: one entry per series

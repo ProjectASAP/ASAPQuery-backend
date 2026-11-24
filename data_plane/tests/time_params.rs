@@ -193,7 +193,6 @@ async fn times_in_neither_form_are_refused_as_prometheus_refuses_them() {
     write(&app, 60).await;
     for bad in [
         "yesterday",
-        "",
         "1970-01-01T00:02:00",
         "1970-01-01 00:02:00Z",
         "1970-13-01T00:00:00Z",
@@ -221,5 +220,34 @@ async fn times_in_neither_form_are_refused_as_prometheus_refuses_them() {
                 format!("invalid parameter \"{name}\": cannot parse {bad:?} to a valid timestamp"),
             );
         }
+    }
+    // An empty `start` or `end` is refused too; an empty `time` is now.
+    for name in ["start", "end"] {
+        let mut params = vec![("start", "0"), ("end", "60"), ("step", "10")];
+        params.retain(|(n, _)| *n != name);
+        params.push((name, ""));
+        let (status, _, body) = get(&app, "query_range", &params).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}=\"\": {body}");
+    }
+    let (status, _, body) = get(&app, "query", &[("time", "")]).await;
+    assert_ne!(status, StatusCode::BAD_REQUEST, "time=\"\": {body}");
+}
+
+/// Prometheus' min and max times ("no bound") are valid times the plan
+/// does not evaluate at: forwarded, so refused here without forwarding,
+/// not rejected as unparsable.
+#[tokio::test(flavor = "multi_thread")]
+async fn prometheus_min_and_max_times_are_not_answered_from_the_plan() {
+    let app = data_plane();
+    write(&app, 60).await;
+    for time in [
+        "-292273086-05-16T16:47:06Z",
+        "292277025-08-17T07:12:55.999999999Z",
+    ] {
+        let (status, from_plan, body) = get(&app, "query", &[("time", time)]).await;
+        assert!(
+            status != StatusCode::BAD_REQUEST && !from_plan,
+            "{time}: {status} {body}"
+        );
     }
 }
