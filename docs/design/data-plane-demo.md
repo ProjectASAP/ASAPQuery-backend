@@ -258,6 +258,12 @@ HTTP queries ─► query workers: one query run per worker thread over
     level) needs those chains' windows back 21 min. A reader of a group
     that still skipped further skips as far, to its own next boundary, so
     it never builds a window from windows never built.
+- Push precompute is the default (`--precompute-mode push`): each ingest
+  shard folds its samples into the open windows' pipelines as they arrive,
+  and a window's shard partials are combined and committed at its close
+  ([parallel-precompute.md](parallel-precompute.md)). Groups that cannot
+  be pushed, and every group under `--precompute-mode window`, run on the
+  precompute task pool below.
 - Precompute task pool (`--precompute-threads`, default a quarter of the
   cores, 1 to 4). Each closed refresh window is a task. Windows of
   different refresh groups compute in parallel, and so do consecutive

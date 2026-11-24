@@ -1,6 +1,6 @@
 # Data plane and demo plan
 
-This document describes the data plane as it stands on this branch and the
+This document describes the data plane as it stands on `main` and the
 plan for the single-server demo against VictoriaMetrics. The component
 designs it summarises are in `data-plane-demo.md` (ingest, precompute,
 queries), `parallel-precompute.md` (push pipelines) and
@@ -274,7 +274,7 @@ each query's latency (p50/p99) and error; and whether ingestion keeps up
 
 ## 10. Results so far and next steps
 
-Candidate backend: this branch at 60ae5ada (ASAPPlanner 846a70a,
+Candidate backend: the pre-merge branch at 60ae5ada (ASAPPlanner 846a70a,
 asap_sketchlib 355093f). All data plane tests and the parity test pass.
 
 Results at 10k series and 10 Hz, 12 cores, each engine alone:
@@ -290,8 +290,8 @@ Results at 10k series and 10 Hz, 12 cores, each engine alone:
 
 - Accuracy: every verified point is within 5%; rate and increase match the
   Prometheus truth exactly; counter resets are handled; ten complex queries
-  are all exact and 4–15× faster than VictoriaMetrics. The ASAP-alone run at
-  60ae5ada still needs a run with a VictoriaMetrics arm to verify accuracy.
+  are all exact and 4–15× faster than VictoriaMetrics. The ASAP-alone run on
+  the pre-merge branch at 60ae5ada still needs a run with a VictoriaMetrics arm to verify accuracy.
 - VictoriaMetrics fails in two ways: under instant-query load from two or
   three users its ingestion falls minutes behind and its answers go stale;
   under range load it rejects most queries with 429.

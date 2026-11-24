@@ -145,7 +145,6 @@ Non-goals:
 - **Risks and costs?** Shard threads now do the view work. A hot series is
   bounded by one core. Grouped and global partials multiply open-window
   state by the shard count.
-- **How long?** About 5 days after the test plan is approved.
 - **Checks?** Midterm: parity at 1, 2, 4 and 8 shards. Final: B1 and B2
   against the window path at 1k, 10k and 100k series.
 
@@ -354,7 +353,7 @@ guessed.
     window path reads from the shards' raw data.
   - Idle shards answer the flush at once and seal empty, so they never
     hold the watermark or a window back.
-- **Chunked seal (D5).** Emitting a shard's states for a large group is
+- **Chunked seal (D5; T16, not yet implemented).** Emitting a shard's states for a large group is
   split into chunks of a bounded time (target about 2 ms; E5 sets it).
   Ingest requests run between the chunks, so close work does not stall
   ingestion.
@@ -784,15 +783,11 @@ overturns it.
   - **Scaling.** Per-thread rates held to 16 cores in the series-hash arm.
   - **Short windows.** A source with 1 s windows needs more than one
     thread at 100k series: 5 views take 1.34 s per 1 s window.
-- **Conclusion:** *provisional* (b). Combine runs on the window-task pool,
-  so no new pool and no `--precompute-threads` flag. (c) only if E1 shows
-  per-source rates differ widely within one deployment. Push becomes the
-  default mode when:
-  - parity passes on every workload, and
-  - E1 and B1 show higher sustained samples/s and lower newest-window
-    commit lag than the window path at 1k and 10k series.
-
-  The window mode stays behind `--precompute-mode=window`.
+- **Conclusion:** (b). Combine runs on the window-task pool, so no new
+  pool and no `--precompute-threads` flag. (c) only if E1 shows per-source
+  rates differ widely within one deployment. Push became the default mode
+  after parity passed on every workload and the demo A/B. The window mode
+  stays behind `--precompute-mode=window`.
 
 ### D10. Planner memory term
 
@@ -946,7 +941,7 @@ cores.
   10 samples/s (about 342k samples/s routed to views, 4 paced feeders, Zipf
   values), every query from the stream start, 4 query users, 2 s allowed
   lateness, view files on.
-- **Hosts.** Two hosts of the same model (2 × 10-core E5-2660 v2, 40
+- **Hosts.** Two hosts of the same model (2 × 10-core x86 CPUs, 40
   threads), one arm each, started at the same aligned stream start. The
   engine is pinned to 20 CPUs (10 cores and their hyperthreads) in a cgroup
   of 20 cores and 100 GiB; feeders and the query client use the other 20.
@@ -1027,7 +1022,7 @@ default (D9); `--precompute-mode window` keeps the window path.
 | Views of one source | inline on the shard thread (D2) | a thread per view or per pipeline (cache locality; buffered fan-out cost) |
 | Partition key | today's series routing (D3) | vnodes (no per-shard state persists); round-robin for series-affine state |
 | Non-mergeable | single partition, listed for ordered-merge (D4) | exchange now |
-| Close work | fold on arrival, chunked seal (D5) | compute at close |
+| Close work | fold on arrival, chunked seal (D5; T16, not yet implemented) | compute at close |
 | Idle shards | flush-gated watermark, every shard seals every window (D6) | min over shards with idleness timeouts |
 | Views over views | post-commit task (D7) | push sealed partials into coarse instances |
 | Memory | reserve, then backpressure, no spill (D8) | a separate limit per instance |
@@ -1048,11 +1043,10 @@ default (D9); `--precompute-mode window` keeps the window path.
 - **Debuggability:** the install log and status show each breaker's rule.
   A failed window names its group, window and shard.
 
-## Acceptance and test design (for approval)
+## Acceptance and test design
 
 Each test states the behavior it verifies, its inputs, the expected
-result, and whether it fails today. Tests are written after this plan is
-approved and before the implementation. "Fails today" means the test fails
+result, and whether it fails today. "Fails today" means the test fails
 or cannot be built against the current data plane. A guard ("passes
 today") protects a property the window path has by construction and the
 push path could break. K is the ingest shard count (`--ingest-threads`).
@@ -1092,20 +1086,17 @@ plan is requested in the PR, not claimed.
 
 | Day | Work |
 | --- | --- |
-| 0 | T1–T19 and B1–B2, failing (after approval) |
+| 0 | T1–T19 and B1–B2, failing |
 | 1 | Rule table and install refusal (T7); per-instance channel store; instances and push on the shards |
-| 2 | Seal in the flush; chunked seal; combine (concatenate, merge, single partition) on the window-task pool |
+| 2 | Seal in the flush; chunked seal (T16, not yet implemented); combine (concatenate, merge, single partition) on the window-task pool |
 | 3 | Committer reorder buffer; pipelines above breakers; post-commit groups; window-path routing for groups that cannot be pushed |
 | 4 | Reservations and backpressure; late-data counter; metrics; failure paths |
 | 5 | Parity at K = 1–8; B1, B2; fixes |
 
 ## Risks, rollout, and exit criteria
 
-- **Rollout.** Push becomes the default by the D9 rule.
-  `--precompute-mode=window` stays for one release.
-- **Exit.** If B1 shows no gain at 10k series, the default stays window
-  mode and the profile is reported. The per-sample path (append plus
-  per-batch fold) is then the next target.
+- **Rollout.** Push is the data_plane default; `--precompute-mode window`
+  stays for one release.
 - **Shard threads now do view work.** Heavy views slow ingestion on every
   shard. `precompute_push` shows it.
 - **Hot series.** One series is bounded by one core (D3).

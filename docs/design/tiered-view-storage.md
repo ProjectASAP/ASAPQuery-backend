@@ -344,7 +344,7 @@ and leave the cache, so the hot set shrinks by about the same factor as
 the merges, and cold reads stay rare. Nothing in this design depends on
 levels: each level is its own view, tiered the same way.
 
-### Zero-copy state views (revision, for approval)
+### Zero-copy state views
 
 **Why.** Decoding a cold window rebuilds every state on the heap. The
 implementation measured so far (sketch states rebuilt from their mapped
@@ -586,8 +586,8 @@ state. The row-wise MessagePack encoding is bloated for exact states
 (140 B for a 48 B counter state plus a 4 B identity index), which is why
 version 2 is columnar.
 
-**Expected after tiering** (derived from the numbers above, to be measured
-by B1 and B2):
+**Expected after tiering** (estimated before implementation, from the
+numbers above):
 
 | Setting | Heap for views | Page cache (reclaimable) | Query cost |
 | --- | --- | --- | --- |
@@ -643,7 +643,7 @@ here changes the Planner.
 | Shrink decoded states instead | complementary, not instead | compact sealed KLL, shared identity columns and smaller exact states cut the hot bytes about 4x (memory investigation), but they stay unreclaimable and still grow with retention; tiering bounds them. Both are wanted |
 | Budget source | cgroup `memory.max` minus bounded pools, plus a 1 s monitor | a fixed default (wrong on every host); `memory.high` throttling alone (slows the whole process, including ingest) |
 
-### Decided at review
+### Decisions
 
 - **Read path:** `mmap` of sealed segments with in-place decoding;
   `pread` only for the active segment and as a fallback option. B3 still
@@ -652,20 +652,19 @@ here changes the Planner.
 - **Fragment encoding:** columnar, with format version 2.
 - **No cgroup limit:** no budget, plus idle eviction.
 - **Old view files:** renamed `*.stale`.
-- **Revision (pending approval):** states are used from the mapping
+- **Zero-copy revision:** states are used from the mapping
   through read-only views (section "Zero-copy state views"), with
   decode-to-owned only for the families listed there.
 
-## Acceptance and test design (for approval)
+## Acceptance and test design
 
 Each test states what it verifies, its inputs, the expected result, and
 whether it fails today ("fails today" means it fails or cannot be built).
-The tests were written after this plan was approved and before the
-implementation; they fail until it lands. Unless a row says otherwise, tiering is compared with the
+The tests were written before the implementation. Unless a row says otherwise, tiering is compared with the
 same build with tiering off (`--view-cache-max-bytes` unbounded and
 `--view-cache-idle-ms 0`, which keeps every window hot).
 
-| # | Behavior verified | Inputs | Expected | Today |
+| # | Behavior verified | Inputs | Expected | Before this design |
 | --- | --- | --- | --- | --- |
 | V1 | Answers are identical with tiering on and off. | All parity workloads (`tests/workloads/`), raw data kept and not kept, ingest shards 1, 4 and 8 (`PARITY_INGEST_THREADS`), instant and range queries; tiering with a budget of zero (every read cold). | Equal to the Planner executor and to tiering off. KLL plans within the existing 5 %, as today. | Fails: no tiering options. |
 | V2 (revised) | Every family answers identically from a mapped view and from an owned state. | Per view family (DDSketch, KLL, Count-Min, Count Sketch, HLL, KMV, exact Sum/Count/Min/Max, Counter, IRate): states written to a fragment, sealed, then read as views: each estimate or finalize, and `merge_into` of 1, 2 and 240 views into one accumulator, against the same on owned states. Fallback families (heap variants, UnivMon, Hydra) through decode-to-owned. | Equal answers (KLL: equal, since the same items merge in the same order into the same seeded accumulator); accumulators equal by bytes. | Fails: no view types. |
@@ -715,7 +714,7 @@ PR.
 
 | Step | Work |
 | --- | --- |
-| 0 | V1–V17 and B1–B3, failing (after approval) |
+| 0 | V1–V17 and B1–B3, failing |
 | 1 | Record v2 and segments: writer, scanner, per-segment dictionary, roll and delete (V2, V3, V9, V12, V13) |
 | 2 | Window states and persist acks; startup index without decode (V7, V8, V11) |
 | 3 | Window cache: CLOCK, idle time, budget, single flight; lazy cold reads in `read_materialized_view` (V4–V6, V10) |
@@ -733,8 +732,8 @@ PR.
   cgroup.
 - **Recency is not the plan's schedule.** A reader with a long interval
   (a 1 h range every 5 min) may find its windows evicted between
-  evaluations. The idle time defaults to twice the longest reader interval
-  for that reason; B2 reports the hit ratio.
+  evaluations. The idle time defaults to 60 s (four 15 s dashboard
+  refreshes) for that reason; B2 reports the hit ratio.
 - **Budget estimate.** Bytes per window come from `Batch` accounting,
   which is about 10 % below the allocator's (KLL: 872 B counted vs 964 B
   allocated); the monitor is the backstop.
