@@ -129,6 +129,9 @@ pub type ViewIndex = BTreeMap<PhysicalASAPNodeId, Vec<((i64, i64), WindowLocatio
 struct ActiveSegment {
     segment: Arc<Segment>,
     texts: HashMap<Arc<str>, u32>,
+    /// The labels of each series identity its records held, looked up once
+    /// per segment ([`SegmentTexts::identity_labels`]).
+    labels_by_identity: crate::segment::LabelsByIdentity,
     /// The start of its first window: it rolls once a window starts
     /// `segment_ms` or more after it.
     first_start_ms: i64,
@@ -420,6 +423,7 @@ impl ViewFiles {
             files.active = Some(ActiveSegment {
                 segment: Segment::create(&path, &header)?,
                 texts: HashMap::new(),
+                labels_by_identity: HashMap::new(),
                 first_start_ms: start_ms,
             });
             written.bytes += files.active.as_ref().expect("set").segment.len();
@@ -427,6 +431,7 @@ impl ViewFiles {
         let active = files.active.as_mut().expect("set");
         let mut texts = SegmentTexts {
             known: &active.texts,
+            labels_by_identity: &mut active.labels_by_identity,
             base: active.segment.text_count() as u32,
             new: Vec::new(),
             new_index: HashMap::new(),

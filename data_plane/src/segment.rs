@@ -762,7 +762,14 @@ pub(crate) struct SegmentTexts<'a> {
     pub base: u32,
     pub new: Vec<Arc<str>>,
     pub new_index: HashMap<Arc<str>, u32>,
+    /// The labels of each series identity the segment's records held, by
+    /// identity text: looked up in the interner once per segment, not once
+    /// per row of every window.
+    pub labels_by_identity: &'a mut LabelsByIdentity,
 }
+
+/// Per series identity text, its labels (`None`: no label set's JSON).
+pub(crate) type LabelsByIdentity = HashMap<Arc<str>, Option<Arc<BTreeMap<String, String>>>>;
 
 impl SegmentTexts<'_> {
     fn key(&mut self, text: &Arc<str>) -> u32 {
@@ -773,6 +780,18 @@ impl SegmentTexts<'_> {
         self.new.push(text.clone());
         self.new_index.insert(text.clone(), key);
         key
+    }
+
+    /// The labels of the series whose identity text is `identity`
+    /// ([`labels_of_identity`]), cached for the segment.
+    fn identity_labels(&mut self, identity: &Arc<str>) -> Option<Arc<BTreeMap<String, String>>> {
+        if let Some(labels) = self.labels_by_identity.get(identity) {
+            return labels.clone();
+        }
+        let labels = labels_of_identity(identity);
+        self.labels_by_identity
+            .insert(identity.clone(), labels.clone());
+        labels
     }
 
     /// Drops the new texts after the first `mark` (a fragment left out).
@@ -819,7 +838,7 @@ pub(crate) fn encode_fragment(
     out.extend_from_slice(&(columns as u32).to_le_bytes());
     let descriptors_at = out.len();
     out.resize(descriptors_at + columns * DESCRIPTOR_BYTES, 0);
-    let identity_labels = IdentityLabels::of(schema, rows);
+    let identity_labels = IdentityLabels::of(schema, rows, texts);
     for (column, field) in schema.fields.iter().enumerate() {
         let values = rows.iter().map(|row| &row[column]);
         let nulls: Vec<bool> = rows
@@ -963,7 +982,7 @@ struct IdentityLabels {
 impl IdentityLabels {
     /// `None` when there are no rows, or `schema` has no series identity
     /// text column or no other text column.
-    fn of(schema: &Schema, rows: &[Vec<Value>]) -> Option<Self> {
+    fn of(schema: &Schema, rows: &[Vec<Value>], texts: &mut SegmentTexts) -> Option<Self> {
         if rows.is_empty() {
             return None;
         }
@@ -983,7 +1002,7 @@ impl IdentityLabels {
         let by_row = rows
             .iter()
             .map(|row| match &row[column] {
-                Value::Utf8(identity) => labels_of_identity(identity),
+                Value::Utf8(identity) => texts.identity_labels(identity),
                 _ => None,
             })
             .collect();
