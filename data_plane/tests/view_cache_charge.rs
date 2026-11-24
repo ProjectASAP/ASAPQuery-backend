@@ -2,8 +2,10 @@
 //! what it holds in memory, the same as when it was written: its own
 //! columns and states, not the segment's text dictionary its text columns
 //! share with every other window of the segment. That dictionary is
-//! counted once per segment in the view bytes. Measured with a counting
-//! global allocator (one test per binary, so no other test allocates).
+//! counted once per segment in the view bytes, as is each older one a
+//! window still holds after the active segment's dictionary grew.
+//! Measured with a counting global allocator (one test per binary, so no
+//! other test allocates).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,7 +17,7 @@ use asap_executor::planner::plan::materialized_view::MaterializedView;
 use asap_executor::values::{Batch, Value};
 use data_plane::persist::{ViewFiles, ViewRead};
 use data_plane::store::{ViewStore, ViewTier};
-use data_plane::window_cache::WindowCache;
+use data_plane::window_cache::{WindowCache, WindowKey};
 
 /// Counts the bytes allocated now.
 struct Counting;
@@ -72,8 +74,9 @@ fn schema() -> Arc<Schema> {
     ))
 }
 
-fn window(end_ms: i64) -> Batch {
-    let rows = (0..SERIES)
+/// `series` series of the view's window ending `end_ms`.
+fn window(end_ms: i64, series: usize) -> Batch {
+    let rows = (0..series)
         .map(|s| {
             let (job, region, service) = (s % 200, s % 4, s % 20);
             vec![
@@ -94,28 +97,53 @@ fn window(end_ms: i64) -> Batch {
     Batch::try_new(schema(), rows).unwrap()
 }
 
-#[test]
-fn a_read_back_window_is_charged_what_it_holds() {
-    let dir = std::env::temp_dir().join(format!("view_cache_charge-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let view: MaterializedView = serde_json::from_value(serde_json::json!({
+fn view() -> MaterializedView {
+    serde_json::from_value(serde_json::json!({
         "node_id": VIEW,
         "refresh": "on_first_read",
         "coverage": {"definition_id": "test-view", "selection": []},
         "inputs": {"materialized_views": []},
         "retention_ms": 1_000_000,
     }))
-    .unwrap();
+    .unwrap()
+}
+
+/// The heap bytes `read` leaves allocated, and how much the view bytes
+/// grew over it.
+fn held_by(views: &ViewStore, read: impl FnOnce()) -> (usize, usize) {
+    let view_bytes_before = views.bytes();
+    let heap_before = CURRENT.load(Ordering::Relaxed);
+    read();
+    let heap_held = CURRENT.load(Ordering::Relaxed).saturating_sub(heap_before);
+    (heap_held, views.bytes() - view_bytes_before)
+}
+
+fn assert_close(what: &str, a: u64, b: u64) {
+    let ratio = a as f64 / b as f64;
+    assert!((0.8..=1.25).contains(&ratio), "{what}: {a} B vs {b} B");
+}
+
+/// Writes `WINDOWS` windows of `SERIES` series, seals the segment, drops
+/// them from the cache and reads them back `how`; checks each read-back
+/// window is charged what it was when written and, for `pread` (where
+/// every byte read is on the heap), that the view bytes grow by what the
+/// read holds.
+fn sealed_windows_read_back(how: ViewRead) {
+    let dir = std::env::temp_dir().join(format!("view_cache_charge-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let view = view();
     let tier = Arc::new(ViewTier::new(
         WindowCache::new(None, None),
-        ViewRead::Pread,
+        how,
         Duration::ZERO,
     ));
     let mut views = ViewStore::tiered(tier.clone());
     let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
     for w in 1..=WINDOWS {
         let range = ((w - 1) * WIDTH_MS, w * WIDTH_MS);
-        views.append(&view, range, vec![window(range.1)]).unwrap();
+        views
+            .append(&view, range, vec![window(range.1, SERIES)])
+            .unwrap();
         let slot = views.slot(VIEW, range.1).unwrap();
         let batches = views.rows()[&VIEW].last().unwrap().1.clone();
         let written = files.append(0, range, &[(VIEW, &batches)]).unwrap();
@@ -129,12 +157,9 @@ fn a_read_back_window_is_charged_what_it_holds() {
     tier.cache.set_target_bytes(Some(0));
     tier.cache.set_target_bytes(None);
     assert_eq!(tier.cache.stats().bytes, 0);
-    let view_bytes_before = views.bytes();
-    let heap_before = CURRENT.load(Ordering::Relaxed);
-    let read_back = views.rows();
-    let heap_held = CURRENT.load(Ordering::Relaxed) - heap_before;
-    let view_bytes_added = views.bytes() - view_bytes_before;
-    assert_eq!(read_back[&VIEW].len(), WINDOWS as usize);
+    let (heap_held, view_bytes_added) = held_by(&views, || {
+        assert_eq!(views.rows()[&VIEW].len(), WINDOWS as usize);
+    });
     let stats = tier.cache.stats();
     assert_eq!(
         (stats.entries, stats.loads),
@@ -142,25 +167,81 @@ fn a_read_back_window_is_charged_what_it_holds() {
     );
     let read_back_charge = stats.bytes / WINDOWS as u64;
     println!(
-        "per window: written charge {written_charge} B, read-back charge {read_back_charge} B; \
-         {WINDOWS} windows read back: heap held {heap_held} B, view bytes added {view_bytes_added} B"
+        "{how:?}, sealed: per window, written charge {written_charge} B, read-back charge \
+         {read_back_charge} B; {WINDOWS} windows read back: heap held {heap_held} B, view \
+         bytes added {view_bytes_added} B"
     );
-
-    // The read-back window is charged what the written one was: the same
-    // rows, keys and values (its keys index a larger dictionary, the
-    // segment's, which is not the window's own).
-    let ratio = read_back_charge as f64 / written_charge as f64;
-    assert!(
-        (0.8..=1.25).contains(&ratio),
-        "read-back charge {read_back_charge} B vs written charge {written_charge} B per window"
+    // The same rows, keys and values: its keys index a larger dictionary,
+    // the segment's, which is not the window's own.
+    assert_close(
+        &format!("{how:?}: read-back vs written charge per window"),
+        read_back_charge,
+        written_charge,
     );
-    // The view bytes grow by what the read actually holds: the windows
-    // and one dictionary for the segment.
-    let ratio = view_bytes_added as f64 / heap_held as f64;
-    assert!(
-        (0.8..=1.25).contains(&ratio),
-        "view bytes grew {view_bytes_added} B; the read holds {heap_held} B on the heap"
-    );
-    drop(read_back);
+    // A mapped read borrows the fixed-width columns from the file's pages
+    // (charged, not on the heap).
+    if how == ViewRead::Pread {
+        assert_close(
+            "view bytes added vs heap held",
+            view_bytes_added as u64,
+            heap_held as u64,
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Reads back each window from the active segment right after writing it,
+/// each with series new to the segment: each read rebuilds the segment's
+/// dictionary, and the cached windows keep the older ones alive. The view
+/// bytes count every dictionary still held, once.
+fn active_windows_read_back_while_the_dictionary_grows() {
+    let dir = std::env::temp_dir().join(format!("view_cache_grow-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let view = view();
+    let tier = Arc::new(ViewTier::new(
+        WindowCache::new(None, None),
+        ViewRead::Mmap,
+        Duration::ZERO,
+    ));
+    let mut views = ViewStore::tiered(tier.clone());
+    let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
+    let (mut heap_held, mut view_bytes_added) = (0, 0);
+    for w in 1..=WINDOWS {
+        let range = ((w - 1) * WIDTH_MS, w * WIDTH_MS);
+        let series = SERIES + w as usize * 100;
+        views
+            .append(&view, range, vec![window(range.1, series)])
+            .unwrap();
+        let slot = views.slot(VIEW, range.1).unwrap();
+        let batches = views.rows()[&VIEW].last().unwrap().1.clone();
+        let written = files.append(0, range, &[(VIEW, &batches)]).unwrap();
+        slot.stored(written.locations[0].1.clone());
+        tier.cache.remove(WindowKey {
+            view: VIEW,
+            end_ms: range.1,
+        });
+        let (heap, added) = held_by(&views, || {
+            views.rows();
+        });
+        heap_held += heap;
+        view_bytes_added += added;
+    }
+    assert_eq!(tier.cache.stats().loads, WINDOWS as u64);
+    println!(
+        "active segment, growing: {WINDOWS} windows read back: heap held {heap_held} B, view \
+         bytes added {view_bytes_added} B"
+    );
+    assert_close(
+        "view bytes added vs heap held",
+        view_bytes_added as u64,
+        heap_held as u64,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_read_back_window_is_charged_what_it_holds() {
+    sealed_windows_read_back(ViewRead::Pread);
+    sealed_windows_read_back(ViewRead::Mmap);
+    active_windows_read_back_while_the_dictionary_grows();
 }

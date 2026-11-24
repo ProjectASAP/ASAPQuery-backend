@@ -19,7 +19,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use asap_executor::arrow::array::{
     Array, ArrayRef, DictionaryArray, PrimitiveArray, StringArray, UInt32Array,
@@ -175,6 +175,9 @@ pub struct Segment {
     /// The texts as one Arrow array, shared by every window read from the
     /// segment; rebuilt when texts were added since.
     dictionary: Mutex<Option<ArrayRef>>,
+    /// Every text dictionary built, the current one and those a window
+    /// read before a rebuild may still hold, to count each live one once.
+    dictionaries_built: Mutex<Vec<Weak<dyn Array>>>,
     /// The newest window end of its records.
     max_end_ms: AtomicI64,
 }
@@ -235,6 +238,7 @@ impl Segment {
             mapping: OnceLock::new(),
             texts: RwLock::new(Vec::new()),
             dictionary: Mutex::new(None),
+            dictionaries_built: Mutex::default(),
             max_end_ms: AtomicI64::new(i64::MIN),
         }))
     }
@@ -309,6 +313,7 @@ impl Segment {
                 mapping: OnceLock::new(),
                 texts: RwLock::new(texts),
                 dictionary: Mutex::new(None),
+                dictionaries_built: Mutex::default(),
                 max_end_ms: AtomicI64::new(max_end_ms),
             }),
             heads,
@@ -454,14 +459,21 @@ impl Segment {
             .map_err(|e| Error::Invalid(format!("mapping {}: {e}", self.path.display())))
     }
 
-    /// Bytes of its text dictionary, once built: one array shared by every
-    /// window read from the segment, so counted once for the segment.
-    fn dictionary_bytes(&self) -> usize {
-        self.dictionary
+    /// Bytes of its text dictionaries still in memory: each is one array
+    /// shared by the windows read from the segment while it was current,
+    /// so it is counted once for the segment. Several only while the
+    /// active segment's dictionary grew under a window still held.
+    pub(crate) fn dictionary_bytes(&self) -> usize {
+        let mut built = self
+            .dictionaries_built
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .map_or(0, |values| values.get_array_memory_size())
+            .unwrap_or_else(|e| e.into_inner());
+        built.retain(|dictionary| dictionary.strong_count() > 0);
+        built
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|dictionary| dictionary.get_array_memory_size())
+            .sum()
     }
 
     /// The texts with keys below `needed`, as one array shared by the
@@ -480,6 +492,10 @@ impl Segment {
         }
         let values: ArrayRef = Arc::new(StringArray::from_iter_values(texts.iter().map(|t| &**t)));
         *dictionary = Some(values.clone());
+        self.dictionaries_built
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::downgrade(&values));
         Ok(values)
     }
 }
@@ -610,6 +626,18 @@ impl WindowLocation {
 
     /// The fragment's rows as one batch of `schema`.
     pub fn read(&self, schema: &SchemaRef, how: ViewRead) -> Result<Batch, Error> {
+        self.read_counted(schema, how).map(|(batch, _)| batch)
+    }
+
+    /// [`Self::read`], with the bytes of its state columns read in the
+    /// executor's mapped layout, which [`Batch::memory_bytes`] does not
+    /// count (`StateColumn::from_mapped`): borrowed from the mapping, or
+    /// copied to the heap by `pread`.
+    pub(crate) fn read_counted(
+        &self,
+        schema: &SchemaRef,
+        how: ViewRead,
+    ) -> Result<(Batch, usize), Error> {
         let grids: Vec<Option<Arc<HydraCms>>> = if self.grids.1 == 0 {
             Vec::new()
         } else {
@@ -628,14 +656,9 @@ impl WindowLocation {
         decode_fragment(&bytes, schema, &self.segment, &grids)
     }
 
-    /// Its segment's text dictionary, which every window read from the
-    /// segment shares: the segment's address (to count it once) and the
-    /// dictionary's bytes (0 until a window of the segment is read).
-    pub(crate) fn segment_dictionary(&self) -> (usize, usize) {
-        (
-            Arc::as_ptr(&self.segment) as usize,
-            self.segment.dictionary_bytes(),
-        )
+    /// The segment holding the fragment.
+    pub(crate) fn segment(&self) -> &Arc<Segment> {
+        &self.segment
     }
 
     /// The fragment's length, for counting bytes read.
@@ -898,13 +921,14 @@ fn primitive<T: ArrowPrimitiveType>(
     PrimitiveArray::<T>::try_new(values, nulls).map_err(|e| Error::Invalid(e.to_string()))
 }
 
-/// The fragment in `source` as one batch of `schema`.
+/// The fragment in `source` as one batch of `schema`, and the bytes of its
+/// mapped state columns ([`WindowLocation::read_counted`]).
 fn decode_fragment(
     source: &Bytes,
     schema: &SchemaRef,
     segment: &Segment,
     grids: &[Option<Arc<HydraCms>>],
-) -> Result<Batch, Error> {
+) -> Result<(Batch, usize), Error> {
     let bytes = source.slice();
     let header = word(bytes, 0)?;
     let rows = (header & 0xffff_ffff) as usize;
@@ -915,6 +939,7 @@ fn decode_fragment(
     // The Arrow layout of each plain column, as the executor builds it.
     let empty = Batch::try_new(schema.clone(), Vec::new())?;
     let mut out = Vec::with_capacity(columns);
+    let mut mapped_state_bytes = 0;
     for (column, field) in schema.fields.iter().enumerate() {
         let at = 8 + column * DESCRIPTOR_BYTES;
         let kind_flags = word(bytes, at)?;
@@ -987,6 +1012,7 @@ fn decode_fragment(
                 if data.1 != (rows + 1) * 4 {
                     return Err(damaged());
                 }
+                mapped_state_bytes += data.1 + valid.1;
                 let offsets =
                     ScalarBuffer::<u32>::new(buffer(source, data.0, data.1)?, 0, rows + 1);
                 let states = buffer(source, valid.0, valid.1)?;
@@ -1063,7 +1089,10 @@ fn decode_fragment(
         }
         out.push(BatchColumn::Plain(array));
     }
-    Batch::try_from_columns(schema.clone(), out)
+    Ok((
+        Batch::try_from_columns(schema.clone(), out)?,
+        mapped_state_bytes,
+    ))
 }
 
 /// `rows` of one column `field` built by the executor: its array, and its

@@ -737,9 +737,10 @@ enum SlotState {
 pub struct WindowSlot {
     key: WindowKey,
     schema: SchemaRef,
-    /// Its rows' bytes when decoded, counted when appended (a run that
+    /// Its charge when appended ([`window_batch_bytes`]: its buffers and
+    /// states, less the view's shared texts), kept although a run that
     /// later reads its states marks them held outside the run, after which
-    /// [`Batch::memory_bytes`] no longer counts them).
+    /// [`Batch::memory_bytes`] no longer counts them.
     bytes: u64,
     /// Its state, and whether the window left the store (past retention).
     state: Mutex<(SlotState, bool)>,
@@ -806,17 +807,6 @@ impl WindowSlot {
         }
     }
 
-    /// What it holds in memory outside the cache.
-    fn resident(&self) -> Resident {
-        match &self.lock().0 {
-            SlotState::Pending(_) | SlotState::Pinned(_) => Resident::Batches(self.bytes),
-            SlotState::Stored(location) => {
-                let (segment, bytes) = location.segment_dictionary();
-                Resident::SegmentDictionary { segment, bytes }
-            }
-        }
-    }
-
     /// The window's batches: from memory, the cache, or its fragment.
     fn batches(&self) -> Result<Arc<Vec<Batch>>, Error> {
         let location = match &self.lock().0 {
@@ -833,30 +823,22 @@ impl WindowSlot {
                     std::thread::sleep(tier.decode_delay);
                 }
                 let timer = Timer::start();
-                let batch = location.read(&self.schema, tier.read).map_err(|error| {
-                    Error::Invalid(format!(
-                        "materialized view {} window ending {}: {error}",
-                        self.key.view, self.key.end_ms
-                    ))
-                })?;
+                let (batch, mapped_state_bytes) = location
+                    .read_counted(&self.schema, tier.read)
+                    .map_err(|error| {
+                        Error::Invalid(format!(
+                            "materialized view {} window ending {}: {error}",
+                            self.key.view, self.key.end_ms
+                        ))
+                    })?;
                 tier.decode.record(timer);
                 tier.cold_reads.fetch_add(1, Ordering::Relaxed);
                 tier.cold_read_bytes
                     .fetch_add(location.read_bytes(), Ordering::Relaxed);
-                let bytes = window_batch_bytes(&batch) as u64;
+                let bytes = (window_batch_bytes(&batch) + mapped_state_bytes) as u64;
                 Ok((Arc::new(vec![batch]), bytes))
             })
     }
-}
-
-/// What a window holds in memory outside the window cache.
-enum Resident {
-    /// Its batches (`Pending` or `Pinned`), of these bytes.
-    Batches(u64),
-    /// Nothing of its own (`Stored`: cached or not, the cache counts it),
-    /// but the text dictionary of its segment (by address), shared by
-    /// every window read from the segment, of these bytes.
-    SegmentDictionary { segment: usize, bytes: usize },
 }
 
 /// The texts of one text column of one view, each stored once: every
@@ -1221,11 +1203,12 @@ impl ViewStore {
             .map(|window| window.time_range_ms.1)
     }
 
-    /// Bytes of the stored rows: each window as counted when it was
-    /// appended (states included, whether or not a run has read them
-    /// since) or read back ([`window_batch_bytes`]), plus each view's
-    /// shared texts once and, for windows read back, each segment's text
-    /// dictionary once.
+    /// Bytes of the stored rows: each window in memory as counted when it
+    /// was appended (states included, whether or not a run has read them
+    /// since), each cached window as the cache charges it, each view's
+    /// shared texts once, and the text dictionaries of the segments holding
+    /// stored windows once per segment (built when one of its windows is
+    /// read back).
     pub fn bytes(&self) -> usize {
         let windows: usize = match &self.tier {
             None => self
@@ -1235,20 +1218,22 @@ impl ViewStore {
                 .map(|window| window.slot.bytes as usize)
                 .sum(),
             Some(tier) => {
-                let mut heap = 0;
-                let mut dictionaries = 0;
-                let mut segments = BTreeSet::new();
+                let mut in_memory_bytes = 0;
+                let mut dictionary_bytes = 0;
+                let mut segments_counted = BTreeSet::new();
                 for window in self.by_view.values().flatten() {
-                    match window.slot.resident() {
-                        Resident::Batches(bytes) => heap += bytes as usize,
-                        Resident::SegmentDictionary { segment, bytes } => {
-                            if segments.insert(segment) {
-                                dictionaries += bytes;
+                    match &window.slot.lock().0 {
+                        SlotState::Pending(_) | SlotState::Pinned(_) => {
+                            in_memory_bytes += window.slot.bytes as usize
+                        }
+                        SlotState::Stored(location) => {
+                            if segments_counted.insert(Arc::as_ptr(location.segment())) {
+                                dictionary_bytes += location.segment().dictionary_bytes();
                             }
                         }
                     }
                 }
-                heap + dictionaries + tier.cache.stats().bytes as usize
+                in_memory_bytes + dictionary_bytes + tier.cache.stats().bytes as usize
             }
         };
         let texts: usize = self
@@ -1334,8 +1319,9 @@ impl ViewStore {
 /// states ([`Batch::memory_bytes`]) less each text column's values array,
 /// which is shared and counted once by its owner: the view's
 /// [`SharedTexts`] for a window as appended, its segment's dictionary for
-/// a window read back from its file. The charge of a window whichever way
-/// it is in memory.
+/// a window read back from its file. A window's cache charge both when
+/// appended and when read back (plus, read back, its mapped state columns:
+/// [`WindowLocation::read_counted`]).
 fn window_batch_bytes(batch: &Batch) -> usize {
     let shared: usize = (0..batch.schema().fields.len())
         .filter(|&index| batch.state_column(index).is_none())

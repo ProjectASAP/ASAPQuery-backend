@@ -1451,6 +1451,12 @@ mod tests {
         );
         let copied = l1.read(first.schema(), ViewRead::Pread).unwrap();
         assert_same_rows(&first, &copied, "pread");
+        // The mapped states' bytes, which the batch does not count, are
+        // reported for the window's charge, mapped or copied alike.
+        let (_, mapped_state_bytes) = l1.read_counted(first.schema(), ViewRead::Mmap).unwrap();
+        let (_, copied_state_bytes) = l1.read_counted(first.schema(), ViewRead::Pread).unwrap();
+        assert!(mapped_state_bytes > (first.num_rows() + 1) * 4);
+        assert_eq!(mapped_state_bytes, copied_state_bytes);
         assert!(!l1.maps(identity(&copied).keys().values().as_ptr() as usize));
         let _ = std::fs::remove_dir_all(&dir);
     }
