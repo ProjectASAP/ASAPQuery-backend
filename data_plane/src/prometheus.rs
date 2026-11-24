@@ -23,14 +23,13 @@ pub const MAX_TIME_MS: i64 = i64::MAX / 4;
 
 /// Why an instant query's parameters are refused (400, `bad_data`).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("invalid parameter \"time\": {0}")]
+#[error("{0}")]
 pub struct BadTime(pub String);
 
 impl InstantQuery {
-    /// Reads `query` and `time` (Unix seconds). `Ok(None)` if either is
-    /// missing or `time` is in another format, such as RFC 3339 (the query
-    /// is then forwarded); `Err` if `time` is a number that is not finite or
-    /// beyond [`MAX_TIME_MS`].
+    /// Reads `query` and `time` ([`parse_time_ms`]). `Ok(None)` if `query`
+    /// is missing (the request is then forwarded); `Err` if `time` is no
+    /// time or one beyond [`MAX_TIME_MS`].
     pub fn parse(url_query: Option<&str>, form: &[u8]) -> Result<Option<Self>, BadTime> {
         let params: BTreeMap<String, String> =
             form_urlencoded::parse(url_query.unwrap_or_default().as_bytes())
@@ -39,14 +38,7 @@ impl InstantQuery {
                 .collect();
         let time_ms = match params.get("time") {
             None => None,
-            Some(time) => match time.parse::<f64>() {
-                Err(_) => return Ok(None),
-                Ok(seconds) => Some(checked_seconds_to_ms(seconds).ok_or_else(|| {
-                    BadTime(format!(
-                        "{time} is not a time the data plane can evaluate at"
-                    ))
-                })?),
-            },
+            Some(time) => Some(parse_time_ms("time", time).map_err(BadTime)?),
         };
         let Some(query) = params.get("query") else {
             return Ok(None);
@@ -77,12 +69,12 @@ pub struct RangeQuery {
 pub struct BadRange(pub String);
 
 impl RangeQuery {
-    /// Reads `query`, `start` and `end` (Unix seconds) and `step` (seconds
-    /// or a Prometheus duration such as `15s` or `1m30s`). `Ok(None)` if
-    /// one is missing or a time is in another format, such as RFC 3339 (the
-    /// query is then forwarded); `Err` if they cannot be evaluated: a time
-    /// beyond [`MAX_TIME_MS`], a step that is not positive, an end before
-    /// the start, or more than [`MAX_RANGE_STEPS`] steps.
+    /// Reads `query`, `start` and `end` ([`parse_time_ms`]) and `step`
+    /// (seconds or a Prometheus duration such as `15s` or `1m30s`).
+    /// `Ok(None)` if one is missing (the request is then forwarded); `Err`
+    /// if they cannot be evaluated: no time or one beyond [`MAX_TIME_MS`],
+    /// a step that is not positive, an end before the start, or more than
+    /// [`MAX_RANGE_STEPS`] steps.
     pub fn parse(url_query: Option<&str>, form: &[u8]) -> Result<Option<Self>, BadRange> {
         let params: BTreeMap<String, String> =
             form_urlencoded::parse(url_query.unwrap_or_default().as_bytes())
@@ -97,19 +89,8 @@ impl RangeQuery {
         ) else {
             return Ok(None);
         };
-        let time = |name: &str, text: &str| -> Result<Option<i64>, BadRange> {
-            match text.parse::<f64>() {
-                Err(_) => Ok(None),
-                Ok(seconds) => checked_seconds_to_ms(seconds).map(Some).ok_or_else(|| {
-                    BadRange(format!(
-                        "invalid parameter \"{name}\": {text} is not a time the data plane can evaluate at"
-                    ))
-                }),
-            }
-        };
-        let (Some(start_ms), Some(end_ms)) = (time("start", start)?, time("end", end)?) else {
-            return Ok(None);
-        };
+        let start_ms = parse_time_ms("start", start).map_err(BadRange)?;
+        let end_ms = parse_time_ms("end", end).map_err(BadRange)?;
         let step_ms = step_ms(step).filter(|&ms| ms > 0).ok_or_else(|| {
             BadRange(format!(
                 "invalid parameter \"step\": {step:?} is not a positive duration"
@@ -172,6 +153,96 @@ fn step_ms(text: &str) -> Option<i64> {
         rest = &rest[unit_len..];
     }
     (!text.is_empty()).then_some(total)
+}
+
+/// Query parameter `name`'s time `text` in milliseconds since the epoch,
+/// read as the Prometheus HTTP API reads it: Unix seconds with an optional
+/// fraction (rounded to the millisecond), or RFC 3339 with optional
+/// fractional seconds and a `Z` or `±hh:mm` offset (truncated to the
+/// millisecond). `Err` is the 400 error text: Prometheus' for no time, or
+/// a time beyond [`MAX_TIME_MS`].
+pub fn parse_time_ms(name: &str, text: &str) -> Result<i64, String> {
+    let ms = match text.parse::<f64>() {
+        Ok(seconds) => checked_seconds_to_ms(seconds),
+        Err(_) => Some(rfc3339_ms(text).ok_or_else(|| {
+            format!("invalid parameter \"{name}\": cannot parse {text:?} to a valid timestamp")
+        })?)
+        .filter(|ms| ms.abs() <= MAX_TIME_MS),
+    };
+    ms.ok_or_else(|| {
+        format!("invalid parameter \"{name}\": {text} is not a time the data plane can evaluate at")
+    })
+}
+
+/// An RFC 3339 time (`2026-11-24T05:00:00Z`, `2026-11-24T05:00:00.25+01:00`)
+/// in milliseconds since the epoch, as Go's `time.RFC3339Nano` layout
+/// parses it: a four-digit year, `T`, up to nine fraction digits.
+fn rfc3339_ms(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    let number = |range: std::ops::Range<usize>| -> Option<i64> {
+        let digits = bytes.get(range)?;
+        digits
+            .iter()
+            .all(u8::is_ascii_digit)
+            .then(|| digits.iter().fold(0, |n, d| n * 10 + i64::from(d - b'0')))
+    };
+    let separators = [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':')];
+    if separators.iter().any(|&(at, c)| bytes.get(at) != Some(&c)) {
+        return None;
+    }
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=days_in_month).contains(&day) || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    // Fractional seconds: a dot and one to nine digits.
+    let mut at = 19;
+    let mut fraction_ms = 0;
+    if bytes.get(at) == Some(&b'.') {
+        let digits = bytes[at + 1..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if !(1..=9).contains(&digits) {
+            return None;
+        }
+        let first_three = number(at + 1..at + 1 + digits.min(3))?;
+        fraction_ms = first_three * 10_i64.pow(3 - digits.min(3) as u32);
+        at += 1 + digits;
+    }
+    let offset_s = match &bytes[at..] {
+        b"Z" => 0,
+        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
+            let (hours, minutes) = (number(at + 1..at + 3)?, number(at + 4..at + 6)?);
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            let offset = hours * 3600 + minutes * 60;
+            if *sign == b'-' {
+                -offset
+            } else {
+                offset
+            }
+        }
+        _ => return None,
+    };
+    // Days since the epoch of the civil date (H. Hinnant's algorithm).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let year_of_era = y - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let seconds = days * 86_400 + hour * 3600 + minute * 60 + second - offset_s;
+    Some(seconds * 1000 + fraction_ms)
 }
 
 /// `seconds` in milliseconds, if finite and within [`MAX_TIME_MS`].
@@ -410,11 +481,11 @@ mod tests {
             .unwrap();
         assert_eq!((q.query.as_str(), q.time_ms), ("sum(x)", None));
         assert!(InstantQuery::parse(Some("time=1"), b"").unwrap().is_none());
-        assert!(
-            InstantQuery::parse(Some("query=up&time=2026-01-01T00:00:00Z"), b"")
-                .unwrap()
-                .is_none()
-        );
+        let q = InstantQuery::parse(Some("query=up&time=2026-01-01T00:00:00Z"), b"")
+            .unwrap()
+            .unwrap();
+        assert_eq!(q.time_ms, Some(1_767_225_600_000));
+        assert!(InstantQuery::parse(Some("query=up&time=tomorrow"), b"").is_err());
         for time in ["-1e300", "1e300", "NaN", "inf"] {
             let url = format!("query=up&time={time}");
             assert!(InstantQuery::parse(Some(&url), b"").is_err(), "{time}");
@@ -439,12 +510,13 @@ mod tests {
         assert!(RangeQuery::parse(Some("query=up&start=0&end=60"), b"")
             .unwrap()
             .is_none());
-        assert!(RangeQuery::parse(
-            Some("query=up&start=2026-01-01T00:00:00Z&end=1&step=1"),
-            b""
+        let q = RangeQuery::parse(
+            Some("query=up&start=1970-01-01T00:00:01Z&end=2&step=1"),
+            b"",
         )
         .unwrap()
-        .is_none());
+        .unwrap();
+        assert_eq!((q.start_ms, q.end_ms), (1_000, 2_000));
         for bad in [
             "query=up&start=0&end=60&step=0",
             "query=up&start=0&end=60&step=x",
@@ -454,6 +526,48 @@ mod tests {
         ] {
             assert!(RangeQuery::parse(Some(bad), b"").is_err(), "{bad}");
         }
+    }
+
+    /// RFC 3339 times as Go's `time.RFC3339Nano` reads them, in
+    /// milliseconds since the epoch (fractions truncated, as Prometheus
+    /// truncates a parsed time to the millisecond).
+    #[test]
+    fn parses_rfc3339_times() {
+        for (text, ms) in [
+            ("1970-01-01T00:00:00Z", 0),
+            ("2026-11-24T05:00:00Z", 1_795_496_400_000),
+            ("2026-11-24T05:00:00.5Z", 1_795_496_400_500),
+            ("2026-11-24T05:00:00.123456789Z", 1_795_496_400_123),
+            ("2026-11-24T06:30:00+01:30", 1_795_496_400_000),
+            ("2026-11-24T00:00:00-05:00", 1_795_496_400_000),
+            ("2024-02-29T00:00:00Z", 1_709_164_800_000),
+            ("1969-12-31T23:59:59.999Z", -1),
+            ("0001-01-01T00:00:00Z", -62_135_596_800_000),
+        ] {
+            assert_eq!(rfc3339_ms(text), Some(ms), "{text}");
+        }
+        for text in [
+            "2026-11-24T05:00:00",
+            "2026-11-24t05:00:00Z",
+            "2026-11-24 05:00:00Z",
+            "2026-11-24T05:00:00.Z",
+            "2026-11-24T05:00:00.1234567890Z",
+            "2026-11-24T05:00Z",
+            "2023-02-29T00:00:00Z",
+            "2026-04-31T00:00:00Z",
+            "2026-11-24T05:00:60Z",
+            "2026-11-24T05:00:00+0100",
+            "2026-11-24T05:00:00+24:00",
+            "+2026-11-24T05:00:00Z",
+            "2026-11-24T05:00:00Z ",
+        ] {
+            assert_eq!(rfc3339_ms(text), None, "{text}");
+        }
+        assert_eq!(
+            parse_time_ms("time", "x").unwrap_err(),
+            "invalid parameter \"time\": cannot parse \"x\" to a valid timestamp"
+        );
+        assert_eq!(parse_time_ms("end", "1.0015"), Ok(1_002));
     }
 
     /// Range results use Prometheus' matrix shape: one entry per series

@@ -329,9 +329,7 @@ async fn query_range(
     let range = match RangeQuery::parse(query.0.as_deref(), &body) {
         Ok(Some(range)) => range,
         Ok(None) if state.no_forward => {
-            return not_answered(
-                "the request lacks query, start, end or step, or names a time that is not in Unix seconds",
-            );
+            return not_answered("the request lacks query, start, end or step");
         }
         Ok(None) => return forward(state, "query_range", method, query, headers, body).await,
         Err(bad) => {
