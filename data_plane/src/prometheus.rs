@@ -32,7 +32,10 @@ impl InstantQuery {
     /// or max time (the request is then forwarded, or refused without
     /// forwarding); `Err` if `time` is not a parsable time or is beyond
     /// [`MAX_TIME_MS`].
-    pub(crate) fn parse(url_query: Option<&str>, form: &[u8]) -> Result<Option<Self>, BadParameter> {
+    pub(crate) fn parse(
+        url_query: Option<&str>,
+        form: &[u8],
+    ) -> Result<Option<Self>, BadParameter> {
         let params: BTreeMap<String, String> =
             form_urlencoded::parse(url_query.unwrap_or_default().as_bytes())
                 .chain(form_urlencoded::parse(form))
@@ -77,7 +80,10 @@ impl RangeQuery {
     /// parsable or is beyond [`MAX_TIME_MS`], a step that is not positive or
     /// is beyond [`MAX_TIME_MS`], an end before the start, or more than
     /// [`MAX_RANGE_STEPS`] steps.
-    pub(crate) fn parse(url_query: Option<&str>, form: &[u8]) -> Result<Option<Self>, BadParameter> {
+    pub(crate) fn parse(
+        url_query: Option<&str>,
+        form: &[u8],
+    ) -> Result<Option<Self>, BadParameter> {
         let params: BTreeMap<String, String> =
             form_urlencoded::parse(url_query.unwrap_or_default().as_bytes())
                 .chain(form_urlencoded::parse(form))

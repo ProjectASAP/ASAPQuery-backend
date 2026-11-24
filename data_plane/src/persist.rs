@@ -1547,7 +1547,9 @@ mod tests {
                 .into();
                 let identity: Arc<str> = if s % 2 == 0 {
                     labels.insert("__name__".into(), "data".into());
-                    crate::series_ids::intern(&labels).identity.clone()
+                    crate::series_ids::intern_pairs(&labels.iter().collect::<Vec<_>>())
+                        .identity
+                        .clone()
                 } else {
                     labels.insert("series".into(), format!("never-interned-{s}"));
                     serde_json::to_string(&labels).unwrap().into()
@@ -1931,7 +1933,7 @@ mod tests {
         for (_, location) in &recovered[&1] {
             assert_same_rows(
                 &batch,
-                &location.read(batch.schema(), ViewRead::Mmap).unwrap(),
+                &location.read(batch.schema(), ViewRead::Mmap).unwrap().0,
                 "recovered",
             );
         }

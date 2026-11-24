@@ -162,7 +162,7 @@ fn sealed_windows_read_back(how: ViewRead) {
     });
     let stats = tier.cache.stats();
     assert_eq!(
-        (stats.entries, stats.loads),
+        (stats.entries, tier.cold_reads.load(Ordering::Relaxed)),
         (WINDOWS as u64, WINDOWS as u64)
     );
     let read_back_charge = stats.bytes / WINDOWS as u64;
@@ -226,7 +226,7 @@ fn active_windows_read_back_while_the_dictionary_grows() {
         heap_held += heap;
         view_bytes_added += added;
     }
-    assert_eq!(tier.cache.stats().loads, WINDOWS as u64);
+    assert_eq!(tier.cold_reads.load(Ordering::Relaxed), WINDOWS as u64);
     println!(
         "active segment, growing: {WINDOWS} windows read back: heap held {heap_held} B, view \
          bytes added {view_bytes_added} B"

@@ -1513,14 +1513,8 @@ mod tests {
             bytes.extend_from_slice(&word.to_le_bytes());
         }
         bytes.extend_from_slice(&10i64.to_le_bytes());
-        let len = bytes.len();
-        let mut words = vec![0u64; len.div_ceil(8)];
-        // SAFETY: `words` is at least `len` writable bytes.
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), words.as_mut_ptr().cast::<u8>(), len)
-        };
         let segment = Segment::create_new(&dir, 20, &header).unwrap();
-        assert!(decode_fragment(&Bytes::Owned(words, len), &schema, &segment, &[]).is_err());
+        assert!(decode_fragment(&bytes, &schema, &segment, &[]).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
