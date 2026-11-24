@@ -445,6 +445,7 @@ impl EngineHandle {
                 tracing::info!(dir = %dir.display(), windows = loaded, "indexed persisted views");
                 if loaded > 0 {
                     ingestion.restarted();
+                    views.restarted();
                 }
                 Some((files, loaded))
             }

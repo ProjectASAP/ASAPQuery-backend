@@ -976,10 +976,10 @@ pub struct ViewStore {
     /// retention for a reader that runs right behind it, and the precompute
     /// pool lets a group run ahead of its readers.
     readers: BTreeMap<PhysicalASAPNodeId, BTreeMap<usize, i64>>,
-    /// Per view, the start of the first window ever stored. Before it the
-    /// view has no data at all, so a read reaching back past it answers
-    /// from the rows that exist, as PromQL does over a range that starts
-    /// before the first sample.
+    /// Per view, the start of the first window ever stored. With the
+    /// stream start declared, the view has no data at all before it, so a
+    /// read reaching back past it answers from the rows that exist, as
+    /// PromQL does over a range that starts before the first sample.
     first_start: BTreeMap<PhysicalASAPNodeId, i64>,
     /// Where the producer's stream starts, when declared: no view has data
     /// before it, so a view with no window yet reads as empty there.
@@ -991,6 +991,13 @@ impl ViewStore {
     pub fn with_stream_start(mut self, stream_start_ms: Option<i64>) -> Self {
         self.stream_start_ms = stream_start_ms;
         self
+    }
+
+    /// After a restart that loaded views from files: the samples before
+    /// the restart are gone, so the declared stream start no longer says
+    /// where the views' data starts.
+    pub fn restarted(&mut self) {
+        self.stream_start_ms = None;
     }
 
     /// An empty store whose windows, once written, are read through `tier`.
@@ -1264,14 +1271,17 @@ impl ViewStore {
         context: RunContext,
     ) -> Result<OutputStream<'_, Batch>, Error> {
         let (requested_start, end) = request.time_range_ms;
-        // A range reaching back before the view's first window reads the
-        // rows that exist (PromQL semantics while a window is still
-        // filling); a gap after the first window is still missing data.
-        let floor = self
-            .first_start
-            .get(&view.node_id)
-            .copied()
-            .or(self.stream_start_ms);
+        // With the stream start declared (and no restart since), a range
+        // reaching back before the view's first window reads the rows that
+        // exist (PromQL semantics while a window is still filling); a gap
+        // after the first window is still missing data. Otherwise the
+        // skipped first window had data, so it is missing too.
+        let floor = self.stream_start_ms.map(|start| {
+            self.first_start
+                .get(&view.node_id)
+                .copied()
+                .unwrap_or(start)
+        });
         let start = match floor {
             Some(first) if requested_start < first => first.min(end),
             _ => requested_start,
@@ -1791,7 +1801,7 @@ mod tests {
             "retention_ms": 1_000_000,
         }))
         .unwrap();
-        let mut views = ViewStore::default();
+        let mut views = ViewStore::default().with_stream_start(Some(0));
         for end in [10, 20, 30, 40] {
             views.append(&view, (end - 10, end), Vec::new()).unwrap();
         }
@@ -1810,9 +1820,10 @@ mod tests {
             ((5, 30), false),
             ((10, 35), false),
             ((40, 50), false),
-            // Before the first window there is no data: a range reaching
-            // back past it reads the rows that exist (PromQL semantics
-            // while a window fills), and one wholly before it is empty.
+            // With the stream start declared, there is no data before the
+            // first window: a range reaching back past it reads the rows
+            // that exist (PromQL semantics while a window fills), and one
+            // wholly before it is empty.
             ((-20, 20), true),
             ((-10, 0), true),
             ((-5, 25), false),
@@ -1826,6 +1837,19 @@ mod tests {
                 tiled,
                 "{range:?}"
             );
+        }
+        // Without a declared stream start, or after a restart (the samples
+        // before it are gone), windows before the first may have had data:
+        // a range reaching back past it is missing data.
+        let mut undeclared = ViewStore::default();
+        undeclared.append(&view, (0, 10), Vec::new()).unwrap();
+        views.restarted();
+        for views in [&undeclared, &views] {
+            let request = MaterializedViewRequest {
+                time_range_ms: (-20, 10),
+                schema: &schema,
+            };
+            assert!(views.read(&view, &request, context.clone()).is_err());
         }
     }
 
