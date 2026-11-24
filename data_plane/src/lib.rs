@@ -274,7 +274,9 @@ async fn query(
     let instant = match InstantQuery::parse(query.0.as_deref(), &body) {
         Ok(Some(instant)) => instant,
         Ok(None) if state.no_forward => {
-            return not_answered("the request has no query parameter");
+            return not_answered(
+                "the request has no query parameter, or names Prometheus' min or max time",
+            );
         }
         Ok(None) => return forward(state, "query", method, query, headers, body).await,
         Err(bad) => {
@@ -329,7 +331,9 @@ async fn query_range(
     let range = match RangeQuery::parse(query.0.as_deref(), &body) {
         Ok(Some(range)) => range,
         Ok(None) if state.no_forward => {
-            return not_answered("the request lacks query, start, end or step");
+            return not_answered(
+                "the request lacks query, start, end or step, or names Prometheus' min or max time",
+            );
         }
         Ok(None) => return forward(state, "query_range", method, query, headers, body).await,
         Err(bad) => {
