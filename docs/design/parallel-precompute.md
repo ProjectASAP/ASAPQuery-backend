@@ -312,9 +312,10 @@ guessed.
 - The rule is derived from the plan: from `Reduction` and from the
   Planner's `SummaryTypeCapability`, which is the authoritative merge
   rule. The plan format does not change.
-- The rule is recorded at install. It appears in the log line
-  `group, node, operator, rule` and in `/api/v1/status/asap` under
-  `ingestion.pipelines`.
+- Not implemented as a table: install decides per group whether it can
+  be pushed by probing the group's run (`push::probe`); a group that
+  cannot be pushed uses the window path. The rule table above is checked
+  by the push tests only.
 - **Empty windows.** Every shard opens every window and seals it even
   when it saw no sample. Its empty partial costs nothing (no allocation).
   A global build with no input emits its one empty row
