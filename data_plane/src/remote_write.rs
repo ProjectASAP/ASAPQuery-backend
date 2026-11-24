@@ -2,8 +2,6 @@
 
 use prost::Message;
 
-use std::sync::Arc;
-
 use crate::series_ids::Series;
 use crate::store::RawSample;
 
@@ -120,23 +118,72 @@ pub fn decode(body: &[u8], limits: &Limits) -> Result<WriteRequest, RemoteWriteE
 /// executor's sample selector drops them from range windows and ends
 /// instant selectors.
 ///
-/// The protobuf is walked in place, without building a `WriteRequest`. A
-/// series is looked up by the bytes of its encoded labels in a per-thread
-/// cache, so a known series costs a hash and a compare; only a new one is
-/// parsed, validated (UTF-8, `__name__`, no duplicate label) and interned.
-/// Errors are those of [`decode`].
+/// The body is decompressed into a buffer this thread keeps between
+/// requests, and the protobuf is walked in place, without building a
+/// `WriteRequest`. A series is looked up by the bytes of its encoded labels
+/// in a per-thread cache (`SeriesCache`), so a known series costs a
+/// compare (and a hash when the sender changed its order); only a new one
+/// is parsed, validated (UTF-8, `__name__`, no duplicate label) and
+/// interned. Errors are those of [`decode`].
 pub fn decode_samples(body: &[u8], limits: &Limits) -> Result<Vec<RawSample>, RemoteWriteError> {
-    let decoded = decompress(body, limits)?;
-    // A sample takes at least 11 encoded bytes (tag, length, value,
-    // timestamp), so this rarely grows.
-    let mut samples = Vec::with_capacity(decoded.len() / 12);
-    let mut request = Reader::new(&decoded);
-    while let Some((field, value)) = request.field()? {
-        if let (1, Value::Bytes(series)) = (field, value) {
-            decode_series(series, &mut samples, limits)?;
+    DECOMPRESSED.with(|buffer| {
+        let mut buffer = buffer.borrow_mut();
+        let decoded = decompress_into(body, limits, &mut buffer)?;
+        // Room for one sample per 40 encoded bytes: a sender's one-sample
+        // series take 60 to 150, so this grows only for tiny label sets.
+        let mut samples = Vec::with_capacity(decoded.len() / 40);
+        let mut request = Reader::new(decoded);
+        let walked = (|| {
+            while let Some((field, value)) = request.field()? {
+                if let (1, Value::Bytes(series)) = (field, value) {
+                    decode_series(series, &mut samples, limits)?;
+                }
+            }
+            Ok(())
+        })();
+        // An unusually large request's buffer is not kept.
+        if buffer.len() > KEPT_DECOMPRESSED_BYTES {
+            *buffer = Vec::new();
         }
+        walked.map(|()| samples)
+    })
+}
+
+/// The largest decompression buffer a thread keeps between requests.
+const KEPT_DECOMPRESSED_BYTES: usize = 32 * 1024 * 1024;
+
+thread_local! {
+    /// This thread's decompression buffer, kept between requests: a
+    /// request's decompressed bytes are written over the last one's, with
+    /// no allocation, zeroing or page faults once it has grown.
+    static DECOMPRESSED: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::default();
+}
+
+/// [`decompress`] into `buffer`, grown as needed; the decompressed bytes.
+fn decompress_into<'a>(
+    body: &[u8],
+    limits: &Limits,
+    buffer: &'a mut Vec<u8>,
+) -> Result<&'a [u8], RemoteWriteError> {
+    if body.len() > limits.max_compressed_bytes {
+        return Err(RemoteWriteError::CompressedTooLarge(
+            limits.max_compressed_bytes,
+        ));
     }
-    Ok(samples)
+    let len =
+        snap::raw::decompress_len(body).map_err(|e| RemoteWriteError::Snappy(e.to_string()))?;
+    if len > limits.max_decompressed_bytes {
+        return Err(RemoteWriteError::DecompressedTooLarge(
+            limits.max_decompressed_bytes,
+        ));
+    }
+    if buffer.len() < len {
+        buffer.resize(len, 0);
+    }
+    let written = snap::raw::Decoder::new()
+        .decompress(body, buffer)
+        .map_err(|e| RemoteWriteError::Snappy(e.to_string()))?;
+    Ok(&buffer[..written])
 }
 
 /// Appends the samples of one encoded `TimeSeries` to `samples`.
@@ -145,13 +192,20 @@ fn decode_series(
     samples: &mut Vec<RawSample>,
     limits: &Limits,
 ) -> Result<(), RemoteWriteError> {
-    // First pass, skipping over the samples: the labels' encoded bytes, the
-    // key of the series cache; one slice of `series` when the labels are
-    // contiguous, as senders write them.
+    // First pass, over every field: where the labels' encoded bytes are,
+    // the key of the series cache; one slice of `series` when the labels
+    // are contiguous, as senders write them.
     let mut labels_start = None;
     let mut labels_end = 0;
     let mut contiguous = true;
     let mut reader = Reader::new(series);
+    // Senders write the labels first: skip over them by their one-byte
+    // tag and short length, leaving anything else to the general walk.
+    while let Some(end) = short_label_end(series, reader.position) {
+        labels_start = Some(0);
+        reader.position = end;
+        labels_end = end;
+    }
     while let Some((field, value)) = reader.field()? {
         if let (1, Value::Bytes(_)) = (field, value) {
             match labels_start {
@@ -163,7 +217,13 @@ fn decode_series(
         }
     }
     let labels = match (labels_start, contiguous) {
-        (Some(start), true) => cached_series(&series[start..labels_end])?,
+        (Some(start), true) => {
+            let labels = cached_series(&series[start..labels_end])?;
+            // Second pass: the samples, in the fields before and after the
+            // labels (both whole fields, as the first pass found).
+            push_samples(&series[..start], labels, samples, limits)?;
+            return push_samples(&series[labels_end..], labels, samples, limits);
+        }
         (None, _) => return Err(RemoteWriteError::MissingMetricName),
         (Some(_), false) => {
             // Rare: labels interleaved with other fields; key by their
@@ -178,8 +238,37 @@ fn decode_series(
             cached_series(&key)?
         }
     };
-    // Second pass: the samples.
-    let mut reader = Reader::new(series);
+    push_samples(series, labels, samples, limits)
+}
+
+/// The end of the `Label` field (tag `0x0a`) at `start` of `series`, when
+/// its length takes one or two bytes and the field ends within `series`;
+/// `None` otherwise, for the general walk.
+#[inline(always)]
+fn short_label_end(series: &[u8], start: usize) -> Option<usize> {
+    let (&tag, rest) = series.get(start..)?.split_first()?;
+    if tag != 0x0a {
+        return None;
+    }
+    let (len, len_bytes) = match *rest {
+        [low, ..] if low < 0x80 => (usize::from(low), 1),
+        [low, high, ..] if high < 0x80 => (usize::from(low & 0x7f) | usize::from(high) << 7, 2),
+        _ => return None,
+    };
+    let end = start + 1 + len_bytes + len;
+    (end <= series.len()).then_some(end)
+}
+
+/// Appends the `Sample`s (field 2) of the encoded `TimeSeries` fields
+/// `fields` to `samples`, each with series `labels`.
+#[inline]
+fn push_samples(
+    fields: &[u8],
+    labels: &'static Series,
+    samples: &mut Vec<RawSample>,
+    limits: &Limits,
+) -> Result<(), RemoteWriteError> {
+    let mut reader = Reader::new(fields);
     while let Some((field, value)) = reader.field()? {
         let (2, Value::Bytes(sample)) = (field, value) else {
             continue;
@@ -192,7 +281,7 @@ fn decode_series(
             None => sample_generic(sample)?,
         };
         samples.push(RawSample {
-            labels: labels.clone(),
+            labels,
             timestamp_ms,
             value,
         });
@@ -207,10 +296,17 @@ fn sample_fast(sample: &[u8]) -> Option<(i64, f64)> {
     if sample.len() < 11 || sample[0] != 0x09 || sample[9] != 0x10 {
         return None;
     }
-    let mut tail = Reader::new(&sample[10..]);
-    let raw = tail.varint().ok()?;
-    if tail.position != tail.bytes.len() {
+    // The timestamp's varint, ending at the end of the sample.
+    let tail = &sample[10..];
+    if tail.len() > 10 {
         return None;
+    }
+    let mut raw = 0u64;
+    for (i, &byte) in tail.iter().enumerate() {
+        raw |= u64::from(byte & 0x7f) << (7 * i);
+        if (byte < 0x80) != (i + 1 == tail.len()) {
+            return None;
+        }
     }
     let value = f64::from_bits(u64::from_le_bytes(sample[1..9].try_into().ok()?));
     Some((raw as i64, value))
@@ -232,21 +328,88 @@ fn sample_generic(sample: &[u8]) -> Result<(i64, f64), RemoteWriteError> {
 
 /// The series of the encoded labels `key` (a run of `TimeSeries` field-1
 /// entries): from this thread's cache, or parsed, validated and interned.
-fn cached_series(key: &[u8]) -> Result<Arc<Series>, RemoteWriteError> {
+fn cached_series(key: &[u8]) -> Result<&'static Series, RemoteWriteError> {
     thread_local! {
-        static CACHE: std::cell::RefCell<ahash::HashMap<Box<[u8]>, Arc<Series>>> =
-            std::cell::RefCell::default();
+        static CACHE: std::cell::RefCell<SeriesCache> = std::cell::RefCell::default();
     }
-    if let Some(series) = CACHE.with(|cache| cache.borrow().get(key).cloned()) {
+    if let Some(series) = CACHE.with(|cache| cache.borrow_mut().get(key)) {
         return Ok(series);
     }
     let series = parse_labels(key)?;
-    CACHE.with(|cache| cache.borrow_mut().insert(key.into(), series.clone()));
+    CACHE.with(|cache| cache.borrow_mut().insert(key, series));
     Ok(series)
 }
 
+/// One thread's series by the bytes of their encoded labels. A sender
+/// writes its series in the same order request after request, so each
+/// entry remembers the entry looked up after it last time, and a lookup
+/// first compares the key with that prediction: a hit costs one compare,
+/// no hash. Every hit is a byte-for-byte match of the key.
+#[derive(Default)]
+struct SeriesCache {
+    entries: Vec<CacheEntry>,
+    /// Entries by the hash of their key.
+    by_key: hashbrown::HashTable<u32>,
+    /// The entry looked up last.
+    last: Option<u32>,
+}
+
+struct CacheEntry {
+    key: Box<[u8]>,
+    series: &'static Series,
+    /// The entry looked up right after this one, last time.
+    next: Option<u32>,
+}
+
+impl SeriesCache {
+    fn hash(key: &[u8]) -> u64 {
+        static STATE: std::sync::OnceLock<ahash::RandomState> = std::sync::OnceLock::new();
+        STATE.get_or_init(ahash::RandomState::new).hash_one(key)
+    }
+
+    #[inline]
+    fn get(&mut self, key: &[u8]) -> Option<&'static Series> {
+        let predicted = self.last.and_then(|last| self.entries[last as usize].next);
+        if let Some(index) = predicted {
+            let entry = &self.entries[index as usize];
+            if *entry.key == *key {
+                self.last = Some(index);
+                return Some(entry.series);
+            }
+        }
+        let entries = &self.entries;
+        let index = *self
+            .by_key
+            .find(Self::hash(key), |&i| *entries[i as usize].key == *key)?;
+        self.follow(index);
+        Some(self.entries[index as usize].series)
+    }
+
+    fn insert(&mut self, key: &[u8], series: &'static Series) {
+        let index = u32::try_from(self.entries.len()).expect("fewer than 2^32 series");
+        self.entries.push(CacheEntry {
+            key: key.into(),
+            series,
+            next: None,
+        });
+        let entries = &self.entries;
+        self.by_key.insert_unique(Self::hash(key), index, |&i| {
+            Self::hash(&entries[i as usize].key)
+        });
+        self.follow(index);
+    }
+
+    /// Records that `index` was looked up after the last entry.
+    fn follow(&mut self, index: u32) {
+        if let Some(last) = self.last {
+            self.entries[last as usize].next = Some(index);
+        }
+        self.last = Some(index);
+    }
+}
+
 /// Parses, validates and interns the labels encoded in `key`.
-fn parse_labels(key: &[u8]) -> Result<Arc<Series>, RemoteWriteError> {
+fn parse_labels(key: &[u8]) -> Result<&'static Series, RemoteWriteError> {
     let mut pairs: Vec<(&str, &str)> = Vec::new();
     let mut reader = Reader::new(key);
     while let Some((_, value)) = reader.field()? {
@@ -302,11 +465,25 @@ impl<'a> Reader<'a> {
         }
     }
 
+    #[cold]
     fn error(message: &str) -> RemoteWriteError {
         RemoteWriteError::Protobuf(message.into())
     }
 
+    #[inline(always)]
     fn varint(&mut self) -> Result<u64, RemoteWriteError> {
+        // One byte: most tags and lengths.
+        if let Some(&byte) = self.bytes.get(self.position) {
+            if byte < 0x80 {
+                self.position += 1;
+                return Ok(u64::from(byte));
+            }
+        }
+        self.varint_slow()
+    }
+
+    #[inline(never)]
+    fn varint_slow(&mut self) -> Result<u64, RemoteWriteError> {
         let mut value = 0u64;
         for shift in (0..64).step_by(7) {
             let byte = *self
@@ -322,6 +499,7 @@ impl<'a> Reader<'a> {
         Err(Self::error("varint too long"))
     }
 
+    #[inline(always)]
     fn take(&mut self, len: usize) -> Result<&'a [u8], RemoteWriteError> {
         let end = self
             .position
@@ -334,6 +512,7 @@ impl<'a> Reader<'a> {
     }
 
     /// The next field number and value; `None` at the end.
+    #[inline(always)]
     fn field(&mut self) -> Result<Option<(u64, Value<'a>)>, RemoteWriteError> {
         if self.position == self.bytes.len() {
             return Ok(None);
@@ -478,7 +657,7 @@ mod tests {
                 .collect();
             let got: Vec<(BTreeMap<String, String>, i64, u64)> = samples
                 .iter()
-                .map(|s| ((*s.labels).clone(), s.timestamp_ms, s.value.to_bits()))
+                .map(|s| ((**s.labels).clone(), s.timestamp_ms, s.value.to_bits()))
                 .collect();
             assert_eq!(got, expected);
         }

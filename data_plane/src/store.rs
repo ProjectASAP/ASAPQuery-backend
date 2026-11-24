@@ -57,7 +57,7 @@ use crate::window_cache::{WindowCache, WindowKey};
 /// `__name__` included), time and value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawSample {
-    pub labels: Arc<Series>,
+    pub labels: &'static Series,
     pub timestamp_ms: i64,
     pub value: f64,
 }
@@ -72,7 +72,7 @@ struct Chunk {
     /// Each row's series, as an index into `series`.
     codes: UInt32Array,
     /// The chunk's distinct series, in order of their first row.
-    series: Vec<Arc<Series>>,
+    series: Vec<&'static Series>,
     /// Each series' identity text, by code: the dictionary of the series
     /// identity column, built by the first read that needs it and shared by
     /// every later one.
@@ -83,13 +83,13 @@ struct Chunk {
 
 impl Chunk {
     /// `rows` (series, time, value), in order; `None` when there is none.
-    fn new<'a>(rows: impl Iterator<Item = (&'a Arc<Series>, i64, f64)>) -> Option<Self> {
+    fn new(rows: impl Iterator<Item = (&'static Series, i64, f64)>) -> Option<Self> {
         let mut code_of: HashMap<u32, u32> = HashMap::new();
-        let mut series: Vec<Arc<Series>> = Vec::new();
+        let mut series: Vec<&'static Series> = Vec::new();
         let (mut times, mut values, mut codes) = (Vec::new(), Vec::new(), Vec::new());
         for (row_series, time, value) in rows {
             let code = *code_of.entry(row_series.id).or_insert_with(|| {
-                series.push(row_series.clone());
+                series.push(row_series);
                 series.len() as u32 - 1
             });
             times.push(time);
@@ -107,13 +107,13 @@ impl Chunk {
         })
     }
 
-    fn rows(&self) -> impl Iterator<Item = (&Arc<Series>, i64, f64)> {
+    fn rows(&self) -> impl Iterator<Item = (&'static Series, i64, f64)> + '_ {
         self.codes
             .values()
             .iter()
             .zip(self.time.values().iter())
             .zip(self.value.values().iter())
-            .map(|((&code, &time), &value)| (&self.series[code as usize], time, value))
+            .map(|((&code, &time), &value)| (self.series[code as usize], time, value))
     }
 
     fn len(&self) -> usize {
@@ -137,7 +137,7 @@ impl Chunk {
                 .identities
                 .get()
                 .map_or(0, |identities| identities.get_array_memory_size())
-            + self.series.len() * std::mem::size_of::<Arc<Series>>()
+            + self.series.len() * std::mem::size_of::<&Series>()
     }
 
     /// The rows in `(start, end]`; the chunk itself when all are.
@@ -162,7 +162,7 @@ impl Chunk {
         for (code, one) in self.series.iter().enumerate() {
             if partition.holds(one.id) {
                 new_code[code] = series.len() as u32;
-                series.push(one.clone());
+                series.push(*one);
             }
         }
         if series.len() == self.series.len() {
@@ -291,7 +291,7 @@ impl RawData {
             let Some(metric) = self.by_metric.get_mut(metric) else {
                 continue;
             };
-            let chunk = Chunk::new(rows.iter().map(|s| (&s.labels, s.timestamp_ms, s.value)));
+            let chunk = Chunk::new(rows.iter().map(|s| (s.labels, s.timestamp_ms, s.value)));
             metric
                 .panes
                 .entry(pane_end)
@@ -1589,7 +1589,7 @@ mod tests {
                         if Some(index) == schema.time_index {
                             Value::Timestamp(sample.timestamp_ms)
                         } else if field.name == PROMQL_SERIES_IDENTITY {
-                            let labels: &BTreeMap<String, String> = &sample.labels;
+                            let labels: &BTreeMap<String, String> = sample.labels;
                             Value::Utf8(serde_json::to_string(labels).unwrap().into())
                         } else if field.name == "value" {
                             Value::Float64(sample.value)
@@ -1639,14 +1639,14 @@ mod tests {
             }
             for (index, series) in series.iter().enumerate() {
                 requests.last_mut().unwrap().push(RawSample {
-                    labels: series.clone(),
+                    labels: series,
                     timestamp_ms: t + index as i64,
                     value: (t / 100 + index as i64) as f64,
                 });
             }
         }
         requests.push(vec![RawSample {
-            labels: series[0].clone(),
+            labels: series[0],
             timestamp_ms: 4_242,
             value: -1.0,
         }]);
