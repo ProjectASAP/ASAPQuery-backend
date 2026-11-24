@@ -407,9 +407,7 @@ impl ViewFiles {
             group,
             version: FORMAT_VERSION,
         };
-        let path = self
-            .retention_dir(group, retention_ms)
-            .join(format!("{end_ms}.seg"));
+        let dir = self.retention_dir(group, retention_ms);
         let files = self.files.entry((group, retention_ms)).or_default();
         if files
             .active
@@ -419,20 +417,20 @@ impl ViewFiles {
             files.seal_active()?;
             written.segments_marked_cold = files.cool();
         }
-        if files.active.is_none() {
-            files.active = Some(ActiveSegment {
-                segment: Segment::create(&path, &header)?,
-                texts: HashMap::new(),
-                first_start_ms: start_ms,
-            });
-            written.bytes += files.active.as_ref().expect("set").segment.len();
-        }
-        let active = files.active.as_mut().expect("set");
-        let mut texts = SegmentTexts {
-            known: &active.texts,
-            base: active.segment.text_count() as u32,
-            new: Vec::new(),
-            new_index: HashMap::new(),
+        let no_texts = HashMap::new();
+        let mut texts = match &files.active {
+            Some(active) => SegmentTexts {
+                known: &active.texts,
+                base: active.segment.text_count() as u32,
+                new: Vec::new(),
+                new_index: HashMap::new(),
+            },
+            None => SegmentTexts {
+                known: &no_texts,
+                base: 0,
+                new: Vec::new(),
+                new_index: HashMap::new(),
+            },
         };
         let mut grids = Grids::default();
         let mut fragments: Vec<(PhysicalASAPNodeId, Vec<u8>)> = Vec::new();
@@ -456,6 +454,15 @@ impl ViewFiles {
             return Ok(written);
         }
         let new_texts = texts.new;
+        if files.active.is_none() {
+            files.active = Some(ActiveSegment {
+                segment: Segment::create_new(&dir, end_ms, &header)?,
+                texts: HashMap::new(),
+                first_start_ms: start_ms,
+            });
+            written.bytes += files.active.as_ref().expect("set").segment.len();
+        }
+        let active = files.active.as_mut().expect("set");
         let texts_part =
             rmp_serde::to_vec(&new_texts.iter().map(|t| t.as_ref()).collect::<Vec<&str>>())
                 .map_err(std::io::Error::other)?;
@@ -538,7 +545,9 @@ impl ViewFiles {
                     .filter_map(|entry| entry.ok().map(|e| e.path()))
                     .filter(|path| path.extension().is_some_and(|x| x == "seg"))
                     .filter_map(|path| {
-                        let end = path.file_stem()?.to_str()?.parse::<i64>().ok()?;
+                        // `<end>.seg`, or `<end>_<n>.seg` beside an existing one.
+                        let stem = path.file_stem()?.to_str()?;
+                        let end = stem.split('_').next()?.parse::<i64>().ok()?;
                         Some((end, path))
                     })
                     .collect()
@@ -1657,6 +1666,53 @@ mod tests {
                 "after the cut",
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A segment file is created only once a fragment encodes, and never
+    /// over an existing one: a window recomputed after a restart whose end
+    /// is a recovered segment's first end goes to a new file, and the
+    /// recovered windows stay readable.
+    #[test]
+    fn appends_never_truncate_an_existing_segment() {
+        let dir = segment_dir("no-truncate");
+        let (_, batch) = every_family().remove(0);
+        let view: MaterializedView = serde_json::from_value(serde_json::json!({
+            "node_id": 1,
+            "refresh": "at_ingestion",
+            "coverage": {"definition_id": "v", "selection": []},
+            "inputs": {"materialized_views": []},
+            "retention_ms": 1_000_000,
+        }))
+        .unwrap();
+        let groups = vec![vec![(view, batch.schema().clone())]];
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
+        files.append(0, (0, 10), &[(1, &[])]).unwrap();
+        assert!(segment_files(&dir).is_empty(), "nothing encoded");
+        for end in [10, 20] {
+            files
+                .append(0, (end - 10, end), &[(1, std::slice::from_ref(&batch))])
+                .unwrap();
+        }
+        drop(files);
+        let mut files = ViewFiles::open(&dir, 7, Duration::ZERO).unwrap();
+        let recovered = files.index(&groups).unwrap();
+        files
+            .append(0, (0, 10), &[(1, std::slice::from_ref(&batch))])
+            .unwrap();
+        assert_eq!(segment_files(&dir).len(), 2);
+        for (_, location) in &recovered[&1] {
+            assert_same_rows(
+                &batch,
+                &location.read(batch.schema(), ViewRead::Mmap).unwrap(),
+                "recovered",
+            );
+        }
+        let index = ViewFiles::open(&dir, 7, Duration::ZERO)
+            .unwrap()
+            .index(&groups)
+            .unwrap();
+        assert_eq!(index[&1].len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

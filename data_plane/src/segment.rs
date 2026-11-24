@@ -209,18 +209,34 @@ fn frame(kind: u32, payload: &[u8]) -> std::io::Result<Vec<u8>> {
 }
 
 impl Segment {
-    /// A new, empty segment at `path` (replacing any file there), with its
-    /// header written.
-    pub(crate) fn create(path: &Path, header: &SegmentHeader) -> std::io::Result<Arc<Self>> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
+    /// A new, empty segment in `dir` whose first window ends at `end_ms`,
+    /// with its header written: `<end_ms>.seg`, or `<end_ms>_<n>.seg` when
+    /// that file exists (a recovered segment is never overwritten).
+    pub(crate) fn create_new(
+        dir: &Path,
+        end_ms: i64,
+        header: &SegmentHeader,
+    ) -> std::io::Result<Arc<Self>> {
+        std::fs::create_dir_all(dir)?;
+        let mut n = 0u32;
+        let (path, file) = loop {
+            let name = match n {
+                0 => format!("{end_ms}.seg"),
+                n => format!("{end_ms}_{n}.seg"),
+            };
+            let path = dir.join(name);
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => break (path, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+                Err(error) => return Err(error),
+            }
+        };
+        let path = path.as_path();
         let bytes = frame(
             HEADER_FRAME,
             &rmp_serde::to_vec(header).map_err(std::io::Error::other)?,
