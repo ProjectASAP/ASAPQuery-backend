@@ -3,18 +3,20 @@
 //!
 //! A segment is an append-only file of frames, each an 8-byte head (a
 //! little-endian `u32` payload length and a `u32` kind) and its payload,
-//! padded to a multiple of 8 bytes so every frame and every part inside a
-//! record starts 8-byte aligned. The first frame is the segment's header;
-//! each later frame is one refreshed window's record: its parts (the texts
-//! new to the segment, the Hydra-Count-Min grids, one fragment per view),
-//! then its head (MessagePack) and the head's length as the last 4 bytes.
+//! padded to a multiple of 8 bytes. The first frame is the segment's
+//! header; each later frame is one refreshed window's record: its parts
+//! (the texts new to the segment, the Hydra-Count-Min grids, one fragment
+//! per view), then its head (MessagePack) and the head's length as the last
+//! 4 bytes.
 //!
-//! A fragment holds one view's rows of one window by column, so a cold read
-//! decodes one (view, window) without the record's other views, and a
-//! fixed-width column of a sealed (mapped) segment is used in place. A text
-//! column holding each row's series label is not stored: it is rebuilt from
-//! the series identity column.
+//! A fragment holds one view's rows of one window by column, compressed
+//! (zstd), so a cold read decodes one (view, window) without the record's
+//! other views. State and text columns are stored compact
+//! ([`crate::state_codec`]) and rebuilt in the executor's mapped state
+//! layout when read. A text column holding each row's series label is not
+//! stored: it is rebuilt from the series identity column.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -33,6 +35,7 @@ use asap_executor::arrow::datatypes::{
 };
 use asap_executor::planner::ir::schema::{DataType, FieldDataType, Schema, PROMQL_SERIES_IDENTITY};
 use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
+use asap_executor::planner::summary_type::{ExactKind, SketchAlgorithm};
 use asap_executor::summary_kernels::HydraCms;
 use asap_executor::values::{
     family_has_mapped_form, state_view_bytes, Batch, BatchColumn, SchemaRef, Value,
@@ -42,9 +45,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::persist::{decode_stored_state, encode_state, Grids, StoredValue};
 use crate::series_ids::labels_of_identity;
+use crate::state_codec::{
+    decode_states, decode_text_keys, encode_states, encode_text_keys, CompactKind,
+};
 
 /// The view file format version these segments are.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// Frame kinds.
 const HEADER_FRAME: u32 = 0;
@@ -54,6 +60,8 @@ const RECORD_FRAME: u32 = 1;
 const MAX_FRAME_BYTES: u64 = 1 << 31;
 
 /// Column kinds in a fragment.
+/// Text: each row's key into the segment's texts, a signed varint delta
+/// from the previous row's.
 const TEXT: u32 = 1;
 const FLOAT64: u32 = 2;
 const INT64: u32 = 3;
@@ -62,24 +70,30 @@ const TIMESTAMP: u32 = 4;
 const GENERIC: u32 = 5;
 const STATES: u32 = 6;
 /// A state column in the executor's mapped layout: `u32` offsets in the
-/// data section, the states (each 8-byte aligned) in the second section;
-/// read in place, never rebuilt.
+/// data section, the states (each 8-byte aligned) in the second section.
+/// For a family with a mapped form but no compact one (KLL, Count-Min).
 const MAPPED_STATES: u32 = 7;
 /// A text column whose every row holds its series identity's label of the
 /// column's name (`""` when the series has none): no data, rebuilt on read
 /// from the identity column, whose index is the descriptor's flags.
 const IDENTITY_LABEL: u32 = 8;
+/// A state column in compact form ([`crate::state_codec`]); its flags are
+/// the [`CompactKind`] code. Read back into the mapped layout.
+const COMPACT_STATES: u32 = 9;
 /// Flag: a timestamp column whose rows all hold one value, stored once.
 const CONSTANT: u32 = 1;
 /// Bytes of one column descriptor: kind, flags, data offset and length,
 /// validity offset and length.
 const DESCRIPTOR_BYTES: usize = 40;
+/// The zstd level fragments are compressed at: level 1 compresses view
+/// fragments within a few percent of level 3 at about half the CPU.
+const ZSTD_LEVEL: i32 = 1;
 
 /// How a cold window's fragment is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum ViewRead {
-    /// Sealed segments mapped and decoded in place; the active segment
-    /// read with `pread`.
+    /// Sealed segments mapped, each fragment decompressed from the
+    /// mapping; the active segment read with `pread`.
     #[default]
     Mmap,
     /// Every fragment read with `pread` into a buffer.
@@ -652,21 +666,17 @@ pub struct WindowLocation {
     grids: (u64, u32),
 }
 
-/// Bytes read for a decode: borrowed from a mapping, or owned (8-byte
-/// aligned).
+/// Bytes read for a decode: borrowed from a mapping, or owned.
 enum Bytes {
     Mapped(Arc<Mapping>, usize, usize),
-    Owned(Vec<u64>, usize),
+    Owned(Vec<u8>),
 }
 
 impl Bytes {
     fn slice(&self) -> &[u8] {
         match self {
             Bytes::Mapped(mapping, offset, len) => &mapping.bytes()[*offset..*offset + *len],
-            Bytes::Owned(words, len) => {
-                // SAFETY: `words` holds at least `len` initialized bytes.
-                unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), *len) }
-            }
+            Bytes::Owned(bytes) => bytes,
         }
     }
 }
@@ -714,18 +724,6 @@ impl WindowLocation {
         self.segment.is_cold()
     }
 
-    /// Whether `address` lies inside its segment's mapping.
-    #[cfg(test)]
-    pub(crate) fn maps(&self, address: usize) -> bool {
-        match self.segment.mapping.get() {
-            Some(Ok(mapping)) => {
-                let start = mapping.ptr.as_ptr() as usize;
-                (start..start + mapping.len).contains(&address)
-            }
-            _ => false,
-        }
-    }
-
     /// `len` bytes at `offset` of the segment.
     fn bytes(&self, (offset, len): (u64, u32), how: ViewRead) -> Result<Bytes, Error> {
         let len = len as usize;
@@ -755,21 +753,18 @@ impl WindowLocation {
             };
             return Ok(Bytes::Mapped(mapping, offset as usize, len));
         }
-        let mut words = vec![0u64; len.div_ceil(8)];
-        // SAFETY: `words` is `len.div_ceil(8) * 8` writable bytes.
-        let buffer =
-            unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), len) };
+        let mut bytes = vec![0u8; len];
         self.segment
             .file
-            .read_exact_at(buffer, offset)
+            .read_exact_at(&mut bytes, offset)
             .map_err(|e| Error::Invalid(format!("{}: {e}", self.segment.path.display())))?;
-        Ok(Bytes::Owned(words, len))
+        Ok(Bytes::Owned(bytes))
     }
 
-    /// The fragment's rows as one batch of `schema`, and the bytes of its
-    /// state columns in the executor's mapped layout, which
-    /// [`Batch::memory_bytes`] does not count (`StateColumn::from_mapped`):
-    /// borrowed from the mapping, or copied to the heap by `pread`.
+    /// The fragment's rows as one batch of `schema`, and the bytes its
+    /// state columns hold: they are rebuilt in the mapped layout, which
+    /// [`Batch::memory_bytes`] counts as held outside the run, so a cache
+    /// holding the batch charges them itself.
     pub fn read(&self, schema: &SchemaRef, how: ViewRead) -> Result<(Batch, usize), Error> {
         let grids: Vec<Option<Arc<HydraCms>>> = if self.grids.1 == 0 {
             Vec::new()
@@ -785,8 +780,13 @@ impl WindowLocation {
                 })
                 .collect()
         };
-        let bytes = self.bytes((self.offset, self.len), how)?;
-        decode_fragment(&bytes, schema, &self.segment, &grids)
+        let compressed = self.bytes((self.offset, self.len), how)?;
+        decode_fragment(
+            &decompress(compressed.slice())?,
+            schema,
+            &self.segment,
+            &grids,
+        )
     }
 
     /// The segment holding the fragment.
@@ -870,8 +870,8 @@ fn validity(nulls: &[bool]) -> Option<Vec<u8>> {
     Some(bits)
 }
 
-/// `rows` (of `schema`) as one columnar fragment; `None` when a state has
-/// no byte encoding.
+/// `rows` (of `schema`) as one compressed columnar fragment; `None` when a
+/// state has no byte encoding.
 pub(crate) fn encode_fragment(
     schema: &Schema,
     rows: &[Vec<Value>],
@@ -902,96 +902,113 @@ pub(crate) fn encode_fragment(
                     && labels.holds_label(rows, column, &field.name)
             })
             .map(|labels| labels.column as u32);
-        let (kind, mut flags, data): (u32, u32, Vec<u8>) = if let Some(identity_column) =
-            label_of_identity_column
-        {
-            (IDENTITY_LABEL, identity_column, Vec::new())
-        } else {
-            match &field.dtype {
-                FieldDataType::Plain(DataType::Utf8) => {
-                    let mut data = Vec::with_capacity(rows.len() * 4);
-                    for value in values {
-                        let key = match value {
-                            Value::Utf8(text) => texts.key(text),
-                            _ => 0,
-                        };
-                        data.extend_from_slice(&key.to_le_bytes());
-                    }
-                    (TEXT, 0, data)
-                }
-                FieldDataType::Plain(DataType::Float64) => {
-                    let mut data = Vec::with_capacity(rows.len() * 8);
-                    for value in values {
-                        let v = match value {
-                            Value::Float64(v) => *v,
-                            _ => 0.0,
-                        };
-                        data.extend_from_slice(&v.to_le_bytes());
-                    }
-                    (FLOAT64, 0, data)
-                }
-                FieldDataType::Plain(DataType::Int64) => {
-                    let mut data = Vec::with_capacity(rows.len() * 8);
-                    for value in values {
-                        let v = match value {
-                            Value::Int64(v) => *v,
-                            _ => 0,
-                        };
-                        data.extend_from_slice(&v.to_le_bytes());
-                    }
-                    (INT64, 0, data)
-                }
-                FieldDataType::Plain(DataType::Timestamp) => {
-                    let times: Vec<i64> = values
-                        .map(|value| match value {
-                            Value::Timestamp(t) => *t,
-                            _ => 0,
-                        })
-                        .collect();
-                    let constant = !times.is_empty()
-                        && !nulls.iter().any(|&n| n)
-                        && times.iter().all(|&t| t == times[0]);
-                    let data: Vec<u8> = if constant {
-                        times[0].to_le_bytes().to_vec()
-                    } else {
-                        times.iter().flat_map(|t| t.to_le_bytes()).collect()
+        // A state column of a family with a compact form, compacted from
+        // each state's mapped layout (`None` when a state has none, e.g. a
+        // keyed exact state, or the column has no compact form).
+        let mut compact = compact_kind(&field.dtype).and_then(|kind| {
+            let views = rows
+                .iter()
+                .map(|row| match &row[column] {
+                    Value::Summary { state, .. } => state_view_bytes(state.as_ref()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some((kind, encode_states(kind, views.iter())?))
+        });
+        // Otherwise the column in the mapped layout, when it has one.
+        let mut mapped = match &field.dtype {
+            FieldDataType::Plain(_) => None,
+            _ if compact.is_some() => None,
+            family if family_has_mapped_form(family) => mapped_states(rows, column),
+            _ => None,
+        };
+        let (kind, mut flags, data): (u32, u32, Vec<u8>) = match &field.dtype {
+            _ if label_of_identity_column.is_some() => (
+                IDENTITY_LABEL,
+                label_of_identity_column.expect("checked"),
+                Vec::new(),
+            ),
+            FieldDataType::Plain(DataType::Utf8) => {
+                let keys = values.map(|value| match value {
+                    Value::Utf8(text) => texts.key(text),
+                    _ => 0,
+                });
+                (TEXT, 0, encode_text_keys(keys))
+            }
+            FieldDataType::Plain(DataType::Float64) => {
+                let mut data = Vec::with_capacity(rows.len() * 8);
+                for value in values {
+                    let v = match value {
+                        Value::Float64(v) => *v,
+                        _ => 0.0,
                     };
-                    (TIMESTAMP, if constant { CONSTANT } else { 0 }, data)
+                    data.extend_from_slice(&v.to_le_bytes());
                 }
-                FieldDataType::Plain(_) => {
-                    let values: Vec<&Value> = values.collect();
-                    (GENERIC, 0, rmp_serde::to_vec(&values).ok()?)
+                (FLOAT64, 0, data)
+            }
+            FieldDataType::Plain(DataType::Int64) => {
+                let mut data = Vec::with_capacity(rows.len() * 8);
+                for value in values {
+                    let v = match value {
+                        Value::Int64(v) => *v,
+                        _ => 0,
+                    };
+                    data.extend_from_slice(&v.to_le_bytes());
                 }
-                family
-                    if family_has_mapped_form(family) && mapped_states(rows, column).is_some() =>
-                {
-                    let (offsets, states) = mapped_states(rows, column).expect("checked");
-                    second = Some(states);
-                    (MAPPED_STATES, 0, offsets)
+                (INT64, 0, data)
+            }
+            FieldDataType::Plain(DataType::Timestamp) => {
+                let times: Vec<i64> = values
+                    .map(|value| match value {
+                        Value::Timestamp(t) => *t,
+                        _ => 0,
+                    })
+                    .collect();
+                let constant = !times.is_empty()
+                    && !nulls.iter().any(|&n| n)
+                    && times.iter().all(|&t| t == times[0]);
+                let data: Vec<u8> = if constant {
+                    times[0].to_le_bytes().to_vec()
+                } else {
+                    times.iter().flat_map(|t| t.to_le_bytes()).collect()
+                };
+                (TIMESTAMP, if constant { CONSTANT } else { 0 }, data)
+            }
+            FieldDataType::Plain(_) => {
+                let values: Vec<&Value> = values.collect();
+                (GENERIC, 0, rmp_serde::to_vec(&values).ok()?)
+            }
+            _ if compact.is_some() => {
+                let (compact_kind, compact) = compact.take().expect("checked");
+                (COMPACT_STATES, compact_kind.code(), compact)
+            }
+            _ if mapped.is_some() => {
+                let (offsets, states) = mapped.take().expect("checked");
+                second = Some(states);
+                (MAPPED_STATES, 0, offsets)
+            }
+            _ => {
+                // States: u32 offsets[rows + 1], then each state's stored bytes.
+                let mut offsets = Vec::with_capacity(rows.len() + 1);
+                let mut bytes = Vec::new();
+                offsets.push(0u32);
+                for value in values {
+                    let Value::Summary { state, .. } = value else {
+                        return None;
+                    };
+                    let stored = encode_state(state.as_ref(), grids)?;
+                    bytes.extend(rmp_serde::to_vec(&stored).ok()?);
+                    offsets.push(u32::try_from(bytes.len()).ok()?);
                 }
-                _ => {
-                    // States: u32 offsets[rows + 1], then each state's stored bytes.
-                    let mut offsets = Vec::with_capacity(rows.len() + 1);
-                    let mut bytes = Vec::new();
-                    offsets.push(0u32);
-                    for value in values {
-                        let Value::Summary { state, .. } = value else {
-                            return None;
-                        };
-                        let stored = encode_state(state.as_ref(), grids)?;
-                        bytes.extend(rmp_serde::to_vec(&stored).ok()?);
-                        offsets.push(u32::try_from(bytes.len()).ok()?);
-                    }
-                    let mut data: Vec<u8> = offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
-                    data.extend(bytes);
-                    (STATES, 0, data)
-                }
+                let mut data: Vec<u8> = offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
+                data.extend(bytes);
+                (STATES, 0, data)
             }
         };
         let (data_offset, data_len) = section(&mut out, &data);
         let (valid_offset, valid_len) = match (kind, validity(&nulls)) {
             (MAPPED_STATES, _) => section(&mut out, &second.take().expect("states")),
-            (STATES, _) | (GENERIC, _) => (0, 0),
+            (STATES | GENERIC | COMPACT_STATES, _) => (0, 0),
             (_, Some(bits)) => section(&mut out, &bits),
             (_, None) => (0, 0),
         };
@@ -1012,8 +1029,22 @@ pub(crate) fn encode_fragment(
             out[at + i * 8..at + i * 8 + 8].copy_from_slice(&word.to_le_bytes());
         }
     }
-    out.resize(padded(out.len()), 0);
-    Some(out)
+    compress(&out)
+}
+
+/// The compact form of a state family's column, if it has one.
+fn compact_kind(family: &FieldDataType) -> Option<CompactKind> {
+    Some(match family {
+        FieldDataType::Sketch(SketchAlgorithm::DDSketch) => CompactKind::DDSketch,
+        FieldDataType::ExactAggregate(kind, _) => match kind {
+            ExactKind::Sum => CompactKind::Sum,
+            ExactKind::Count => CompactKind::Count,
+            ExactKind::Min | ExactKind::Max => CompactKind::MinMax,
+            ExactKind::Counter => CompactKind::Counter,
+            ExactKind::IRate => CompactKind::LastTwoSamples,
+        },
+        _ => return None,
+    })
 }
 
 /// The labels of each row's series, from the series identity column, for
@@ -1104,36 +1135,74 @@ fn damaged() -> Error {
     Error::Invalid("a damaged view fragment".into())
 }
 
-/// A buffer over `bytes[offset..offset + len]`: borrowed from the mapping
-/// when `source` is one, copied otherwise.
-fn buffer(source: &Bytes, offset: usize, len: usize) -> Result<Buffer, Error> {
-    let slice = source
-        .slice()
-        .get(offset..offset + len)
-        .ok_or_else(damaged)?;
-    match source {
-        Bytes::Mapped(mapping, ..) => {
-            let ptr = NonNull::new(slice.as_ptr().cast_mut()).ok_or_else(damaged)?;
-            // SAFETY: `ptr` points at `len` bytes of the mapping, which the
-            // buffer keeps alive through its owner.
-            Ok(unsafe { Buffer::from_custom_allocation(ptr, len, mapping.clone()) })
-        }
-        // Copied into 8-byte words, so the buffer is aligned for any
-        // fixed-width type (an empty `Vec<u8>` is not).
-        Bytes::Owned(..) => {
-            let mut words = vec![0u64; len.div_ceil(8)];
-            // SAFETY: `words` is at least `len` writable bytes.
-            unsafe {
-                std::ptr::copy_nonoverlapping(slice.as_ptr(), words.as_mut_ptr().cast::<u8>(), len)
-            };
-            Ok(Buffer::from(words).slice_with_length(0, len))
-        }
+/// `bytes[offset..offset + len]` copied into a buffer of its own, 8-byte
+/// aligned (for any fixed-width type) and charged exactly its size.
+fn buffer(bytes: &[u8], offset: usize, len: usize) -> Result<Buffer, Error> {
+    let slice = bytes.get(offset..offset + len).ok_or_else(damaged)?;
+    let mut words = vec![0u64; len.div_ceil(8)];
+    // SAFETY: `words` is at least `len` writable bytes.
+    unsafe { std::ptr::copy_nonoverlapping(slice.as_ptr(), words.as_mut_ptr().cast::<u8>(), len) };
+    Ok(Buffer::from(words).slice_with_length(0, len))
+}
+
+/// A stored fragment: the length of its columnar bytes (`u32`), then
+/// those bytes compressed.
+/// `None` past [`MAX_FRAME_BYTES`], which a read rejects as damaged.
+fn compress(columnar: &[u8]) -> Option<Vec<u8>> {
+    if columnar.len() as u64 > MAX_FRAME_BYTES {
+        return None;
     }
+    let mut out = u32::try_from(columnar.len()).ok()?.to_le_bytes().to_vec();
+    // One zstd context per thread, not one per fragment.
+    let compressed = COMPRESSOR.with(|compressor| {
+        let mut compressor = compressor.borrow_mut();
+        if compressor.is_none() {
+            *compressor = Some(zstd::bulk::Compressor::new(ZSTD_LEVEL).ok()?);
+        }
+        compressor.as_mut()?.compress(columnar).ok()
+    })?;
+    out.extend(compressed);
+    Some(out)
+}
+
+thread_local! {
+    static COMPRESSOR: RefCell<Option<zstd::bulk::Compressor<'static>>> = const { RefCell::new(None) };
+    static DECOMPRESSOR: RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+        const { RefCell::new(None) };
+}
+
+/// The columnar bytes of a stored fragment.
+fn decompress(stored: &[u8]) -> Result<Vec<u8>, Error> {
+    let length = u32::from_le_bytes(stored.get(..4).ok_or_else(damaged)?.try_into().unwrap());
+    // The length is checked against the frame's own content size before it
+    // sizes an allocation.
+    let content_size = zstd::zstd_safe::get_frame_content_size(&stored[4..]);
+    if u64::from(length) > MAX_FRAME_BYTES
+        || !matches!(content_size, Ok(Some(size)) if size == u64::from(length))
+    {
+        return Err(damaged());
+    }
+    let columnar = DECOMPRESSOR
+        .with(|decompressor| {
+            let mut decompressor = decompressor.borrow_mut();
+            if decompressor.is_none() {
+                *decompressor = Some(zstd::bulk::Decompressor::new().ok()?);
+            }
+            decompressor
+                .as_mut()?
+                .decompress(&stored[4..], length as usize)
+                .ok()
+        })
+        .ok_or_else(damaged)?;
+    if columnar.len() != length as usize {
+        return Err(damaged());
+    }
+    Ok(columnar)
 }
 
 /// A primitive column of `rows` values at `offset`, with nulls.
 fn primitive<T: ArrowPrimitiveType>(
-    source: &Bytes,
+    source: &[u8],
     (offset, len): (usize, usize),
     rows: usize,
     nulls: Option<NullBuffer>,
@@ -1174,15 +1243,15 @@ fn descriptor(bytes: &[u8], column: usize) -> Result<Descriptor, Error> {
     })
 }
 
-/// The fragment in `source` as one batch of `schema`, and the bytes of its
-/// mapped state columns ([`WindowLocation::read`]).
+/// The columnar fragment `bytes` as one batch of `schema`, and the bytes
+/// its state columns hold.
 fn decode_fragment(
-    source: &Bytes,
+    bytes: &[u8],
     schema: &SchemaRef,
     segment: &Segment,
     grids: &[Option<Arc<HydraCms>>],
 ) -> Result<(Batch, usize), Error> {
-    let bytes = source.slice();
+    let mut state_bytes = 0;
     let header = word(bytes, 0)?;
     let rows = (header & 0xffff_ffff) as usize;
     let columns = (header >> 32) as usize;
@@ -1198,7 +1267,9 @@ fn decode_fragment(
     // The Arrow layout of each plain column, as the executor builds it.
     let empty = Batch::try_new(schema.clone(), Vec::new())?;
     let mut out = Vec::with_capacity(columns);
-    let mut mapped_state_bytes = 0;
+    // The series identity column's index and keys, decoded once for every
+    // label column read back from it.
+    let mut identity_keys: Option<(usize, ScalarBuffer<u32>)> = None;
     for (column, field) in schema.fields.iter().enumerate() {
         let Descriptor {
             kind,
@@ -1206,7 +1277,7 @@ fn decode_fragment(
             data,
             valid,
         } = descriptor(bytes, column)?;
-        let nulls = if valid.1 == 0 || kind == MAPPED_STATES {
+        let nulls = if valid.1 == 0 || kind == MAPPED_STATES || kind == COMPACT_STATES {
             None
         } else {
             if valid.1 != rows.div_ceil(8) {
@@ -1218,8 +1289,14 @@ fn decode_fragment(
         let expected = empty.column(column).data_type().clone();
         let array: ArrayRef = match kind {
             TEXT => {
-                let keys = primitive::<UInt32Type>(source, data, rows, nulls)?;
+                let keys =
+                    decode_text_keys(&bytes[data.0..data.0 + data.1], rows).ok_or_else(damaged)?;
+                let keys = UInt32Array::try_new(keys.into(), nulls)
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
                 let needed = keys.iter().flatten().max().map_or(0, |k| k as usize + 1);
+                if field.name == PROMQL_SERIES_IDENTITY && keys.null_count() == 0 {
+                    identity_keys = Some((column, keys.values().clone()));
+                }
                 let values = segment.dictionary(needed)?;
                 Arc::new(
                     DictionaryArray::<UInt32Type>::try_new(keys, values)
@@ -1237,7 +1314,23 @@ fn decode_fragment(
                 if identity.kind != TEXT || identity.valid.1 != 0 || data.1 != 0 || valid.1 != 0 {
                     return Err(damaged());
                 }
-                let keys = primitive::<UInt32Type>(source, identity.data, rows, None)?;
+                // Each label column holds a copy of the identity column's
+                // keys, so its charge is what it holds.
+                let keys = match &identity_keys {
+                    Some((at, keys)) if *at == identity_column => keys.clone(),
+                    _ => {
+                        let keys = ScalarBuffer::from(
+                            decode_text_keys(
+                                &bytes[identity.data.0..identity.data.0 + identity.data.1],
+                                rows,
+                            )
+                            .ok_or_else(damaged)?,
+                        );
+                        identity_keys = Some((identity_column, keys.clone()));
+                        keys
+                    }
+                };
+                let keys = UInt32Array::from(keys.to_vec());
                 let needed = keys.values().iter().max().map_or(0, |&k| k as usize + 1);
                 let values = segment.label_values(&field.name, needed)?;
                 Arc::new(
@@ -1245,8 +1338,8 @@ fn decode_fragment(
                         .map_err(|e| Error::Invalid(e.to_string()))?,
                 )
             }
-            FLOAT64 => Arc::new(primitive::<Float64Type>(source, data, rows, nulls)?),
-            INT64 => Arc::new(primitive::<Int64Type>(source, data, rows, nulls)?),
+            FLOAT64 => Arc::new(primitive::<Float64Type>(bytes, data, rows, nulls)?),
+            INT64 => Arc::new(primitive::<Int64Type>(bytes, data, rows, nulls)?),
             TIMESTAMP if flags & CONSTANT != 0 => {
                 if data.1 != 8 {
                     return Err(damaged());
@@ -1258,7 +1351,7 @@ fn decode_fragment(
                 ]))
             }
             TIMESTAMP => Arc::new(primitive::<TimestampMillisecondType>(
-                source, data, rows, nulls,
+                bytes, data, rows, nulls,
             )?),
             GENERIC => {
                 let values: Vec<Value> = rmp_serde::from_slice(&bytes[data.0..data.0 + data.1])
@@ -1268,16 +1361,32 @@ fn decode_fragment(
                 }
                 one_column(field, values.into_iter().map(|v| vec![v]).collect())?.0
             }
+            COMPACT_STATES => {
+                let compact = CompactKind::from_code(flags)
+                    .filter(|&kind| Some(kind) == compact_kind(&field.dtype))
+                    .ok_or_else(damaged)?;
+                let (states, offsets) =
+                    decode_states(compact, &bytes[data.0..data.0 + data.1], rows)
+                        .ok_or_else(damaged)?;
+                state_bytes += states.len() * 8 + offsets.len() * 4;
+                let column = asap_executor::values::StateColumn::from_mapped(
+                    field.dtype.clone(),
+                    Buffer::from(states),
+                    ScalarBuffer::from(offsets),
+                )?;
+                out.push(BatchColumn::States {
+                    indices: UInt32Array::from_iter_values(0..rows as u32),
+                    states: Arc::new(column),
+                });
+                continue;
+            }
             MAPPED_STATES => {
-                // Read in place: the offsets and the states are borrowed
-                // from the mapping (copied for `pread`), never rebuilt.
                 if data.1 != (rows + 1) * 4 {
                     return Err(damaged());
                 }
-                mapped_state_bytes += data.1 + valid.1;
-                let offsets =
-                    ScalarBuffer::<u32>::new(buffer(source, data.0, data.1)?, 0, rows + 1);
-                let states = buffer(source, valid.0, valid.1)?;
+                state_bytes += data.1 + valid.1;
+                let offsets = ScalarBuffer::<u32>::new(buffer(bytes, data.0, data.1)?, 0, rows + 1);
+                let states = buffer(bytes, valid.0, valid.1)?;
                 let column = asap_executor::values::StateColumn::from_mapped(
                     field.dtype.clone(),
                     states,
@@ -1351,10 +1460,7 @@ fn decode_fragment(
         }
         out.push(BatchColumn::Plain(array));
     }
-    Ok((
-        Batch::try_from_columns(schema.clone(), out)?,
-        mapped_state_bytes,
-    ))
+    Ok((Batch::try_from_columns(schema.clone(), out)?, state_bytes))
 }
 
 /// `rows` of one column `field` built by the executor: its array, and its

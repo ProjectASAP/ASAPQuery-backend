@@ -21,6 +21,7 @@ pub mod remote_write;
 pub mod result_cache;
 pub mod segment;
 pub mod series_ids;
+mod state_codec;
 pub mod store;
 pub mod window_cache;
 
