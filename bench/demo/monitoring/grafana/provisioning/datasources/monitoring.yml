@@ -1,0 +1,10 @@
+apiVersion: 1
+datasources:
+  - name: Monitoring Prometheus
+    uid: monprom
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:19090
+    isDefault: true
+    jsonData:
+      timeInterval: 1s

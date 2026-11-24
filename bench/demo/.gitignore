@@ -1,0 +1,26 @@
+# Checkouts, binaries and everything a run writes under $ASAPQ_BENCH.
+/backend
+/ASAPQuery
+/prep/
+/runs/
+/report_demo/
+/logs/
+/live/data/
+/live/logs/
+/live/pids/
+/live/screenshots/
+/live/prep-*/
+/live/aside-*/
+/live/cmds/
+/live/mnt/
+/live/disk/
+/live/limits.env
+/live/reference_start_ms
+/live/stream_start_ms
+/live/watchdog.pid
+/live/planner/report.json
+/live/planner/planning.json
+/monitoring/textfile/
+/monitoring/grafana/dashboards/
+__pycache__/
+*.pyc

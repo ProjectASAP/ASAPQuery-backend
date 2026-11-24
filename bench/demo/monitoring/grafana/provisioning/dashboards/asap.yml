@@ -1,0 +1,9 @@
+apiVersion: 1
+providers:
+  - name: asap-demo
+    folder: ASAP
+    type: file
+    allowUiUpdates: true
+    options:
+      # Set by docker-compose.yml (container path) or run_binaries.sh (host path).
+      path: $ASAP_DASHBOARDS_DIR

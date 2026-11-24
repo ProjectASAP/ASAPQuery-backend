@@ -1,0 +1,58 @@
+# Monitoring Prometheus for the ASAP data plane vs VictoriaMetrics demo.
+# Every target is on the run host's loopback (host networking). Ports:
+#   19091 node-exporter (+ textfile collector: the harness report)
+#   19092 process-exporter (per-process CPU/RSS of the arms, feeders, harness)
+#   19093 harness run.py --metrics-port (per-query latency, phases, component CPU/RSS)
+#   19500 VictoriaMetrics arm (its own /metrics)
+#   19601 ASAP data plane, `asap` arm (GET /metrics, `asap_*`); 19301/19401 the backend arms
+#   19100 Prometheus exact-reference arm (its own /metrics)
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+scrape_configs:
+  - job_name: harness
+    scrape_interval: 1s
+    scrape_timeout: 1s
+    static_configs: [{targets: ["127.0.0.1:19093"]}]
+  - job_name: node
+    static_configs: [{targets: ["127.0.0.1:19091"]}]
+  - job_name: process
+    static_configs: [{targets: ["127.0.0.1:19092"]}]
+  - job_name: asap_data_plane
+    scrape_interval: 2s
+    scrape_timeout: 2s
+    static_configs:
+      - {targets: ["127.0.0.1:19601"], labels: {arm: asap}}
+      - {targets: ["127.0.0.1:19301"], labels: {arm: backend}}
+      - {targets: ["127.0.0.1:19401"], labels: {arm: backend_alone}}
+  - job_name: victoriametrics
+    scrape_interval: 2s
+    scrape_timeout: 2s
+    static_configs: [{targets: ["127.0.0.1:19500"], labels: {arm: victoriametrics}}]
+  - job_name: prometheus_reference
+    static_configs: [{targets: ["127.0.0.1:19100"], labels: {arm: prometheus}}]
+  # Live demo (run_live_demo.sh): the three engines, the logging proxies
+  # Grafana queries them through, and Grafana's own metrics.
+  - job_name: asap_live
+    scrape_interval: 5s
+    static_configs: [{targets: ["127.0.0.1:19711"], labels: {arm: asap}}]
+  - job_name: vm_live
+    scrape_interval: 5s
+    static_configs: [{targets: ["127.0.0.1:19712"], labels: {arm: victoriametrics}}]
+  - job_name: prometheus_live
+    static_configs: [{targets: ["127.0.0.1:19713"], labels: {arm: prometheus}}]
+  - job_name: live_proxy
+    scrape_interval: 5s
+    metrics_path: /proxy/metrics
+    static_configs: [{targets: ["127.0.0.1:19721", "127.0.0.1:19722", "127.0.0.1:19723"]}]
+  - job_name: grafana
+    static_configs: [{targets: ["127.0.0.1:13000"]}]
+  - job_name: live_ingest
+    scrape_interval: 2s
+    static_configs: [{targets: ["127.0.0.1:19724"]}]
+  - job_name: live_load
+    scrape_interval: 5s
+    static_configs: [{targets: ["127.0.0.1:19725"]}]
+  - job_name: live_limits
+    scrape_interval: 5s
+    static_configs: [{targets: ["127.0.0.1:19726"]}]

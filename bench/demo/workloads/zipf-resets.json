@@ -1,0 +1,208 @@
+{
+  "data_facts": {
+    "backfill_history_ms": 1200000,
+    "events": {
+      "assignment": "deterministic_rotating_pool_with_cross_leaf_overlap",
+      "distinct_key": "user_id",
+      "table": "events",
+      "time_column": "ts",
+      "user_id_universe_size": 10000,
+      "user_ids_per_leaf": 1000
+    },
+    "feeder_seed": 862,
+    "metrics": {
+      "data": {
+        "kind": "gauge",
+        "pareto_shape": 2.0,
+        "value_shape": "rank_scaled_pareto"
+      },
+      "data_total": {
+        "increment_shape": "rank_scaled_positive_deterministic",
+        "kind": "counter",
+        "resets": "none"
+      }
+    },
+    "scrape_interval_ms": 100,
+    "series": {
+      "leaf_count": 10000,
+      "ranking": {
+        "exponent": 1.1,
+        "kind": "deterministic_zipf_like",
+        "rank_scope": "leaf_series"
+      }
+    }
+  },
+  "description": "Smoke for Zipf data and counter resets: per-series increase/rate over 10m/5m (windows span resets), job-level sums, gauge quantile/max; 2 h query phase so resets (5% of series every 30-120 min) occur.",
+  "id": "zipf-resets",
+  "labels": [
+    {
+      "cardinality": 4,
+      "name": "region"
+    },
+    {
+      "cardinality": 5,
+      "child_of": "region",
+      "name": "service"
+    },
+    {
+      "cardinality": 10,
+      "child_of": "service",
+      "name": "job"
+    },
+    {
+      "cardinality": 50,
+      "child_of": "job",
+      "name": "label_0"
+    }
+  ],
+  "queries": [
+    {
+      "grouping": [
+        "region",
+        "service",
+        "job",
+        "label_0"
+      ],
+      "id": "r01-increase-series-10m",
+      "interval_ms": 15000,
+      "lookback_ms": 600000,
+      "promql": "increase(data_total[10m])",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [
+            "region",
+            "service",
+            "job",
+            "label_0"
+          ],
+          "id": "r01-increase-series-10m/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 600000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [
+        "region",
+        "service",
+        "job",
+        "label_0"
+      ],
+      "id": "r02-rate-series-5m",
+      "interval_ms": 15000,
+      "lookback_ms": 300000,
+      "promql": "rate(data_total[5m])",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [
+            "region",
+            "service",
+            "job",
+            "label_0"
+          ],
+          "id": "r02-rate-series-5m/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 300000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [
+        "job"
+      ],
+      "id": "r03-increase-job-10m",
+      "interval_ms": 15000,
+      "lookback_ms": 600000,
+      "promql": "sum by (job) (increase(data_total[10m]))",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "sum",
+          "grouping_labels": [
+            "job"
+          ],
+          "id": "r03-increase-job-10m/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 600000,
+          "metric": "data_total"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [
+        "region",
+        "service",
+        "job",
+        "label_0"
+      ],
+      "id": "r04-quantile-10m",
+      "interval_ms": 15000,
+      "lookback_ms": 600000,
+      "promql": "quantile_over_time(0.99, data[10m])",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "quantile",
+          "grouping_labels": [
+            "region",
+            "service",
+            "job",
+            "label_0"
+          ],
+          "id": "r04-quantile-10m/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 600000,
+          "metric": "data",
+          "phi": 0.99
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    },
+    {
+      "grouping": [
+        "region",
+        "service",
+        "job",
+        "label_0"
+      ],
+      "id": "r05-max-10m",
+      "interval_ms": 15000,
+      "lookback_ms": 600000,
+      "promql": "max_over_time(data[10m])",
+      "rqes": [
+        {
+          "accuracy_sla": 0.95,
+          "capability": "max",
+          "grouping_labels": [
+            "region",
+            "service",
+            "job",
+            "label_0"
+          ],
+          "id": "r05-max-10m/rqe",
+          "interval_ms": 15000,
+          "lookback_ms": 600000,
+          "metric": "data"
+        }
+      ],
+      "sql": null,
+      "support": "common-promql"
+    }
+  ],
+  "samples_per_sec_per_series": 10,
+  "seed": 862,
+  "version": 1
+}
