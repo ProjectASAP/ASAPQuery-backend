@@ -88,12 +88,9 @@ pub(crate) enum FrequencyKind {
     CountSketchHeap,
 }
 
-/// One stored state (or, in version 1 files, value) of a view row.
+/// One stored state of a view row.
 #[derive(Serialize, Deserialize)]
 pub(crate) enum StoredValue {
-    Plain(Value),
-    /// A text value, by its index in the file's dictionary.
-    Text(u32),
     Exact(ExactAccumulator),
     Increase(IncreaseAccumulator),
     Sketch {
@@ -655,7 +652,6 @@ pub(crate) fn decode_stored_state(
     grids: &[Option<Arc<HydraCms>>],
 ) -> Option<Arc<dyn AggregateCore>> {
     Some(match value {
-        StoredValue::Plain(_) | StoredValue::Text(_) => return None,
         StoredValue::Exact(state) => Arc::new(state),
         StoredValue::Increase(state) => Arc::new(state),
         StoredValue::Sketch { kernel, asapv1 } => decode_sketch(kernel, &asapv1)?,
