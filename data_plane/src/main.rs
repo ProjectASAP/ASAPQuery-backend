@@ -102,6 +102,20 @@ struct Args {
     /// with an error giving the reason.
     #[arg(long)]
     no_forward: bool,
+    /// Forward mode (off by default): deliver every accepted Remote Write
+    /// request to this raw store (a VictoriaMetrics single-node base URL),
+    /// which also answers every query the plan does not answer and every
+    /// other API path, in place of `--prometheus-url`. Cannot be used with
+    /// `--no-forward`.
+    #[arg(long, conflicts_with = "no_forward")]
+    raw_store_url: Option<String>,
+    /// Forward mode: bytes of Remote Write bodies queued or in flight to the
+    /// raw store beyond which writes are refused with 503.
+    #[arg(long, default_value_t = data_plane::raw_forward::RawForwardOptions::new("").max_queued_bytes)]
+    raw_forward_queue_bytes: u64,
+    /// Forward mode: Remote Write requests delivered to the raw store at once.
+    #[arg(long, default_value_t = data_plane::raw_forward::RawForwardOptions::new("").concurrency)]
+    raw_forward_concurrency: usize,
     /// The most bytes one ingestion or query run may hold.
     #[arg(long, default_value_t = EngineOptions::default().run_memory_limit_bytes)]
     run_memory_limit_bytes: usize,
@@ -207,6 +221,19 @@ async fn main() -> anyhow::Result<()> {
         )?
         .with_forward_timeout(Duration::from_secs(args.forward_timeout_seconds)),
     );
+    let state = match &args.raw_store_url {
+        Some(url) => {
+            let mut options = data_plane::raw_forward::RawForwardOptions::new(url.clone());
+            options.max_queued_bytes = args.raw_forward_queue_bytes;
+            options.concurrency = args.raw_forward_concurrency;
+            let state = Arc::try_unwrap(state)
+                .map_err(|_| anyhow::anyhow!("the data plane is already shared"))?
+                .with_raw_forward(options)?;
+            tracing::info!(raw_store = %url, "forward mode: raw samples and unplanned queries go to the raw store");
+            Arc::new(state)
+        }
+        None => state,
+    };
     tracing::info!(queries = state.queries.len(), "installed plan");
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     tracing::info!(address = %listener.local_addr()?, "listening");

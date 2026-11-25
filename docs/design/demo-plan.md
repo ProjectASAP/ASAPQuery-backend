@@ -298,11 +298,7 @@ Results at 10k series and 10 Hz, 12 cores, each engine alone:
 
 Next, after the 48-core demo:
 
-1. Forward mode (optional): the data plane forwards raw samples to a
-   VictoriaMetrics single-node used as the raw store; planned queries are
-   answered by ASAP, the rest by VictoriaMetrics. Resources are reported as
-   the sum of both, against VictoriaMetrics alone. With forwarding off the
-   demo is unchanged.
+1. Forward mode: designed and implemented, see §10.1.
 2. A compressed raw store, so the data plane answers any query itself:
    compressed blocks written by the ingest shards, a label inverted index
    and time-range reads. Existing options (Parquet/Arrow with DataFusion,
@@ -310,3 +306,100 @@ Next, after the 48-core demo:
    before a design.
 3. Multi-level windows under cost model 3: start from the plan solved
    without levels and cap the search by a node limit, reporting the gap.
+
+### 10.1 Forward mode
+
+Forward mode is an optional switch, off by default. With it on, the data plane
+also sends every raw sample to a VictoriaMetrics single-node used as the raw
+store. That lets the demo answer any query: planned queries are answered by
+ASAP, and everything else by VictoriaMetrics.
+
+**Switch.** `--raw-store-url URL`, the base URL of the VictoriaMetrics instance.
+
+- Off (no flag), the data plane behaves exactly as before. The forwarder does
+  not exist, no extra route is served, and no metric is added.
+- It cannot be combined with `--no-forward`, which refuses unplanned queries.
+- Two settings tune it:
+  - `--raw-forward-queue-bytes` (default 256 MiB): the byte bound described under
+    Write path.
+  - `--raw-forward-concurrency` (default 4): how many deliveries run at once.
+
+**Write path.** For each Remote Write request:
+
+1. The data plane decodes it. A bad request is answered with 400 and is not
+   forwarded.
+2. It reserves room for the compressed body in a forward queue, bounded in
+   bytes (bodies being delivered count too). If the queue is full, it answers
+   503 and goes no further.
+3. It hands the samples to the engine. If the engine refuses them (its own
+   backpressure), it releases the reserved room and answers 503.
+4. It puts the body, unchanged, in the forward queue and answers 204.
+
+So a 204 means both stores have the request: the engine has admitted the
+samples, and the raw store's copy is queued. A 503 means neither has it, so a
+sender's retry never duplicates samples in either store.
+
+All samples go to VictoriaMetrics, including metrics no plan reads, because it
+is the store for every query the plan does not cover.
+
+**Delivery.** A few workers on their own thread send queued bodies to
+`URL/api/v1/write`:
+
+- They send the snappy-compressed bodies with the Remote Write headers.
+- After a 429, a 5xx, a timeout or a connection error they retry the same body,
+  with an exponential backoff from 100 ms to 5 s.
+- Any other 4xx means VictoriaMetrics will never accept that body. It is dropped
+  and counted.
+- The order between concurrent deliveries is not kept. VictoriaMetrics accepts
+  samples out of order.
+- The queue is in memory, and there is no disk spool, by decision. This is a
+  known limit: a crash of the data plane loses up to `--raw-forward-queue-bytes`
+  of samples it has already acknowledged, on the raw-store side only. ASAP
+  still holds those samples; VictoriaMetrics, which answers the unplanned
+  queries, does not. A smaller bound limits the loss, at the cost of more 503s
+  when the raw store slows down.
+
+**Queries.** Each query is answered by whichever store can answer it:
+
+- A planned query the plan answers gets `x-asap-execution: plan`.
+- Every other query (unplanned, or a planned query the plan cannot answer) goes
+  to VictoriaMetrics, and so does every other path: `labels`, `series`, label
+  values, metadata and the VictoriaMetrics UI.
+- These forwarded answers get `x-asap-execution: forwarded`. A planned query that
+  falls back also carries `x-asap-forward-reason`.
+- This reuses the existing query forwarding: forward mode points it at the raw
+  store instead of `--prometheus-url`.
+
+**Resources.** The forward-mode arm runs the data plane and VictoriaMetrics in
+one cgroup, under the same limits as the VictoriaMetrics-alone arm. The
+cgroup's memory, disk and network are therefore their sum, ASAP +
+VictoriaMetrics. CPU and RSS are also reported per process. All of this is
+compared against VictoriaMetrics alone.
+
+The data plane also exports these metrics:
+
+- `asap_raw_forward_queued_bytes` and `asap_raw_forward_queued_requests`;
+- `asap_raw_forward_requests_total{outcome="delivered|dropped"}`;
+- `asap_raw_forward_retries_total`;
+- `asap_raw_forward_delivered_bytes_total`;
+- `asap_raw_forward_refused_writes_total`.
+
+The same numbers appear under `raw_forward` in `/api/v1/status/asap`.
+
+**Test plan** (`data_plane/tests/forward_mode.rs`). The raw store is a
+recording mock that can accept, fail N times or hold requests.
+
+| # | Behaviour | Expected |
+| --- | --- | --- |
+| F1 | Forward mode off | Unknown paths answer 404. Writes and planned queries behave as before. No `asap_raw_forward` metric exists. |
+| F2 | Accepted writes | They reach the raw store byte for byte, snappy-encoded. ASAP's answers equal those with forwarding off. |
+| F3 | Planned query | Answered by ASAP, marked `plan`. |
+| F3 | Unplanned `query` and `query_range`, `labels`, `series`, label values | Proxied with their query string, marked `forwarded`. |
+| F4 | Raw store answers 503 or 429 twice | The body is retried and delivered once, with 2 retries counted. |
+| F5 | Raw store down, then up | Queued bodies wait, and are delivered once it is up. |
+| F6 | Queue full (raw store holds requests) | The write gets 503 and the engine never sees it. After the store recovers, the retried write is accepted, and each store has every sample exactly once. |
+| F7 | Raw store answers 400 | The body is dropped and counted. Later bodies are still delivered. |
+| F8 | Forward mode with `--no-forward` | Refused at start. |
+
+All existing data plane tests run with forward mode off and must pass
+unchanged.
