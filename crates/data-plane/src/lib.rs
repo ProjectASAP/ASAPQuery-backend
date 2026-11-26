@@ -204,7 +204,7 @@ async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
                 },
                 None => None,
             };
-            if let Err(refused) = ingest(&state, samples, "Remote Write") {
+            if let Some(refused) = ingest(&state, samples, "Remote Write") {
                 return refused;
             }
             if let Some(reservation) = reservation {
@@ -226,7 +226,7 @@ async fn write_victoriametrics(State(state): State<Arc<DataPlane>>, body: Bytes)
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
     if !samples.is_empty() {
-        if let Err(refused) = ingest(&state, samples, "VictoriaMetrics Remote Write") {
+        if let Some(refused) = ingest(&state, samples, "VictoriaMetrics Remote Write") {
             return refused;
         }
     }
@@ -250,38 +250,35 @@ async fn write_otlp(
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
     if !samples.is_empty() {
-        if let Err(refused) = ingest(&state, samples, "OTLP") {
+        if let Some(refused) = ingest(&state, samples, "OTLP") {
             return refused;
         }
     }
     axum::Json(serde_json::json!({ "rejected": 0 })).into_response()
 }
 
-/// Hands decoded samples to the engine; the response refusing them when it
-/// is busy (503, which senders retry) or has stopped (500).
+/// Hands decoded samples to the engine: `None` once it has them, or the
+/// response refusing them when it is busy (503, which senders retry) or has
+/// stopped (500).
 fn ingest(
     state: &DataPlane,
     samples: Vec<storage::store::RawSample>,
     protocol: &str,
-) -> Result<(), Response> {
-    state
-        .engine
-        .try_ingest(samples)
-        .map_err(|error| match error {
-            IngestError::Busy => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                IngestError::Busy.to_string(),
+) -> Option<Response> {
+    let refused = match state.engine.try_ingest(samples).err()? {
+        IngestError::Busy => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            IngestError::Busy.to_string(),
+        ),
+        IngestError::Stopped => {
+            tracing::error!("{protocol} refused: the engine has stopped");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                IngestError::Stopped.to_string(),
             )
-                .into_response(),
-            IngestError::Stopped => {
-                tracing::error!("{protocol} refused: the engine has stopped");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    IngestError::Stopped.to_string(),
-                )
-                    .into_response()
-            }
-        })
+        }
+    };
+    Some(refused.into_response())
 }
 
 /// `POST /api/v1/precompute/watermark?time_ms=T`: the producer states that
