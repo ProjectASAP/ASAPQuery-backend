@@ -2,8 +2,8 @@
 //! windows in a bounded cache, the rest read cold from the view files.
 //! Tests V7–V12, V16 and V17 of the design's test plan, end to end through
 //! the HTTP API; the parity test V1 is in `planner_executor_parity.rs` and
-//! the unit tests are next to the code (`persist.rs`, `window_cache.rs`,
-//! `memory_budget.rs`). Each compares a tiered data plane with one that
+//! the unit tests are next to the code (`crates/storage`: `persist.rs`,
+//! `window_cache.rs`, `memory_budget.rs`). Each compares a tiered data plane with one that
 //! keeps every window in memory (the control).
 
 mod common;

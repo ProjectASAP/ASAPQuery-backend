@@ -231,6 +231,8 @@ not stored) with a Prometheus `execution` error (422,
 |---|---|
 | `crates/control-plane/` | package `control_plane`: workload → `asap-planner` → plan file |
 | `crates/data-plane/` | package `data_plane`: the data plane and its binary |
+| `crates/storage/` | package `storage`: raw samples and views in memory, the view cache, segments and persistence |
+| `crates/internal-metrics/` | package `internal_metrics`: the backend's measurements of itself, exported on `/metrics` |
 | `benchmarks/` | the backend alone: `micro/` benchmarks (examples of `data_plane`) and `scripts/` |
 | `eval/` | comparisons with other systems and the live demo; see [eval/README.md](eval/README.md) |
 | `deployment/monitoring/` | Prometheus, exporters and Grafana for the demo and the comparisons |

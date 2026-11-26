@@ -31,7 +31,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use asap_executor::arrow::array::{
@@ -48,9 +48,8 @@ use asap_executor::sources::{DataStore, MaterializedViewRequest, RawDataRequest}
 use asap_executor::values::{Batch, BatchColumn, SchemaRef};
 use asap_executor::Error;
 use futures::{stream, StreamExt};
+use internal_metrics::{PhaseStats, Timer};
 
-use crate::ingestion::window_end;
-use crate::metrics::{PhaseStats, Timer};
 use crate::persist::{ViewRead, WindowLocation};
 use crate::series_ids::Series;
 use crate::window_cache::{WindowCache, WindowKey};
@@ -355,7 +354,7 @@ impl RawData {
     /// when `None`) as batches of `request`'s schema: one per chunk of the
     /// panes overlapping the range, the open pane's included. A chunk read
     /// whole is converted once per `reads` and shared by its later reads.
-    pub(crate) fn read(
+    pub fn read(
         &self,
         metric: &str,
         request: &RawDataRequest,
@@ -433,7 +432,7 @@ impl SeriesPartition {
 /// One run's part of the series and the stored chunks it has cut to that
 /// part, so the run's scans filter each chunk (and build its series
 /// identities) once, as a whole run reads each chunk's cached ones.
-pub(crate) struct PartitionReads {
+pub struct PartitionReads {
     partition: SeriesPartition,
     /// By chunk address; each entry holds the chunk, so its address is not
     /// reused while it is kept.
@@ -685,7 +684,19 @@ pub type ViewRowsByView = BTreeMap<PhysicalASAPNodeId, Vec<((i64, i64), Vec<Batc
 /// The end at or before which `view`'s windows are past its retention,
 /// counted back from the window ending at `newest_end`.
 pub(crate) fn oldest_kept_end(view: &MaterializedView, newest_end: i64) -> i64 {
-    newest_end.saturating_sub(crate::ingestion::millis(view.retention_ms()))
+    newest_end.saturating_sub(millis(view.retention_ms()))
+}
+
+/// A duration option in milliseconds as a time offset, saturating.
+pub fn millis(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// End of the tumbling window of width `width_ms` (on multiples of it)
+/// that holds `timestamp_ms`. Windows are `(end - width_ms, end]`, like
+/// PromQL ranges: a sample at a boundary belongs to the window it ends.
+pub fn window_end(timestamp_ms: i64, width_ms: i64) -> i64 {
+    -((-timestamp_ms).div_euclid(width_ms)) * width_ms
 }
 
 /// Rows stored for one view: one entry per appended window, oldest first.
@@ -736,6 +747,27 @@ impl ViewTier {
             cold_reads: AtomicU64::new(0),
             cold_read_bytes: AtomicU64::new(0),
             decode: PhaseStats::default(),
+        }
+    }
+}
+
+/// The view cache's monitor: once a second, drops idle windows and, under
+/// a cgroup memory limit, lowers the cache's target while anonymous memory
+/// runs higher than its budget assumed.
+pub fn serve_view_cache(tier: Arc<ViewTier>, budget: Option<u64>, running: Arc<AtomicBool>) {
+    let cgroup = crate::memory_budget::own_cgroup();
+    while running.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        tier.cache.evict_idle(std::time::Instant::now());
+        if let Some(memory) = cgroup
+            .as_ref()
+            .and_then(|dir| crate::memory_budget::read_cgroup(dir).ok())
+        {
+            let cached = tier.cache.stats().bytes;
+            tier.cache
+                .set_target_bytes(crate::memory_budget::monitored_target(
+                    budget, &memory, cached,
+                ));
         }
     }
 }
@@ -1434,7 +1466,7 @@ type QueryTimeEntry<E> = Arc<(Mutex<ResultState<E>>, Condvar)>;
 /// one at a later time is computed by each run that needs it. A result is
 /// kept while `T` is within `retention_ms` of the watermark, and the
 /// oldest are dropped while more than `max_bytes` are held.
-pub struct QueryTimeResults<E = crate::query::Unanswered> {
+pub struct QueryTimeResults<E> {
     entries: Mutex<BTreeMap<(i64, PhysicalASAPNodeId), QueryTimeEntry<E>>>,
     retention_ms: i64,
     max_bytes: usize,

@@ -1,9 +1,8 @@
 //! Prometheus Remote Write v1 decoding and validation.
 
 use prost::Message;
-
-use crate::series_ids::Series;
-use crate::store::RawSample;
+use storage::series_ids::Series;
+use storage::store::RawSample;
 
 #[derive(Clone, PartialEq, Message)]
 pub struct WriteRequest {
@@ -404,7 +403,7 @@ fn parse_labels(key: &[u8]) -> Result<&'static Series, RemoteWriteError> {
     if !names.contains(&"__name__") {
         return Err(RemoteWriteError::MissingMetricName);
     }
-    Ok(crate::series_ids::intern_pairs(&pairs))
+    Ok(storage::series_ids::intern_pairs(&pairs))
 }
 
 /// One protobuf field value.

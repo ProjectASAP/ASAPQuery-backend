@@ -15,9 +15,9 @@ use std::time::Duration;
 use asap_executor::planner::ir::schema::{DataType, Field, Schema, PROMQL_SERIES_IDENTITY};
 use asap_executor::planner::plan::materialized_view::MaterializedView;
 use asap_executor::values::{Batch, Value};
-use data_plane::persist::{ViewFiles, ViewRead};
-use data_plane::store::{ViewStore, ViewTier};
-use data_plane::window_cache::{WindowCache, WindowKey};
+use storage::persist::{ViewFiles, ViewRead};
+use storage::store::{ViewStore, ViewTier};
+use storage::window_cache::{WindowCache, WindowKey};
 
 /// Counts the bytes allocated now.
 struct Counting;

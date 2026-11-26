@@ -1,0 +1,21 @@
+[package]
+name = "storage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+internal_metrics.workspace = true
+asap-executor.workspace = true
+asap_sketchlib.workspace = true
+serde_bytes = "0.11"
+# Each view fragment is compressed (segment.rs).
+zstd = "0.13"
+ahash = "0.8"
+libc = "0.2"
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+# `ViewRead` is a command-line value of the data plane (`--view-read`).
+clap.workspace = true
+rmp-serde = "1"
+futures = "0.3"

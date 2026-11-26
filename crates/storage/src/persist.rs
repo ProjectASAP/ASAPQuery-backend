@@ -536,7 +536,7 @@ impl ViewFiles {
         &mut self,
         groups: &[Vec<(MaterializedView, SchemaRef)>],
     ) -> std::io::Result<ViewIndex> {
-        let millis = |view: &MaterializedView| crate::ingestion::millis(view.retention_ms());
+        let millis = |view: &MaterializedView| crate::store::millis(view.retention_ms());
         for (view, _) in groups.iter().flatten() {
             self.view_retention_ms.insert(view.node_id, millis(view));
         }
