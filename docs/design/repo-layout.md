@@ -210,8 +210,17 @@ not on the measured path, so it copies them.
 The Prometheus HTTP routes forward what the plan does not answer verbatim:
 `PrometheusHttpFallback::forward` sends the request's method, path, query
 string, headers and body unchanged, so the response is byte-identical to the
-server's. `PrometheusHttpFallback` also implements `FallbackClient`, the seam
-the ClickHouse and Elastic fallback clients (step 8) implement.
+server's. `PrometheusHttpFallback` also implements `FallbackClient`.
+
+The ClickHouse and Elasticsearch routes have no request to forward verbatim,
+so they use the seam: each parses its request into a `QueryRequest`, calls
+`QueryDispatcher::dispatch` (through `QueryEngine`, with `QueryResult`), and
+sends what the plan does not answer to its protocol's `FallbackClient`
+(`ClickHouseHttpFallback`, `ElasticHttpFallback`). Only a PromQL request can
+be the plan's: the control plane plans PromQL workloads, and `storage` holds
+time series, while ASAPPlanner lowers SQL to `Table` scans and has no
+Elasticsearch frontend. So today every ClickHouse and Elasticsearch query is
+forwarded, even one whose text equals a planned PromQL query.
 
 `PlanInstaller` installs once, as #935's I14 does; a retryable install
 comes with tracker-delivered plans.
@@ -227,6 +236,7 @@ comes with tracker-delivered plans.
 | Raw data | `RawDataStore` in memory | raw samples in `store.rs`, plus optional forward to a raw store | `RawDataStore` trait over both; the forward becomes a `FallbackClient` plus an ingest tee in `data-plane` |
 | Sketch kernels | move out of `asap-executor` into a shared ASAPPlanner crate (#935's decision 48) | through `asap-executor` and `asap_sketchlib` | No change until that crate exists |
 | Adapters' dependency | the whole engine crate | `common` only | as in the dependency graph above |
+| SQL and Query DSL queries | planned and answered from views | the control plane plans PromQL only; `storage` holds no tables | The ClickHouse and Elasticsearch routes forward every query; planned answers need table sources (ingest, `RawDataStore`, a SQL catalog for the control plane) |
 
 ## Where the current files go
 
@@ -242,6 +252,7 @@ comes with tracker-delivered plans.
 | `data_plane/src/remote_write.rs` | `crates/adapters/ingest/prometheus-remote-write/` (the series interning stays in `crates/data-plane/`) |
 | ASAPQuery's VictoriaMetrics Remote Write and OTLP decoders | `crates/adapters/ingest/{victoriametrics-remote-write,otlp}/`, served on ASAPQuery's routes (`/api/v1/import`, `/v1/metrics`) |
 | `data_plane/src/prometheus.rs` | `crates/adapters/query/prometheus-http/` |
+| ASAPQuery's ClickHouse and Elastic query adapters and fallback clients | `crates/adapters/query/{clickhouse-http,elastic-http}/`, served on ASAPQuery's routes (`/clickhouse/query`, `/_sql`, `/_search`) when their server is given |
 | `data_plane/src/metrics.rs` | `crates/internal-metrics/` |
 | `data_plane/src/{lib,main}.rs` | `crates/data-plane/` |
 | `data_plane/tests/` | the crate whose behavior each test checks; end-to-end tests in `crates/data-plane/tests/` |
@@ -288,7 +299,10 @@ each reviewed on its own:
    change (ProjectASAP/ASAPQuery#937). They feed the ingest engine as Remote
    Write does.
 8. Bring over ASAPQuery's query adapters and fallback clients (ClickHouse and
-   Elastic HTTP).
+   Elastic HTTP), named as in #936 (`ClickHouseHttpFallback`,
+   `ElasticHttpFallback`) and taking #937's `QueryRequest` (already in
+   `common`). Their routes go through `QueryDispatcher::dispatch` and reach
+   their fallback through `FallbackClient`.
 9. `eval/` baselines (ClickHouse and others) and `deployment/` Dockerfiles.
 
 ## Decisions
