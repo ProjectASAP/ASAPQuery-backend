@@ -22,10 +22,11 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use control_plane::plan_workload;
-use data_plane::engine::{EngineOptions, SlowRefresh};
-use data_plane::ingestion::IngestionOptions;
+use data_plane::engine::EngineOptions;
 use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use data_plane::{router, DataPlane};
+use precompute::engine::SlowRefresh;
+use precompute::ingestion::IngestionOptions;
 use tower::ServiceExt;
 
 /// Series per metric.

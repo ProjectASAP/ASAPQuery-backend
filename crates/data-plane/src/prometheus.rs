@@ -6,8 +6,9 @@ use std::collections::BTreeMap;
 use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
 
-use crate::query::ResultSample;
-use crate::result_cache::Answer;
+use precompute::ingestion::MAX_TIME_MS;
+use query::result_cache::Answer;
+use query::ResultSample;
 
 /// Parameters of an instant query, from its URL query and form body.
 pub struct InstantQuery {
@@ -15,11 +16,6 @@ pub struct InstantQuery {
     /// `None` when the request names no time: evaluate now.
     pub time_ms: Option<i64>,
 }
-
-/// The largest evaluation time, in milliseconds either side of the epoch, the
-/// data plane answers; beyond it a request is refused as Prometheus refuses
-/// a time it cannot represent. Leaves room for any window offset.
-pub(crate) const MAX_TIME_MS: i64 = i64::MAX / 4;
 
 /// Why a query's parameters are refused (400, `bad_data`): the error text.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

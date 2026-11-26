@@ -19,9 +19,10 @@ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[export_name = "_rjem_malloc_conf"]
 static malloc_conf: &[u8] =
     b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0,narenas:8\0";
-use data_plane::engine::{EngineOptions, PrecomputeMode};
-use data_plane::ingestion::IngestionOptions;
+use data_plane::engine::EngineOptions;
 use data_plane::{router, DataPlane, DEFAULT_FORWARD_TIMEOUT};
+use precompute::engine::PrecomputeMode;
+use precompute::ingestion::IngestionOptions;
 use storage::persist::ViewRead;
 
 /// Serve Remote Write ingestion and the Prometheus query API for a plan.
@@ -78,10 +79,10 @@ struct Args {
     precompute_memory_budget_bytes: Option<u64>,
     /// Push mode: a shard folds its pending samples once this many are
     /// pending (0: fold every request's samples at once).
-    #[arg(long, default_value_t = data_plane::push::MorselBatching::default().max_samples)]
+    #[arg(long, default_value_t = precompute::push::MorselBatching::default().max_samples)]
     push_batch_samples: usize,
     /// Push mode: ... or once the oldest pending sample is this old.
-    #[arg(long, default_value_t = data_plane::push::MorselBatching::default().max_age_ms)]
+    #[arg(long, default_value_t = precompute::push::MorselBatching::default().max_age_ms)]
     push_batch_max_ms: u64,
     /// Threads computing closed refresh windows at once: windows of
     /// different refresh groups, and of one group, run in parallel and are
@@ -212,7 +213,7 @@ async fn main() -> anyhow::Result<()> {
                 view_read: args.view_read,
                 precompute_mode: args.precompute_mode,
                 precompute_memory_budget_bytes: args.precompute_memory_budget_bytes,
-                push_batching: data_plane::push::MorselBatching {
+                push_batching: precompute::push::MorselBatching {
                     max_samples: args.push_batch_samples,
                     max_age_ms: args.push_batch_max_ms,
                 },

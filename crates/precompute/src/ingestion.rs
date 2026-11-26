@@ -45,7 +45,11 @@ use storage::store::{
     millis, window_end, RawData, RawSample, RawShards, RunStore, SeriesPartition, ViewStore,
 };
 
-use crate::prometheus::MAX_TIME_MS;
+/// The largest time, in milliseconds either side of the epoch, the data
+/// plane takes a sample at or answers a query at; beyond it a sample is
+/// dropped and a query refused, as Prometheus refuses a time it cannot
+/// represent. Leaves room for any window offset.
+pub const MAX_TIME_MS: i64 = i64::MAX / 4;
 
 /// How ingestion treats sample times.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,7 +116,7 @@ pub struct IngestionStats {
 
 /// Why a plan cannot be ingested.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum IngestionError {
+pub enum IngestionError {
     #[error("{0}")]
     Unsupported(String),
     #[error("refresh group of views {views:?}: {error}")]
@@ -203,7 +207,7 @@ impl Ingestion {
     /// for the [`Precompute`] returned with the ingestion. Refuses views
     /// refreshed on first read, which the data plane does not refresh yet,
     /// and groups without a bounded window.
-    pub(crate) fn new(
+    pub fn new(
         dag: &PhysicalASAPDAG,
         views: &[MaterializedView],
         groups: Vec<IngestionRefreshGroup>,
