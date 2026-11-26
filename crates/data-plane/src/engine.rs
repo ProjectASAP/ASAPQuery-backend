@@ -33,13 +33,15 @@ use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::time::Instant;
 
+use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
 use asap_executor::runtime::Limits;
+use asap_executor::values::Batch;
 use asap_planner::InstallablePlan;
 use internal_metrics::{Metrics, PushMetrics, Timer};
+use storage::memory_budget::serve_view_cache;
 use storage::persist::{plan_hash, ViewFiles, ViewRead};
-use storage::store::SeriesPartition;
 use storage::store::{
-    serve_view_cache, PublishedStore, QueryTimeResults, RawData, RawSample, RawShards, RunStore,
+    PublishedStore, QueryTimeResults, RawData, RawSample, RawShards, RunStore, SeriesPartition,
     ViewStore, ViewTier, WindowSlot,
 };
 use storage::window_cache::WindowCache;
@@ -53,8 +55,6 @@ use crate::metrics_endpoint::Gauges;
 use crate::push::{Partial, PushGroup, PushShard};
 use crate::query::{QueryEngine, Snapshot, Unanswered};
 use crate::result_cache::{Answer, ResultCache};
-use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
-use asap_executor::values::Batch;
 
 /// How the views of a closed refresh window are built
 /// (docs/design/parallel-precompute.md). The `data_plane` binary defaults
