@@ -16,8 +16,11 @@ use std::io::Read;
 
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{any_value, KeyValue};
-use opentelemetry_proto::tonic::metrics::v1::{metric::Data, number_data_point};
+use opentelemetry_proto::tonic::metrics::v1::{metric::Data, number_data_point, Gauge, Sum};
 use prost::Message;
+
+/// The OTLP protobuf messages, for senders and tests.
+pub use opentelemetry_proto::tonic as proto;
 
 /// Request size limits; a request over any limit is rejected whole.
 #[derive(Debug, Clone)]
@@ -26,22 +29,13 @@ pub struct Limits {
     pub max_points: usize,
 }
 
-impl Default for Limits {
-    fn default() -> Self {
-        Self {
-            max_decompressed_bytes: 128 * 1024 * 1024,
-            max_points: 1_000_000,
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum OtlpError {
-    #[error("gzip decode failed: {0}")]
+    #[error("Gzip decode error: {0}")]
     Gzip(String),
     #[error("decompressed request exceeds {0} bytes")]
     DecompressedTooLarge(usize),
-    #[error("protobuf decoding failed: {0}")]
+    #[error("Protobuf decode error: {0}")]
     Protobuf(String),
     #[error("request has more than {0} points")]
     TooManyPoints(usize),
@@ -102,19 +96,6 @@ fn points(
     max_points: usize,
 ) -> Result<Vec<Point>, OtlpError> {
     let mut points = Vec::new();
-    let mut push = |labels: &BTreeMap<String, String>, name: String, nanos: u64, value: f64| {
-        if points.len() >= max_points {
-            return Err(OtlpError::TooManyPoints(max_points));
-        }
-        let mut labels = labels.clone();
-        labels.insert("__name__".to_string(), name);
-        points.push(Point {
-            labels: labels.into_iter().collect(),
-            timestamp_ms: (nanos / 1_000_000) as i64,
-            value,
-        });
-        Ok(())
-    };
     for resource_metrics in &request.resource_metrics {
         let resource = resource_metrics.resource.as_ref();
         for scope_metrics in &resource_metrics.scope_metrics {
@@ -130,66 +111,73 @@ fn points(
                 if metric.name.is_empty() {
                     continue;
                 }
-                let name = &metric.name;
-                // The point's attributes over the scope's and resource's;
-                // `None` for a sketch payload point.
-                let labels = |attributes: &[KeyValue]| {
+                // One data point's samples: a value per name suffix (none
+                // when `None`), labeled by the point's attributes over the
+                // scope's and resource's.
+                let mut push = |attributes: &[KeyValue],
+                                nanos: u64,
+                                values: &[(&str, Option<f64>)]|
+                 -> Result<(), OtlpError> {
                     if has_sketch_payload(attributes) {
-                        return None;
+                        return Ok(());
                     }
                     let mut labels = scope_labels.clone();
                     insert_attributes(&mut labels, attributes);
-                    Some(labels)
+                    for &(suffix, value) in values {
+                        let Some(value) = value else { continue };
+                        if points.len() >= max_points {
+                            return Err(OtlpError::TooManyPoints(max_points));
+                        }
+                        let name = format!("{}{suffix}", metric.name);
+                        let mut labels = labels.clone();
+                        labels.insert("__name__".to_string(), name);
+                        points.push(Point {
+                            labels: labels.into_iter().collect(),
+                            timestamp_ms: (nanos / 1_000_000) as i64,
+                            value,
+                        });
+                    }
+                    Ok(())
                 };
                 match &metric.data {
-                    Some(Data::Gauge(gauge)) => {
-                        for point in &gauge.data_points {
-                            if let Some(labels) = labels(&point.attributes) {
-                                let value = number(&point.value);
-                                push(&labels, name.clone(), point.time_unix_nano, value)?;
-                            }
-                        }
-                    }
-                    Some(Data::Sum(sum)) => {
-                        for point in &sum.data_points {
-                            if let Some(labels) = labels(&point.attributes) {
-                                let value = number(&point.value);
-                                push(&labels, name.clone(), point.time_unix_nano, value)?;
-                            }
+                    Some(Data::Gauge(Gauge { data_points }))
+                    | Some(Data::Sum(Sum { data_points, .. })) => {
+                        for p in data_points {
+                            push(
+                                &p.attributes,
+                                p.time_unix_nano,
+                                &[("", Some(number(&p.value)))],
+                            )?;
                         }
                     }
                     Some(Data::Histogram(histogram)) => {
-                        for point in &histogram.data_points {
-                            if let Some(labels) = labels(&point.attributes) {
-                                let nanos = point.time_unix_nano;
-                                if let Some(sum) = point.sum {
-                                    push(&labels, format!("{name}_sum"), nanos, sum)?;
-                                }
-                                let count = point.count as f64;
-                                push(&labels, format!("{name}_count"), nanos, count)?;
-                            }
+                        for p in &histogram.data_points {
+                            let count = Some(p.count as f64);
+                            push(
+                                &p.attributes,
+                                p.time_unix_nano,
+                                &[("_sum", p.sum), ("_count", count)],
+                            )?;
                         }
                     }
                     Some(Data::ExponentialHistogram(histogram)) => {
-                        for point in &histogram.data_points {
-                            if let Some(labels) = labels(&point.attributes) {
-                                let nanos = point.time_unix_nano;
-                                if let Some(sum) = point.sum {
-                                    push(&labels, format!("{name}_sum"), nanos, sum)?;
-                                }
-                                let count = point.count as f64;
-                                push(&labels, format!("{name}_count"), nanos, count)?;
-                            }
+                        for p in &histogram.data_points {
+                            let count = Some(p.count as f64);
+                            push(
+                                &p.attributes,
+                                p.time_unix_nano,
+                                &[("_sum", p.sum), ("_count", count)],
+                            )?;
                         }
                     }
                     Some(Data::Summary(summary)) => {
-                        for point in &summary.data_points {
-                            if let Some(labels) = labels(&point.attributes) {
-                                let nanos = point.time_unix_nano;
-                                push(&labels, format!("{name}_sum"), nanos, point.sum)?;
-                                let count = point.count as f64;
-                                push(&labels, format!("{name}_count"), nanos, count)?;
-                            }
+                        for p in &summary.data_points {
+                            let count = Some(p.count as f64);
+                            push(
+                                &p.attributes,
+                                p.time_unix_nano,
+                                &[("_sum", Some(p.sum)), ("_count", count)],
+                            )?;
                         }
                     }
                     None => {}
@@ -240,19 +228,19 @@ fn number(value: &Option<number_data_point::Value>) -> f64 {
     }
 }
 
-/// The protobuf encoding of `request`, as an OTLP/HTTP sender sends it
-/// without compression.
-pub fn encode(request: &ExportMetricsServiceRequest) -> Vec<u8> {
-    request.encode_to_vec()
-}
-
-/// The OTLP protobuf messages, for senders and tests.
-pub use opentelemetry_proto::tonic as proto;
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope};
+
+    const LIMITS: Limits = Limits {
+        max_decompressed_bytes: 128 * 1024 * 1024,
+        max_points: 1_000_000,
+    };
+
+    fn encode(request: &ExportMetricsServiceRequest) -> Vec<u8> {
+        request.encode_to_vec()
+    }
     use opentelemetry_proto::tonic::metrics::v1::{
         ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram, HistogramDataPoint,
         Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, Summary, SummaryDataPoint,
@@ -359,7 +347,7 @@ mod tests {
                 }),
             ),
         ]));
-        let points = decode(&body, None, &Limits::default()).unwrap();
+        let points = decode(&body, None, &LIMITS).unwrap();
         assert_eq!(
             points,
             vec![
@@ -440,7 +428,7 @@ mod tests {
                 }),
             ),
         ]));
-        let points: Vec<(String, f64)> = decode(&body, None, &Limits::default())
+        let points: Vec<(String, f64)> = decode(&body, None, &LIMITS)
             .unwrap()
             .into_iter()
             .map(|point| {
@@ -495,7 +483,7 @@ mod tests {
                 }),
             ),
         ]));
-        let points = decode(&body, None, &Limits::default()).unwrap();
+        let points = decode(&body, None, &LIMITS).unwrap();
         assert_eq!(points.len(), 1);
         assert_eq!(points[0].value, 0.0);
     }
@@ -523,7 +511,7 @@ mod tests {
     #[test]
     fn gzip_bodies_decode_as_uncompressed_ones() {
         let body = one_gauge();
-        let limits = Limits::default();
+        let limits = LIMITS;
         assert_eq!(
             decode(&gzip(&body), Some(" GZIP "), &limits),
             decode(&body, None, &limits)
@@ -538,7 +526,7 @@ mod tests {
     /// rejected.
     #[test]
     fn rejects_malformed_and_oversized_bodies() {
-        let limits = Limits::default();
+        let limits = LIMITS;
         assert!(matches!(
             decode(&[0xff; 8], None, &limits),
             Err(OtlpError::Protobuf(_))
@@ -546,7 +534,7 @@ mod tests {
         let body = one_gauge();
         let small = Limits {
             max_decompressed_bytes: 4,
-            ..Limits::default()
+            ..LIMITS
         };
         assert_eq!(
             decode(&body, None, &small),
@@ -558,7 +546,7 @@ mod tests {
         );
         let one = Limits {
             max_points: 1,
-            ..Limits::default()
+            ..LIMITS
         };
         assert_eq!(decode(&body, None, &one), Err(OtlpError::TooManyPoints(1)));
     }

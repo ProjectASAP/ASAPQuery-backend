@@ -195,7 +195,7 @@ async fn victoriametrics_and_otlp_ingest_what_remote_write_ingests() {
 
     for gzipped in [false, true] {
         let (state, app) = data_plane();
-        let body = otlp::encode(&otlp_request());
+        let body = prost::Message::encode_to_vec(&otlp_request());
         let (body, encoding) = if gzipped {
             (gzip(&body), Some("gzip"))
         } else {
@@ -206,6 +206,48 @@ async fn victoriametrics_and_otlp_ingest_what_remote_write_ingests() {
         assert_eq!(response, r#"{"rejected":0}"#);
         assert_eq!(answers(&state, &app).await, expected, "gzip: {gzipped}");
     }
+}
+
+/// The three decoders give the same samples: each of the same interned
+/// series (the same `&'static Series`), timestamp and value.
+#[test]
+fn decoders_give_the_same_series_and_samples() {
+    use data_plane::remote_write::{
+        decode_otlp_samples, decode_samples, decode_victoriametrics_samples,
+    };
+    type Decoded = Vec<(usize, i64, u64)>;
+    let identity = |samples: Vec<storage::store::RawSample>| -> Decoded {
+        samples
+            .into_iter()
+            .map(|s| {
+                (
+                    s.labels as *const _ as usize,
+                    s.timestamp_ms,
+                    s.value.to_bits(),
+                )
+            })
+            .collect()
+    };
+    let limits = prometheus_remote_write::Limits::default();
+    let request = remote_write_request();
+    let remote_write =
+        identity(decode_samples(&prometheus_remote_write::encode(&request), &limits).unwrap());
+    let victoriametrics = identity(
+        decode_victoriametrics_samples(&victoriametrics_remote_write::encode(&request), &limits)
+            .unwrap(),
+    );
+    assert_eq!(victoriametrics, remote_write);
+    let otlp = identity(
+        decode_otlp_samples(
+            &prost::Message::encode_to_vec(&otlp_request()),
+            None,
+            &limits,
+        )
+        .unwrap(),
+    );
+    // The OTLP request lists the same series and samples in the same order.
+    assert_eq!(otlp, remote_write);
+    assert_eq!(otlp.len(), SERIES * END_S as usize);
 }
 
 /// Malformed bodies are rejected with 400 and ingest nothing.

@@ -1,10 +1,12 @@
-//! Backend data plane: receives Prometheus Remote Write samples and serves
-//! the Prometheus query API for an installed plan.
+//! Backend data plane: receives Prometheus Remote Write samples (and
+//! VictoriaMetrics Remote Write and OTLP) and serves the Prometheus query
+//! API for an installed plan.
 //!
 //! The protocols are adapters: `prometheus_remote_write`,
 //! `victoriametrics_remote_write` and `otlp` decode ingest requests
-//! ([`remote_write`] interns their series into the store), and `prometheus_http` reads query parameters, writes responses and
-//! sends what the plan does not answer to Prometheus.
+//! ([`remote_write`] interns their series into the store), and
+//! `prometheus_http` reads query parameters, writes responses and sends
+//! what the plan does not answer to Prometheus.
 //!
 //! The installed plan is ASAPPlanner's `InstallablePlan`: one selected
 //! physical ASAP DAG. The precompute engine's ingest shards store the raw
@@ -134,7 +136,7 @@ pub fn router(state: Arc<DataPlane>) -> Router {
     let write_body_limit = DefaultBodyLimit::max(state.limits.max_compressed_bytes);
     let forward_mode = state.raw_forward.is_some();
     let router = Router::new()
-        .route("/api/v1/write", post(write).layer(write_body_limit.clone()))
+        .route("/api/v1/write", post(write).layer(write_body_limit))
         .route("/api/v1/query", get(query).post(query))
         .route("/api/v1/query_range", get(query_range).post(query_range))
         .route("/api/v1/status/asap", get(status))
@@ -152,7 +154,7 @@ pub fn router(state: Arc<DataPlane>) -> Router {
         router
             .route(
                 "/api/v1/import",
-                post(write_victoriametrics).layer(write_body_limit.clone()),
+                post(write_victoriametrics).layer(write_body_limit),
             )
             .route("/v1/metrics", post(write_otlp).layer(write_body_limit))
     };
@@ -219,12 +221,10 @@ async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
 /// Prometheus one; 204 once the engine has it. Not served in forward mode
 /// (see [`router`]).
 async fn write_victoriametrics(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
-    let timer = internal_metrics::Timer::start();
     let samples = match remote_write::decode_victoriametrics_samples(&body, &state.limits) {
         Ok(samples) => samples,
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
-    state.engine.metrics().remote_write_decode.record(timer);
     if !samples.is_empty() {
         if let Err(refused) = ingest(&state, samples, "VictoriaMetrics Remote Write") {
             return refused;
@@ -245,11 +245,7 @@ async fn write_otlp(
     let content_encoding = headers
         .get(header::CONTENT_ENCODING)
         .and_then(|value| value.to_str().ok());
-    let limits = otlp::Limits {
-        max_decompressed_bytes: state.limits.max_decompressed_bytes,
-        max_points: state.limits.max_samples,
-    };
-    let samples = match remote_write::decode_otlp_samples(&body, content_encoding, &limits) {
+    let samples = match remote_write::decode_otlp_samples(&body, content_encoding, &state.limits) {
         Ok(samples) => samples,
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
