@@ -45,11 +45,7 @@ use storage::store::{
     millis, window_end, RawData, RawSample, RawShards, RunStore, SeriesPartition, ViewStore,
 };
 
-/// The largest time, in milliseconds either side of the epoch, the data
-/// plane takes a sample at or answers a query at; beyond it a sample is
-/// dropped and a query refused, as Prometheus refuses a time it cannot
-/// represent. Leaves room for any window offset.
-pub const MAX_TIME_MS: i64 = i64::MAX / 4;
+use common::MAX_TIME_MS;
 
 /// How ingestion treats sample times.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -541,11 +537,6 @@ impl Ingestion {
         self.newest_clock_ms = self.newest_clock_ms.max(Some(now_ms));
     }
 
-    /// The newest sample time the watermark follows.
-    pub fn newest_sample_ms(&self) -> Option<i64> {
-        self.newest_sample_ms
-    }
-
     /// Sets the newest sample time the watermark follows (it never goes
     /// back): the newest sample any shard ran by the last flush.
     pub fn advance_newest_sample(&mut self, newest_ms: Option<i64>) {
@@ -937,22 +928,8 @@ pub struct Precompute {
 impl Precompute {
     /// Runs `window`'s group's views in one ingestion run over
     /// `(end - W, end]`, reading `raw_data` (as it was when the window
-    /// closed) and `views`, and appends each view's rows to `views`. A view
-    /// that already stores the window (loaded from files at startup) is not
-    /// appended to again; a window every view of the group stores is not
-    /// run.
-    pub fn refresh(
-        &self,
-        window: ClosedWindow,
-        raw_data: RawShards,
-        views: &mut Arc<ViewStore>,
-    ) -> Result<Refreshed, asap_executor::Error> {
-        let computed = self.compute(window, raw_data, views.clone(), None)?;
-        self.commit(window, computed, views)
-    }
-
-    /// The first half of [`Self::refresh`]: runs the window over
-    /// `raw_data` and `views` without storing its rows. Windows of one
+    /// closed) and `views`, without storing its rows ([`Self::commit`]
+    /// stores them). Windows of one
     /// group may be computed at once on several threads ([`RefreshTaskGraph`]);
     /// their rows must be committed in window order, and a window must be
     /// computed over views that store the windows it reads.

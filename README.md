@@ -230,8 +230,11 @@ not stored) with a Prometheus `execution` error (422,
 | Path | Holds |
 |---|---|
 | `crates/control-plane/` | package `control_plane`: workload → `asap-planner` → plan file |
-| `crates/data-plane/` | package `data_plane`: the data plane and its binary |
-| `crates/storage/` | package `storage`: raw samples and views in memory, the view cache, segments and persistence |
+| `crates/common/` | package `common`: the engine boundary's types and traits |
+| `crates/data-plane/` | package `data_plane`: the binary, its CLI and HTTP routes, and the engine that wires the crates below |
+| `crates/precompute/` | package `precompute`: ingest shards, the ingest coordinator, push pipelines and the precompute pool |
+| `crates/query/` | package `query`: planned queries on the query workers, and the result cache |
+| `crates/storage/` | package `storage`: raw samples and views in memory, the view cache, segments, persistence and the persist threads |
 | `crates/internal-metrics/` | package `internal_metrics`: the backend's measurements of itself, exported on `/metrics` |
 | `benchmarks/` | the backend alone: `micro/` benchmarks (examples of `data_plane`) and `scripts/` |
 | `eval/` | comparisons with other systems and the live demo; see [eval/README.md](eval/README.md) |

@@ -7,7 +7,11 @@
 > stays in `crates/data-plane/examples/`), the workloads in `examples/` are in
 > `docs/examples/`, `scripts/profile.sh` and `scripts/tiered_views_cgroup.sh`
 > are in `benchmarks/scripts/`, and `bench/demo/` is split into `eval/`,
-> `eval/demo/` and `deployment/monitoring/`.
+> `eval/demo/` and `deployment/monitoring/`. The data plane's sources are
+> split into crates: `src/{ingestion,push}.rs` and the ingest and
+> precompute threads of `src/engine.rs` are in `crates/precompute/`,
+> `src/{query,result_cache}.rs` and the query workers in `crates/query/`,
+> and the stores, persistence and the persist threads in `crates/storage/`.
 
 This document describes the data plane as it stands on `main` and the
 plan for the single-server demo against VictoriaMetrics. The component

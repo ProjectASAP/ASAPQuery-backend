@@ -7,6 +7,7 @@ edition.workspace = true
 # push pipelines and the precompute pool over the Planner's executor.
 [dependencies]
 asap-executor.workspace = true
+common.workspace = true
 internal_metrics.workspace = true
 storage.workspace = true
 anyhow.workspace = true
