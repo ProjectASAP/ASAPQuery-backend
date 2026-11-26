@@ -504,7 +504,7 @@ async fn barriers_during_one_flush_all_answer() {
 }
 
 /// A sample stamped further from the epoch than the data plane evaluates
-/// (`prometheus::MAX_TIME_MS`) is dropped and counted, so window
+/// (`common::MAX_TIME_MS`) is dropped and counted, so window
 /// arithmetic over it cannot overflow; later samples are ingested as
 /// usual.
 #[tokio::test(flavor = "multi_thread")]

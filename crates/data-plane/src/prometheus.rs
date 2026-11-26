@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
 
-use precompute::ingestion::MAX_TIME_MS;
+use common::MAX_TIME_MS;
 use query::result_cache::Answer;
 use query::ResultSample;
 

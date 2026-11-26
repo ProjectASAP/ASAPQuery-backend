@@ -7,7 +7,11 @@
 > stays in `crates/data-plane/examples/`), the workloads in `examples/` are in
 > `docs/examples/`, `scripts/profile.sh` and `scripts/tiered_views_cgroup.sh`
 > are in `benchmarks/scripts/`, and `bench/demo/` is split into `eval/`,
-> `eval/demo/` and `deployment/monitoring/`.
+> `eval/demo/` and `deployment/monitoring/`. The data plane's sources are
+> split into crates: `src/{ingestion,push}.rs` and the ingest and
+> precompute threads of `src/engine.rs` are in `crates/precompute/`,
+> `src/{query,result_cache}.rs` and the query workers in `crates/query/`,
+> and the stores, persistence and the persist threads in `crates/storage/`.
 
 ## Audience and context
 
@@ -623,7 +627,7 @@ requests' shape, so the plan delivers every step time.
 A Grafana range panel refreshed every 15 s asks for the same range shifted
 by one step; without a cache every step is computed again. VictoriaMetrics
 keeps a rollup result cache for this; the data plane keeps one too
-(`data_plane/src/result_cache.rs`).
+(`crates/query/src/result_cache.rs`).
 
 - Key and value: (planned query root, evaluation time T) → the answer
   vector (`Arc`). An instant query at T and a range step at T share the

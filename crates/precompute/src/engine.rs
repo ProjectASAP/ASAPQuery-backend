@@ -207,21 +207,34 @@ impl Drop for RunningGuard {
     }
 }
 
-/// How the precompute engine ingests samples and builds the views; the
-/// data plane's `EngineOptions` describes each field.
+/// How the precompute engine ingests samples and builds the views.
 #[derive(Debug, Clone)]
 pub struct PrecomputeOptions {
+    /// Lateness, future bound and first-window checks of ingestion.
     pub ingestion: IngestionOptions,
+    /// Samples queued for the ingest shards beyond which `try_ingest` is
+    /// `Busy`.
     pub max_queued_samples: u64,
+    /// Refresh windows closed and not yet refreshed beyond which the
+    /// ingest coordinator waits.
     pub max_precompute_backlog: usize,
+    /// Ingest shard threads.
     pub ingest_threads: usize,
+    /// Threads computing closed refresh windows at once.
     pub precompute_threads: usize,
+    /// For tests: refresh windows whose computation waits first.
     pub slow_refreshes: Vec<SlowRefresh>,
+    /// For tests: fail a window whose inputs are not committed or change.
     pub check_task_inputs: bool,
+    /// For tests: how long every shard but the first waits per batch.
     pub shard_delay_ms: u64,
+    /// How the views of a closed window are built.
     pub precompute_mode: PrecomputeMode,
+    /// Push mode: how each shard coalesces samples into morsels.
     pub push_batching: crate::push::MorselBatching,
+    /// Push mode: bytes of open-window state all shards may hold together.
     pub precompute_memory_budget_bytes: Option<u64>,
+    /// For tests, push mode: the combine of the window ending here panics.
     pub panic_in_combine_of_window_end_ms: Option<i64>,
 }
 

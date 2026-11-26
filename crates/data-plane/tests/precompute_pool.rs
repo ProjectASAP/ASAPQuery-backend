@@ -6,7 +6,7 @@
 //! the precompute backlog still holds Remote Write back. No public
 //! workload's plan has a group reading another group's views at
 //! ingestion, so that order is covered by the scheduler's unit tests
-//! (`engine.rs`).
+//! (`crates/precompute/src/engine.rs`).
 
 mod common;
 

@@ -28,6 +28,12 @@ pub use store::{
     RawDataStore, ViewId, ViewInstance, ViewInstanceKey, ViewInstanceMetadata, ViewState, ViewStore,
 };
 
+/// The largest time, in milliseconds either side of the epoch, the data
+/// plane takes a sample at or answers a query at; beyond it a sample is
+/// dropped and a query refused, as Prometheus refuses a time it cannot
+/// represent. Leaves room for any window offset.
+pub const MAX_TIME_MS: i64 = i64::MAX / 4;
+
 /// One series' labels, name to value, `__name__` included: on raw data and
 /// on query results.
 pub type LabelSet = std::collections::BTreeMap<String, String>;
