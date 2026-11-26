@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/common",
     "crates/control-plane",
     "crates/data-plane",
     "crates/internal-metrics",
@@ -12,11 +13,13 @@ edition = "2021"
 version = "0.1.0"
 
 [workspace.dependencies]
-# The backend depends on two Planner crates, at one immutable revision:
-# `asap-planner` to plan and `asap-executor` to execute. Planner IR types
-# are reached through `asap_executor::planner`.
+# The backend depends on three Planner crates, at one immutable revision:
+# `asap-planner` to plan, `asap-executor` to execute, and `asap-types` for
+# the plan types `common`'s boundary names (`QueryLanguage`, `Source`).
+# Elsewhere, Planner IR types are reached through `asap_executor::planner`.
 asap-planner = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "1d527bca445b6372f0eb72aafd725d04a3a77dfb" }
 asap-executor = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "1d527bca445b6372f0eb72aafd725d04a3a77dfb" }
+asap-types = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "1d527bca445b6372f0eb72aafd725d04a3a77dfb" }
 # The sketch library the Planner's executor pins, for the byte encodings of
 # the sketch states the data plane persists; keep it at the Planner's rev
 # (here overridden below for the executor too).
@@ -27,6 +30,7 @@ serde = { version = "1.0", features = ["derive"] }
 # (its predicted usage and prices are floats).
 serde_json = { version = "1.0", features = ["float_roundtrip"] }
 thiserror = "1.0"
+async-trait = "0.1"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
