@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+clickhouse_http.workspace = true
 common.workspace = true
+elastic_http.workspace = true
 internal_metrics.workspace = true
 precompute.workspace = true
 prometheus_http.workspace = true

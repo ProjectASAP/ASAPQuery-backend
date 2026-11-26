@@ -1,0 +1,19 @@
+[package]
+name = "clickhouse_http"
+version.workspace = true
+edition.workspace = true
+
+# ClickHouse's HTTP interface: the query parameter, TabSeparated response
+# bodies, and the fallback client of a ClickHouse server. An adapter: of
+# this workspace it depends on `common` only, never on an engine or a store.
+[dependencies]
+common.workspace = true
+# `common::FallbackClient`'s async method.
+async-trait.workspace = true
+form_urlencoded = "1"
+reqwest.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tokio.workspace = true

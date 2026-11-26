@@ -224,6 +224,16 @@ cost and predicted usage per node and per query. The data facts the plan
 assumed are printed. The Planner returns a plan only when its executor
 compiles it; otherwise the control plane fails.
 
+`--clickhouse-url URL` (with `--clickhouse-database`, default `default`)
+serves ClickHouse's query route on ASAPQuery's path, `/clickhouse/query`
+(`query` in the URL or a form), and `--elastic-url URL` (with
+`--elastic-index`) Elasticsearch's, `POST /_sql` and `POST /_search`. Each
+query goes through the plan first; the control plane plans PromQL only, so
+today every one is forwarded to its server with the client's
+`Authorization`, and the server's answer is returned as is
+(`x-asap-execution: forwarded`). Without the flag the routes are not
+served; neither flag can be used with `--no-forward`.
+
 `--forward-timeout-seconds` bounds each forwarded query (default 120, matching
 Prometheus's default query timeout); a query that runs longer gets 502.
 
@@ -248,6 +258,8 @@ not stored) with a Prometheus `execution` error (422,
 | `crates/adapters/ingest/prometheus-remote-write/` | package `prometheus_remote_write`: Remote Write v1 decoding and validation |
 | `crates/adapters/ingest/victoriametrics-remote-write/` | package `victoriametrics_remote_write`: VictoriaMetrics Remote Write (the Remote Write protobuf, zstd-compressed), `POST /api/v1/import` |
 | `crates/adapters/ingest/otlp/` | package `otlp`: OTLP/HTTP metrics decoding into samples, `POST /v1/metrics` |
+| `crates/adapters/query/clickhouse-http/` | package `clickhouse_http`: the `query` parameter, TabSeparated bodies and the fallback client of a ClickHouse server, `/clickhouse/query` |
+| `crates/adapters/query/elastic-http/` | package `elastic_http`: `_sql` and `_search` bodies and the fallback client of an Elasticsearch server, `POST /_sql`, `POST /_search` |
 | `crates/adapters/query/prometheus-http/` | package `prometheus_http`: query parameters, response bodies and the fallback client of a Prometheus-compatible server |
 | `benchmarks/` | the backend alone: `micro/` benchmarks (examples of `data_plane`) and `scripts/` |
 | `eval/` | comparisons with other systems and the live demo; see [eval/README.md](eval/README.md) |
