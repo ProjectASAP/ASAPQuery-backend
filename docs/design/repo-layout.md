@@ -98,7 +98,7 @@ adapters/*     common
 precompute     common, internal-metrics, asap-executor
 storage        common, internal-metrics, asap-executor
 query          common, internal-metrics, asap-executor
-common         ASAPPlanner's plan types only
+common         asap-planner and asap-types (plan types; asap-planner itself builds on the executor)
 internal-metrics  nothing in this workspace (a leaf)
 data-plane     every crate above (wiring only)
 ```
@@ -149,8 +149,8 @@ These are #935's interfaces, with the same names, so adapters move unchanged:
 
 ```rust
 // Requests and results (adapters ↔ dispatcher)
-struct QueryRequest { language: QueryLanguage, query: String, eval: Eval }
-enum Eval { Instant { time_ms: i64 }, Range { start_ms: i64, end_ms: i64, step_ms: i64 } }
+struct QueryRequest { language: QueryLanguage, query: String, eval: QueryEval }
+enum QueryEval { Instant { time_ms: i64 }, Range { start_ms: i64, end_ms: i64, step_ms: i64 } }
 enum QueryResult { Vector(..), Matrix(..), Scalar(..), Table { columns, rows } }
 
 // Ingest (ingest adapters → precompute)
@@ -172,12 +172,15 @@ trait QueryEngine {
 
 // Stores (precompute writes, query reads)
 struct ViewId { plan: PlanId, node: PhysicalASAPNodeId }
-struct ViewInstanceKey { view: ViewId, window: (i64, i64) }      // (start, end]
+struct ViewInstanceKey { view: ViewId, window_ms: (i64, i64) }   // (start, end]
 trait ViewStore { put, get, instances, evict_before, timestamp_range_per_view }
-trait RawDataStore { append, read, evict }
+trait RawDataStore { append, read /* None if the range reaches evicted data */, evict }
 
 // Fallback (data-plane → query adapters)
-trait FallbackClient { async fn execute(&self, req: &QueryRequest) -> Response; }
+trait FallbackClient {
+    async fn execute(&self, req: &QueryRequest, headers: &[(String, String)])
+        -> Result<FallbackResponse, FallbackError>;   // status, content type, body: no HTTP crates
+}
 ```
 
 `QueryDispatcher` (in `data-plane`) resolves each request against the
@@ -190,7 +193,7 @@ installed plan's query texts, runs the query engine, and falls back on
 |---|---|---|---|
 | Query engine | ASAPPlanner's DataFusion query-time engine (ProjectASAP/ASAPPlanner#1468, a merged proposal, not yet code) | `asap-executor` | Keep `asap-executor` behind `QueryEngine`. Switching later changes only `crates/query` |
 | Ingest engine | a new push engine modeled on ASAPQuery's precompute engine | ingest shards + push precompute + the executor's ingestion (docs/design/parallel-precompute.md) | Keep ours behind `IngestEngine` |
-| View state | opaque `Arc<dyn Any>`, in memory only, durability deferred | hot tier of decoded windows plus compact on-disk segments | `ViewStore` adds an encode/decode pair for durable tiers (#935's I6 anticipates it) |
+| View state | opaque `Arc<dyn Any>`, in memory only, durability deferred | hot tier of decoded windows plus compact on-disk segments | `storage` keeps its own state codecs; an encode/decode hook joins `ViewStore` only when a second implementer needs it |
 | View id | `(PlanId, PhysicalASAPNodeId)` | directories per refresh group and retention | Key the store by `ViewId`. On-disk recovery across plans needs ProjectASAP/ASAPPlanner#1429, as in #935 |
 | Raw data | `RawDataStore` in memory | raw samples in `store.rs`, plus optional forward to a raw store | `RawDataStore` trait over both; the forward becomes a `FallbackClient` plus an ingest tee in `data-plane` |
 | Sketch kernels | move out of `asap-executor` into a shared ASAPPlanner crate (#935's decision 48) | through `asap-executor` and `asap_sketchlib` | No change until that crate exists |
