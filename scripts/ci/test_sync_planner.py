@@ -33,7 +33,7 @@ class PlannerSyncTests(unittest.TestCase):
     revision = "a" * 40
     manifest = ''.join(
         f'{name} = {{ git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "{"b" * 40}" }}\n'
-        for name in ['asap-planner', 'asap-executor']
+        for name in ['asap-planner', 'asap-executor', 'asap-types']
     )
 
     def run_sync(self, manifest, revision=None, cargo_status=0):
@@ -58,10 +58,11 @@ class PlannerSyncTests(unittest.TestCase):
         root, result = self.run_sync(self.manifest + other)
         self.assertEqual(result.returncode, 0, result.stderr)
         updated = (root / 'Cargo.toml').read_text()
-        self.assertEqual(updated.count(f'rev = "{self.revision}"'), 2)
+        self.assertEqual(updated.count(f'rev = "{self.revision}"'), 3)
         self.assertTrue(updated.endswith(other))
         self.assertEqual((root / 'cargo-args').read_text().splitlines(), [
-            'update', '-p', 'asap-planner', '-p', 'asap-executor', '--precise', self.revision])
+            'update', '-p', 'asap-planner', '-p', 'asap-executor', '-p', 'asap-types', '--precise',
+            self.revision])
 
     def test_repository_manifest_updates_only_locked_packages(self):
         """Every pin in the real Cargo.toml is rewritten and every `-p` names a locked package."""
