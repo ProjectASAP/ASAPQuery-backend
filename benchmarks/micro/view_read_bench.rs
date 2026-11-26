@@ -23,7 +23,7 @@ use asap_executor::summary_kernels::exact::ExactAccumulator;
 use asap_executor::summary_kernels::{DDSketchAccumulator, DatasketchesKLLAccumulator};
 use asap_executor::values::{Batch, Value};
 use asap_executor::AggregateCore;
-use data_plane::persist::{ViewFiles, ViewRead};
+use storage::persist::{ViewFiles, ViewRead};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

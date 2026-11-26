@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use data_plane::series_ids::intern_pairs;
+use storage::series_ids::intern_pairs;
 
 fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs

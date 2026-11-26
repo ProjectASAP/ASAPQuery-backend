@@ -47,9 +47,10 @@ use futures::executor::LocalPool;
 use futures::task::LocalSpawnExt;
 use futures::StreamExt;
 
-use crate::ingestion::{window_end, ClosedWindow, Computed, Precompute};
-use crate::metrics::{Metrics, Timer};
-use crate::store::{RawData, RawSample};
+use internal_metrics::{Metrics, Timer};
+use storage::store::{window_end, RawData, RawSample};
+
+use crate::ingestion::{ClosedWindow, Computed, Precompute};
 
 /// The samples of one Remote Write request routed to a shard, and their
 /// batches converted once per metric and slot schema: every `Scan` of

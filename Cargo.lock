@@ -963,22 +963,21 @@ dependencies = [
  "futures",
  "hashbrown 0.15.5",
  "http-body-util",
+ "internal_metrics",
  "libc",
  "prost",
  "reqwest",
- "rmp-serde",
  "ryu",
  "serde",
- "serde_bytes",
  "serde_json",
  "snap",
+ "storage",
  "thiserror 1.0.69",
  "tikv-jemallocator",
  "tokio",
  "tower",
  "tracing",
  "tracing-subscriber",
- "zstd",
 ]
 
 [[package]]
@@ -2174,6 +2173,13 @@ checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
+]
+
+[[package]]
+name = "internal_metrics"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -3449,6 +3455,25 @@ dependencies = [
  "libc",
  "psm",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "storage"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "asap-executor",
+ "asap_sketchlib",
+ "clap",
+ "futures",
+ "internal_metrics",
+ "libc",
+ "rmp-serde",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "tracing",
+ "zstd",
 ]
 
 [[package]]

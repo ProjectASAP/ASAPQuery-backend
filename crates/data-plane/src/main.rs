@@ -21,8 +21,8 @@ static malloc_conf: &[u8] =
     b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0,narenas:8\0";
 use data_plane::engine::{EngineOptions, PrecomputeMode};
 use data_plane::ingestion::IngestionOptions;
-use data_plane::persist::ViewRead;
 use data_plane::{router, DataPlane, DEFAULT_FORWARD_TIMEOUT};
+use storage::persist::ViewRead;
 
 /// Serve Remote Write ingestion and the Prometheus query API for a plan.
 #[derive(Parser)]

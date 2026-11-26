@@ -14,8 +14,8 @@ use data_plane::remote_write::{decode_samples, Limits, RemoteWriteError};
 /// interned `&'static Series`.
 mod reference {
     use data_plane::remote_write::{Limits, RemoteWriteError};
-    use data_plane::series_ids::Series;
-    use data_plane::store::RawSample;
+    use storage::series_ids::Series;
+    use storage::store::RawSample;
 
     fn decompress(body: &[u8], limits: &Limits) -> Result<Vec<u8>, RemoteWriteError> {
         if body.len() > limits.max_compressed_bytes {
@@ -187,7 +187,7 @@ mod reference {
         if !names.contains(&"__name__") {
             return Err(RemoteWriteError::MissingMetricName);
         }
-        Ok(data_plane::series_ids::intern_pairs(&pairs))
+        Ok(storage::series_ids::intern_pairs(&pairs))
     }
 
     /// One protobuf field value.
@@ -281,7 +281,7 @@ mod reference {
 /// Each decoded sample as (series id, time, value bits), or the error.
 type Decoded = Result<Vec<(u32, i64, u64)>, RemoteWriteError>;
 
-fn decoded(samples: Result<Vec<data_plane::store::RawSample>, RemoteWriteError>) -> Decoded {
+fn decoded(samples: Result<Vec<storage::store::RawSample>, RemoteWriteError>) -> Decoded {
     samples.map(|samples| {
         samples
             .iter()

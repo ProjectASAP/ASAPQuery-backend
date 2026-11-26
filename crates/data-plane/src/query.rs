@@ -33,9 +33,9 @@ use asap_executor::values::{Batch, Value};
 use asap_planner::InstallablePlan;
 use futures::executor::block_on;
 use futures::StreamExt;
+use storage::store::{PublishedStore, QueryTimeResults, RawReads, RawShards, RunStore, ViewStore};
 
 use crate::result_cache::{Answer, ResultCache};
-use crate::store::{PublishedStore, QueryTimeResults, RawReads, RawShards, RunStore, ViewStore};
 
 /// One series of an instant-query result.
 #[derive(Debug, Clone, PartialEq)]
@@ -78,7 +78,7 @@ pub struct QueryEngine {
     runs: BTreeMap<PhysicalASAPNodeId, Run>,
     /// The shared nodes: their outputs live in `results`.
     shared: BTreeSet<PhysicalASAPNodeId>,
-    results: QueryTimeResults,
+    results: QueryTimeResults<Unanswered>,
     limits: Limits,
     /// The query roots whose runs read raw data through a `Scan` (rather
     /// than only materialized views).
@@ -98,7 +98,7 @@ impl QueryEngine {
         plan: &InstallablePlan,
         views: &[MaterializedView],
         limits: Limits,
-        results: QueryTimeResults,
+        results: QueryTimeResults<Unanswered>,
         share_one_evaluation: bool,
         result_cache: Option<ResultCache>,
     ) -> anyhow::Result<Self> {
@@ -174,7 +174,7 @@ impl QueryEngine {
     }
 
     /// The query-time partition of the view store.
-    pub fn query_time_results(&self) -> &QueryTimeResults {
+    pub fn query_time_results(&self) -> &QueryTimeResults<Unanswered> {
         &self.results
     }
 
@@ -315,7 +315,7 @@ impl Snapshot {
     /// Every stored view's rows: per view, each window's `(start, end]`
     /// and batches, oldest first (for comparing two engines' views).
     #[doc(hidden)]
-    pub fn view_rows(&self) -> crate::store::ViewRowsByView {
+    pub fn view_rows(&self) -> storage::store::ViewRowsByView {
         self.views.rows()
     }
 }
@@ -443,7 +443,7 @@ fn query_time_slot(node: PhysicalASAPNodeId) -> anyhow::Result<MaterializedView>
 /// The batches of `compiled`'s one root in a query run at `time_ms`.
 fn run_compiled(
     compiled: &CompiledPhysicalDAG,
-    store: std::sync::Arc<crate::store::RunStore>,
+    store: std::sync::Arc<storage::store::RunStore>,
     time_ms: i64,
     limits: &Limits,
 ) -> Result<Vec<Batch>, asap_executor::Error> {
@@ -542,7 +542,7 @@ fn result_samples(schema: &Schema, batches: &[Batch]) -> Result<Vec<ResultSample
                 Value::Utf8(text) if field.name == PROMQL_SERIES_IDENTITY => {
                     // An input series' identity is interned; parse only a
                     // series the query built.
-                    match crate::series_ids::by_identity(text) {
+                    match storage::series_ids::by_identity(text) {
                         Some(series) => match own.as_mut() {
                             Some(own) => own.extend(
                                 series
@@ -552,9 +552,10 @@ fn result_samples(schema: &Schema, batches: &[Batch]) -> Result<Vec<ResultSample
                             None => shared = Some(series.labels().clone()),
                         },
                         None => {
-                            let identity = crate::series_ids::result_labels(text).map_err(|e| {
-                                Unanswered::Execution(format!("series identity: {e}"))
-                            })?;
+                            let identity =
+                                storage::series_ids::result_labels(text).map_err(|e| {
+                                    Unanswered::Execution(format!("series identity: {e}"))
+                                })?;
                             match own.as_mut() {
                                 Some(own) => own.extend(
                                     identity
