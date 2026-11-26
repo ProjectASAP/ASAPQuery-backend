@@ -50,12 +50,13 @@ ASAPQuery-backend/
 │       └── query/                # prometheus-http, clickhouse-http, elastic-http, fallback clients
 ├── benchmarks/                   # the backend alone: micro (criterion) and system ingest/query
 ├── eval/                         # cross-system experiments for the paper
-│   ├── baselines/<system>/       # install and configure each compared system
+│   ├── baselines/<system>/       # compared systems that run as their own service (compose files)
 │   ├── workloads/
-│   ├── harness/
-│   ├── scripts/
-│   └── results/                  # .gitignore'd; never committed
-├── deployment/                   # Dockerfiles, compose files, monitoring (Grafana, Prometheus)
+│   ├── harness/                  # prepare, run the arms, report
+│   ├── scripts/                  # entry points: fetch pinned binaries, build, run, profile
+│   ├── demo/                     # the live Grafana demo
+│   └── campaign/                 # records of past multi-host runs
+├── deployment/                   # Dockerfile, compose file, monitoring/ (Grafana, Prometheus)
 ├── docs/
 └── README.md
 ```
@@ -83,7 +84,8 @@ ASAPQuery-backend/
 - `benchmarks/` measures the backend alone and guards against regressions.
   It runs often and needs only this repository.
 - `eval/` compares the backend with other systems for the paper. It installs
-  other systems, runs long and writes large results, which stay out of git.
+  other systems, runs long and writes large results, which stay out of git
+  (`eval/.gitignore`).
   Private workloads and anything derived from them never go into `eval/`.
 
 ## Boundaries
@@ -257,11 +259,14 @@ comes with tracker-delivered plans.
 | `data_plane/src/{lib,main}.rs` | `crates/data-plane/` |
 | `data_plane/tests/` | the crate whose behavior each test checks; end-to-end tests in `crates/data-plane/tests/` |
 | `data_plane/examples/*_bench.rs` | `benchmarks/micro/` |
-| `bench/demo/{campaign,harness,workloads,profile}` | `eval/` |
+| `bench/demo/{campaign,harness,workloads}` | `eval/` |
 | `bench/demo/{live,run_live_demo.sh}` | `eval/demo/` |
 | `bench/demo/monitoring/` | `deployment/monitoring/` |
 | `scripts/ci/`, `scripts/sync-asapplanner-main.sh` | stay in `scripts/` |
 | `scripts/profile.sh`, `scripts/tiered_views_cgroup.sh` | `benchmarks/scripts/` |
+| `bench/demo/{run_vm_demo,fetch_binaries,build}.sh`, `bench/demo/profile/profile_query_phase.sh` | `eval/scripts/` |
+| ASAPQuery's ClickHouse experiment service | `eval/baselines/clickhouse/docker-compose.yml` (image pinned) |
+| (new) a single-node Elasticsearch | `eval/baselines/elasticsearch/docker-compose.yml` (image pinned) |
 | `examples/*.json` | `docs/examples/` |
 
 `engine.rs` (about 2,700 lines) is the one file that splits rather than
@@ -303,7 +308,17 @@ each reviewed on its own:
    `ElasticHttpFallback`) and taking #937's `QueryRequest` (already in
    `common`). Their routes go through `QueryDispatcher::dispatch` and reach
    their fallback through `FallbackClient`.
-9. `eval/` baselines (ClickHouse and others) and `deployment/` Dockerfiles.
+9. `eval/` baselines and `deployment/` Dockerfiles. The entry-point scripts
+   move to `eval/scripts/`. Systems the harness starts itself (Prometheus,
+   VictoriaMetrics) stay pinned in `eval/scripts/fetch_binaries.sh` and
+   configured in `eval/harness/run.py`; ClickHouse and Elasticsearch get a
+   pinned compose file each under `eval/baselines/`, as the servers the
+   backend's query routes forward to. `eval/README.md` lists every baseline
+   and what is not ported yet (harness arms for ClickHouse and Elasticsearch,
+   ASAPQuery's data loaders, sampling baselines). `deployment/Dockerfile`
+   builds `control_plane` and `data_plane` into one image (multi-stage,
+   pinned bases), and `deployment/docker-compose.yml` plans a workload and
+   serves the plan.
 
 ## Decisions
 
