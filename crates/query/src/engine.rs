@@ -15,19 +15,26 @@ use common::{
 use storage::store::{PublishedStore, QueryTimeResults};
 
 use crate::result_cache::{Answer, ResultCache};
-use crate::workers::QueryWorkers;
-use crate::{CompiledQueries, Unanswered};
+use crate::workers::InstalledQueries;
+use crate::CompiledQueries;
 
-/// How the query engine compiles and runs the plan's queries; the data
-/// plane's `EngineOptions` describes each field.
+/// How the query engine compiles and runs the plan's queries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryOptions {
+    /// The most bytes one query run may hold.
     pub run_memory_limit_bytes: usize,
+    /// Query worker threads: the most query runs at once.
     pub threads: usize,
+    /// Compute each query-time `OneEvaluation` node several queries read
+    /// once per evaluation time; `false` computes it in every query's run.
     pub share_one_evaluation_results: bool,
+    /// How long a query-time result is kept after its evaluation time.
     pub query_time_results_retention_ms: u64,
+    /// The most bytes of query-time results kept.
     pub query_time_results_max_bytes: usize,
+    /// Keep each planned query's final answer at each evaluation time.
     pub result_cache: bool,
+    /// The most bytes of answers the result cache keeps.
     pub result_cache_max_bytes: usize,
     /// How much longer than the plan's retention views are kept, which
     /// bounds how far back the result cache keeps answers.
@@ -44,7 +51,7 @@ pub struct ExecutorQueryEngine {
     published: Arc<PublishedStore>,
     /// Held while a plan is installed, so two installs do not both start.
     installing: Mutex<()>,
-    installed: OnceLock<QueryWorkers>,
+    installed: OnceLock<InstalledQueries>,
 }
 
 impl ExecutorQueryEngine {
@@ -59,12 +66,12 @@ impl ExecutorQueryEngine {
     }
 
     /// The installed plan's queries and workers; `None` before the install.
-    pub fn installed(&self) -> Option<&QueryWorkers> {
+    pub fn installed(&self) -> Option<&InstalledQueries> {
         self.installed.get()
     }
 
     /// Compiles `plan`'s queries and starts the workers.
-    fn start(&self, plan: &InstalledPlan) -> anyhow::Result<QueryWorkers> {
+    fn start(&self, plan: &InstalledPlan) -> anyhow::Result<InstalledQueries> {
         let options = &self.options;
         let views = plan.plan.materialized_views()?;
         let limits = Limits {
@@ -102,7 +109,7 @@ impl ExecutorQueryEngine {
                 reasons.join("; ")
             );
         }
-        Ok(QueryWorkers::start(
+        Ok(InstalledQueries::start(
             plan.id,
             compiled,
             self.published.clone(),
@@ -145,9 +152,7 @@ impl ExecutorQueryEngine {
         };
         match result {
             Ok(result) => Ok(EngineQueryResult::Ready { result }),
-            Err(Unanswered::MissingRows(_) | Unanswered::PlanChanged) => {
-                Ok(EngineQueryResult::NotReady)
-            }
+            Err(unanswered) if unanswered.is_not_ready() => Ok(EngineQueryResult::NotReady),
             Err(error) => Err(QueryEngineError::new(error.to_string())),
         }
     }
@@ -246,7 +251,8 @@ mod tests {
 
     /// Through `QueryEngine`: nothing is ready before the install, the plan
     /// installs once, a query resolved against another plan is not ready,
-    /// and neither is one whose views are not stored yet.
+    /// and neither is one whose views are not stored yet. Its measurements
+    /// are found by its trimmed text.
     #[tokio::test]
     async fn the_query_engine_installs_once_and_reports_not_ready() {
         let options = QueryOptions {
@@ -284,6 +290,10 @@ mod tests {
         };
         assert_eq!(engine.install(installed(1)), Ok(()));
         assert!(engine.install(installed(2)).is_err());
+        // The query's measurements are found by its text, trimmed.
+        let compiled = engine.installed().unwrap().compiled();
+        assert_eq!(compiled.metrics_index(&format!(" {QUERY} ")), Some(0));
+        assert_eq!(compiled.metrics_index("up"), None);
         let range = request(QueryEval::Range {
             start_ms: 10_000,
             end_ms: 30_000,

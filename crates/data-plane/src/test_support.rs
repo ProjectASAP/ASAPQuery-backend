@@ -1,6 +1,6 @@
 //! Plans and options for the unit tests.
 
-use asap_planner::InstallablePlan;
+use common::InstallablePlan;
 use precompute::ingestion::IngestionOptions;
 use storage::store::RawSample;
 

@@ -5,15 +5,14 @@
 
 use std::sync::Arc;
 
-use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
-use asap_planner::InstallablePlan;
+use common::{InstallablePlan, PhysicalASAPNodeId};
 use internal_metrics::{Metrics, QueryMetrics};
 use precompute::engine::{
     IngestError, InstalledPrecompute, PersistedViews, PrecomputeEngine, PrecomputeMode,
     PrecomputeOptions, SlowRefresh,
 };
 use precompute::ingestion::{IngestionOptions, IngestionStats};
-use query::workers::QueryWorkers;
+use query::workers::InstalledQueries;
 use query::{ExecutorQueryEngine, QueryOptions, Unanswered};
 use storage::persist::{plan_hash, ViewRead};
 use storage::persist_pool::PersistOptions;
@@ -189,7 +188,7 @@ impl Default for EngineOptions {
 #[derive(Clone)]
 pub struct EngineHandle {
     precompute: InstalledPrecompute,
-    query: QueryWorkers,
+    query: InstalledQueries,
     dispatcher: Arc<QueryDispatcher>,
     /// The views' cold tier, when they are persisted.
     view_tier: Option<Arc<ViewTier>>,
@@ -251,12 +250,15 @@ impl EngineHandle {
         &self.dispatcher
     }
 
-    /// The newest published store: what a query starting now reads.
+    /// For tests: the newest published store, what a query starting now
+    /// reads.
+    #[doc(hidden)]
     pub fn snapshot(&self) -> Arc<query::Snapshot> {
         self.query.snapshot()
     }
 
-    /// Each planned query's measurements, by query text.
+    /// For benchmarks: each planned query's measurements, by query text.
+    #[doc(hidden)]
     pub fn query_metrics(&self) -> &[(String, QueryMetrics)] {
         self.query.compiled().metrics()
     }

@@ -76,6 +76,14 @@ pub enum Unanswered {
     Execution(String),
 }
 
+impl Unanswered {
+    /// Whether the query only lacks data, or was resolved against another
+    /// plan (the boundary's `NotReady`), rather than failing to run.
+    pub fn is_not_ready(&self) -> bool {
+        matches!(self, Self::MissingRows(_) | Self::PlanChanged)
+    }
+}
+
 /// One compiled query run: of a query's root, or of a shared node.
 struct Run {
     compiled: CompiledPhysicalDAG,
@@ -85,8 +93,8 @@ struct Run {
 
 /// The installed plan's queries, compiled.
 pub struct CompiledQueries {
-    /// Each query and its root, or why it cannot run.
-    roots: Vec<(String, Result<PhysicalASAPNodeId, String>)>,
+    /// Each planned query (trimmed) the engine cannot run, with why.
+    unexecutable: Vec<(String, String)>,
     /// Each planned root: whether its run, and every shared node's run it
     /// reads, compiled.
     runnable: HashMap<PhysicalASAPNodeId, Result<(), String>>,
@@ -159,31 +167,30 @@ impl CompiledQueries {
                 .map_err(|e| e.to_string());
             compiled.insert(node, run);
         }
-        let roots: Vec<(String, Result<PhysicalASAPNodeId, String>)> = plan
-            .query_texts
-            .iter()
-            .zip(&dag.roots)
-            .map(|(query, &root)| {
-                let runnable = runnable(root, &compiled).map(|()| root);
-                (query.trim().to_string(), runnable)
-            })
-            .collect();
-        let runnable_roots = dag
+        let runnable_roots: HashMap<PhysicalASAPNodeId, Result<(), String>> = dag
             .roots
             .iter()
             .map(|&root| (root, runnable(root, &compiled)))
             .collect();
-        let metrics: BTreeSet<&String> = roots.iter().map(|(query, _)| query).collect();
+        let queries = || plan.query_texts.iter().map(|query| query.trim());
+        let unexecutable = queries()
+            .zip(&dag.roots)
+            .filter_map(|(query, root)| {
+                let reason = runnable_roots[root].as_ref().err()?;
+                Some((query.to_string(), reason.clone()))
+            })
+            .collect();
+        let metrics: BTreeSet<&str> = queries().collect();
         let metrics = metrics
             .into_iter()
-            .map(|query| (query.clone(), QueryMetrics::default()))
+            .map(|query| (query.to_string(), QueryMetrics::default()))
             .collect();
         let runs = compiled
             .into_iter()
             .filter_map(|(node, run)| Some((node, run.ok()?)))
             .collect();
         Ok(Self {
-            roots,
+            unexecutable,
             runnable: runnable_roots,
             metrics,
             runs,
@@ -196,11 +203,8 @@ impl CompiledQueries {
     }
 
     /// The planned queries the engine cannot run, with why.
-    pub fn unexecutable(&self) -> Vec<(String, String)> {
-        self.roots
-            .iter()
-            .filter_map(|(query, root)| Some((query.clone(), root.as_ref().err()?.clone())))
-            .collect()
+    pub fn unexecutable(&self) -> &[(String, String)] {
+        &self.unexecutable
     }
 
     /// The query-time partition of the view store.
@@ -219,7 +223,7 @@ impl CompiledQueries {
     }
 
     /// Where the planned `query`'s measurements are in [`Self::metrics`].
-    pub fn metrics_index(&self, query: &str) -> Option<usize> {
+    pub(crate) fn metrics_index(&self, query: &str) -> Option<usize> {
         let query = query.trim();
         self.metrics
             .binary_search_by(|(planned, _)| planned.as_str().cmp(query))

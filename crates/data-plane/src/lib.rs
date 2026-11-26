@@ -2,12 +2,14 @@
 //! the Prometheus query API for an installed plan.
 //!
 //! The installed plan is ASAPPlanner's `InstallablePlan`: one selected
-//! physical ASAP DAG. The engine's ingest shards store the raw samples its
-//! `Scan`s read, its precompute pool refreshes the materialized views in
-//! ingestion runs, and query worker threads answer the plan's instant and
-//! range queries with query runs, all through the Planner's executor
-//! ([`engine`]); every other query, and any planned query it cannot
-//! answer, is forwarded to Prometheus (or refused with `--no-forward`).
+//! physical ASAP DAG. The precompute engine's ingest shards store the raw
+//! samples its `Scan`s read and its precompute pool refreshes the
+//! materialized views in ingestion runs ([`precompute`]); the query
+//! engine's worker threads answer the plan's instant and range queries
+//! with query runs ([`query`]), all through the Planner's executor. The
+//! HTTP routes run queries through the [`dispatcher`]: every other query,
+//! and any planned query the plan cannot answer, is forwarded to
+//! Prometheus (or refused with `--no-forward`).
 //!
 //! Forward mode (`--raw-store-url`, [`raw_forward`]): every accepted Remote
 //! Write request is also delivered to a raw store (VictoriaMetrics), which
@@ -16,7 +18,7 @@
 
 pub mod dispatcher;
 pub mod engine;
-pub mod installer;
+mod installer;
 mod metrics_endpoint;
 pub mod prometheus;
 pub mod raw_forward;
@@ -362,7 +364,7 @@ async fn query(
         }
         QueryOutcome::NotAnswerable(reason) => reason,
     };
-    match Fallback::new(&reason, &instant.query, state.no_forward) {
+    match Fallback::new(reason, &instant.query, state.no_forward) {
         Fallback::Refuse { reason } => not_answered(&reason),
         Fallback::Forward { reason } => {
             if let Some(reason) = &reason {
@@ -413,7 +415,7 @@ async fn query_range(
         }
         Err(reason) => reason,
     };
-    match Fallback::new(&reason, &range.query, state.no_forward) {
+    match Fallback::new(reason, &range.query, state.no_forward) {
         Fallback::Refuse { reason } => not_answered(&reason),
         Fallback::Forward { reason } => {
             if let Some(reason) = &reason {
@@ -458,8 +460,7 @@ async fn answer_range(
     // on that worker, instant queries and Remote Write included, and with
     // every worker so busy no timer or socket is polled: built on the
     // blocking pool instead.
-    let failed =
-        |error: String| NotAnswerableReason::EngineError(Unanswered::Execution(error).to_string());
+    let failed = |error: String| NotAnswerableReason::new(Unanswered::Execution(error));
     tokio::task::spawn_blocking(move || {
         prometheus::range_response_body(&steps)
             .map_err(|error| failed(format!("the range response: {error}")))

@@ -339,17 +339,10 @@ impl common::IngestEngine for PrecomputeEngine {
         let Some(installed) = self.installed() else {
             return Ok(());
         };
-        let RawDataBatch::TimeSeries { series } = batch;
-        let mut samples = Vec::new();
-        for (labels, points) in &series {
-            let pairs: Vec<(&String, &String)> = labels.iter().collect();
-            let series = storage::series_ids::intern_pairs(&pairs);
-            samples.extend(points.iter().map(|&(timestamp_ms, value)| RawSample {
-                labels: series,
-                timestamp_ms,
-                value,
-            }));
-        }
+        let samples = RawSample::from_batch(&batch);
+        // `try_ingest` takes the samples, so each attempt gets a copy: this
+        // path is for adapters (no HTTP route calls it); Remote Write calls
+        // `try_ingest` directly and answers 503 instead of waiting.
         loop {
             match installed.try_ingest(samples.clone()) {
                 Ok(()) => return Ok(()),
