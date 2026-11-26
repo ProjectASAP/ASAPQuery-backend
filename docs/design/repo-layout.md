@@ -94,7 +94,7 @@ ASAPQuery-backend/
 crate          depends on
 -------------  --------------------------------------------------
 control-plane  common, asap-planner
-adapters/*     common
+adapters/*     common, nothing, or the adapter whose wire format they extend
 precompute     common, storage, internal-metrics, asap-executor
 storage        common, internal-metrics, asap-executor
 query          common, storage, internal-metrics, asap-executor
@@ -106,9 +106,13 @@ data-plane     every crate above (wiring only)
 - `common` depends on ASAPPlanner's plan types only (`InstallablePlan`,
   `PhysicalASAPDAG`, `QueryLanguage`, …), never on the executor's runtime.
   This is #935's decision 1.
-- Adapters depend on `common` only: they never see an engine or a store. In
-  ASAPQuery, adapters depend on the whole engine crate (#935, "Not solved");
-  a separate `common` crate closes that here.
+- Adapters never see an engine or a store. In ASAPQuery, adapters depend
+  on the whole engine crate (#935, "Not solved"); a separate `common` crate
+  closes that here. The ingest adapters need not even `common`: each
+  decodes into the caller's types (below), so `prometheus-remote-write` and
+  `otlp` depend on nothing in the workspace, and
+  `victoriametrics-remote-write` only on `prometheus-remote-write`, whose
+  protobuf it reads (zstd-compressed instead of snappy).
 - `precompute` and `query` do not depend on each other. Both depend on
   `storage`: they read its copy-on-write snapshot and the executor's record
   batches, which the `ViewStore` and `RawDataStore` traits cannot express
@@ -154,8 +158,10 @@ These are #935's interfaces, with the same names, so adapters move unchanged:
 struct QueryRequest { language: QueryLanguage, query: String, eval: QueryEval }
 enum QueryEval { Instant { time_ms: i64 }, Range { start_ms: i64, end_ms: i64, step_ms: i64 } }
 enum QueryResult { Vector(..), Matrix(..), Scalar(..), Table { columns, rows } }
+type Answer = Arc<Vec<ResultSample>>;   // an instant answer as the query engine returns it natively
+struct ResultSample { labels: Arc<LabelSet>, value: f64 }   // labels shared with the stored series: no copy
 
-// Ingest (ingest adapters → precompute)
+// Ingest (data-plane → precompute)
 enum RawDataBatch { TimeSeries { series: Vec<(LabelSet, Vec<(i64, f64)>)> } }
 trait IngestEngine {
     fn install(&self, plan: InstalledPlan) -> Result<(), InstallError>;
@@ -188,10 +194,27 @@ trait FallbackClient {
 `QueryDispatcher` (in `data-plane`) resolves each request against the
 installed plan's query texts, runs the query engine, and falls back on
 `Unmatched`, `NotReady` or an engine error, as #935 specifies. On the hot
-path it calls the query engine's native answer type instead of
+path it calls the query engine's native answer type (`Answer`) instead of
 `QueryEngine::execute_batch`, so a query does not copy every series'
-labels into a `QueryResult`. `PlanInstaller` installs once, as #935's I14
-does; a retryable install comes with tracker-delivered plans.
+labels into a `QueryResult`.
+
+The same holds on the ingest side. An ingest adapter does not build a
+`RawDataBatch`: its decoder takes the caller's series and sample types
+(the Remote Write decoder's `SampleBuilder`, which
+`victoriametrics-remote-write` reuses), so `data-plane` interns each new series into the store's series
+table and a Remote Write request decodes straight into the ingest engine's
+samples, with no label copied per sample. `otlp` returns each point's
+labels as strings, which `data-plane` interns the same way; OTLP ingest is
+not on the measured path, so it copies them.
+
+The Prometheus HTTP routes forward what the plan does not answer verbatim:
+`PrometheusHttpFallback::forward` sends the request's method, path, query
+string, headers and body unchanged, so the response is byte-identical to the
+server's. `PrometheusHttpFallback` also implements `FallbackClient`, the seam
+the ClickHouse and Elastic fallback clients (step 8) implement.
+
+`PlanInstaller` installs once, as #935's I14 does; a retryable install
+comes with tracker-delivered plans.
 
 ### Where the backend differs from #935
 
@@ -216,7 +239,8 @@ does; a retryable install comes with tracker-delivered plans.
 | `data_plane/src/{store,window_cache,memory_budget,segment,persist,state_codec}.rs` | `crates/storage/` |
 | `data_plane/src/{query,result_cache}.rs` | `crates/query/` |
 | `data_plane/src/raw_forward.rs` | split: the tee into `crates/data-plane/`, the proxy into `crates/adapters/query/` |
-| `data_plane/src/remote_write.rs` | `crates/adapters/ingest/prometheus-remote-write/` |
+| `data_plane/src/remote_write.rs` | `crates/adapters/ingest/prometheus-remote-write/` (the series interning stays in `crates/data-plane/`) |
+| ASAPQuery's VictoriaMetrics Remote Write and OTLP decoders | `crates/adapters/ingest/{victoriametrics-remote-write,otlp}/`, served on ASAPQuery's routes (`/api/v1/import`, `/v1/metrics`) |
 | `data_plane/src/prometheus.rs` | `crates/adapters/query/prometheus-http/` |
 | `data_plane/src/metrics.rs` | `crates/internal-metrics/` |
 | `data_plane/src/{lib,main}.rs` | `crates/data-plane/` |
@@ -259,8 +283,10 @@ each reviewed on its own:
 6. Move the existing Remote Write decoder and Prometheus HTTP API into
    `crates/adapters/`.
 7. Bring over ASAPQuery's ingest adapters (VictoriaMetrics Remote Write,
-   OTLP), after ASAPQuery's adapter extraction (ProjectASAP/ASAPQuery#936)
-   and `QueryRequest` change (ProjectASAP/ASAPQuery#937) merge.
+   OTLP over HTTP) from its main branch, with names that follow its adapter
+   extraction (ProjectASAP/ASAPQuery#936); neither needs its `QueryRequest`
+   change (ProjectASAP/ASAPQuery#937). They feed the ingest engine as Remote
+   Write does.
 8. Bring over ASAPQuery's query adapters and fallback clients (ClickHouse and
    Elastic HTTP).
 9. `eval/` baselines (ClickHouse and others) and `deployment/` Dockerfiles.
