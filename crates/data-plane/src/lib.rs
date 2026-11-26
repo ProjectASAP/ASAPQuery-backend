@@ -1,9 +1,9 @@
 //! Backend data plane: receives Prometheus Remote Write samples and serves
 //! the Prometheus query API for an installed plan.
 //!
-//! The protocols are adapters: `prometheus_remote_write` decodes Remote
-//! Write requests ([`remote_write`] interns their series into the store),
-//! and `prometheus_http` reads query parameters, writes responses and
+//! The protocols are adapters: `prometheus_remote_write`,
+//! `victoriametrics_remote_write` and `otlp` decode ingest requests
+//! ([`remote_write`] interns their series into the store), and `prometheus_http` reads query parameters, writes responses and
 //! sends what the plan does not answer to Prometheus.
 //!
 //! The installed plan is ASAPPlanner's `InstallablePlan`: one selected
@@ -134,7 +134,7 @@ pub fn router(state: Arc<DataPlane>) -> Router {
     let write_body_limit = DefaultBodyLimit::max(state.limits.max_compressed_bytes);
     let forward_mode = state.raw_forward.is_some();
     let router = Router::new()
-        .route("/api/v1/write", post(write).layer(write_body_limit))
+        .route("/api/v1/write", post(write).layer(write_body_limit.clone()))
         .route("/api/v1/query", get(query).post(query))
         .route("/api/v1/query_range", get(query_range).post(query_range))
         .route("/api/v1/status/asap", get(status))
@@ -142,11 +142,19 @@ pub fn router(state: Arc<DataPlane>) -> Router {
         .route("/api/v1/precompute/watermark", post(watermark))
         .route("/-/ready", get(ready));
     // Forward mode: any other path (labels, series, metadata, the raw
-    // store's UI) is proxied to the raw store. Off: those paths are 404.
+    // store's UI) is proxied to the raw store. Off: those paths are 404,
+    // except the VictoriaMetrics Remote Write and OTLP ingest routes, served
+    // only then: forward mode delivers Remote Write bodies alone to the raw
+    // store, which would miss their samples.
     let router = if forward_mode {
         router.fallback(proxy)
     } else {
         router
+            .route(
+                "/api/v1/import",
+                post(write_victoriametrics).layer(write_body_limit.clone()),
+            )
+            .route("/v1/metrics", post(write_otlp).layer(write_body_limit))
     };
     router.with_state(state)
 }
@@ -194,31 +202,90 @@ async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
                 },
                 None => None,
             };
-            match state.engine.try_ingest(samples) {
-                Ok(()) => {
-                    if let Some(reservation) = reservation {
-                        reservation.commit(body);
-                    }
-                    StatusCode::NO_CONTENT.into_response()
-                }
-                // Remote Write senders retry on 503.
-                Err(IngestError::Busy) => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    IngestError::Busy.to_string(),
-                )
-                    .into_response(),
-                Err(IngestError::Stopped) => {
-                    tracing::error!("Remote Write refused: the engine has stopped");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        IngestError::Stopped.to_string(),
-                    )
-                        .into_response()
-                }
+            if let Err(refused) = ingest(&state, samples, "Remote Write") {
+                return refused;
             }
+            if let Some(reservation) = reservation {
+                reservation.commit(body);
+            }
+            StatusCode::NO_CONTENT.into_response()
         }
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
+}
+
+/// `POST /api/v1/import`: a VictoriaMetrics Remote Write body (the Remote
+/// Write protobuf, zstd-compressed), ingested as `/api/v1/write` ingests a
+/// Prometheus one; 204 once the engine has it. Not served in forward mode
+/// (see [`router`]).
+async fn write_victoriametrics(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
+    let timer = internal_metrics::Timer::start();
+    let samples = match remote_write::decode_victoriametrics_samples(&body, &state.limits) {
+        Ok(samples) => samples,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    state.engine.metrics().remote_write_decode.record(timer);
+    if !samples.is_empty() {
+        if let Err(refused) = ingest(&state, samples, "VictoriaMetrics Remote Write") {
+            return refused;
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /v1/metrics`: an OTLP/HTTP metrics body (protobuf, gzip when its
+/// `Content-Encoding` says so), each data point ingested as a sample
+/// ([`otlp`]); 200 with `{"rejected": 0}` once the engine has them, as
+/// ASAPQuery answers. Not served in forward mode (see [`router`]).
+async fn write_otlp(
+    State(state): State<Arc<DataPlane>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let content_encoding = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok());
+    let limits = otlp::Limits {
+        max_decompressed_bytes: state.limits.max_decompressed_bytes,
+        max_points: state.limits.max_samples,
+    };
+    let samples = match remote_write::decode_otlp_samples(&body, content_encoding, &limits) {
+        Ok(samples) => samples,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    if !samples.is_empty() {
+        if let Err(refused) = ingest(&state, samples, "OTLP") {
+            return refused;
+        }
+    }
+    axum::Json(serde_json::json!({ "rejected": 0 })).into_response()
+}
+
+/// Hands decoded samples to the engine; the response refusing them when it
+/// is busy (503, which senders retry) or has stopped (500).
+fn ingest(
+    state: &DataPlane,
+    samples: Vec<storage::store::RawSample>,
+    protocol: &str,
+) -> Result<(), Response> {
+    state
+        .engine
+        .try_ingest(samples)
+        .map_err(|error| match error {
+            IngestError::Busy => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                IngestError::Busy.to_string(),
+            )
+                .into_response(),
+            IngestError::Stopped => {
+                tracing::error!("{protocol} refused: the engine has stopped");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    IngestError::Stopped.to_string(),
+                )
+                    .into_response()
+            }
+        })
 }
 
 /// `POST /api/v1/precompute/watermark?time_ms=T`: the producer states that

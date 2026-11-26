@@ -129,19 +129,8 @@ impl<B: SampleBuilder> Decoder<B> {
             decompressed: buffer,
             cache,
         } = self;
-        let decoded = (|| {
-            let decoded = decompress_into(body, limits, buffer)?;
-            // Room for one sample per 40 encoded bytes: a sender's one-sample
-            // series take 60 to 150, so this grows only for tiny label sets.
-            let mut samples = Vec::with_capacity(decoded.len() / 40);
-            let mut request = Reader::new(decoded);
-            while let Some((field, value)) = request.field()? {
-                if let (1, Value::Bytes(series)) = (field, value) {
-                    decode_series(series, cache, &mut samples, limits)?;
-                }
-            }
-            Ok(samples)
-        })();
+        let decoded = decompress_into(body, limits, buffer)
+            .and_then(|request| decode_request(request, cache, limits));
         // An unusually large request's buffer is not kept, whether or not the
         // request decoded: a short body claiming a large size and then failing
         // to decompress must not leave the decoder holding that buffer.
@@ -150,6 +139,44 @@ impl<B: SampleBuilder> Decoder<B> {
         }
         decoded
     }
+
+    /// The samples of an uncompressed Remote Write v1 `WriteRequest`, as
+    /// [`Decoder::decode`] reads a decompressed body: for a protocol that
+    /// sends the same protobuf compressed another way (VictoriaMetrics
+    /// sends it zstd-compressed). Errors: `request` is over
+    /// `max_decompressed_bytes`, or as [`Decoder::decode`] after
+    /// decompression.
+    pub fn decode_uncompressed(
+        &mut self,
+        request: &[u8],
+        limits: &Limits,
+    ) -> Result<Vec<B::Sample>, RemoteWriteError> {
+        if request.len() > limits.max_decompressed_bytes {
+            return Err(RemoteWriteError::DecompressedTooLarge(
+                limits.max_decompressed_bytes,
+            ));
+        }
+        decode_request(request, &mut self.cache, limits)
+    }
+}
+
+/// The samples of the encoded `WriteRequest` `request`, in request order.
+#[inline]
+fn decode_request<B: SampleBuilder>(
+    request: &[u8],
+    cache: &mut SeriesCache<B>,
+    limits: &Limits,
+) -> Result<Vec<B::Sample>, RemoteWriteError> {
+    // Room for one sample per 40 encoded bytes: a sender's one-sample
+    // series take 60 to 150, so this grows only for tiny label sets.
+    let mut samples = Vec::with_capacity(request.len() / 40);
+    let mut reader = Reader::new(request);
+    while let Some((field, value)) = reader.field()? {
+        if let (1, Value::Bytes(series)) = (field, value) {
+            decode_series(series, cache, &mut samples, limits)?;
+        }
+    }
+    Ok(samples)
 }
 
 /// The largest decompression buffer a decoder keeps between requests.
@@ -811,6 +838,47 @@ mod tests {
         assert_eq!(
             decoder.labeled(&body, &one).err(),
             Some(RemoteWriteError::TooManySamples(1))
+        );
+    }
+
+    /// An uncompressed request decodes to the samples of the same request
+    /// snappy-compressed, and is held to the decompressed size limit.
+    #[test]
+    fn uncompressed_requests_decode_as_compressed_ones() {
+        let request = WriteRequest {
+            timeseries: vec![
+                series(&[("__name__", "m"), ("job", "a")], &[(1, 1.0), (2, 2.0)]),
+                series(&[("job", "b"), ("__name__", "m")], &[(3, f64::NAN)]),
+            ],
+        };
+        let limits = Limits::default();
+        let compressed = Decoder::new(Labeled::default())
+            .labeled(&encode(&request), &limits)
+            .unwrap();
+        let mut decoder = Decoder::new(Labeled::default());
+        let samples = decoder
+            .decode_uncompressed(&request.encode_to_vec(), &limits)
+            .unwrap();
+        let uncompressed: Vec<(Labels, i64, u64)> = samples
+            .into_iter()
+            .map(|(series, timestamp_ms, value)| {
+                (
+                    decoder.cache.builder.series[series].clone(),
+                    timestamp_ms,
+                    value.to_bits(),
+                )
+            })
+            .collect();
+        assert_eq!(uncompressed, compressed);
+        let small = Limits {
+            max_decompressed_bytes: 4,
+            ..Limits::default()
+        };
+        assert_eq!(
+            decoder
+                .decode_uncompressed(&request.encode_to_vec(), &small)
+                .err(),
+            Some(RemoteWriteError::DecompressedTooLarge(4))
         );
     }
 

@@ -197,6 +197,15 @@ cargo run -p control_plane -- \
 cargo run -p data_plane -- --plan plan.json --prometheus-url http://localhost:9090
 ```
 
+Besides Prometheus Remote Write, the data plane ingests VictoriaMetrics
+Remote Write (the same protobuf, zstd-compressed) on `/api/v1/import` and
+OTLP/HTTP metrics (protobuf, optionally gzip) on `/v1/metrics`, the routes
+ASAPQuery serves them on. An OTLP data point becomes a sample of the series
+named by its metric (`<name>_sum` and `<name>_count` for histograms and
+summaries) and labeled by its scope's, resource's and own attributes. Both
+routes answer as Remote Write does (400, 503, 500), and are not served in
+forward mode, which delivers only Remote Write bodies to the raw store.
+
 `--deployment-capabilities caps.json` replaces the default
 `DeploymentCapabilities`: every summary the Planner's executor builds, raw
 data kept by the data plane, and no query-time result kept across
@@ -237,6 +246,8 @@ not stored) with a Prometheus `execution` error (422,
 | `crates/storage/` | package `storage`: raw samples and views in memory, the view cache, segments, persistence and the persist threads |
 | `crates/internal-metrics/` | package `internal_metrics`: the backend's measurements of itself, exported on `/metrics` |
 | `crates/adapters/ingest/prometheus-remote-write/` | package `prometheus_remote_write`: Remote Write v1 decoding and validation |
+| `crates/adapters/ingest/victoriametrics-remote-write/` | package `victoriametrics_remote_write`: VictoriaMetrics Remote Write (the Remote Write protobuf, zstd-compressed), `POST /api/v1/import` |
+| `crates/adapters/ingest/otlp/` | package `otlp`: OTLP/HTTP metrics decoding into samples, `POST /v1/metrics` |
 | `crates/adapters/query/prometheus-http/` | package `prometheus_http`: query parameters, response bodies and the fallback client of a Prometheus-compatible server |
 | `benchmarks/` | the backend alone: `micro/` benchmarks (examples of `data_plane`) and `scripts/` |
 | `eval/` | comparisons with other systems and the live demo; see [eval/README.md](eval/README.md) |

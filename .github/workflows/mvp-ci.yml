@@ -53,7 +53,7 @@ jobs:
 
       - name: Check workspace formatting
         working-directory: ASAPQuery-backend
-        run: cargo fmt -p common -p control_plane -p data_plane -p internal_metrics -p precompute -p prometheus_http -p prometheus_remote_write -p query -p storage -- --check
+        run: cargo fmt -p common -p control_plane -p data_plane -p internal_metrics -p otlp -p precompute -p prometheus_http -p prometheus_remote_write -p query -p storage -p victoriametrics_remote_write -- --check
 
       - name: Check workspace
         env:

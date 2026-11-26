@@ -9,6 +9,8 @@ internal_metrics.workspace = true
 precompute.workspace = true
 prometheus_http.workspace = true
 prometheus_remote_write.workspace = true
+victoriametrics_remote_write.workspace = true
+otlp.workspace = true
 query.workspace = true
 storage.workspace = true
 libc = "0.2"
@@ -39,6 +41,8 @@ http-body-util = "0.1"
 # cache (tests/remote_write_reference.rs).
 snap = "1.1"
 ahash = "0.8"
+# gzip OTLP bodies (tests/ingest_protocols.rs).
+flate2 = "1.0"
 
 # The micro benchmarks live in benchmarks/micro/ and build as examples of this
 # crate (`cargo run --release -p data_plane --example <name>`).

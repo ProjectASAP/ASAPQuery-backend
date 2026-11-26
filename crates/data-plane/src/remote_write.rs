@@ -1,12 +1,14 @@
-//! Remote Write ingest: the `prometheus_remote_write` adapter's decoder,
-//! with each series interned into the store's series table, so a request
-//! decodes straight into the engine's [`RawSample`]s.
+//! Ingest decoding: the ingest adapters' decoders (Prometheus and
+//! VictoriaMetrics Remote Write, OTLP), with each series interned into the
+//! store's series table, so a request decodes into the engine's
+//! [`RawSample`]s.
 
 use std::cell::RefCell;
 
 use prometheus_remote_write::{Decoder, Limits, RemoteWriteError, SampleBuilder};
 use storage::series_ids::{intern_pairs, Series};
 use storage::store::RawSample;
+use victoriametrics_remote_write::VictoriaMetricsRemoteWriteError;
 
 /// The samples of a snappy-compressed Remote Write v1 body, each with its
 /// interned series, in request order ([`Decoder::decode`]). Each thread
@@ -17,6 +19,38 @@ pub fn decode_samples(body: &[u8], limits: &Limits) -> Result<Vec<RawSample>, Re
         static DECODER: RefCell<Decoder<Interned>> = RefCell::new(Decoder::new(Interned));
     }
     DECODER.with(|decoder| decoder.borrow_mut().decode(body, limits))
+}
+
+/// The samples of a zstd-compressed VictoriaMetrics Remote Write body, as
+/// [`decode_samples`] decodes a Prometheus one
+/// ([`victoriametrics_remote_write::Decoder::decode`]).
+pub fn decode_victoriametrics_samples(
+    body: &[u8],
+    limits: &Limits,
+) -> Result<Vec<RawSample>, VictoriaMetricsRemoteWriteError> {
+    thread_local! {
+        static DECODER: RefCell<victoriametrics_remote_write::Decoder<Interned>> =
+            RefCell::new(victoriametrics_remote_write::Decoder::new(Interned));
+    }
+    DECODER.with(|decoder| decoder.borrow_mut().decode(body, limits))
+}
+
+/// The samples of an OTLP metrics body ([`otlp::decode`]), each point's
+/// series interned. `content_encoding` is the request's `Content-Encoding`.
+pub fn decode_otlp_samples(
+    body: &[u8],
+    content_encoding: Option<&str>,
+    limits: &otlp::Limits,
+) -> Result<Vec<RawSample>, otlp::OtlpError> {
+    let points = otlp::decode(body, content_encoding, limits)?;
+    Ok(points
+        .into_iter()
+        .map(|point| RawSample {
+            labels: intern_pairs(&point.labels),
+            timestamp_ms: point.timestamp_ms,
+            value: point.value,
+        })
+        .collect())
 }
 
 /// Interns each series into the store's series table and builds the
