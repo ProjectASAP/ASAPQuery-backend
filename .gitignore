@@ -1,5 +1,3 @@
 target/
 __pycache__/
 .claude/
-# Evaluation results are never committed (docs/design/repo-layout.md).
-eval/results/

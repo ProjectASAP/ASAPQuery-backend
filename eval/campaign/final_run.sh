@@ -23,10 +23,10 @@ grep -v '^#' "$jobs" | grep . | while IFS='|' read -r cfg round series modes ran
   meta=$B/runs/$RUN_TAG.meta
   { echo "cfg=$cfg round=$round host=$(hostname) backend_commit=$(cat $BIN_DIR/BACKEND_COMMIT) start=$(date -u +%FT%TZ)"
     echo "SERIES=$SERIES MODES=$MODES RANGE=${RANGE:-} WORKLOADS=$WORKLOADS ARMS=$ARMS CONCURRENT=$CONCURRENT QUERY_DELAY_S=$QUERY_DELAY_S KEEP_VM_DATA=$KEEP_VM_DATA ARM_CORES=$ARM_CORES QUERY_PHASE_S=$QUERY_PHASE_S"
-    echo "harness_sha256_16=$(cd $B && cat harness/*.py run_vm_demo.sh fetch_binaries.sh | sha256sum | cut -c1-16)"
+    echo "harness_sha256_16=$(cd $B && cat harness/*.py scripts/run_vm_demo.sh scripts/fetch_binaries.sh | sha256sum | cut -c1-16)"
     echo "victoriametrics: $("$vm" -version 2>&1 | head -1)"
     sha256sum $BIN_DIR/data_plane $BIN_DIR/control_plane "$vm"; } > "$meta"
-  (cd $B && ./run_vm_demo.sh) > "$B/runs/$RUN_TAG.campaign.log" 2>&1
+  (cd $B && ./scripts/run_vm_demo.sh) > "$B/runs/$RUN_TAG.campaign.log" 2>&1
   for d in "$B"/runs/$RUN_TAG.*/; do
     [ -d "$d" ] && (cd $B && BIN_DIR=$BIN_DIR report_demo/collect_meta.sh "$d/host_meta.json" >/dev/null) && \
       python3 -c "import json,sys; p=sys.argv[1]; m=json.load(open(p)); m['victoriametrics_version']=sys.argv[2]; json.dump(m,open(p,'w'),indent=1)" \

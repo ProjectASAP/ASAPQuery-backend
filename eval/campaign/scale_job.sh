@@ -40,12 +40,12 @@ meta=$B/runs/$tag.meta
 { echo "tag=$tag step=$step driver=$(hostname) engine=$ENGINE_SSH ($ENGINE_ADDR) backend_commit=$(cat $BIN_DIR/BACKEND_COMMIT) start=$(date -u +%FT%TZ)"
   env | grep -E '^(SERIES|QUERY_|ENGINE_LIMITS|ENGINE_ADDR|VMCLUSTER_LAYOUT|ARM_CPUS|ARMS|VM_MAX_QUERY_DURATION|PRECOMPUTE_THREADS|FEEDER_|ZIPF_|KEEP_VM_DATA|CONCURRENT|MODES|WORKLOADS|DATA_PLANE_EXTRA_ARGS|NET_IFACE|VICTORIAMETRICS_VERSION)=' | sort
   echo "vm_flags: single-node and vmselect -search.maxQueryDuration=$VM_MAX_QUERY_DURATION -search.latencyOffset=${QUERY_DELAY_S}s; concurrency limits default; client timeout ${QUERY_TIMEOUT_S}s"
-  echo "harness_sha256_16=$(cd $B && cat harness/*.py run_vm_demo.sh fetch_binaries.sh | sha256sum | cut -c1-16)"
+  echo "harness_sha256_16=$(cd $B && cat harness/*.py scripts/run_vm_demo.sh scripts/fetch_binaries.sh | sha256sum | cut -c1-16)"
   for c in victoria-metrics vmstorage vmselect vminsert; do echo "$c: $($BIN_DIR/$c-$VICTORIAMETRICS_VERSION -version 2>&1 | head -1)"; done
   sha256sum $BIN_DIR/data_plane $BIN_DIR/control_plane $BIN_DIR/*-v1.156.0 $FEEDER_BIN
   echo "engine host: $(ssh $ENGINE_SSH_OPTS $ENGINE_SSH 'hostname; lscpu | grep "Model name"; lsblk -d -o NAME,ROTA,MODEL | tr "\n" " "; df -h / | tail -1')"
 } > "$meta"
-(cd $B && ./run_vm_demo.sh) > "$B/runs/$tag.campaign.log" 2>&1
+(cd $B && ./scripts/run_vm_demo.sh) > "$B/runs/$tag.campaign.log" 2>&1
 rc=$?
 echo "end=$(date -u +%FT%TZ) rc=$rc" >> "$meta"
 grep -q VM_DEMO_DONE "$B/runs/$tag.campaign.log" || exit 1

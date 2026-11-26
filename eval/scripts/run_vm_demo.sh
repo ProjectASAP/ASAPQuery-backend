@@ -1,7 +1,7 @@
 #!/bin/bash
 # ASAP data plane vs VictoriaMetrics demo, one command:
 #
-#   SERIES=1000 QUERY_PHASE_S=600 WORKLOADS="demo/dashboard-heavy" ./run_vm_demo.sh
+#   SERIES=1000 QUERY_PHASE_S=600 WORKLOADS="demo/dashboard-heavy" scripts/run_vm_demo.sh
 #
 # For each workload: prepare (scaled manifest, feeder table, ASAPPlanner's
 # plan through the backend's control plane, timed as a one-time offline
@@ -76,7 +76,7 @@ else
 fi
 
 # 1. Binaries: pinned releases, and the Rust binaries built when missing.
-"$BASE/fetch_binaries.sh" victoriametrics prometheus flamegraph
+"$BASE/scripts/fetch_binaries.sh" victoriametrics prometheus flamegraph
 build() {  # dir, cargo args..., then copies the named binaries
   local dir=$1; shift
   local bins=$1; shift
@@ -133,7 +133,7 @@ for w in $WORKLOADS; do
     log "no joint plan for $w (see $P/backend/plan_joint_summary.json); skipping"; continue
   fi
   if [ "$PROFILE" = 1 ]; then
-    ${AUX_CPUS:+taskset -c "$AUX_CPUS"} "$BASE/profile/profile_query_phase.sh" "$R" "$PROFILE_SECONDS" "victoriametrics asap" > "$R.profile.log" 2>&1 &
+    ${AUX_CPUS:+taskset -c "$AUX_CPUS"} "$BASE/scripts/profile_query_phase.sh" "$R" "$PROFILE_SECONDS" "victoriametrics asap" > "$R.profile.log" 2>&1 &
     PROFILER=$!
   fi
   log "run $w ($MODE): arms $ARMS, query phase ${QUERY_PHASE_S}s"

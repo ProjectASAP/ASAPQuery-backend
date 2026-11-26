@@ -197,6 +197,11 @@ cargo run -p control_plane -- \
 cargo run -p data_plane -- --plan plan.json --prometheus-url http://localhost:9090
 ```
 
+`deployment/Dockerfile` builds both binaries into one image
+(`docker build -f deployment/Dockerfile -t asap-backend .` from the
+repository root), and `deployment/docker-compose.yml` plans a workload
+(`WORKLOAD`, Example 1 by default) and serves the plan on port 8088.
+
 Besides Prometheus Remote Write, the data plane ingests VictoriaMetrics
 Remote Write (the same protobuf, zstd-compressed) on `/api/v1/import` and
 OTLP/HTTP metrics (protobuf, optionally gzip) on `/v1/metrics`, the routes
@@ -262,8 +267,8 @@ not stored) with a Prometheus `execution` error (422,
 | `crates/adapters/query/elastic-http/` | package `elastic_http`: `_sql` and `_search` bodies and the fallback client of an Elasticsearch server, `POST /_sql`, `POST /_search` |
 | `crates/adapters/query/prometheus-http/` | package `prometheus_http`: query parameters, response bodies and the fallback client of a Prometheus-compatible server |
 | `benchmarks/` | the backend alone: `micro/` benchmarks (examples of `data_plane`) and `scripts/` |
-| `eval/` | comparisons with other systems and the live demo; see [eval/README.md](eval/README.md) |
-| `deployment/monitoring/` | Prometheus, exporters and Grafana for the demo and the comparisons |
+| `eval/` | comparisons with other systems (`baselines/`, `harness/`, `scripts/`, `workloads/`) and the live demo; see [eval/README.md](eval/README.md) |
+| `deployment/` | the backend's Docker image (`Dockerfile`) and Compose file; `monitoring/`: Prometheus, exporters and Grafana for the demo and the comparisons |
 | `docs/` | design documents and `examples/` workloads |
 | `scripts/` | CI and the Planner dependency updater |
 

@@ -33,12 +33,12 @@ rm -rf "$B"/runs/$tag.*
 meta=$B/runs/$tag.meta
 { echo "tag=$tag driver=$(hostname) engine=$ENGINE_SSH ($ENGINE_ADDR) backend_commit=$(cat $BIN_DIR/BACKEND_COMMIT) start=$(date -u +%FT%TZ)"
   env | grep -E '^(SERIES|QUERY_[A-Z_]*|QUERIES_FROM_START|ENGINE_LIMITS|ENGINE_ADDR|ARM_CPUS|ARMS|VM_MAX_QUERY_DURATION|PRECOMPUTE_THREADS|FEEDER_[A-Z_]*|ZIPF_[A-Z]*|ANSWER_RESULTS_EVERY|KEEP_VM_DATA|CONCURRENT|MODES|WORKLOADS|DATA_PLANE_EXTRA_ARGS|NET_IFACE|VICTORIAMETRICS_VERSION)=' | sort
-  echo "harness_sha256_16=$(cd $B && cat harness/*.py run_vm_demo.sh fetch_binaries.sh | sha256sum | cut -c1-16)"
+  echo "harness_sha256_16=$(cd $B && cat harness/*.py scripts/run_vm_demo.sh scripts/fetch_binaries.sh | sha256sum | cut -c1-16)"
   echo "victoria-metrics: $($BIN_DIR/victoria-metrics-$VICTORIAMETRICS_VERSION -version 2>&1 | head -1)"
   sha256sum $BIN_DIR/data_plane $BIN_DIR/control_plane $BIN_DIR/victoria-metrics-$VICTORIAMETRICS_VERSION $FEEDER_BIN
   echo "engine host: $(ssh $ENGINE_SSH_OPTS $ENGINE_SSH 'hostname; lscpu | grep "Model name"; lsblk -d -o NAME,ROTA,MODEL | tr "\n" " "; df -h / | tail -1')"
 } > "$meta"
-(cd $B && ./run_vm_demo.sh) > "$B/runs/$tag.campaign.log" 2>&1
+(cd $B && ./scripts/run_vm_demo.sh) > "$B/runs/$tag.campaign.log" 2>&1
 rc=$?
 echo "end=$(date -u +%FT%TZ) rc=$rc" >> "$meta"
 grep -q VM_DEMO_DONE "$B/runs/$tag.campaign.log" || exit 1

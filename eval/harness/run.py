@@ -1120,7 +1120,7 @@ class Arm:
 
     def write_state(self, phase, query_url):
         """<arm>/state.json: the phase and every process' pid, for the
-        profiling wrapper (profile/profile_query_phase.sh) to attach to."""
+        profiling wrapper (scripts/profile_query_phase.sh) to attach to."""
         write_json(self.dir / "state.json", {
             "arm": self.name, "phase": phase, "query_url": query_url, "time": time.time(),
             "pids": {role: proc.pid for role, proc in self.procs.items() if proc.poll() is None},

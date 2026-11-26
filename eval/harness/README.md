@@ -20,7 +20,7 @@ sink, real time (1 s of event time per second). `--label0` scales the series cou
 
 ```sh
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target}
-../build.sh                                   # feeder, engine, backend, converter
+../scripts/build.sh                           # feeder, engine, backend, converter
 python3 prepare.py --set seed-862 --workload workload-01 --label0 5 \
     --out ../prep/seed-862.workload-01.s1000  # 4*5*10*5 = 1,000 series
 python3 run.py --prep ../prep/seed-862.workload-01.s1000 --out ../runs/w01 --rounds 3
@@ -63,7 +63,7 @@ Two arms under test, one reference, on the same feed and query schedule:
   beside it), installing ASAPPlanner's joint plan (`prep/.../backend/plan.json`).
   A query the plan cannot answer is refused, never forwarded.
 - `victoriametrics`: VictoriaMetrics single-node `v1.156.0` (the latest release, pinned with its
-  sha256 in `../fetch_binaries.sh`), **no stream aggregation** (no
+  sha256 in `../scripts/fetch_binaries.sh`), **no stream aggregation** (no
   `-streamAggr.config`), fed by the same paced feeder over Remote Write
   (`/api/v1/write`) and queried with `/api/v1/query` at the same evaluation
   times. Explicit flags (`run.py: VM_FLAGS`): `-retentionPeriod=1d`,
@@ -120,7 +120,7 @@ hits/misses/computes and backlog, VictoriaMetrics' counters), which
 `demo_table.py` prints.
 
 ```sh
-SERIES="1000 10000" ARM_CORES=16 QUERY_PHASE_S=600 WORKLOADS="demo/dashboard-heavy" ../run_vm_demo.sh
+SERIES="1000 10000" ARM_CORES=16 QUERY_PHASE_S=600 WORKLOADS="demo/dashboard-heavy" ../scripts/run_vm_demo.sh
 ```
 
 `run_vm_demo.sh` downloads missing pinned binaries into `$BIN_DIR`, builds `paced_feeder`/`data_plane`/`control_plane`
@@ -128,7 +128,7 @@ there when missing (from `$BACKEND_DIR`), starts the monitoring stack
 (`../../deployment/monitoring`: docker compose, or `run_binaries.sh` without docker), and
 for each workload runs prepare → run (`--metrics-port 19093`) → `report.py`
 → `demo_table.py` (also into the monitoring textfile directory). `PROFILE=1`
-runs `../profile/profile_query_phase.sh` beside it. Grafana:
+runs `../scripts/profile_query_phase.sh` beside it. Grafana:
 `http://127.0.0.1:13000/d/asap-vs-vm`.
 
 Ports: arms prometheus 19100, victoriametrics 19500, asap 19601; monitoring

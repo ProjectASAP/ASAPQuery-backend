@@ -1,7 +1,7 @@
 #!/bin/bash
 # The monitoring stack of docker-compose.yml without docker: the same
 # configs, run from the pinned release binaries in $BIN_DIR (fetched by
-# eval/fetch_binaries.sh when missing). State lives in $MON_DATA.
+# eval/scripts/fetch_binaries.sh when missing). State lives in $MON_DATA.
 #
 #   deployment/monitoring/run_binaries.sh start|stop|status
 #
@@ -28,7 +28,7 @@ start_one() {  # name, command...
 
 case "${1:-start}" in
 start)
-  BIN_DIR=$BIN_DIR "$BASE/fetch_binaries.sh" prometheus node_exporter process_exporter grafana
+  BIN_DIR=$BIN_DIR "$BASE/scripts/fetch_binaries.sh" prometheus node_exporter process_exporter grafana
   start_one prometheus "$BIN_DIR/prometheus-3.5.0" --config.file="$MON/prometheus/prometheus.yml" \
     --storage.tsdb.path="$MON_DATA/prometheus" --storage.tsdb.retention.time=30d \
     --web.listen-address=127.0.0.1:19090
