@@ -1,26 +1,27 @@
-//! The engine: the installed plan, compiled once when it is installed,
-//! and the precompute and query engines that execute it
-//! ([`precompute::engine`], [`query::workers`]), wired to one published
-//! store.
+//! The engine: the precompute and query engines, wired to one published
+//! store, with the plan file installed into them
+//! ([`crate::installer::PlanInstaller`]), and the dispatcher the HTTP
+//! routes run queries through.
 
 use std::sync::Arc;
 
 use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
-use asap_executor::runtime::Limits;
 use asap_planner::InstallablePlan;
-use internal_metrics::Metrics;
+use internal_metrics::{Metrics, QueryMetrics};
 use precompute::engine::{
-    IngestError, PersistedViews, PrecomputeEngine, PrecomputeMode, PrecomputeOptions, SlowRefresh,
+    IngestError, InstalledPrecompute, PersistedViews, PrecomputeEngine, PrecomputeMode,
+    PrecomputeOptions, SlowRefresh,
 };
-use precompute::ingestion::{Ingestion, IngestionOptions, IngestionStats, Precompute};
-use query::result_cache::{Answer, ResultCache};
+use precompute::ingestion::{IngestionOptions, IngestionStats};
 use query::workers::QueryWorkers;
-use query::{QueryEngine, Snapshot, Unanswered};
+use query::{ExecutorQueryEngine, QueryOptions, Unanswered};
 use storage::persist::{plan_hash, ViewRead};
 use storage::persist_pool::PersistOptions;
 use storage::store::{PublishedStore, QueryTimeResults, RawSample, ViewTier};
 use storage::window_cache::WindowCache;
 
+use crate::dispatcher::QueryDispatcher;
+use crate::installer::PlanInstaller;
 use crate::metrics_endpoint::Gauges;
 
 /// How the engine ingests samples and runs queries.
@@ -187,8 +188,9 @@ impl Default for EngineOptions {
 /// The HTTP side of the engine.
 #[derive(Clone)]
 pub struct EngineHandle {
-    precompute: PrecomputeEngine,
+    precompute: InstalledPrecompute,
     query: QueryWorkers,
+    dispatcher: Arc<QueryDispatcher>,
     /// The views' cold tier, when they are persisted.
     view_tier: Option<Arc<ViewTier>>,
 }
@@ -198,7 +200,8 @@ impl EngineHandle {
     /// compiled once, and returns the plan's queries. Fails if the plan is
     /// invalid or the data plane cannot execute it.
     pub fn spawn(plan_json: String, options: EngineOptions) -> anyhow::Result<(Self, Vec<String>)> {
-        let (ingestion, precompute, query, query_texts) = install(&plan_json, &options)?;
+        let plan = InstallablePlan::from_json(&plan_json)?;
+        let query_texts = plan.query_texts.clone();
         let view_tier = options
             .view_dir
             .is_some()
@@ -221,76 +224,51 @@ impl EngineHandle {
                 tier,
             });
         let published = Arc::new(PublishedStore::new(Arc::default()));
-        let precompute = PrecomputeEngine::start(
-            ingestion,
-            precompute,
-            &query_texts,
-            &options.precompute(),
+        let precompute = Arc::new(PrecomputeEngine::new(
+            options.precompute(),
             persisted,
             published.clone(),
-        )?;
-        let query = QueryWorkers::start(
-            query,
-            published,
-            precompute.metrics().clone(),
-            options.query_threads,
-        )?;
+        ));
+        let query = Arc::new(ExecutorQueryEngine::new(options.query(), published));
+        let dispatcher = Arc::new(QueryDispatcher::new(query.clone()));
+        PlanInstaller::new(precompute.clone(), query.clone(), dispatcher.clone()).install(plan)?;
         let handle = Self {
-            precompute,
-            query,
+            precompute: precompute.installed().expect("installed").clone(),
+            query: query.installed().expect("installed").clone(),
+            dispatcher,
             view_tier,
         };
         Ok((handle, query_texts))
     }
 
-    /// Queues `samples` for ingestion; see [`PrecomputeEngine::try_ingest`].
+    /// Queues `samples` for ingestion; see [`InstalledPrecompute::try_ingest`].
     pub fn try_ingest(&self, samples: Vec<RawSample>) -> Result<(), IngestError> {
         self.precompute.try_ingest(samples)
     }
 
-    /// Answers the planned `query` at `time_ms` on a query worker; see
-    /// [`QueryWorkers::evaluate`].
-    pub async fn evaluate(&self, query: String, time_ms: i64) -> Result<Answer, Unanswered> {
-        self.query.evaluate(query, time_ms).await
+    /// What the HTTP routes run queries through.
+    pub fn dispatcher(&self) -> &QueryDispatcher {
+        &self.dispatcher
     }
 
-    /// Evaluates one step of a range query over `snapshot`; see
-    /// [`QueryWorkers::evaluate_range_step`].
-    pub async fn evaluate_range_step(
-        &self,
-        query: String,
-        time_ms: i64,
-        snapshot: Arc<Snapshot>,
-    ) -> Result<Answer, Unanswered> {
-        self.query
-            .evaluate_range_step(query, time_ms, snapshot)
-            .await
-    }
-
-    /// The newest published store, for the steps of one range request.
-    pub fn snapshot(&self) -> Arc<Snapshot> {
+    /// The newest published store: what a query starting now reads.
+    pub fn snapshot(&self) -> Arc<query::Snapshot> {
         self.query.snapshot()
     }
 
-    /// The result cache's answer to the planned `query` at `time_ms`, if
-    /// it keeps one ([`QueryEngine::cached`]).
-    pub fn cached(&self, query: &str, time_ms: i64) -> Option<Answer> {
-        self.query.cached(query, time_ms)
-    }
-
-    /// The query worker threads: the most query runs at once.
-    pub fn query_threads(&self) -> usize {
-        self.query.threads()
+    /// Each planned query's measurements, by query text.
+    pub fn query_metrics(&self) -> &[(String, QueryMetrics)] {
+        self.query.compiled().metrics()
     }
 
     /// How many query-time `OneEvaluation` nodes several queries share.
     pub fn shared_nodes(&self) -> usize {
-        self.query.engine().shared_nodes().len()
+        self.query.compiled().shared_nodes().len()
     }
 
     /// The query-time partition of the view store.
     pub fn query_time_results(&self) -> &QueryTimeResults<Unanswered> {
-        self.query.engine().query_time_results()
+        self.query.compiled().query_time_results()
     }
 
     /// The engine's measurements.
@@ -302,6 +280,7 @@ impl EngineHandle {
     /// format.
     pub fn render_metrics(&self) -> String {
         let persist_backlog = self.precompute.persist_backlog();
+        let compiled = self.query.compiled();
         crate::metrics_endpoint::render(
             self.metrics(),
             &Gauges {
@@ -311,8 +290,9 @@ impl EngineHandle {
                 persist_backlog: persist_backlog.windows(),
                 persist_backlog_bytes: persist_backlog.bytes(),
                 now_ms: precompute::ingestion::wall_clock_ms(),
-                query_time_results: self.query_time_results(),
-                result_cache: self.query.engine().result_cache(),
+                queries: compiled.metrics(),
+                query_time_results: compiled.query_time_results(),
+                result_cache: compiled.result_cache(),
                 view_tier: self.view_tier.as_deref(),
             },
         )
@@ -339,12 +319,12 @@ impl EngineHandle {
     }
 
     /// Queues an event-time barrier and waits for it; see
-    /// [`PrecomputeEngine::advance_watermark`].
+    /// [`InstalledPrecompute::advance_watermark`].
     pub async fn advance_watermark(&self, barrier_ms: i64) -> Result<i64, IngestError> {
         self.precompute.advance_watermark(barrier_ms).await
     }
 
-    /// For tests: stops ingestion; see [`PrecomputeEngine::stop`].
+    /// For tests: stops ingestion; see [`InstalledPrecompute::stop`].
     #[doc(hidden)]
     pub fn stop(&self) {
         self.precompute.stop()
@@ -362,6 +342,7 @@ impl EngineOptions {
     fn precompute(&self) -> PrecomputeOptions {
         PrecomputeOptions {
             ingestion: self.ingestion,
+            run_memory_limit_bytes: self.run_memory_limit_bytes,
             max_queued_samples: self.max_queued_samples,
             max_precompute_backlog: self.max_precompute_backlog,
             ingest_threads: self.ingest_threads,
@@ -375,62 +356,21 @@ impl EngineOptions {
             panic_in_combine_of_window_end_ms: self.panic_in_combine_of_window_end_ms,
         }
     }
-}
 
-/// Reads, checks and compiles the plan file `plan_json`: its ingestion,
-/// refresh runs, queries and query texts.
-fn install(
-    plan_json: &str,
-    options: &EngineOptions,
-) -> anyhow::Result<(Ingestion, Precompute, QueryEngine, Vec<String>)> {
-    let plan = InstallablePlan::from_json(plan_json)?;
-    plan.validate()?;
-    let views = plan.materialized_views()?;
-    let groups = plan.ingestion_refresh_groups()?;
-    let limits = Limits {
-        max_bytes: options.run_memory_limit_bytes,
-    };
-    tracing::info!(
-        views = views.len(),
-        refresh_groups = groups.len(),
-        "materialized views"
-    );
-    let results = QueryTimeResults::new(
-        storage::store::millis(options.query_time_results_retention_ms),
-        options.query_time_results_max_bytes,
-    );
-    let query = QueryEngine::new(
-        &plan,
-        &views,
-        limits.clone(),
-        results,
-        options.share_one_evaluation_results,
-        options.result_cache.then(|| {
-            ResultCache::new(
-                ResultCache::horizon_ms(&plan.dag, options.ingestion.view_retention_margin_ms),
-                options.result_cache_max_bytes,
-            )
-        }),
-    )?;
-    tracing::info!(
-        shared = ?query.shared_nodes(),
-        "query-time OneEvaluation nodes shared across queries"
-    );
-    let unexecutable = query.unexecutable();
-    if options.no_forward && !unexecutable.is_empty() {
-        let reasons: Vec<String> = unexecutable
-            .iter()
-            .map(|(query, reason)| format!("{query:?}: {reason}"))
-            .collect();
-        anyhow::bail!(
-            "--no-forward refuses a plan with queries the data plane cannot run: {}",
-            reasons.join("; ")
-        );
+    /// The options of the query engine.
+    fn query(&self) -> QueryOptions {
+        QueryOptions {
+            run_memory_limit_bytes: self.run_memory_limit_bytes,
+            threads: self.query_threads,
+            share_one_evaluation_results: self.share_one_evaluation_results,
+            query_time_results_retention_ms: self.query_time_results_retention_ms,
+            query_time_results_max_bytes: self.query_time_results_max_bytes,
+            result_cache: self.result_cache,
+            result_cache_max_bytes: self.result_cache_max_bytes,
+            view_retention_margin_ms: self.ingestion.view_retention_margin_ms,
+            refuse_unexecutable: self.no_forward,
+        }
     }
-    let (ingestion, precompute) =
-        Ingestion::new(&plan.dag, &views, groups, options.ingestion, limits)?;
-    tracing::info!(pane_width_ms = ingestion.pane_width_ms(), "raw data panes");
-    Ok((ingestion, precompute, query, plan.query_texts.clone()))
 }
 
 /// The cold tier of a data plane persisting its views: the window cache

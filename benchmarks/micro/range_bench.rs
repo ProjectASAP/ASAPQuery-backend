@@ -258,10 +258,9 @@ async fn request(app: &Router, state: &DataPlane, queries: &[String], end_ms: i6
 fn steps_cached(state: &DataPlane) -> u64 {
     state
         .engine
-        .metrics()
-        .queries
-        .values()
-        .map(|m| {
+        .query_metrics()
+        .iter()
+        .map(|(_, m)| {
             m.range_steps_cached
                 .load(std::sync::atomic::Ordering::Relaxed)
         })
