@@ -8,13 +8,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use asap_executor::runtime::Limits;
 use async_trait::async_trait;
 use common::{
-    AnswerSource, EngineQueryResult, InstallError, InstalledPlan, InstantVector,
+    Answer, AnswerSource, EngineQueryResult, InstallError, InstalledPlan, InstantVector,
     InstantVectorElement, LabelSet, QueryEngineError, QueryEval, QueryRequest, QueryResult,
     RangeVector, RangeVectorElement, Sample,
 };
 use storage::store::{PublishedStore, QueryTimeResults};
 
-use crate::result_cache::{Answer, ResultCache};
+use crate::result_cache::ResultCache;
 use crate::workers::InstalledQueries;
 use crate::CompiledQueries;
 

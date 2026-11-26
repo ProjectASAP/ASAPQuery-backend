@@ -34,13 +34,13 @@ use asap_executor::planner::plan::physical_asap_dag::{PhysicalASAPDAG, PhysicalA
 use asap_executor::planner::stages::Lifetime;
 use asap_executor::runtime::{Limits, RunContext, Scope};
 use asap_executor::values::{Batch, Value};
-use common::{InstallablePlan, ResultSample};
+use common::{Answer, InstallablePlan, ResultSample};
 use futures::executor::block_on;
 use futures::StreamExt;
 use internal_metrics::QueryMetrics;
 use storage::store::{PublishedStore, QueryTimeResults, RawReads, RawShards, RunStore, ViewStore};
 
-use crate::result_cache::{Answer, ResultCache};
+use crate::result_cache::ResultCache;
 
 mod engine;
 pub mod result_cache;

@@ -123,7 +123,7 @@ impl DataPlane {
     /// Bounds each forwarded query by `timeout`, from sending the request to
     /// reading the whole response (default [`DEFAULT_FORWARD_TIMEOUT`]).
     pub fn with_forward_timeout(mut self, timeout: Duration) -> Self {
-        self.fallback = PrometheusHttpFallback::new(self.fallback.base_url(), timeout);
+        self.fallback = self.fallback.with_timeout(timeout);
         self
     }
 }
@@ -479,9 +479,7 @@ fn not_answered(reason: &str) -> Response {
     response
 }
 
-/// Sends the request to Prometheus with its end-to-end headers (including
-/// `Authorization` and tenancy headers such as `X-Scope-OrgID`) and returns
-/// Prometheus's status, body and `Content-Type`.
+/// Forwards the request to Prometheus' `/api/v1/{endpoint}` ([`forward_path`]).
 async fn forward(
     state: State<Arc<DataPlane>>,
     endpoint: &str,
@@ -494,10 +492,10 @@ async fn forward(
     forward_path(state, &path, method, query, headers, body).await
 }
 
-/// [`forward`] for any `path` of the Prometheus (or raw store) server:
-/// the request as received, through [`PrometheusHttpFallback::forward`].
-/// 502 with the reason when the server cannot be reached or its response
-/// cannot be read.
+/// Forwards the request, as received, to `path` of the Prometheus (or raw
+/// store) server ([`PrometheusHttpFallback::forward`]) and answers with its
+/// status, body and `Content-Type`; 502 with the reason when the server
+/// cannot be reached or its response cannot be read.
 async fn forward_path(
     State(state): State<Arc<DataPlane>>,
     path: &str,
@@ -514,9 +512,8 @@ async fn forward_path(
         Ok(upstream) => upstream,
         Err(error) => return (StatusCode::BAD_GATEWAY, error.message).into_response(),
     };
-    let status = StatusCode::from_u16(upstream.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut response = (status, upstream.body).into_response();
-    if let Ok(content_type) = HeaderValue::from_str(&upstream.content_type) {
+    let mut response = (upstream.status, upstream.body).into_response();
+    if let Some(content_type) = upstream.content_type {
         response
             .headers_mut()
             .insert(header::CONTENT_TYPE, content_type);

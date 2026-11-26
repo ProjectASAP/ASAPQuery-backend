@@ -11,6 +11,8 @@ common.workspace = true
 # `common::FallbackClient`'s async method.
 async-trait.workspace = true
 ahash = "0.8"
+# A forwarded response's body, as reqwest returns it.
+bytes = "1"
 form_urlencoded = "1"
 reqwest.workspace = true
 # Shortest round-trip float digits for range responses.
@@ -20,7 +22,5 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-# `QueryLanguage::SQL`'s dialect, for the fallback's refusal test.
-asap-types.workspace = true
 axum.workspace = true
 tokio.workspace = true

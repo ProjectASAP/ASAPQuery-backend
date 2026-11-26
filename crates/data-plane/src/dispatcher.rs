@@ -3,15 +3,14 @@
 //! does not answer falls back ([`Fallback`]).
 //!
 //! The Prometheus routes run queries through the query engine's own
-//! answers ([`query::result_cache::Answer`]: labels shared with the
+//! answers ([`common::Answer`]: labels shared with the
 //! interned series and the result cache), not through
 //! [`common::QueryEngine`]'s [`common::QueryResult`], which would copy
 //! every series' labels per query.
 
 use std::sync::{Arc, OnceLock};
 
-use common::{AnswerSource, InstalledPlan, PhysicalASAPNodeId, PlanId, QueryEngineError};
-use query::result_cache::Answer;
+use common::{Answer, AnswerSource, InstalledPlan, PhysicalASAPNodeId, PlanId, QueryEngineError};
 use query::{ExecutorQueryEngine, Unanswered};
 
 /// The dispatcher's verdict on one query.

@@ -21,7 +21,7 @@ pub use plan::{InstallError, InstalledPlan, PlanId};
 pub use query_engine::{AnswerSource, EngineQueryResult, QueryEngine, QueryEngineError};
 pub use query_request::{QueryEval, QueryRequest};
 pub use query_result::{
-    InstantVector, InstantVectorElement, QueryResult, RangeVector, RangeVectorElement,
+    Answer, InstantVector, InstantVectorElement, QueryResult, RangeVector, RangeVectorElement,
     ResultSample, Sample, Table, TableValue,
 };
 pub use store::{
@@ -42,4 +42,4 @@ pub type LabelSet = std::collections::BTreeMap<String, String>;
 // dependency to use it.
 pub use asap_planner::{InstallablePlan, PhysicalASAPNodeId, RawDataRetention};
 pub use asap_types::ir::operator::arguments::Source;
-pub use asap_types::workload::QueryLanguage;
+pub use asap_types::workload::{QueryLanguage, SqlDialect};

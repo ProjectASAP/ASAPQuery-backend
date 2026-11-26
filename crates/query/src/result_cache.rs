@@ -16,10 +16,7 @@ use std::sync::{Arc, Mutex};
 use asap_executor::planner::ir::{NonASAPOp, Operator};
 use asap_executor::planner::plan::physical_asap_dag::{PhysicalASAPDAG, PhysicalASAPNodeId};
 
-use common::ResultSample;
-
-/// One evaluation's answer, shared by every request that reads it.
-pub type Answer = Arc<Vec<ResultSample>>;
+use common::{Answer, ResultSample};
 
 /// An entry's key: the query root and the evaluation time.
 type Key = (PhysicalASAPNodeId, i64);

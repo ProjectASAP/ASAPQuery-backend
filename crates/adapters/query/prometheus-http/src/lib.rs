@@ -8,12 +8,9 @@ use std::collections::BTreeMap;
 use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
 
-use common::{ResultSample, MAX_TIME_MS};
+use common::{Answer, LabelSet, ResultSample, MAX_TIME_MS};
 
 pub mod fallback;
-
-/// One instant answer, as the query engine returns it: one row per series.
-type Answer = std::sync::Arc<Vec<ResultSample>>;
 
 /// Parameters of an instant query, from its URL query and form body.
 pub struct InstantQuery {
@@ -336,7 +333,7 @@ impl Serialize for VectorResponse {
 /// found by that pointer and its labels compared only once; each step's
 /// time and each series' labels are formatted once.
 pub fn range_response_body(steps: &[(i64, Answer)]) -> Result<Vec<u8>, serde_json::Error> {
-    type Labels = BTreeMap<String, String>;
+    type Labels = LabelSet;
     // Each series' points as (step, value), in step order.
     let mut series: Vec<(&Labels, Vec<(u32, f64)>)> = Vec::new();
     let mut by_labels: BTreeMap<&Labels, usize> = BTreeMap::new();

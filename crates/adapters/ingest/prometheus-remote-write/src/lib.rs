@@ -1,7 +1,7 @@
 //! Prometheus Remote Write v1 decoding and validation.
 //!
 //! [`Decoder`] walks a request body into samples without building a
-//! [`WriteRequest`]. It knows no engine type: the caller's [`SampleSink`]
+//! [`WriteRequest`]. It knows no engine type: the caller's [`SampleBuilder`]
 //! interns each new series into its own series handle (any `Copy` value,
 //! such as an interned `&'static` series) and builds its own sample from
 //! the handle, timestamp and value, so samples are decoded straight into
@@ -76,9 +76,9 @@ pub enum RemoteWriteError {
 }
 
 /// The caller's series and sample types, which a [`Decoder`] decodes
-/// into: the data plane interns each series into its store's series table
-/// and builds its engine's sample, so no sample is copied.
-pub trait SampleSink {
+/// into: for example, a caller interns each series into its own series
+/// table and builds its own sample type, so no sample is copied.
+pub trait SampleBuilder {
     /// A series handle, kept in the decoder's cache for every series seen.
     type Series: Copy;
     type Sample;
@@ -90,47 +90,41 @@ pub trait SampleSink {
     fn sample(series: Self::Series, timestamp_ms: i64, value: f64) -> Self::Sample;
 }
 
-/// A decoder's state, kept between requests (one per thread): its
-/// decompression buffer and its series cache, which maps the encoded
-/// labels of each series seen to the sink's series handle.
-pub struct Decoder<K: SampleSink> {
+/// A decoder's state, kept between requests: its decompression buffer and
+/// its series cache, which maps the encoded labels of each series seen to
+/// the builder's series handle.
+pub struct Decoder<B: SampleBuilder> {
     /// A request's decompressed bytes are written over the last one's,
     /// with no allocation, zeroing or page faults once it has grown.
     decompressed: Vec<u8>,
-    cache: SeriesCache<K>,
+    cache: SeriesCache<B>,
 }
 
-impl<K: SampleSink + Default> Default for Decoder<K> {
-    fn default() -> Self {
-        Self::new(K::default())
-    }
-}
-
-impl<K: SampleSink> Decoder<K> {
-    pub fn new(sink: K) -> Self {
+impl<B: SampleBuilder> Decoder<B> {
+    pub fn new(builder: B) -> Self {
         Self {
             decompressed: Vec::new(),
-            cache: SeriesCache::new(sink),
+            cache: SeriesCache::new(builder),
         }
     }
 
     /// The samples of a snappy-compressed Remote Write v1 body, in request
-    /// order. Stale markers are kept: the executor's sample selector drops
-    /// them from range windows and ends instant selectors.
+    /// order. Stale markers (a special NaN value) are kept, as any other
+    /// sample.
     ///
     /// The body is decompressed into this decoder's buffer, and the
     /// protobuf is walked in place, without building a `WriteRequest`. A
     /// series is looked up by the bytes of its encoded labels in this
     /// decoder's cache, so a known series costs a compare (and a hash when
     /// the sender changed its order); only a new one is parsed, validated
-    /// and passed to [`SampleSink::intern`]. Errors: the body is too large,
+    /// and passed to [`SampleBuilder::intern`]. Errors: the body is too large,
     /// not snappy or not protobuf, has too many samples, or a series has no
     /// `__name__` or a label twice.
     pub fn decode(
         &mut self,
         body: &[u8],
         limits: &Limits,
-    ) -> Result<Vec<K::Sample>, RemoteWriteError> {
+    ) -> Result<Vec<B::Sample>, RemoteWriteError> {
         let Self {
             decompressed: buffer,
             cache,
@@ -195,10 +189,10 @@ fn decompress_into<'a>(
 }
 
 /// Appends the samples of one encoded `TimeSeries` to `samples`.
-fn decode_series<K: SampleSink>(
+fn decode_series<B: SampleBuilder>(
     series: &[u8],
-    cache: &mut SeriesCache<K>,
-    samples: &mut Vec<K::Sample>,
+    cache: &mut SeriesCache<B>,
+    samples: &mut Vec<B::Sample>,
     limits: &Limits,
 ) -> Result<(), RemoteWriteError> {
     // First pass, over every field: where the labels' encoded bytes are,
@@ -225,13 +219,13 @@ fn decode_series<K: SampleSink>(
             labels_end = reader.position;
         }
     }
-    let labels = match (labels_start, contiguous) {
+    let handle = match (labels_start, contiguous) {
         (Some(start), true) => {
-            let labels = cache.get_or_intern(&series[start..labels_end])?;
+            let handle = cache.get_or_intern(&series[start..labels_end])?;
             // Second pass: the samples, in the fields before and after the
             // labels (both whole fields, as the first pass found).
-            push_samples::<K>(&series[..start], labels, samples, limits)?;
-            return push_samples::<K>(&series[labels_end..], labels, samples, limits);
+            push_samples::<B>(&series[..start], handle, samples, limits)?;
+            return push_samples::<B>(&series[labels_end..], handle, samples, limits);
         }
         (None, _) => return Err(RemoteWriteError::MissingMetricName),
         (Some(_), false) => {
@@ -247,7 +241,7 @@ fn decode_series<K: SampleSink>(
             cache.get_or_intern(&key)?
         }
     };
-    push_samples::<K>(series, labels, samples, limits)
+    push_samples::<B>(series, handle, samples, limits)
 }
 
 /// The end of the `Label` field (tag `0x0a`) at `start` of `series`, when
@@ -271,10 +265,10 @@ fn short_label_end(series: &[u8], start: usize) -> Option<usize> {
 /// Appends the `Sample`s (field 2) of the encoded `TimeSeries` fields
 /// `fields` to `samples`, each with series `labels`.
 #[inline]
-fn push_samples<K: SampleSink>(
+fn push_samples<B: SampleBuilder>(
     fields: &[u8],
-    labels: K::Series,
-    samples: &mut Vec<K::Sample>,
+    series: B::Series,
+    samples: &mut Vec<B::Sample>,
     limits: &Limits,
 ) -> Result<(), RemoteWriteError> {
     let mut reader = Reader::new(fields);
@@ -289,7 +283,7 @@ fn push_samples<K: SampleSink>(
             Some(decoded) => decoded,
             None => sample_generic(sample)?,
         };
-        samples.push(K::sample(labels, timestamp_ms, value));
+        samples.push(B::sample(series, timestamp_ms, value));
     }
     Ok(())
 }
@@ -341,23 +335,23 @@ fn sample_generic(sample: &[u8]) -> Result<(i64, f64), RemoteWriteError> {
 /// entry remembers the entry looked up after it last time, and a lookup
 /// first compares the key with that prediction: a hit costs one compare,
 /// no hash. Every hit is a byte-for-byte match of the key.
-struct SeriesCache<K: SampleSink> {
-    entries: Vec<CacheEntry<K::Series>>,
+struct SeriesCache<B: SampleBuilder> {
+    entries: Vec<CacheEntry<B::Series>>,
     /// Entries by the hash of their key.
     by_key: hashbrown::HashTable<u32>,
     /// The entry looked up last.
     last: Option<u32>,
     /// Interns each series seen for the first time.
-    sink: K,
+    builder: B,
 }
 
-impl<K: SampleSink> SeriesCache<K> {
-    fn new(sink: K) -> Self {
+impl<B: SampleBuilder> SeriesCache<B> {
+    fn new(builder: B) -> Self {
         Self {
             entries: Vec::new(),
             by_key: hashbrown::HashTable::new(),
             last: None,
-            sink,
+            builder,
         }
     }
 }
@@ -369,15 +363,15 @@ struct CacheEntry<S> {
     next: Option<u32>,
 }
 
-impl<K: SampleSink> SeriesCache<K> {
+impl<B: SampleBuilder> SeriesCache<B> {
     /// The series of the encoded labels `key` (a run of `TimeSeries`
     /// field-1 entries): from the cache, or parsed, validated and interned
-    /// by the sink.
-    fn get_or_intern(&mut self, key: &[u8]) -> Result<K::Series, RemoteWriteError> {
+    /// by the builder.
+    fn get_or_intern(&mut self, key: &[u8]) -> Result<B::Series, RemoteWriteError> {
         if let Some(series) = self.get(key) {
             return Ok(series);
         }
-        let series = parse_labels(key, |labels| self.sink.intern(labels))?;
+        let series = parse_labels(key, |labels| self.builder.intern(labels))?;
         self.insert(key, series);
         Ok(series)
     }
@@ -388,7 +382,7 @@ impl<K: SampleSink> SeriesCache<K> {
     }
 
     #[inline]
-    fn get(&mut self, key: &[u8]) -> Option<K::Series> {
+    fn get(&mut self, key: &[u8]) -> Option<B::Series> {
         let predicted = self.last.and_then(|last| self.entries[last as usize].next);
         if let Some(index) = predicted {
             let entry = &self.entries[index as usize];
@@ -405,7 +399,7 @@ impl<K: SampleSink> SeriesCache<K> {
         Some(self.entries[index as usize].series)
     }
 
-    fn insert(&mut self, key: &[u8], series: K::Series) {
+    fn insert(&mut self, key: &[u8], series: B::Series) {
         let index = u32::try_from(self.entries.len()).expect("fewer than 2^32 series");
         self.entries.push(CacheEntry {
             key: key.into(),
@@ -597,7 +591,7 @@ mod tests {
         body.extend_from_slice(&[0xf0, 0x00]);
         let limits = super::Limits::default();
         assert!(claimed <= limits.max_decompressed_bytes);
-        let mut decoder = Decoder::<Labeled>::default();
+        let mut decoder = Decoder::new(Labeled::default());
         assert!(matches!(
             decoder.decode(&body, &limits),
             Err(super::RemoteWriteError::Snappy(_))
@@ -610,14 +604,14 @@ mod tests {
 
     type Labels = BTreeMap<String, String>;
 
-    /// A sink whose series handle is an index into `series`, the labels of
+    /// A builder whose series handle is an index into `series`, the labels of
     /// each series it interned, in order.
     #[derive(Default)]
     struct Labeled {
         series: Vec<Labels>,
     }
 
-    impl SampleSink for Labeled {
+    impl SampleBuilder for Labeled {
         type Series = usize;
         type Sample = (usize, i64, f64);
 
@@ -648,7 +642,7 @@ mod tests {
                 .into_iter()
                 .map(|(series, timestamp_ms, value)| {
                     (
-                        self.cache.sink.series[series].clone(),
+                        self.cache.builder.series[series].clone(),
                         timestamp_ms,
                         value.to_bits(),
                     )
@@ -766,7 +760,7 @@ mod tests {
             ],
         };
         let body = encode(&request);
-        let mut decoder = Decoder::<Labeled>::default();
+        let mut decoder = Decoder::new(Labeled::default());
         for _ in 0..2 {
             let got = decoder.labeled(&body, &limits).unwrap();
             let expected: Vec<(BTreeMap<String, String>, i64, u64)> = request
@@ -787,7 +781,7 @@ mod tests {
         }
         // Each series interned once: the second request, and the repeated
         // series in the first, are cache hits.
-        assert_eq!(decoder.cache.sink.series.len(), 3);
+        assert_eq!(decoder.cache.builder.series.len(), 3);
         let unnamed = WriteRequest {
             timeseries: vec![series(&[("job", "api")], &[(1, 1.0)])],
         };

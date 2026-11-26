@@ -64,15 +64,16 @@ pub enum TableValue {
     Float(f64),
 }
 
-/// One series of an instant answer as the query engine returns it natively
-/// to the dispatcher and the Prometheus response writers: unlike
-/// [`InstantVectorElement`], its labels are shared, not copied.
+/// One instant query's answer as the query engine returns it natively, one
+/// row per series: what the HTTP routes write, with no label copied.
+pub type Answer = Arc<Vec<ResultSample>>;
+
+/// One row of an [`Answer`]: a series' labels and its value. Unlike
+/// [`InstantVectorElement`], the labels are an `Arc` shared with the stored
+/// series or with every other row of the same series, so answers and
+/// caches hold no copy of them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResultSample {
-    /// Shared with the interned series (an input series) or with every
-    /// other row of the same result series (`series_ids::result_labels`)
-    /// when the row has no other label column, so results and the result
-    /// cache hold no copy of it.
     pub labels: Arc<LabelSet>,
     pub value: f64,
 }
