@@ -23,7 +23,7 @@ log "replay done: $($SSH $REF_HOST "tr '\n' ' ' < $BENCH_ROOT/replay/replay-$sta
 rm -rf $BENCH_ROOT/replay-ref-$start; mkdir -p $BENCH_ROOT/replay-ref-$start
 $SSH $REF_HOST "tar -C $BENCH_ROOT/replay -cf - vm-data-$start" | tar -C $BENCH_ROOT/replay-ref-$start -xf -
 log "copied: $(du -sh $BENCH_ROOT/replay-ref-$start/vm-data-$start | cut -f1)"
-until grep -q "^end=" $ASAPQ_BENCH/runs/$TAG.meta 2>/dev/null && ! pgrep -f "^/bin/bash ./run_vm_demo.sh" >/dev/null; do sleep 60; done
+until grep -q "^end=" $ASAPQ_BENCH/runs/$TAG.meta 2>/dev/null && ! pgrep -f "^/bin/bash ./scripts/run_vm_demo.sh" >/dev/null; do sleep 60; done
 log "run and post-run ended; re-scoring against the replay"
 cd $CAMPAIGN_DIR && REF_START=$start REF_DIR=$BENCH_ROOT/replay-ref-$start/vm-data-$start ./redo_accuracy.sh $TAG > redo-r2.out 2>&1
 log "re-scoring done"

@@ -1,0 +1,37 @@
+# Plan a workload once with control_plane, then serve the plan with
+# data_plane on port 8088 (Remote Write on /api/v1/write, the Prometheus
+# query API on /api/v1/query[_range]). Run from this directory:
+#
+#   docker compose up --build
+#   WORKLOAD=/path/to/workload.json PROMETHEUS_URL=http://prometheus:9090 docker compose up
+#   docker compose down -v
+#
+# WORKLOAD defaults to the planner-layering Example 1 in docs/examples.
+# PROMETHEUS_URL answers the queries the plan does not; the default is a
+# Prometheus on the Docker host.
+services:
+  plan:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    image: asap-backend
+    command: ["control_plane", "--workload", "/workload.json", "--out", "/data/plan.json", "--report", "/data/report.json"]
+    volumes:
+      - ${WORKLOAD:-../docs/examples/planner-layering-example1.json}:/workload.json:ro
+      - data:/data
+
+  data-plane:
+    image: asap-backend
+    depends_on:
+      plan:
+        condition: service_completed_successfully
+    command: ["data_plane", "--plan", "/data/plan.json", "--listen", "0.0.0.0:8088", "--prometheus-url", "${PROMETHEUS_URL:-http://host.docker.internal:9090}"]
+    ports:
+      - "${DATA_PLANE_PORT:-8088}:8088"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - data:/data
+
+volumes:
+  data:

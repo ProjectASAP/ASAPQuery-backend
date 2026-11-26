@@ -1,7 +1,7 @@
 #!/bin/bash
 # CPU-profile the demo arms during their query phase.
 #
-#   profile/profile_query_phase.sh RUN_DIR [SECONDS] [ARMS]
+#   scripts/profile_query_phase.sh RUN_DIR [SECONDS] [ARMS]
 #
 # Start it next to run.py (run_vm_demo.sh does with PROFILE=1). For each arm
 # in ARMS (default "victoriametrics asap") it waits for RUN_DIR/<arm>/state.json
@@ -31,7 +31,7 @@ for d in "${FG:-}" "${FLAMEGRAPH_DIR:-}"; do
   [ -n "$d" ] && [ -x "$d/flamegraph.pl" ] && { FG=$d; break; }
 done
 if [ ! -x "$FG/flamegraph.pl" ]; then
-  BIN_DIR=$BIN_DIR "$BASE/fetch_binaries.sh" flamegraph >/dev/null && FG=$BIN_DIR/FlameGraph-41fee1f
+  BIN_DIR=$BIN_DIR "$BASE/scripts/fetch_binaries.sh" flamegraph >/dev/null && FG=$BIN_DIR/FlameGraph-41fee1f
 fi
 GO=${GO:-$(command -v go || true)}
 for g in "${GO_BIN:-}" "$(command -v go || true)"; do [ -z "$GO" ] && [ -x "$g" ] && GO=$g; done

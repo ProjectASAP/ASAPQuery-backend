@@ -21,9 +21,9 @@ rm -rf "$B"/runs/$RUN_TAG.*
 meta=$B/runs/$RUN_TAG.meta
 { echo "diag tag=$tag host=$(hostname) backend_commit=$(cat $BIN_DIR/BACKEND_COMMIT) start=$(date -u +%FT%TZ)"
   env | grep -E "^(SERIES|MODES|WORKLOADS|ARMS|CONCURRENT|QUERY_DELAY_S|QUERY_USERS|QUERY_PHASE_S|ENGINE_LIMITS|DATA_PLANE_EXTRA_ARGS|PRECOMPUTE_THREADS|FEEDER_VALUES|ZIPF_S|ZIPF_N|FEEDER_BIN|ARM_CORES|KEEP_VM_DATA)=" | sort
-  echo "harness_sha256_16=$(cd $B && cat harness/*.py run_vm_demo.sh fetch_binaries.sh | sha256sum | cut -c1-16)"
+  echo "harness_sha256_16=$(cd $B && cat harness/*.py scripts/run_vm_demo.sh scripts/fetch_binaries.sh | sha256sum | cut -c1-16)"
   sha256sum $BIN_DIR/data_plane $BIN_DIR/control_plane $FEEDER_BIN; } > "$meta"
-(cd $B && ./run_vm_demo.sh) > "$B/runs/$RUN_TAG.campaign.log" 2>&1
+(cd $B && ./scripts/run_vm_demo.sh) > "$B/runs/$RUN_TAG.campaign.log" 2>&1
 for d in "$B"/runs/$RUN_TAG.*/; do
   [ -d "$d" ] || continue
   p=$B/prep/$(basename "$d" | sed "s/^$RUN_TAG\.//")

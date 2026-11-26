@@ -17,7 +17,7 @@ WORKLOADS = ASAPQ / "asap-tools/experiments/datasets/fake_metric/random_workload
 DEMO_WORKLOADS = BENCH / "workloads"
 TARGET = Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "release"
 
-# Pinned releases (../fetch_binaries.sh downloads and checks them).
+# Pinned releases (../scripts/fetch_binaries.sh downloads and checks them).
 PROMETHEUS_VERSION = "3.5.0"
 # VICTORIAMETRICS_VERSION=v1.155.0 runs an older pinned release.
 VICTORIAMETRICS_VERSION = os.environ.get("VICTORIAMETRICS_VERSION", "v1.156.0")

@@ -222,7 +222,7 @@ panel("bargauge", "VictoriaMetrics: CPU and time by activity (its own metrics)",
           target('sum(increase(vm_request_duration_seconds_sum{job="victoriametrics", '
                  'path="/api/v1/query"}[$__range]))', "D", "wall time in /api/v1/query", instant=True),
       ], "VictoriaMetrics exports total and GC CPU, and wall time per HTTP path (not CPU). "
-         "eval/profile/profile_query_phase.sh gives the function-level CPU profile.",
+         "eval/scripts/profile_query_phase.sh gives the function-level CPU profile.",
       fieldConfig={"defaults": {"unit": "s", "min": 0, "color": {"mode": "palette-classic"}}},
       options={"orientation": "horizontal", "displayMode": "basic", "showUnfilled": True,
                "reduceOptions": {"calcs": ["lastNotNull"]}})
