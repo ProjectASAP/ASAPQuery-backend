@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+common.workspace = true
 internal_metrics.workspace = true
 asap-executor.workspace = true
 asap_sketchlib.workspace = true

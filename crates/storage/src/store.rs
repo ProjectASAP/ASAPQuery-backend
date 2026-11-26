@@ -324,6 +324,30 @@ impl RawData {
         }
     }
 
+    /// `metric`'s samples with times in `(start, end]`, oldest pane first;
+    /// `None` when samples in it are evicted, as [`Self::read`] fails.
+    pub fn samples(&self, metric: &str, (start, end): (i64, i64)) -> Option<Vec<RawSample>> {
+        let Some(metric) = self.by_metric.get(metric) else {
+            return Some(Vec::new());
+        };
+        if start < metric.evicted_through_ms.unwrap_or(i64::MIN) {
+            return None;
+        }
+        let samples = metric
+            .panes
+            .range(start.saturating_add(1)..)
+            .flat_map(|(_, pane)| pane.iter())
+            .flat_map(|chunk| chunk.rows())
+            .filter(|&(_, timestamp_ms, _)| timestamp_ms > start && timestamp_ms <= end)
+            .map(|(labels, timestamp_ms, value)| RawSample {
+                labels,
+                timestamp_ms,
+                value,
+            })
+            .collect();
+        Some(samples)
+    }
+
     fn chunks(&self) -> impl Iterator<Item = &Arc<Chunk>> {
         self.by_metric
             .values()
@@ -680,6 +704,9 @@ impl DataStore for RunStore {
 /// batches, oldest first.
 #[doc(hidden)]
 pub type ViewRowsByView = BTreeMap<PhysicalASAPNodeId, Vec<((i64, i64), Vec<Batch>)>>;
+
+/// One view window's `(start, end]` and its rows.
+pub type WindowRows = ((i64, i64), Arc<Vec<Batch>>);
 
 /// The end at or before which `view`'s windows are past its retention,
 /// counted back from the window ending at `newest_end`.
@@ -1230,6 +1257,43 @@ impl ViewStore {
             return Ok(batch);
         }
         Batch::try_from_columns(schema, columns)
+    }
+
+    /// `view`'s windows within `(start, end]`, each with its rows (cold
+    /// windows are decoded; a window that cannot be read is left out).
+    pub fn windows(&self, view: PhysicalASAPNodeId, (start, end): (i64, i64)) -> Vec<WindowRows> {
+        self.by_view
+            .get(&view)
+            .into_iter()
+            .flatten()
+            .filter(|w| w.time_range_ms.0 >= start && w.time_range_ms.1 <= end)
+            .filter_map(|w| Some((w.time_range_ms, w.slot.batches().ok()?)))
+            .collect()
+    }
+
+    /// Drops `view`'s windows ending at or before `before_ms`.
+    pub fn evict_before(&mut self, view: PhysicalASAPNodeId, before_ms: i64) {
+        if let Some(rows) = self.by_view.get_mut(&view) {
+            rows.retain(|window| {
+                let kept = window.time_range_ms.1 > before_ms;
+                if !kept {
+                    window.slot.left_store();
+                }
+                kept
+            });
+        }
+    }
+
+    /// Per view with stored windows, the start of its oldest and the end
+    /// of its newest.
+    pub fn time_ranges(&self) -> BTreeMap<PhysicalASAPNodeId, (i64, i64)> {
+        self.by_view
+            .iter()
+            .filter_map(|(view, rows)| {
+                let (first, last) = (rows.first()?, rows.last()?);
+                Some((*view, (first.time_range_ms.0, last.time_range_ms.1)))
+            })
+            .collect()
     }
 
     /// The end of `view`'s newest stored rows.

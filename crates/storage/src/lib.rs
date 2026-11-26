@@ -2,8 +2,10 @@
 //! materialized views its precompute writes ([`store`]), the views' window
 //! cache and memory budget, their on-disk segments and persistence (and
 //! the `persist-N` threads that write them, [`persist_pool`]), the state
-//! codecs, and the process-wide series interner.
+//! codecs, and the process-wide series interner. [`boundary`] puts the
+//! stores behind `common`'s store traits.
 
+pub mod boundary;
 pub mod memory_budget;
 pub mod persist;
 pub mod persist_pool;
