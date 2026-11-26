@@ -5,7 +5,10 @@
 //! arrived: method, path, URL query, body and end-to-end headers. The data
 //! plane's routes use it, so the server sees exactly the client's request.
 //! [`FallbackClient::execute`] sends a parsed [`QueryRequest`] instead, for
-//! callers that hold no HTTP request.
+//! callers that hold no HTTP request: the trait seam through which a
+//! dispatcher reaches any protocol's fallback. The Prometheus routes keep
+//! `forward`, since the trait's request cannot carry the client's own
+//! method, extra parameters (`timeout`, `limit`, …) and body.
 
 use std::time::Duration;
 
@@ -14,11 +17,17 @@ use common::{
     FallbackClient, FallbackError, FallbackResponse, QueryEval, QueryLanguage, QueryRequest,
 };
 use reqwest::header::{self, HeaderMap, HeaderName, HeaderValue};
-use reqwest::{Body, Method};
+use reqwest::{Body, Method, StatusCode};
 
-/// The `Content-Type` of a response whose server sent none: bytes of
-/// unknown type (RFC 9110 section 8.3).
-const UNKNOWN_CONTENT_TYPE: &str = "application/octet-stream";
+/// The server's response to a forwarded request, as received: what the
+/// data plane sends back to its client.
+#[derive(Debug)]
+pub struct ForwardedResponse {
+    pub status: StatusCode,
+    /// `None` when the server sent no `Content-Type`.
+    pub content_type: Option<HeaderValue>,
+    pub body: bytes::Bytes,
+}
 
 /// Sends requests to one Prometheus-compatible server.
 pub struct PrometheusHttpFallback {
@@ -31,26 +40,24 @@ impl PrometheusHttpFallback {
     /// A client of the server at `base_url`, each request bounded by
     /// `timeout`, from sending it to reading the whole response.
     pub fn new(base_url: &str, timeout: Duration) -> Self {
-        Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::builder()
-                .timeout(timeout)
-                .build()
-                .expect("reqwest client with only a timeout set"),
-        }
+        Self::with_client(base_url, client(timeout))
     }
 
     /// The same client, sending to `base_url` instead.
     pub fn with_base_url(self, base_url: &str) -> Self {
-        Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
-            ..self
-        }
+        Self::with_client(base_url, self.client)
     }
 
-    /// The server's base URL, without a trailing `/`.
-    pub fn base_url(&self) -> &str {
-        &self.base_url
+    /// The same server, each request bounded by `timeout` instead.
+    pub fn with_timeout(self, timeout: Duration) -> Self {
+        Self::with_client(&self.base_url, client(timeout))
+    }
+
+    fn with_client(base_url: &str, client: reqwest::Client) -> Self {
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            client,
+        }
     }
 
     /// Sends `method` `path` (with `query`, the URL query as received, and
@@ -66,7 +73,7 @@ impl PrometheusHttpFallback {
         query: Option<&str>,
         headers: &HeaderMap,
         body: impl Into<Body>,
-    ) -> Result<FallbackResponse, FallbackError> {
+    ) -> Result<ForwardedResponse, FallbackError> {
         let mut url = format!("{}{path}", self.base_url);
         if let Some(query) = query {
             url = format!("{url}?{query}");
@@ -80,23 +87,25 @@ impl PrometheusHttpFallback {
             .send()
             .await
             .map_err(|error| FallbackError::new(format!("forwarding to Prometheus: {error}")))?;
-        let status_code = upstream.status().as_u16();
-        let content_type = upstream
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or(UNKNOWN_CONTENT_TYPE)
-            .to_string();
+        let status = upstream.status();
+        let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
         let body = upstream
             .bytes()
             .await
             .map_err(|error| FallbackError::new(format!("reading Prometheus response: {error}")))?;
-        Ok(FallbackResponse {
-            status_code,
+        Ok(ForwardedResponse {
+            status,
             content_type,
-            body: body.into(),
+            body,
         })
     }
+}
+
+fn client(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .expect("reqwest client with only a timeout set")
 }
 
 #[async_trait]
@@ -150,8 +159,21 @@ impl FallbackClient for PrometheusHttpFallback {
                 ))
             })
             .collect();
-        self.forward(Method::GET, path, Some(&query), &headers, Vec::new())
-            .await
+        let response = self
+            .forward(Method::GET, path, Some(&query), &headers, Vec::new())
+            .await?;
+        Ok(FallbackResponse {
+            status_code: response.status.as_u16(),
+            // A server that names no type sent bytes of unknown type (RFC
+            // 9110 section 8.3).
+            content_type: response
+                .content_type
+                .as_ref()
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("application/octet-stream")
+                .to_string(),
+            body: response.body.into(),
+        })
     }
 }
 
@@ -296,7 +318,7 @@ mod tests {
     async fn refuses_sql_and_reports_an_unreachable_server() {
         let fallback = PrometheusHttpFallback::new("http://127.0.0.1:1", Duration::from_secs(5));
         let mut request = QueryRequest {
-            language: QueryLanguage::SQL(asap_types::workload::SqlDialect::ClickhouseSQL),
+            language: QueryLanguage::SQL(common::SqlDialect::ClickhouseSQL),
             query: "SELECT 1".into(),
             eval: QueryEval::Instant { time_ms: 0 },
         };

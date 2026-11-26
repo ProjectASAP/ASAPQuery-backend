@@ -980,11 +980,9 @@ dependencies = [
  "prometheus_remote_write",
  "query",
  "reqwest",
- "serde",
  "serde_json",
  "snap",
  "storage",
- "thiserror 1.0.69",
  "tikv-jemallocator",
  "tokio",
  "tower",
@@ -2875,9 +2873,9 @@ name = "prometheus_http"
 version = "0.1.0"
 dependencies = [
  "ahash",
- "asap-types",
  "async-trait",
  "axum",
+ "bytes",
  "common",
  "form_urlencoded",
  "reqwest",

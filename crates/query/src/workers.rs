@@ -13,8 +13,8 @@ use internal_metrics::Timer;
 use storage::store::PublishedStore;
 use tokio::sync::oneshot;
 
-use crate::result_cache::Answer;
 use crate::{CompiledQueries, Snapshot, Unanswered};
+use common::Answer;
 
 type Reply<T> = oneshot::Sender<Result<T, Unanswered>>;
 

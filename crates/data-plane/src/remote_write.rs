@@ -4,7 +4,7 @@
 
 use std::cell::RefCell;
 
-use prometheus_remote_write::{Decoder, Limits, RemoteWriteError, SampleSink};
+use prometheus_remote_write::{Decoder, Limits, RemoteWriteError, SampleBuilder};
 use storage::series_ids::{intern_pairs, Series};
 use storage::store::RawSample;
 
@@ -14,16 +14,16 @@ use storage::store::RawSample;
 /// series cache.
 pub fn decode_samples(body: &[u8], limits: &Limits) -> Result<Vec<RawSample>, RemoteWriteError> {
     thread_local! {
-        static DECODER: RefCell<Decoder<Interned>> = RefCell::default();
+        static DECODER: RefCell<Decoder<Interned>> = RefCell::new(Decoder::new(Interned));
     }
     DECODER.with(|decoder| decoder.borrow_mut().decode(body, limits))
 }
 
-/// Interns each series into the store's series table.
-#[derive(Default)]
+/// Interns each series into the store's series table and builds the
+/// engine's samples.
 struct Interned;
 
-impl SampleSink for Interned {
+impl SampleBuilder for Interned {
     type Series = &'static Series;
     type Sample = RawSample;
 
