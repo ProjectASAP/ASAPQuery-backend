@@ -94,7 +94,9 @@ ASAPQuery-backend/
             control-plane ──► asap-planner
                   │
                   ▼
- adapters/* ──► common ◄── precompute, storage, query, internal-metrics
+ adapters/* ──► common ◄── precompute, storage, query
+                               │        │        │
+                               └────────┴────────┴──► internal-metrics (a leaf)
                   ▲                │          │
                   │                └──► asap-executor (plan execution today)
              data-plane ──► every crate above (wiring only)
@@ -198,7 +200,8 @@ installed plan's query texts, runs the query engine, and falls back on
 | Today | New home |
 |---|---|
 | `control_plane/` | `crates/control-plane/` |
-| `data_plane/src/{ingestion,push,series_ids}.rs` | `crates/precompute/` |
+| `data_plane/src/{ingestion,push}.rs` | `crates/precompute/` |
+| `data_plane/src/series_ids.rs` | `crates/storage/` (the store and segments use it; `storage` must not depend on `precompute`) |
 | `data_plane/src/engine.rs` | split, see below |
 | `data_plane/src/{store,window_cache,memory_budget,segment,persist,state_codec}.rs` | `crates/storage/` |
 | `data_plane/src/{query,result_cache}.rs` | `crates/query/` |
