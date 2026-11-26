@@ -6,11 +6,15 @@
 //! answers ([`common::Answer`]: labels shared with the
 //! interned series and the result cache), not through
 //! [`common::QueryEngine`]'s [`common::QueryResult`], which would copy
-//! every series' labels per query.
+//! every series' labels per query. The other protocols' routes
+//! ([`QueryDispatcher::dispatch`]) go through `common::QueryEngine`.
 
 use std::sync::{Arc, OnceLock};
 
-use common::{Answer, AnswerSource, InstalledPlan, PhysicalASAPNodeId, PlanId, QueryEngineError};
+use common::{
+    Answer, AnswerSource, EngineQueryResult, InstalledPlan, PhysicalASAPNodeId, PlanId,
+    QueryEngine as _, QueryEngineError, QueryLanguage, QueryRequest, QueryResult,
+};
 use query::{ExecutorQueryEngine, Unanswered};
 
 /// The dispatcher's verdict on one query.
@@ -155,6 +159,29 @@ impl QueryDispatcher {
             Err(unanswered) => QueryOutcome::NotAnswerable(NotAnswerableReason::new(unanswered)),
         }
     }
+
+    /// `request` through [`common::QueryEngine`]. Only a PromQL query can
+    /// be the plan's: the control plane plans PromQL workloads only, and
+    /// the data plane stores time series only, which SQL and Query DSL
+    /// plans do not read. A query in another language is unmatched, even
+    /// when its text equals a planned query's.
+    pub async fn dispatch(&self, request: &QueryRequest) -> QueryOutcome<QueryResult> {
+        if request.language != QueryLanguage::PromQL {
+            return QueryOutcome::NotAnswerable(NotAnswerableReason::Unmatched);
+        }
+        let Some(source) = self.resolve(&request.query) else {
+            return QueryOutcome::NotAnswerable(NotAnswerableReason::Unmatched);
+        };
+        match self.engine.execute(&source, request).await {
+            Ok(EngineQueryResult::Ready { result }) => QueryOutcome::Ready(result),
+            Ok(EngineQueryResult::NotReady) => {
+                QueryOutcome::NotAnswerable(NotAnswerableReason::NotReady(
+                    "the stored data does not cover the query, or the plan changed".into(),
+                ))
+            }
+            Err(error) => QueryOutcome::NotAnswerable(NotAnswerableReason::EngineError(error)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +282,40 @@ mod tests {
         assert_eq!(
             Fallback::new(reason, QUERY, true),
             Fallback::Refuse { reason: message }
+        );
+    }
+
+    /// Through `common::QueryEngine`, a planned PromQL query is answered as
+    /// an instant vector with the values the Prometheus path gives, and is
+    /// not ready where that path is not; the same text in ClickHouse SQL is
+    /// unmatched.
+    #[tokio::test]
+    async fn dispatches_a_query_request_by_language() {
+        let engine = engine(&test_support::plan(QUERY, false)).await;
+        let dispatcher = engine.dispatcher();
+        let request = |language, time_ms| QueryRequest {
+            language,
+            query: QUERY.into(),
+            eval: common::QueryEval::Instant { time_ms },
+        };
+        let QueryOutcome::Ready(QueryResult::Vector(vector)) = dispatcher
+            .dispatch(&request(QueryLanguage::PromQL, 30_000))
+            .await
+        else {
+            panic!("not answered");
+        };
+        let values: Vec<f64> = vector.series.iter().map(|series| series.value).collect();
+        assert_eq!((vector.timestamp_ms, values), (30_000, vec![10.0]));
+        assert!(matches!(
+            dispatcher
+                .dispatch(&request(QueryLanguage::PromQL, 60_000))
+                .await,
+            QueryOutcome::NotAnswerable(NotAnswerableReason::NotReady(_))
+        ));
+        let sql = QueryLanguage::SQL(common::SqlDialect::ClickhouseSQL);
+        assert_eq!(
+            dispatcher.dispatch(&request(sql, 30_000)).await,
+            QueryOutcome::NotAnswerable(NotAnswerableReason::Unmatched)
         );
     }
 

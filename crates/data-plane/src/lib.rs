@@ -1,12 +1,14 @@
 //! Backend data plane: receives Prometheus Remote Write samples (and
 //! VictoriaMetrics Remote Write and OTLP) and serves the Prometheus query
-//! API for an installed plan.
+//! API for an installed plan (and, when their servers are given, the
+//! ClickHouse and Elasticsearch query APIs).
 //!
 //! The protocols are adapters: `prometheus_remote_write`,
 //! `victoriametrics_remote_write` and `otlp` decode ingest requests
 //! ([`remote_write`] interns their series into the store), and
-//! `prometheus_http` reads query parameters, writes responses and sends
-//! what the plan does not answer to Prometheus.
+//! `prometheus_http`, `clickhouse_http` and `elastic_http` read query
+//! requests, write responses and send what the plan does not answer to
+//! their protocol's server.
 //!
 //! The installed plan is ASAPPlanner's `InstallablePlan`: one selected
 //! physical ASAP DAG. The precompute engine's ingest shards store the raw
@@ -41,6 +43,7 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use common::{FallbackClient, QueryRequest, QueryResult};
 use dispatcher::{Fallback, NotAnswerableReason, QueryOutcome};
 use engine::{EngineHandle, EngineOptions};
 use precompute::engine::IngestError;
@@ -72,6 +75,12 @@ pub struct DataPlane {
     /// Forward mode: delivers accepted Remote Write bodies to the raw store,
     /// which also answers what the plan does not. `None`: off.
     pub raw_forward: Option<raw_forward::RawForwarder>,
+    /// The ClickHouse server that answers `/clickhouse/query`; `None`: the
+    /// route is not served.
+    clickhouse_fallback: Option<Arc<dyn FallbackClient>>,
+    /// The Elasticsearch server that answers `/_sql` and `/_search`;
+    /// `None`: the routes are not served.
+    elastic_fallback: Option<Arc<dyn FallbackClient>>,
 }
 
 impl DataPlane {
@@ -103,7 +112,39 @@ impl DataPlane {
             limits: prometheus_remote_write::Limits::default(),
             fallback: PrometheusHttpFallback::new(&prometheus_url, DEFAULT_FORWARD_TIMEOUT),
             raw_forward: None,
+            clickhouse_fallback: None,
+            elastic_fallback: None,
         })
+    }
+
+    /// Serves ClickHouse's query route, `/clickhouse/query`, forwarding
+    /// every query the plan does not answer to `fallback`. Refused with
+    /// `--no-forward`, which forbids forwarding.
+    pub fn with_clickhouse_fallback(
+        mut self,
+        fallback: impl FallbackClient + 'static,
+    ) -> anyhow::Result<Self> {
+        if self.no_forward {
+            anyhow::bail!(
+                "--clickhouse-url forwards unplanned queries, which --no-forward refuses"
+            );
+        }
+        self.clickhouse_fallback = Some(Arc::new(fallback));
+        Ok(self)
+    }
+
+    /// Serves Elasticsearch's query routes, `/_sql` and `/_search`,
+    /// forwarding every query the plan does not answer to `fallback`.
+    /// Refused with `--no-forward`, which forbids forwarding.
+    pub fn with_elastic_fallback(
+        mut self,
+        fallback: impl FallbackClient + 'static,
+    ) -> anyhow::Result<Self> {
+        if self.no_forward {
+            anyhow::bail!("--elastic-url forwards unplanned queries, which --no-forward refuses");
+        }
+        self.elastic_fallback = Some(Arc::new(fallback));
+        Ok(self)
     }
 
     /// Turns forward mode on: accepted Remote Write bodies are delivered to
@@ -158,7 +199,183 @@ pub fn router(state: Arc<DataPlane>) -> Router {
             )
             .route("/v1/metrics", post(write_otlp).layer(write_body_limit))
     };
-    router.with_state(state)
+    // Each protocol's query routes, served only with its fallback, so
+    // without one the path is as before (404, or proxied in forward mode).
+    let mut router = router.with_state(state.clone());
+    if let Some(fallback) = state.clickhouse_fallback.clone() {
+        let route = FallbackRoute {
+            plane: state.clone(),
+            fallback,
+        };
+        router = router.merge(
+            Router::new()
+                .route(
+                    "/clickhouse/query",
+                    get(clickhouse_query).post(clickhouse_query),
+                )
+                .with_state(route),
+        );
+    }
+    if let Some(fallback) = state.elastic_fallback.clone() {
+        let route = FallbackRoute {
+            plane: state.clone(),
+            fallback,
+        };
+        router = router.merge(
+            Router::new()
+                .route("/_sql", post(elastic_sql).get(refuse_elastic_get))
+                .route("/_search", post(elastic_search).get(refuse_elastic_get))
+                .with_state(route),
+        );
+    }
+    router
+}
+
+/// The state of one protocol's query routes: the data plane, and the
+/// server that answers what the plan does not.
+#[derive(Clone)]
+struct FallbackRoute {
+    plane: Arc<DataPlane>,
+    fallback: Arc<dyn FallbackClient>,
+}
+
+/// `GET` or `POST /clickhouse/query` (ASAPQuery's ClickHouse route): the
+/// query ([`clickhouse_http::parse_query`]), evaluated now.
+/// Answered from the plan as TabSeparated, or forwarded to ClickHouse
+/// ([`answer_or_forward`]); 400 without a query.
+async fn clickhouse_query(
+    State(route): State<FallbackRoute>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let now_ms = precompute::ingestion::wall_clock_ms();
+    let request = match clickhouse_http::parse_query(query.as_deref(), &body, now_ms) {
+        Ok(request) => request,
+        Err(missing) => return (StatusCode::BAD_REQUEST, missing.to_string()).into_response(),
+    };
+    answer_or_forward(&route, &request, &headers, |result| {
+        let body = clickhouse_http::tab_separated(result).map_err(|e| e.to_string())?;
+        let content_type = clickhouse_http::TAB_SEPARATED_CONTENT_TYPE;
+        Ok(([(header::CONTENT_TYPE, content_type)], body).into_response())
+    })
+    .await
+}
+
+/// `POST /_sql` (ASAPQuery's Elasticsearch SQL route): the body's `query`,
+/// evaluated now ([`elastic_query`]).
+async fn elastic_sql(
+    State(route): State<FallbackRoute>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    elastic_query(
+        &route,
+        elastic_http::parse_sql(&body, precompute::ingestion::wall_clock_ms()),
+        &headers,
+    )
+    .await
+}
+
+/// `POST /_search` (ASAPQuery's Query DSL route): the body, evaluated now
+/// ([`elastic_query`]).
+async fn elastic_search(
+    State(route): State<FallbackRoute>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    elastic_query(
+        &route,
+        elastic_http::parse_search(&body, precompute::ingestion::wall_clock_ms()),
+        &headers,
+    )
+    .await
+}
+
+/// Answers a parsed Elasticsearch request from the plan as `_search` hits,
+/// or forwards it to Elasticsearch ([`answer_or_forward`]); a body that
+/// does not parse is 400 `parsing_exception`.
+async fn elastic_query(
+    route: &FallbackRoute,
+    parsed: Result<QueryRequest, elastic_http::BadRequestBody>,
+    headers: &HeaderMap,
+) -> Response {
+    let request = match parsed {
+        Ok(request) => request,
+        Err(bad) => {
+            return (StatusCode::BAD_REQUEST, axum::Json(bad.error_body())).into_response();
+        }
+    };
+    answer_or_forward(route, &request, headers, |result| {
+        let body = elastic_http::search_response(result).map_err(|e| e.to_string())?;
+        Ok(axum::Json(body).into_response())
+    })
+    .await
+}
+
+/// `GET /_sql` or `/_search`: 400 `illegal_argument_exception`;
+/// Elasticsearch queries are posted as JSON.
+async fn refuse_elastic_get() -> Response {
+    let body = elastic_http::get_refused_body();
+    (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
+}
+
+/// Answers `request` from the plan through the dispatcher, written by
+/// `encode` (`x-asap-execution: plan`; 501 with the reason when the
+/// protocol cannot express the result). Otherwise sends it to the route's
+/// fallback with the client's `Authorization` (the one header ASAPQuery
+/// forwards) and
+/// answers with the server's status, `Content-Type` and body
+/// (`x-asap-execution: forwarded`, and `x-asap-forward-reason` for a
+/// planned query the plan did not answer); 502 with the reason when the
+/// server cannot be reached or its response cannot be read.
+async fn answer_or_forward(
+    route: &FallbackRoute,
+    request: &QueryRequest,
+    headers: &HeaderMap,
+    encode: impl FnOnce(&QueryResult) -> Result<Response, String>,
+) -> Response {
+    let reason = match route.plane.engine.dispatcher().dispatch(request).await {
+        QueryOutcome::Ready(result) => {
+            return match encode(&result) {
+                Ok(mut response) => {
+                    response
+                        .headers_mut()
+                        .insert(EXECUTION_HEADER, HeaderValue::from_static("plan"));
+                    response
+                }
+                Err(reason) => (StatusCode::NOT_IMPLEMENTED, reason).into_response(),
+            };
+        }
+        QueryOutcome::NotAnswerable(reason) => {
+            match Fallback::new(reason, &request.query, route.plane.no_forward) {
+                Fallback::Forward { reason } => reason,
+                // A route with a fallback is never served with --no-forward.
+                Fallback::Refuse { reason } => return not_answered(&reason),
+            }
+        }
+    };
+    let authorization: Vec<(String, String)> = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| (header::AUTHORIZATION.to_string(), value.to_string()))
+        .into_iter()
+        .collect();
+    let upstream = match route.fallback.execute(request, &authorization).await {
+        Ok(upstream) => upstream,
+        Err(error) => return (StatusCode::BAD_GATEWAY, error.message).into_response(),
+    };
+    let status = StatusCode::from_u16(upstream.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response = (status, upstream.body).into_response();
+    if let Ok(content_type) = HeaderValue::from_str(&upstream.content_type) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, content_type);
+    }
+    response
+        .headers_mut()
+        .insert(EXECUTION_HEADER, HeaderValue::from_static("forwarded"));
+    with_forward_reason(response, reason)
 }
 
 /// Forward mode: proxies a request the data plane does not serve to the raw

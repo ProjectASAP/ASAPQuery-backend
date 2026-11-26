@@ -4,6 +4,8 @@ members = [
     "crates/adapters/ingest/otlp",
     "crates/adapters/ingest/prometheus-remote-write",
     "crates/adapters/ingest/victoriametrics-remote-write",
+    "crates/adapters/query/clickhouse-http",
+    "crates/adapters/query/elastic-http",
     "crates/adapters/query/prometheus-http",
     "crates/common",
     "crates/control-plane",
@@ -44,8 +46,10 @@ clap = { version = "4.0", features = ["derive", "env"] }
 tokio = { version = "1.0", features = ["full"] }
 axum = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+clickhouse_http = { path = "crates/adapters/query/clickhouse-http" }
 control_plane = { path = "crates/control-plane" }
 common = { path = "crates/common" }
+elastic_http = { path = "crates/adapters/query/elastic-http" }
 internal_metrics = { path = "crates/internal-metrics" }
 otlp = { path = "crates/adapters/ingest/otlp" }
 precompute = { path = "crates/precompute" }

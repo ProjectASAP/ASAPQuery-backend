@@ -832,6 +832,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "clickhouse_http"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "common",
+ "form_urlencoded",
+ "reqwest",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -985,8 +998,10 @@ dependencies = [
  "async-trait",
  "axum",
  "clap",
+ "clickhouse_http",
  "common",
  "control_plane",
+ "elastic_http",
  "flate2",
  "form_urlencoded",
  "futures",
@@ -1642,6 +1657,19 @@ name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
+
+[[package]]
+name = "elastic_http"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "common",
+ "reqwest",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
 
 [[package]]
 name = "enquote"
