@@ -1,0 +1,24 @@
+# Live demo data sources (run_live_demo.sh). Each goes through the logging
+# proxy (eval/demo/live/proxy.py) in front of its engine. timeInterval is the panels'
+# minimum step: the plan's 15 s grid. timeout 120 s (Grafana's default is 30 s) so a slow
+# answer is measured rather than cut off.
+apiVersion: 1
+datasources:
+  - name: ASAP
+    uid: live-asap
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:19721
+    jsonData: {httpMethod: POST, timeInterval: 15s, prometheusType: Prometheus, incrementalQuerying: false, cacheLevel: None, timeout: 120}
+  - name: VictoriaMetrics
+    uid: live-vm
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:19722
+    jsonData: {httpMethod: POST, timeInterval: 15s, prometheusType: Prometheus, incrementalQuerying: false, cacheLevel: None, timeout: 120}
+  - name: Prometheus (exact)
+    uid: live-exact
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:19723
+    jsonData: {httpMethod: POST, timeInterval: 15s, prometheusType: Prometheus, incrementalQuerying: false, cacheLevel: None, timeout: 120}
