@@ -1,5 +1,14 @@
 # Data plane and demo plan
 
+> **Paths.** This document predates the folder moves of
+> `docs/design/repo-layout.md` and keeps its original paths: `data_plane/` is
+> now `crates/data-plane/`, `control_plane/` is `crates/control-plane/`,
+> `examples/*_bench.rs` are in `benchmarks/micro/` (`remote_write_load.rs`
+> stays in `crates/data-plane/examples/`), the workloads in `examples/` are in
+> `docs/examples/`, `scripts/profile.sh` and `scripts/tiered_views_cgroup.sh`
+> are in `benchmarks/scripts/`, and `bench/demo/` is split into `eval/`,
+> `eval/demo/` and `deployment/monitoring/`.
+
 This document describes the data plane as it stands on `main` and the
 plan for the single-server demo against VictoriaMetrics. The component
 designs it summarises are in `data-plane-demo.md` (ingest, precompute,
