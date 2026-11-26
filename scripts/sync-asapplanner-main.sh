@@ -20,14 +20,15 @@ pattern = re.compile(
     r'(git = "https://github.com/ProjectASAP/ASAPPlanner", rev = ")[0-9a-f]{40}("\s*[,}])'
 )
 updated, replacements = pattern.subn(rf"\g<1>{revision}\2", text)
-if replacements != 2:
-    raise SystemExit(f"expected two ASAPPlanner dependencies, found {replacements}")
+if replacements != 3:
+    raise SystemExit(f"expected three ASAPPlanner dependencies, found {replacements}")
 path.write_text(updated)
 PY
 
 cargo update \
   -p asap-planner \
   -p asap-executor \
+  -p asap-types \
   --precise "$planner_rev"
 
 echo "synchronized ASAPPlanner dependencies to $planner_rev"
