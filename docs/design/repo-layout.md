@@ -95,9 +95,9 @@ crate          depends on
 -------------  --------------------------------------------------
 control-plane  common, asap-planner
 adapters/*     common
-precompute     common, internal-metrics, asap-executor
+precompute     common, storage, internal-metrics, asap-executor
 storage        common, internal-metrics, asap-executor
-query          common, internal-metrics, asap-executor
+query          common, storage, internal-metrics, asap-executor
 common         asap-planner and asap-types (plan types; asap-planner itself builds on the executor)
 internal-metrics  nothing in this workspace (a leaf)
 data-plane     every crate above (wiring only)
@@ -109,9 +109,11 @@ data-plane     every crate above (wiring only)
 - Adapters depend on `common` only: they never see an engine or a store. In
   ASAPQuery, adapters depend on the whole engine crate (#935, "Not solved");
   a separate `common` crate closes that here.
-- `precompute`, `storage` and `query` do not depend on each other. They meet
-  in `common`'s traits: `precompute` writes through `ViewStore` and
-  `RawDataStore`, and `query` reads through them.
+- `precompute` and `query` do not depend on each other. Both depend on
+  `storage`: they read its copy-on-write snapshot and the executor's record
+  batches, which the `ViewStore` and `RawDataStore` traits cannot express
+  without copying. The traits remain the boundary for other implementations;
+  `storage` provides adapters for them.
 - Only `data-plane` knows every implementation. It builds the stores, injects
   them into both engines, and owns `PlanInstaller` and `QueryDispatcher`.
 
@@ -185,7 +187,11 @@ trait FallbackClient {
 
 `QueryDispatcher` (in `data-plane`) resolves each request against the
 installed plan's query texts, runs the query engine, and falls back on
-`Unmatched`, `NotReady` or an engine error, as #935 specifies.
+`Unmatched`, `NotReady` or an engine error, as #935 specifies. On the hot
+path it calls the query engine's native answer type instead of
+`QueryEngine::execute_batch`, so a query does not copy every series'
+labels into a `QueryResult`. `PlanInstaller` installs once, as #935's I14
+does; a retryable install comes with tracker-delivered plans.
 
 ### Where the backend differs from #935
 
