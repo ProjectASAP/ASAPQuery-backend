@@ -31,7 +31,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use asap_executor::arrow::array::{
@@ -747,27 +747,6 @@ impl ViewTier {
             cold_reads: AtomicU64::new(0),
             cold_read_bytes: AtomicU64::new(0),
             decode: PhaseStats::default(),
-        }
-    }
-}
-
-/// The view cache's monitor: once a second, drops idle windows and, under
-/// a cgroup memory limit, lowers the cache's target while anonymous memory
-/// runs higher than its budget assumed.
-pub fn serve_view_cache(tier: Arc<ViewTier>, budget: Option<u64>, running: Arc<AtomicBool>) {
-    let cgroup = crate::memory_budget::own_cgroup();
-    while running.load(Ordering::SeqCst) {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        tier.cache.evict_idle(std::time::Instant::now());
-        if let Some(memory) = cgroup
-            .as_ref()
-            .and_then(|dir| crate::memory_budget::read_cgroup(dir).ok())
-        {
-            let cached = tier.cache.stats().bytes;
-            tier.cache
-                .set_target_bytes(crate::memory_budget::monitored_target(
-                    budget, &memory, cached,
-                ));
         }
     }
 }

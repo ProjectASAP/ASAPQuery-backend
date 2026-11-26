@@ -1,9 +1,9 @@
-//! The data plane's own measurements, for profiling and benchmarks,
-//! exported on `GET /metrics` in the Prometheus text format: thread CPU
-//! time and wall time of each phase (Remote Write decode, append,
-//! precompute per refresh group, query run per query text), query
-//! latency, sample and window counters, backlogs, watermark lag, bytes
-//! held, and each thread's CPU time by name.
+//! The data plane's own measurements, for profiling and benchmarks: thread
+//! CPU time and wall time of each phase (Remote Write decode, append,
+//! precompute per refresh group, query run per query text), query latency,
+//! the watermark, bytes held, and each thread's CPU time by name. The data
+//! plane renders them, with the stores' and the engine's gauges, on
+//! `GET /metrics` in the Prometheus text format.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;

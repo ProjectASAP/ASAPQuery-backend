@@ -13,7 +13,7 @@ use crate::query::Unanswered;
 use crate::result_cache::ResultCache;
 
 /// What `/metrics` reports beside [`Metrics`].
-pub struct Gauges<'a> {
+pub(crate) struct Gauges<'a> {
     pub stats: IngestionStats,
     pub samples_queued: u64,
     pub precompute_backlog: u64,
@@ -28,7 +28,7 @@ pub struct Gauges<'a> {
 }
 
 /// `metrics` and `gauges` in the Prometheus text format.
-pub fn render(metrics: &Metrics, gauges: &Gauges) -> String {
+pub(crate) fn render(metrics: &Metrics, gauges: &Gauges) -> String {
     let mut out = String::new();
     let family = |out: &mut String, name: &str, kind: &str, help: &str| {
         let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}");
@@ -501,7 +501,7 @@ mod tests {
 
     /// The text format names each phase and query.
     #[test]
-    fn records_and_renders_phases() {
+    fn renders_phases_and_queries() {
         let metrics = Metrics::new(
             &[(10_000, vec!["3".into(), "5".into()])],
             &["sum(x)".to_string()],
