@@ -12,8 +12,9 @@ pub struct PlanInstaller {
     ingest: Arc<dyn IngestEngine>,
     query: Arc<dyn QueryEngine>,
     dispatcher: Arc<QueryDispatcher>,
-    /// The installed plan's id; `None` before the first install.
-    installed: Mutex<Option<PlanId>>,
+    /// Whether an install was tried: v1 takes only the first, whether it
+    /// installs or fails.
+    tried: Mutex<bool>,
 }
 
 impl PlanInstaller {
@@ -26,7 +27,7 @@ impl PlanInstaller {
             ingest,
             query,
             dispatcher,
-            installed: Mutex::new(None),
+            tried: Mutex::new(false),
         }
     }
 
@@ -34,19 +35,22 @@ impl PlanInstaller {
     /// engine and the dispatcher, in that order, stopping at the first
     /// failure. Queries reach a plan only through the dispatcher, which
     /// gets it last: on any failure the current plan stays the one queries
-    /// are answered from. The query engine goes first because its install
-    /// only compiles and starts idle workers; the ingest engine's starts
-    /// ingestion. Refused once a plan is installed.
+    /// are answered from (none, in v1). The query engine goes first because
+    /// its install only compiles and starts idle workers; the ingest
+    /// engine's starts ingestion. v1 installs once: only the first call is
+    /// taken, as the engines install once too (after the ingest engine
+    /// refused a plan, the query engine keeps it, unused). A failed install
+    /// at startup ends the data plane.
     pub fn install(&self, plan: InstallablePlan) -> Result<PlanId, InstallError> {
-        let mut installed = self.installed.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(id) = *installed {
-            return Err(InstallError::new(format!(
-                "plan {} is installed, and the data plane installs one plan",
-                id.0
-            )));
+        let mut tried = self.tried.lock().unwrap_or_else(|e| e.into_inner());
+        if std::mem::replace(&mut *tried, true) {
+            return Err(InstallError::new(
+                "the data plane installs one plan, and an install was tried already",
+            ));
         }
         plan.validate()
             .map_err(|error| InstallError::new(format!("{:#}", anyhow::Error::from(error))))?;
+        // #935's plan id counts installs; v1's one install is plan 1.
         let plan = InstalledPlan {
             id: PlanId(1),
             plan,
@@ -54,7 +58,6 @@ impl PlanInstaller {
         self.query.install(plan.clone())?;
         self.ingest.install(plan.clone())?;
         self.dispatcher.install(&plan);
-        *installed = Some(plan.id);
         Ok(plan.id)
     }
 }
@@ -171,35 +174,37 @@ mod tests {
     }
 
     /// An invalid plan, or one either engine refuses, reaches no later
-    /// step: the dispatcher matches no query, and a later plan can still
-    /// install.
+    /// step, the dispatcher matches no query, and no later plan installs.
     #[test]
     fn a_failed_install_leaves_the_plan_as_it_was() {
         let mut invalid = test_support::plan(QUERY, false);
         invalid.query_texts.push("up".into());
-        for (ingest, query, plan) in [
+        // Each case: the ingest and query engines, the plan, and the plans
+        // the query engine got before the failure.
+        type Case = (Arc<Fake>, Arc<Fake>, InstallablePlan, &'static [PlanId]);
+        let cases: [Case; 3] = [
+            (Arc::default(), Arc::default(), invalid, &[]),
             (
-                Arc::new(Fake::default()),
-                Arc::new(Fake::default()),
-                invalid,
-            ),
-            (
-                Arc::new(Fake::default()),
+                Arc::default(),
                 Fake::refusing(),
                 test_support::plan(QUERY, false),
+                &[],
             ),
             (
                 Fake::refusing(),
-                Arc::new(Fake::default()),
+                Arc::default(),
                 test_support::plan(QUERY, false),
+                &[PlanId(1)],
             ),
-        ] {
+        ];
+        for (ingest, query, plan, query_got) in cases {
             let dispatcher = dispatcher();
             let installer = PlanInstaller::new(ingest.clone(), query.clone(), dispatcher.clone());
             assert!(installer.install(plan).is_err());
+            assert!(installer.install(test_support::plan(QUERY, false)).is_err());
             assert!(ingest.installed().is_empty());
+            assert_eq!(query.installed(), query_got);
             assert!(dispatcher.resolve(QUERY).is_none());
-            assert!(installer.installed.lock().unwrap().is_none());
         }
     }
 }

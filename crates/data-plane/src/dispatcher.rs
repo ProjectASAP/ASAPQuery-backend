@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use common::{AnswerSource, InstalledPlan, PhysicalASAPNodeId, PlanId};
+use common::{AnswerSource, InstalledPlan, PhysicalASAPNodeId, PlanId, QueryEngineError};
 use query::result_cache::Answer;
 use query::{ExecutorQueryEngine, Unanswered};
 
@@ -30,34 +30,33 @@ pub enum NotAnswerableReason {
     /// The stored data does not cover the query, or the plan changed since
     /// it was resolved: why.
     NotReady(String),
-    /// The engine failed to run the query: the error.
-    EngineError(String),
+    /// The engine failed to run the query.
+    EngineError(QueryEngineError),
 }
 
 impl NotAnswerableReason {
-    fn new(unanswered: Unanswered) -> Self {
-        match unanswered {
-            Unanswered::MissingRows(_) | Unanswered::PlanChanged => {
-                Self::NotReady(unanswered.to_string())
-            }
-            Unanswered::Unsupported(_) | Unanswered::Execution(_) => {
-                Self::EngineError(unanswered.to_string())
-            }
+    /// Why `unanswered` was not answered, as the dispatcher reports it.
+    pub(crate) fn new(unanswered: Unanswered) -> Self {
+        if unanswered.is_not_ready() {
+            Self::NotReady(unanswered.to_string())
+        } else {
+            Self::EngineError(QueryEngineError::new(unanswered.to_string()))
         }
     }
 
     /// What a client is told: `query` was not answered because of this.
-    pub fn message(&self, query: &str) -> String {
+    pub fn into_message(self, query: &str) -> String {
         match self {
             Self::Unmatched => format!("the installed plan has no query {:?}", query.trim()),
-            Self::NotReady(reason) | Self::EngineError(reason) => reason.clone(),
+            Self::NotReady(reason) => reason,
+            Self::EngineError(error) => error.message,
         }
     }
 }
 
 /// How a query the plan does not answer is answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Fallback {
+pub(crate) enum Fallback {
     /// Forwarded to the backend (Prometheus, or the raw store in forward
     /// mode), with why the plan did not answer when it planned the query.
     Forward { reason: Option<String> },
@@ -68,15 +67,15 @@ pub enum Fallback {
 impl Fallback {
     /// For `query`, not answered because of `reason`, when the data plane
     /// may forward or not (`no_forward`).
-    pub fn new(reason: &NotAnswerableReason, query: &str, no_forward: bool) -> Self {
+    pub(crate) fn new(reason: NotAnswerableReason, query: &str, no_forward: bool) -> Self {
         match reason {
             _ if no_forward => Self::Refuse {
-                reason: reason.message(query),
+                reason: reason.into_message(query),
             },
             NotAnswerableReason::Unmatched => Self::Forward { reason: None },
             NotAnswerableReason::NotReady(_) | NotAnswerableReason::EngineError(_) => {
                 Self::Forward {
-                    reason: Some(reason.message(query)),
+                    reason: Some(reason.into_message(query)),
                 }
             }
         }
@@ -198,7 +197,7 @@ mod tests {
             QueryOutcome::NotAnswerable(NotAnswerableReason::Unmatched)
         );
         assert_eq!(
-            Fallback::new(&NotAnswerableReason::Unmatched, "up", false),
+            Fallback::new(NotAnswerableReason::Unmatched, "up", false),
             Fallback::Forward { reason: None }
         );
     }
@@ -214,9 +213,9 @@ mod tests {
             panic!("expected not ready, got {outcome:?}");
         };
         assert_eq!(
-            Fallback::new(&reason, QUERY, false),
+            Fallback::new(reason.clone(), QUERY, false),
             Fallback::Forward {
-                reason: Some(reason.message(QUERY))
+                reason: Some(reason.into_message(QUERY))
             }
         );
         let range = dispatcher.range(QUERY, [30_000, 40_000].into_iter()).await;
@@ -249,13 +248,13 @@ mod tests {
         else {
             panic!("expected an engine error, got {outcome:?}");
         };
-        let message = reason.message(QUERY);
+        let message = reason.clone().into_message(QUERY);
         assert!(
             message.starts_with("the data plane cannot run this query"),
             "{message}"
         );
         assert_eq!(
-            Fallback::new(&reason, QUERY, true),
+            Fallback::new(reason, QUERY, true),
             Fallback::Refuse { reason: message }
         );
     }
@@ -264,7 +263,7 @@ mod tests {
     #[test]
     fn an_unmatched_query_is_refused_without_forwarding() {
         assert_eq!(
-            Fallback::new(&NotAnswerableReason::Unmatched, " up ", true),
+            Fallback::new(NotAnswerableReason::Unmatched, " up ", true),
             Fallback::Refuse {
                 reason: "the installed plan has no query \"up\"".into()
             }

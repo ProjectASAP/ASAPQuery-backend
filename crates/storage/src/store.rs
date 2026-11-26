@@ -63,6 +63,25 @@ pub struct RawSample {
     pub value: f64,
 }
 
+impl RawSample {
+    /// `batch`'s samples, in order, each series (its labels, `__name__`
+    /// included) interned.
+    pub fn from_batch(batch: &common::RawDataBatch) -> Vec<RawSample> {
+        let common::RawDataBatch::TimeSeries { series } = batch;
+        let mut samples = Vec::new();
+        for (labels, points) in series {
+            let pairs: Vec<(&String, &String)> = labels.iter().collect();
+            let series = crate::series_ids::intern_pairs(&pairs);
+            samples.extend(points.iter().map(|&(timestamp_ms, value)| RawSample {
+                labels: series,
+                timestamp_ms,
+                value,
+            }));
+        }
+        samples
+    }
+}
+
 /// Raw samples of one metric, columnar and immutable: one Remote Write
 /// request's samples of a pane, or a closed pane's samples compacted into
 /// one chunk. Rows keep arrival order.
@@ -326,7 +345,7 @@ impl RawData {
 
     /// `metric`'s samples with times in `(start, end]`, oldest pane first;
     /// `None` when samples in it are evicted, as [`Self::read`] fails.
-    pub fn samples(&self, metric: &str, (start, end): (i64, i64)) -> Option<Vec<RawSample>> {
+    pub(crate) fn samples(&self, metric: &str, (start, end): (i64, i64)) -> Option<Vec<RawSample>> {
         let Some(metric) = self.by_metric.get(metric) else {
             return Some(Vec::new());
         };
@@ -706,7 +725,7 @@ impl DataStore for RunStore {
 pub type ViewRowsByView = BTreeMap<PhysicalASAPNodeId, Vec<((i64, i64), Vec<Batch>)>>;
 
 /// One view window's `(start, end]` and its rows.
-pub type WindowRows = ((i64, i64), Arc<Vec<Batch>>);
+pub(crate) type WindowRows = ((i64, i64), Arc<Vec<Batch>>);
 
 /// The end at or before which `view`'s windows are past its retention,
 /// counted back from the window ending at `newest_end`.
@@ -1261,7 +1280,11 @@ impl ViewStore {
 
     /// `view`'s windows within `(start, end]`, each with its rows (cold
     /// windows are decoded; a window that cannot be read is left out).
-    pub fn windows(&self, view: PhysicalASAPNodeId, (start, end): (i64, i64)) -> Vec<WindowRows> {
+    pub(crate) fn windows(
+        &self,
+        view: PhysicalASAPNodeId,
+        (start, end): (i64, i64),
+    ) -> Vec<WindowRows> {
         self.by_view
             .get(&view)
             .into_iter()
@@ -1272,7 +1295,7 @@ impl ViewStore {
     }
 
     /// Drops `view`'s windows ending at or before `before_ms`.
-    pub fn evict_before(&mut self, view: PhysicalASAPNodeId, before_ms: i64) {
+    pub(crate) fn evict_before(&mut self, view: PhysicalASAPNodeId, before_ms: i64) {
         if let Some(rows) = self.by_view.get_mut(&view) {
             rows.retain(|window| {
                 let kept = window.time_range_ms.1 > before_ms;
@@ -1286,7 +1309,7 @@ impl ViewStore {
 
     /// Per view with stored windows, the start of its oldest and the end
     /// of its newest.
-    pub fn time_ranges(&self) -> BTreeMap<PhysicalASAPNodeId, (i64, i64)> {
+    pub(crate) fn time_ranges(&self) -> BTreeMap<PhysicalASAPNodeId, (i64, i64)> {
         self.by_view
             .iter()
             .filter_map(|(view, rows)| {

@@ -126,24 +126,10 @@ impl BoundaryRawDataStore {
 
 impl common::RawDataStore for BoundaryRawDataStore {
     fn append(&self, source: &Source, batch: RawDataBatch) {
-        let Source::TimeSeries { metric } = source else {
-            return;
-        };
-        let RawDataBatch::TimeSeries { series } = batch;
-        let mut samples = Vec::new();
-        for (labels, points) in &series {
-            // The series' labels name its metric.
-            let mut labels = labels.clone();
-            labels.insert("__name__".into(), metric.clone());
-            let pairs: Vec<(&String, &String)> = labels.iter().collect();
-            let series = crate::series_ids::intern_pairs(&pairs);
-            samples.extend(points.iter().map(|&(timestamp_ms, value)| RawSample {
-                labels: series,
-                timestamp_ms,
-                value,
-            }));
+        // `RawData` keeps each sample by its series' `__name__`.
+        if matches!(source, Source::TimeSeries { .. }) {
+            self.data().append(&RawSample::from_batch(&batch));
         }
-        self.data().append(&samples);
     }
 
     fn read(&self, source: &Source, interval_ms: (i64, i64)) -> Option<RawDataBatch> {
@@ -240,20 +226,20 @@ mod tests {
         Source::TimeSeries { metric: "m".into() }
     }
 
-    /// Appended samples are read back per series with their metric's name;
-    /// once evicted, a read reaching them is `None`.
+    /// Appended samples are read back per series; once evicted, a read
+    /// reaching them is `None`.
     #[test]
     fn the_raw_data_store_reads_until_eviction() {
         let store = BoundaryRawDataStore::new(RawData::for_metrics([&"m".to_string()], 1000));
-        let labels: LabelSet = [("job".to_string(), "a".to_string())].into();
+        let named: LabelSet = [("__name__", "m"), ("job", "a")]
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .into();
         store.append(
             &source(),
             RawDataBatch::TimeSeries {
-                series: vec![(labels.clone(), vec![(1000, 1.0), (2000, 2.0)])],
+                series: vec![(named.clone(), vec![(1000, 1.0), (2000, 2.0)])],
             },
         );
-        let mut named = labels;
-        named.insert("__name__".into(), "m".into());
         assert_eq!(
             store.read(&source(), (0, 2000)),
             Some(RawDataBatch::TimeSeries {

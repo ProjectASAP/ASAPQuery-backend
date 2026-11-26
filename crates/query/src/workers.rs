@@ -18,9 +18,10 @@ use crate::{CompiledQueries, Snapshot, Unanswered};
 
 type Reply<T> = oneshot::Sender<Result<T, Unanswered>>;
 
-/// The installed plan's compiled queries and the workers that run them.
+/// The installed plan's compiled queries and the `query-N` workers that
+/// run them.
 #[derive(Clone)]
-pub struct QueryWorkers {
+pub struct InstalledQueries {
     /// The plan the queries were compiled from.
     plan: PlanId,
     /// Queries for the worker threads.
@@ -30,7 +31,7 @@ pub struct QueryWorkers {
     published: Arc<PublishedStore>,
 }
 
-impl QueryWorkers {
+impl InstalledQueries {
     /// Starts `threads` workers running `compiled`, plan `plan`'s queries,
     /// over the snapshots `published` holds.
     pub(crate) fn start(
@@ -182,11 +183,6 @@ impl QueryWorkers {
     /// The plan the queries were compiled from.
     pub fn plan(&self) -> PlanId {
         self.plan
-    }
-
-    /// The query worker threads: the most query runs at once.
-    pub fn threads(&self) -> usize {
-        self.threads
     }
 
     /// The compiled queries.
