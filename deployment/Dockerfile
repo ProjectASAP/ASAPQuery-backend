@@ -9,8 +9,10 @@
 # deployment/docker-compose.yml plans a workload and serves the plan.
 FROM rust:1.99.0-slim-bookworm AS build
 # git: Cargo fetches the pinned git dependencies with the git CLI (.cargo/config.toml).
+# make: tikv-jemalloc-sys builds jemalloc. cmake, g++, libclang-dev: highs-sys
+# (the Planner's MILP solver) builds HiGHS and generates its bindings.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates \
+ && apt-get install -y --no-install-recommends git make cmake g++ libclang-dev \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
@@ -21,10 +23,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && install -m 0755 target/release/control_plane target/release/data_plane /usr/local/bin/
 
 FROM debian:bookworm-20261104-slim
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
- && rm -rf /var/lib/apt/lists/* \
- && useradd --system --uid 10001 --home-dir /data asap \
+RUN useradd --system --uid 10001 --home-dir /data asap \
  && mkdir /data && chown asap /data
 COPY --from=build /usr/local/bin/control_plane /usr/local/bin/data_plane /usr/local/bin/
 USER asap

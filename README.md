@@ -267,7 +267,7 @@ not stored) with a Prometheus `execution` error (422,
 | `crates/adapters/query/elastic-http/` | package `elastic_http`: `_sql` and `_search` bodies and the fallback client of an Elasticsearch server, `POST /_sql`, `POST /_search` |
 | `crates/adapters/query/prometheus-http/` | package `prometheus_http`: query parameters, response bodies and the fallback client of a Prometheus-compatible server |
 | `benchmarks/` | the backend alone: `micro/` benchmarks (examples of `data_plane`) and `scripts/` |
-| `eval/` | comparisons with other systems (`baselines/`, `harness/`, `scripts/`, `workloads/`) and the live demo; see [eval/README.md](eval/README.md) |
+| `eval/` | comparisons with other systems and the live demo; see [eval/README.md](eval/README.md) |
 | `deployment/` | the backend's Docker image (`Dockerfile`) and Compose file; `monitoring/`: Prometheus, exporters and Grafana for the demo and the comparisons |
 | `docs/` | design documents and `examples/` workloads |
 | `scripts/` | CI and the Planner dependency updater |
