@@ -15,7 +15,7 @@ services:
       context: ..
       dockerfile: deployment/Dockerfile
     image: asap-backend
-    command: ["control_plane", "--workload", "/workload.json", "--out", "/data/plan.json", "--report", "/data/report.json"]
+    command: ["control_plane", "--workload", "/workload.json", "--out", "/data/plan.json"]
     volumes:
       - ${WORKLOAD:-../docs/examples/planner-layering-example1.json}:/workload.json:ro
       - data:/data

@@ -22,7 +22,6 @@ services:
       nofile:
         soft: 65536
         hard: 65536
-    restart: "no"
 
 volumes:
   elasticsearch-data:

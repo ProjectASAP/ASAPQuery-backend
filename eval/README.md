@@ -1,11 +1,10 @@
 # Evaluation: live demo and comparison tooling
 
-Scripts that run the ASAP data plane next to VictoriaMetrics single-node on
-the same Remote Write feed and the same queries, check both against a
-reference, and show them on Grafana. Code and configuration only: no run
-outputs are kept here (`.gitignore` lists where runs write: `prep/`, `runs/`,
-`report_demo/`, `logs/`). Paths below are relative
-to this directory, `$ASAPQ_BENCH`.
+Scripts that run the ASAP data plane next to other systems (see
+[Baselines](#baselines)) on the same Remote Write feed and the same queries,
+check them against a reference, and show them on Grafana. Code and
+configuration only: run outputs are git-ignored (`.gitignore`). Paths below
+are relative to this directory, `$ASAPQ_BENCH`.
 
 | Path | What it holds |
 |---|---|
@@ -13,7 +12,7 @@ to this directory, `$ASAPQ_BENCH`.
 | `scripts/run_vm_demo.sh` | The batch comparison: prepare, run the arms one after another on one feed, report. |
 | `scripts/fetch_binaries.sh`, `scripts/build.sh` | Pinned third-party binaries (sha256-checked); builds of the paced feeder and this repository into `$BIN_DIR`. |
 | `scripts/profile_query_phase.sh` | CPU profiles of each arm's query phase (`scripts/run_vm_demo.sh` with `PROFILE=1`). |
-| `baselines/` | Compared systems that run as their own service (`baselines/<system>/docker-compose.yml`); see [Baselines](#baselines). |
+| `baselines/` | ClickHouse and Elasticsearch, the compared systems that run as their own service (`baselines/<system>/docker-compose.yml`); see [Baselines](#baselines). |
 | `harness/` | `prepare.py` (scaled manifest, feeder table, the Planner's plan through `control_plane`), `run.py` (arms), `report.py`, `demo_table.py`, `tables.py`, `tables2.py`, `accuracy_vs_vm.py`, `compression.py`, `merge_plans.py`, `cgroup_limits.sh`. See `harness/README.md`. |
 | `demo/live/` | The live demo's helpers: `proxy.py`, `query_load.py`, `accuracy.py`, `compare.py`, `verify.py`, `browse.py`, exporters, and `planner/cost_inputs.json`. |
 | `../deployment/monitoring/` | Prometheus and process-exporter configuration, Grafana provisioning, the dashboard generators (`grafana/make_*_dashboard.py`), screenshots, Docker Compose or plain binaries (`run_binaries.sh`). |
@@ -96,14 +95,14 @@ The systems the backend is compared with. "Harness arm" means
 as their own service and are, for now, only what the backend's routes forward
 to. No results are kept here.
 
-| System | Version | How it runs | Harness arm |
+| System | Version pinned in | How it runs | Harness arm |
 |---|---|---|---|
-| Prometheus | 3.5.0 | binary from `scripts/fetch_binaries.sh`, flags in `harness/run.py` | `prometheus` (the exact reference), and beside `backend` and `asapquery` |
-| VictoriaMetrics single-node | v1.156.0 | binary from `scripts/fetch_binaries.sh`, flags in `harness/run.py` (`VM_SEARCH_FLAGS`) | `victoriametrics`; also the reference of `demo/run_live_demo.sh` |
-| VictoriaMetrics cluster | v1.156.0 | `vmstorage`, `vmselect`, `vminsert` installed by hand as `$BIN_DIR/<component>-<version>` (not fetched) | `vmcluster` |
+| Prometheus | `scripts/fetch_binaries.sh`, `harness/common.py` | binary from `scripts/fetch_binaries.sh`, flags in `harness/run.py` | `prometheus` (the exact reference), and beside `backend`, `backend_alone` and `asapquery` |
+| VictoriaMetrics single-node | `scripts/fetch_binaries.sh`, `harness/common.py` | binary from `scripts/fetch_binaries.sh`, flags in `harness/run.py` (`VM_SEARCH_FLAGS`) | `victoriametrics`; the raw store of `asap_forward`; the reference of `demo/run_live_demo.sh` |
+| VictoriaMetrics cluster | `harness/common.py` (the single-node release) | `vmstorage`, `vmselect`, `vminsert` installed by hand as `$BIN_DIR/<component>-<version>` (not fetched) | `vmcluster` |
 | ASAPQuery query engine | the ASAPQuery checkout | `ASAPQUERY_ENGINE=1 scripts/build.sh` | `asapquery` |
-| ClickHouse | 25.8.33.6 | `docker compose -f baselines/clickhouse/docker-compose.yml up -d`, then `data_plane --clickhouse-url http://localhost:8123` | none yet |
-| Elasticsearch | 9.5.3 | `docker compose -f baselines/elasticsearch/docker-compose.yml up -d`, then `data_plane --elastic-url http://localhost:9200` | none yet |
+| ClickHouse | `baselines/clickhouse/docker-compose.yml` | `docker compose -f baselines/clickhouse/docker-compose.yml up -d`, then `data_plane --clickhouse-url http://localhost:8123` | none yet |
+| Elasticsearch | `baselines/elasticsearch/docker-compose.yml` | `docker compose -f baselines/elasticsearch/docker-compose.yml up -d`, then `data_plane --elastic-url http://localhost:9200` | none yet |
 
 Not ported yet:
 

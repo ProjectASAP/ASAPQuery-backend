@@ -2,7 +2,7 @@
 # Build the paced feeder (with campaign/paced-feeder-realistic.diff applied, for
 # FEEDER_VALUES=realistic), this repository's data_plane and control_plane, and
 # optionally ASAPQuery's query engine, and install the binaries into $BIN_DIR.
-#   ASAPQ_BENCH, BIN_DIR   required (see README.md)
+#   ASAPQ_BENCH, BIN_DIR   required (see eval/README.md)
 #   ASAP_PLANNER_DIR       optional: also build the Planner's random-workload example
 #   ASAPQUERY_ENGINE=1     also build ASAPQuery's query_engine_rust (the harness's asapquery arm)
 set -euo pipefail
