@@ -7,14 +7,10 @@ edition.workspace = true
 common.workspace = true
 internal_metrics.workspace = true
 precompute.workspace = true
+prometheus_http.workspace = true
+prometheus_remote_write.workspace = true
 query.workspace = true
 storage.workspace = true
-ahash = "0.8"
-# The per-thread series cache of the Remote Write decoder (a table of
-# indices hashed by the keys they point to).
-hashbrown = "0.15"
-# Shortest round-trip float digits for range responses (prometheus.rs).
-ryu = "1"
 # The data plane's allocator (main.rs): many small per-request allocations.
 tikv-jemallocator = "0.6"
 serde.workspace = true
@@ -26,9 +22,8 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 tokio.workspace = true
 axum.workspace = true
+# The forward-mode tee's delivery workers (raw_forward.rs).
 reqwest.workspace = true
-prost = "0.13"
-snap = "1.1"
 form_urlencoded = "1"
 
 [dev-dependencies]
@@ -42,6 +37,10 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # posix_fadvise in the tier and view-read benchmarks (cold reads).
 libc = "0.2"
+# Remote Write bodies built by hand, and the reference decoder's series
+# cache (tests/remote_write_reference.rs).
+snap = "1.1"
+ahash = "0.8"
 
 # The micro benchmarks live in benchmarks/micro/ and build as examples of this
 # crate (`cargo run --release -p data_plane --example <name>`).

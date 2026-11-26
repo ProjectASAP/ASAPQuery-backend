@@ -1,5 +1,7 @@
 //! A query's answer. Every variant carries its own label or column names.
 
+use std::sync::Arc;
+
 use crate::LabelSet;
 
 /// The result of a query. A response adapter returns an error for a
@@ -60,4 +62,17 @@ pub struct Table {
 pub enum TableValue {
     String(String),
     Float(f64),
+}
+
+/// One series of an instant answer as the query engine returns it natively
+/// to the dispatcher and the Prometheus response writers: unlike
+/// [`InstantVectorElement`], its labels are shared, not copied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResultSample {
+    /// Shared with the interned series (an input series) or with every
+    /// other row of the same result series (`series_ids::result_labels`)
+    /// when the row has no other label column, so results and the result
+    /// cache hold no copy of it.
+    pub labels: Arc<LabelSet>,
+    pub value: f64,
 }

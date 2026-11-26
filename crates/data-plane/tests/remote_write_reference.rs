@@ -8,12 +8,13 @@
 //! byte flips of them, and, with `RW_CORPUS_DIR` set, on a directory of
 //! captured request bodies.
 
-use data_plane::remote_write::{decode_samples, Limits, RemoteWriteError};
+use data_plane::remote_write::decode_samples;
+use prometheus_remote_write::{Limits, RemoteWriteError};
 
 /// The decoder before its speed-ups, verbatim but for returning the
 /// interned `&'static Series`.
 mod reference {
-    use data_plane::remote_write::{Limits, RemoteWriteError};
+    use prometheus_remote_write::{Limits, RemoteWriteError};
     use storage::series_ids::Series;
     use storage::store::RawSample;
 

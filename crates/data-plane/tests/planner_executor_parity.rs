@@ -45,12 +45,12 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use control_plane::{plan_workload, DeploymentInputs};
 use data_plane::engine::EngineOptions;
-use data_plane::remote_write::{Label, Sample, TimeSeries};
 use data_plane::{router, DataPlane, EXECUTION_HEADER};
 use futures::{executor::block_on, StreamExt};
 use http_body_util::BodyExt;
 use precompute::engine::PrecomputeMode;
 use precompute::ingestion::IngestionOptions;
+use prometheus_remote_write::{Label, Sample, TimeSeries};
 use serde_json::Value as Json;
 use tower::ServiceExt;
 

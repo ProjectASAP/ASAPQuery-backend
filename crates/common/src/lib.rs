@@ -19,8 +19,8 @@ pub use plan::{InstallError, InstalledPlan, PlanId};
 pub use query_engine::{AnswerSource, EngineQueryResult, QueryEngineError};
 pub use query_request::{QueryEval, QueryRequest};
 pub use query_result::{
-    InstantVector, InstantVectorElement, QueryResult, RangeVector, RangeVectorElement, Sample,
-    Table, TableValue,
+    InstantVector, InstantVectorElement, QueryResult, RangeVector, RangeVectorElement,
+    ResultSample, Sample, Table, TableValue,
 };
 
 /// The largest time, in milliseconds either side of the epoch, the data

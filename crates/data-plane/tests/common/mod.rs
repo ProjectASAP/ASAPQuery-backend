@@ -7,10 +7,10 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use control_plane::{plan_workload, DeploymentInputs};
 use data_plane::engine::EngineOptions;
-use data_plane::remote_write::{encode, TimeSeries, WriteRequest};
 use data_plane::{DataPlane, EXECUTION_HEADER};
 use http_body_util::BodyExt;
 use precompute::ingestion::IngestionOptions;
+use prometheus_remote_write::{encode, TimeSeries, WriteRequest};
 use serde_json::Value;
 use tower::ServiceExt;
 

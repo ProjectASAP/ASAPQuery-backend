@@ -972,15 +972,14 @@ dependencies = [
  "control_plane",
  "form_urlencoded",
  "futures",
- "hashbrown 0.15.5",
  "http-body-util",
  "internal_metrics",
  "libc",
  "precompute",
- "prost",
+ "prometheus_http",
+ "prometheus_remote_write",
  "query",
  "reqwest",
- "ryu",
  "serde",
  "serde_json",
  "snap",
@@ -2869,6 +2868,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "prometheus_http"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "asap-types",
+ "async-trait",
+ "axum",
+ "common",
+ "form_urlencoded",
+ "reqwest",
+ "ryu",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "prometheus_remote_write"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "hashbrown 0.15.5",
+ "prost",
+ "snap",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

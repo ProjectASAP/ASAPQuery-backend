@@ -43,11 +43,11 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use control_plane::{plan_workload, DeploymentInputs};
 use data_plane::engine::EngineOptions;
-use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use data_plane::{router, DataPlane};
 use internal_metrics::thread_cpu_seconds;
 use precompute::engine::PrecomputeMode;
 use precompute::ingestion::IngestionOptions;
+use prometheus_remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use tower::ServiceExt;
 
 #[tokio::main(flavor = "multi_thread")]

@@ -1,0 +1,16 @@
+[package]
+name = "prometheus_remote_write"
+version.workspace = true
+edition.workspace = true
+
+# Prometheus Remote Write v1: request decoding and validation. An adapter:
+# no workspace dependency, so it never sees an engine or a store. The
+# caller interns each series into its own series type (`Decoder`).
+[dependencies]
+prost = "0.13"
+snap = "1.1"
+# The per-thread series cache (a table of indices hashed by the keys they
+# point to).
+ahash = "0.8"
+hashbrown = "0.15"
+thiserror.workspace = true
