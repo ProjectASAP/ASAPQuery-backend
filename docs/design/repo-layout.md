@@ -103,6 +103,35 @@ internal-metrics  nothing in this workspace (a leaf)
 data-plane     every crate above (wiring only)
 ```
 
+- `common` depends on ASAPPlanner's plan types only (`InstallablePlan`,
+  `PhysicalASAPDAG`, `QueryLanguage`, …), never on the executor's runtime.
+  This is #935's decision 1.
+- Adapters depend on `common` only: they never see an engine or a store. In
+  ASAPQuery, adapters depend on the whole engine crate (#935, "Not solved");
+  a separate `common` crate closes that here.
+- `precompute`, `storage` and `query` do not depend on each other. They meet
+  in `common`'s traits: `precompute` writes through `ViewStore` and
+  `RawDataStore`, and `query` reads through them.
+- Only `data-plane` knows every implementation. It builds the stores, injects
+  them into both engines, and owns `PlanInstaller` and `QueryDispatcher`.
+
+### Control plane → data plane
+
+The contract is the `InstallablePlan`, which is a `PhysicalASAPDAG` plus one
+query text per DAG root. Today the control plane writes it as a JSON plan
+file, and the data plane installs it at startup with `--plan`. This stays:
+
+```rust
+// crates/data-plane
+struct PlanInstaller { /* the two engines and the dispatcher */ }
+impl PlanInstaller {
+    /// Validates the plan (supported operators, sources), then installs it
+    /// into the ingest engine, the query engine and the dispatcher, all or
+    /// nothing. On failure the current plan stays.
+    fn install(&self, plan: InstallablePlan) -> Result<PlanId, InstallError>;
+}
+```
+
 The control plane has two callers of `install`:
 - the plan file at startup, as today;
 - later, the workload tracker (#935's `QueryWorkloadTracker`). It records the
