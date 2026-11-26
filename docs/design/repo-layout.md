@@ -254,10 +254,9 @@ each reviewed on its own:
 
 ## Decisions
 
-1. **`common` lives here for now.** ASAPQuery and this repository should
-   share one copy of #935's traits. The intended home is ASAPPlanner, next to
-   the plan types both repositories already depend on. Until then the traits
-   live in `crates/common`, and ASAPQuery is not changed.
+1. **`common` lives in this repository**, in `crates/common`. This work
+   changes neither ASAPPlanner nor ASAPQuery. The traits keep #935's names and
+   shapes, so ASAPQuery's adapters can move here without changes.
 2. **The workload tracker lives in `control-plane`.** It produces a planning
    input. The query adapters only report each query they receive to it.
 3. **No rename for now.** The binary keeps the `data-plane` name; a product
