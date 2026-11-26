@@ -161,7 +161,10 @@ impl<B: SampleBuilder> Decoder<B> {
 }
 
 /// The samples of the encoded `WriteRequest` `request`, in request order.
-#[inline]
+/// `#[inline(always)]`: inlined into both callers, the request loop keeps
+/// the codegen it had inside `Decoder::decode` (with `#[inline]` alone, one
+/// series per sample decodes about 2% slower).
+#[inline(always)]
 fn decode_request<B: SampleBuilder>(
     request: &[u8],
     cache: &mut SeriesCache<B>,
