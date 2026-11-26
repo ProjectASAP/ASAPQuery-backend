@@ -995,6 +995,7 @@ dependencies = [
  "precompute",
  "prometheus_http",
  "prometheus_remote_write",
+ "prost",
  "query",
  "reqwest",
  "serde_json",

@@ -180,7 +180,7 @@ fn decode_request<B: SampleBuilder>(
 }
 
 /// The largest decompression buffer a decoder keeps between requests.
-const KEPT_DECOMPRESSED_BYTES: usize = 32 * 1024 * 1024;
+pub const KEPT_DECOMPRESSED_BYTES: usize = 32 * 1024 * 1024;
 
 /// The snappy-decompressed bytes of `body`, within the size limits,
 /// written into `buffer` (grown as needed).

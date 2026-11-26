@@ -36,13 +36,18 @@ pub fn decode_victoriametrics_samples(
 }
 
 /// The samples of an OTLP metrics body ([`otlp::decode`]), each point's
-/// series interned. `content_encoding` is the request's `Content-Encoding`.
+/// series interned, within Remote Write's decompressed size and sample
+/// limits. `content_encoding` is the request's `Content-Encoding`.
 pub fn decode_otlp_samples(
     body: &[u8],
     content_encoding: Option<&str>,
-    limits: &otlp::Limits,
+    limits: &Limits,
 ) -> Result<Vec<RawSample>, otlp::OtlpError> {
-    let points = otlp::decode(body, content_encoding, limits)?;
+    let limits = otlp::Limits {
+        max_decompressed_bytes: limits.max_decompressed_bytes,
+        max_points: limits.max_samples,
+    };
+    let points = otlp::decode(body, content_encoding, &limits)?;
     Ok(points
         .into_iter()
         .map(|point| RawSample {

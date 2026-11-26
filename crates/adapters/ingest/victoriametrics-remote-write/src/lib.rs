@@ -8,7 +8,7 @@
 
 use std::io::Read;
 
-pub use prometheus_remote_write::{Limits, RemoteWriteError, SampleBuilder};
+use prometheus_remote_write::{Limits, RemoteWriteError, SampleBuilder, KEPT_DECOMPRESSED_BYTES};
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum VictoriaMetricsRemoteWriteError {
@@ -20,21 +20,20 @@ pub enum VictoriaMetricsRemoteWriteError {
     RemoteWrite(#[from] RemoteWriteError),
 }
 
-/// A decoder's state, kept between requests: its decompression buffer and
-/// the Remote Write decoder (with its series cache) it hands the protobuf to.
+/// A decoder's state, kept between requests: its zstd context and
+/// decompression buffer, and the Remote Write decoder (with its series
+/// cache) it hands the protobuf to.
 pub struct Decoder<B: SampleBuilder> {
+    zstd: zstd::bulk::Decompressor<'static>,
     /// A request's decompressed bytes are written over the last one's.
     decompressed: Vec<u8>,
     remote_write: prometheus_remote_write::Decoder<B>,
 }
 
-/// The largest decompression buffer a decoder keeps between requests, as
-/// `prometheus_remote_write`'s decoder.
-const KEPT_DECOMPRESSED_BYTES: usize = 32 * 1024 * 1024;
-
 impl<B: SampleBuilder> Decoder<B> {
     pub fn new(builder: B) -> Self {
         Self {
+            zstd: zstd::bulk::Decompressor::new().expect("a zstd context"),
             decompressed: Vec::new(),
             remote_write: prometheus_remote_write::Decoder::new(builder),
         }
@@ -50,11 +49,12 @@ impl<B: SampleBuilder> Decoder<B> {
         body: &[u8],
         limits: &Limits,
     ) -> Result<Vec<B::Sample>, VictoriaMetricsRemoteWriteError> {
-        let decoded = decompress_into(body, limits, &mut self.decompressed).and_then(|()| {
-            Ok(self
-                .remote_write
-                .decode_uncompressed(&self.decompressed, limits)?)
-        });
+        let decoded = decompress_into(body, limits, &mut self.zstd, &mut self.decompressed)
+            .and_then(|()| {
+                Ok(self
+                    .remote_write
+                    .decode_uncompressed(&self.decompressed, limits)?)
+            });
         if self.decompressed.capacity() > KEPT_DECOMPRESSED_BYTES {
             self.decompressed = Vec::new();
         }
@@ -63,21 +63,41 @@ impl<B: SampleBuilder> Decoder<B> {
 }
 
 /// Writes the zstd-decompressed bytes of `body` into `buffer` (replacing
-/// its contents), within the size limits. Reads at most one byte past
-/// `max_decompressed_bytes`, so a body that decompresses to more is
-/// rejected without being decompressed whole.
+/// its contents), within the size limits. A body whose frame states its
+/// size (as senders write it) is decompressed in one pass with `zstd`;
+/// any other (no size, several frames) is streamed, reading at most one
+/// byte past `max_decompressed_bytes`, so a body that decompresses to more
+/// is rejected without being decompressed whole.
 fn decompress_into(
     body: &[u8],
     limits: &Limits,
+    zstd: &mut zstd::bulk::Decompressor<'static>,
     buffer: &mut Vec<u8>,
 ) -> Result<(), VictoriaMetricsRemoteWriteError> {
     if body.len() > limits.max_compressed_bytes {
         return Err(RemoteWriteError::CompressedTooLarge(limits.max_compressed_bytes).into());
     }
-    buffer.clear();
-    let zstd_error = |e: std::io::Error| VictoriaMetricsRemoteWriteError::Zstd(e.to_string());
-    let decompressor = zstd::stream::read::Decoder::with_buffer(body).map_err(zstd_error)?;
     let max = limits.max_decompressed_bytes;
+    buffer.clear();
+    if let Ok(Some(len)) = zstd::zstd_safe::get_frame_content_size(body) {
+        if len > max as u64 {
+            return Err(RemoteWriteError::DecompressedTooLarge(max).into());
+        }
+        buffer.reserve(len as usize);
+        // Fails when the body holds more than this frame: streamed below.
+        if zstd.decompress_to_buffer(body, buffer).is_ok() {
+            return Ok(());
+        }
+        buffer.clear();
+    }
+    let zstd_error = |e: std::io::Error| VictoriaMetricsRemoteWriteError::Zstd(e.to_string());
+    let mut decompressor = zstd::stream::read::Decoder::with_buffer(body).map_err(zstd_error)?;
+    // No window larger than the largest request allowed: a small frame
+    // cannot make the decoder allocate more.
+    let window_log = (usize::BITS - max.max(1 << 10).leading_zeros()).min(31);
+    decompressor
+        .window_log_max(window_log)
+        .map_err(zstd_error)?;
     decompressor
         .take(max as u64 + 1)
         .read_to_end(buffer)
@@ -92,7 +112,7 @@ fn decompress_into(
 /// sends it.
 pub fn encode(request: &prometheus_remote_write::WriteRequest) -> Vec<u8> {
     use prost::Message;
-    zstd::encode_all(request.encode_to_vec().as_slice(), 0).expect("zstd compresses any input")
+    zstd::bulk::compress(&request.encode_to_vec(), 0).expect("zstd compresses any input")
 }
 
 #[cfg(test)]
@@ -183,6 +203,44 @@ mod tests {
                 99.9f64.to_bits()
             )]
         );
+    }
+
+    /// A body without its size in the frame header, as a streaming
+    /// encoder writes it, and one of two frames, decode as the one-frame
+    /// body with its size does.
+    #[test]
+    fn decodes_streamed_and_multi_frame_bodies() {
+        let request = WriteRequest {
+            timeseries: vec![
+                series(&[("__name__", "m"), ("job", "a")], &[(1, 1.0)]),
+                series(&[("__name__", "m"), ("job", "b")], &[(2, 2.0)]),
+            ],
+        };
+        let protobuf = prost::Message::encode_to_vec(&request);
+        let limits = Limits::default();
+        let builder = Labeled::default();
+        let mut decoder = Decoder::new(builder.clone());
+        let sized = decoder.decode(&encode(&request), &limits).unwrap();
+        let streamed = zstd::encode_all(protobuf.as_slice(), 0).unwrap();
+        assert!(matches!(
+            zstd::zstd_safe::get_frame_content_size(&streamed),
+            Ok(None)
+        ));
+        assert_eq!(decoder.decode(&streamed, &limits).unwrap(), sized);
+        let (first, second) = protobuf.split_at(protobuf.len() / 2);
+        let mut frames = zstd::bulk::compress(first, 0).unwrap();
+        frames.extend(zstd::bulk::compress(second, 0).unwrap());
+        assert_eq!(decoder.decode(&frames, &limits).unwrap(), sized);
+        // A sized frame over the limit is rejected before decompressing.
+        let small = Limits {
+            max_decompressed_bytes: protobuf.len() - 1,
+            ..Limits::default()
+        };
+        assert_eq!(
+            decoder.decode(&encode(&request), &small).err(),
+            Some(RemoteWriteError::DecompressedTooLarge(protobuf.len() - 1).into())
+        );
+        assert_eq!(builder.labeled(sized).len(), 2);
     }
 
     /// Ported from ASAPQuery's `test_decode_invalid_zstd`.
