@@ -976,7 +976,9 @@ dependencies = [
  "http-body-util",
  "internal_metrics",
  "libc",
+ "precompute",
  "prost",
+ "query",
  "reqwest",
  "ryu",
  "serde",
@@ -2832,6 +2834,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "precompute"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "asap-executor",
+ "clap",
+ "control_plane",
+ "futures",
+ "internal_metrics",
+ "serde",
+ "serde_json",
+ "storage",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2894,6 +2914,22 @@ checksum = "4dcd034599e63b970727f70d79e02d62390a4a84f7c6b827c27c46d5ac3fa622"
 dependencies = [
  "ar_archive_writer",
  "cc",
+]
+
+[[package]]
+name = "query"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "asap-executor",
+ "common",
+ "futures",
+ "internal_metrics",
+ "serde_json",
+ "storage",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

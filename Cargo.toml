@@ -5,6 +5,8 @@ members = [
     "crates/control-plane",
     "crates/data-plane",
     "crates/internal-metrics",
+    "crates/precompute",
+    "crates/query",
     "crates/storage",
 ]
 
@@ -39,7 +41,10 @@ tokio = { version = "1.0", features = ["full"] }
 axum = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 control_plane = { path = "crates/control-plane" }
+common = { path = "crates/common" }
 internal_metrics = { path = "crates/internal-metrics" }
+precompute = { path = "crates/precompute" }
+query = { path = "crates/query" }
 storage = { path = "crates/storage" }
 
 # asap_sketchlib#271's head, ahead of the Planner's pin (389530c): DDSketch

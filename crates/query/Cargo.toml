@@ -1,0 +1,18 @@
+[package]
+name = "query"
+version.workspace = true
+edition.workspace = true
+
+# The query side of the data plane: planned queries over the published
+# store, on the query workers, and the result cache.
+[dependencies]
+asap-executor.workspace = true
+common.workspace = true
+internal_metrics.workspace = true
+storage.workspace = true
+anyhow.workspace = true
+futures = "0.3"
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

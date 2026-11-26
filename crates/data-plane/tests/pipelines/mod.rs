@@ -1,7 +1,7 @@
 //! Push precompute's combine rules (docs/design/parallel-precompute.md,
 //! "Combine rules"): each ingestion-time breaker's rule, from the plan node
 //! alone. The tests check the design's table here; the data plane decides
-//! which groups are pushed by its install probe (`data_plane::push::probe`).
+//! which groups are pushed by its install probe (`precompute::push::probe`).
 
 use asap_executor::planner::plan::physical_asap_dag::{PhysicalASAPDAGNode, PhysicalASAPNodeId};
 use asap_planner::InstallablePlan;

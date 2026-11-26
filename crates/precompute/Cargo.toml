@@ -1,0 +1,24 @@
+[package]
+name = "precompute"
+version.workspace = true
+edition.workspace = true
+
+# The ingest side of the data plane: ingest shards, the ingest coordinator,
+# push pipelines and the precompute pool over the Planner's executor.
+[dependencies]
+asap-executor.workspace = true
+internal_metrics.workspace = true
+storage.workspace = true
+anyhow.workspace = true
+# `PrecomputeMode` is a command-line value of the data plane
+# (`--precompute-mode`).
+clap.workspace = true
+futures = "0.3"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+control_plane.workspace = true
