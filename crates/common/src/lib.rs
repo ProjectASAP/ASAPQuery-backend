@@ -21,8 +21,8 @@ pub use plan::{InstallError, InstalledPlan, PlanId};
 pub use query_engine::{AnswerSource, EngineQueryResult, QueryEngine, QueryEngineError};
 pub use query_request::{QueryEval, QueryRequest};
 pub use query_result::{
-    InstantVector, InstantVectorElement, QueryResult, RangeVector, RangeVectorElement, Sample,
-    Table, TableValue,
+    InstantVector, InstantVectorElement, QueryResult, RangeVector, RangeVectorElement,
+    ResultSample, Sample, Table, TableValue,
 };
 pub use store::{
     RawDataStore, ViewId, ViewInstance, ViewInstanceKey, ViewInstanceMetadata, ViewState, ViewStore,

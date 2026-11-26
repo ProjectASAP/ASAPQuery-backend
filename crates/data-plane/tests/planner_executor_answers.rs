@@ -21,9 +21,9 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use control_plane::plan_workload;
 use data_plane::engine::EngineOptions;
-use data_plane::remote_write::{Label, Sample, TimeSeries};
 use data_plane::{router, DataPlane, EXECUTION_HEADER};
 use http_body_util::BodyExt;
+use prometheus_remote_write::{Label, Sample, TimeSeries};
 use serde_json::Value;
 use tower::ServiceExt;
 

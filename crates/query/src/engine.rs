@@ -315,7 +315,7 @@ mod tests {
     fn answers_convert_to_boundary_results() {
         let labels = |job: &str| Arc::new(LabelSet::from([("job".to_string(), job.to_string())]));
         let (a, b) = (labels("a"), labels("b"));
-        let sample = |labels: &Arc<LabelSet>, value| crate::ResultSample {
+        let sample = |labels: &Arc<LabelSet>, value| common::ResultSample {
             labels: labels.clone(),
             value,
         };

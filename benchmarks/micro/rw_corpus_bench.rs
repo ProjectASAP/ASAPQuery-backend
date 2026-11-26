@@ -29,8 +29,9 @@ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use std::sync::mpsc;
 use std::time::Instant;
 
-use data_plane::remote_write::{decode_samples, Limits};
+use data_plane::remote_write::decode_samples;
 use internal_metrics::thread_cpu_ns;
+use prometheus_remote_write::Limits;
 use storage::store::RawSample;
 
 fn main() {

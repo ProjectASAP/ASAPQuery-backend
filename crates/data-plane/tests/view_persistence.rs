@@ -12,8 +12,8 @@ use axum::http::StatusCode;
 use axum::Router;
 use control_plane::plan_workload;
 use data_plane::engine::EngineOptions;
-use data_plane::remote_write::{Label, Sample, TimeSeries};
 use data_plane::{router, DataPlane};
+use prometheus_remote_write::{Label, Sample, TimeSeries};
 use serde_json::{json, Value};
 
 const SUM: &str = "sum by (job) (sum_over_time(data[30s]))";
