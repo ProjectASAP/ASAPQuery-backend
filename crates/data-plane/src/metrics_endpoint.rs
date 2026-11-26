@@ -1,6 +1,7 @@
-//! `GET /metrics`: the engine's measurements ([`internal_metrics::Metrics`])
-//! and the gauges it reads from the stores, the ingestion counters and the
-//! result cache, in the Prometheus text format.
+//! `GET /metrics`: the engine's measurements ([`internal_metrics::Metrics`]
+//! and each planned query's [`QueryMetrics`]) and the gauges it reads from
+//! the stores, the ingestion counters and the result cache, in the
+//! Prometheus text format.
 
 use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,6 +21,8 @@ pub(crate) struct Gauges<'a> {
     pub persist_backlog: u64,
     pub persist_backlog_bytes: u64,
     pub now_ms: i64,
+    /// Each planned query's measurements, by query text, sorted.
+    pub queries: &'a [(String, QueryMetrics)],
     pub query_time_results: &'a QueryTimeResults<Unanswered>,
     /// `None` when the result cache is off.
     pub result_cache: Option<&'a ResultCache>,
@@ -65,7 +68,7 @@ pub(crate) fn render(metrics: &Metrics, gauges: &Gauges) -> String {
     if let Some(push) = &metrics.push {
         push.render(&mut out);
     }
-    for (query, query_metrics) in &metrics.queries {
+    for (query, query_metrics) in gauges.queries {
         let labels = format!("phase=\"query\",query=\"{}\"", escape(query));
         query_metrics.run.render(&mut out, &labels);
         let labels = format!("phase=\"query_range_step\",query=\"{}\"", escape(query));
@@ -78,7 +81,7 @@ pub(crate) fn render(metrics: &Metrics, gauges: &Gauges) -> String {
         "histogram",
         "Planned instant query latency in the engine, queueing for a worker included.",
     );
-    for (query, query_metrics) in &metrics.queries {
+    for (query, query_metrics) in gauges.queries {
         let labels = format!("query=\"{}\"", escape(query));
         query_metrics
             .latency
@@ -90,7 +93,7 @@ pub(crate) fn render(metrics: &Metrics, gauges: &Gauges) -> String {
         "histogram",
         "Planned range query latency, every step included.",
     );
-    for (query, query_metrics) in &metrics.queries {
+    for (query, query_metrics) in gauges.queries {
         let labels = format!("query=\"{}\"", escape(query));
         query_metrics
             .range_latency
@@ -109,7 +112,7 @@ pub(crate) fn render(metrics: &Metrics, gauges: &Gauges) -> String {
         ),
     ] {
         family(&mut out, name, "counter", help);
-        for (query, query_metrics) in &metrics.queries {
+        for (query, query_metrics) in gauges.queries {
             let _ = writeln!(
                 out,
                 "{name}{{query=\"{}\"}} {}",
@@ -502,15 +505,14 @@ mod tests {
     /// The text format names each phase and query.
     #[test]
     fn renders_phases_and_queries() {
-        let metrics = Metrics::new(
-            &[(10_000, vec!["3".into(), "5".into()])],
-            &["sum(x)".to_string()],
-        );
+        let metrics = Metrics::new(&[(10_000, vec!["3".into(), "5".into()])]);
         metrics.append.record(Timer::start());
-        metrics.query("sum(x) ").unwrap().latency.observe(0.003);
+        let queries = [("sum(x)".to_string(), QueryMetrics::default())];
+        queries[0].1.latency.observe(0.003);
         let text = render(
             &metrics,
             &Gauges {
+                queries: &queries,
                 stats: IngestionStats::default(),
                 samples_queued: 0,
                 precompute_backlog: 2,

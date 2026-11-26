@@ -4,7 +4,7 @@
 //! An instant query at `T` and a range step at `T` share one entry.
 //!
 //! Only a final answer is kept: one whose inputs can no longer change
-//! ([`crate::QueryEngine`] decides). Entries are dropped once `T`
+//! ([`crate::CompiledQueries`] decides). Entries are dropped once `T`
 //! falls further behind the watermark than any planned evaluation reaches
 //! back (the plan's longest retention plus the view retention margin), and
 //! the least recently used while more than `max_bytes` are held.

@@ -26,11 +26,14 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::Instant;
 
 use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
+use asap_executor::runtime::Limits;
 use asap_executor::values::Batch;
+use async_trait::async_trait;
+use common::{InstallError, InstallablePlan, InstalledPlan, RawDataBatch};
 use internal_metrics::{Metrics, PushMetrics, Timer};
 use storage::memory_budget::serve_view_cache;
 use storage::persist::ViewFiles;
@@ -212,6 +215,8 @@ impl Drop for RunningGuard {
 pub struct PrecomputeOptions {
     /// Lateness, future bound and first-window checks of ingestion.
     pub ingestion: IngestionOptions,
+    /// The most bytes one ingestion run may hold.
+    pub run_memory_limit_bytes: usize,
     /// Samples queued for the ingest shards beyond which `try_ingest` is
     /// `Busy`.
     pub max_queued_samples: u64,
@@ -241,6 +246,7 @@ pub struct PrecomputeOptions {
 /// Where the views are persisted, when they are: the view files'
 /// directory, what names them, how they are synced and rolled, the
 /// persist threads, and the cold tier windows are read back through.
+#[derive(Clone)]
 pub struct PersistedViews {
     pub dir: std::path::PathBuf,
     /// The installed plan file's hash ([`storage::persist::plan_hash`]):
@@ -252,11 +258,125 @@ pub struct PersistedViews {
     pub tier: Arc<ViewTier>,
 }
 
-/// The precompute engine: the `ingest-N` shards, the `ingest`
-/// coordinator, the precompute pool and committer, and (with persisted
-/// views) the `persist-N` threads and the `view-cache` monitor.
-#[derive(Clone)]
+/// The precompute engine: created before any plan; its install compiles
+/// the plan's ingestion and starts the threads ([`InstalledPrecompute`]).
+/// v1 installs one plan.
 pub struct PrecomputeEngine {
+    options: PrecomputeOptions,
+    persisted: Option<PersistedViews>,
+    published: Arc<PublishedStore>,
+    /// Held while a plan is installed, so two installs do not both start.
+    installing: Mutex<()>,
+    installed: OnceLock<InstalledPrecompute>,
+}
+
+impl PrecomputeEngine {
+    /// An engine with no plan, which will publish what query runs read to
+    /// `published`, and persist the views as `persisted` says.
+    pub fn new(
+        options: PrecomputeOptions,
+        persisted: Option<PersistedViews>,
+        published: Arc<PublishedStore>,
+    ) -> Self {
+        Self {
+            options,
+            persisted,
+            published,
+            installing: Mutex::new(()),
+            installed: OnceLock::new(),
+        }
+    }
+
+    /// The threads running the installed plan; `None` before the install.
+    pub fn installed(&self) -> Option<&InstalledPrecompute> {
+        self.installed.get()
+    }
+
+    /// Compiles `plan`'s ingestion and starts its threads.
+    fn start(&self, plan: &InstallablePlan) -> anyhow::Result<InstalledPrecompute> {
+        let views = plan.materialized_views()?;
+        let groups = plan.ingestion_refresh_groups()?;
+        tracing::info!(
+            views = views.len(),
+            refresh_groups = groups.len(),
+            "materialized views"
+        );
+        let limits = Limits {
+            max_bytes: self.options.run_memory_limit_bytes,
+        };
+        let (ingestion, precompute) =
+            Ingestion::new(&plan.dag, &views, groups, self.options.ingestion, limits)?;
+        tracing::info!(pane_width_ms = ingestion.pane_width_ms(), "raw data panes");
+        InstalledPrecompute::start(
+            ingestion,
+            precompute,
+            &self.options,
+            self.persisted.clone(),
+            self.published.clone(),
+        )
+    }
+}
+
+#[async_trait]
+impl common::IngestEngine for PrecomputeEngine {
+    fn install(&self, plan: InstalledPlan) -> Result<(), InstallError> {
+        let _installing = self.installing.lock().unwrap_or_else(|e| e.into_inner());
+        if self.installed().is_some() {
+            return Err(InstallError::new(
+                "the precompute engine has a plan installed and installs one plan",
+            ));
+        }
+        let installed = self
+            .start(&plan.plan)
+            .map_err(|error| InstallError::new(format!("{error:#}")))?;
+        let _ = self.installed.set(installed);
+        Ok(())
+    }
+
+    /// Interns each series and queues its samples, waiting while the queues
+    /// are full; discards the batch before the install.
+    async fn ingest(&self, batch: RawDataBatch) -> Result<(), common::IngestError> {
+        let Some(installed) = self.installed() else {
+            return Ok(());
+        };
+        let RawDataBatch::TimeSeries { series } = batch;
+        let mut samples = Vec::new();
+        for (labels, points) in &series {
+            let pairs: Vec<(&String, &String)> = labels.iter().collect();
+            let series = storage::series_ids::intern_pairs(&pairs);
+            samples.extend(points.iter().map(|&(timestamp_ms, value)| RawSample {
+                labels: series,
+                timestamp_ms,
+                value,
+            }));
+        }
+        loop {
+            match installed.try_ingest(samples.clone()) {
+                Ok(()) => return Ok(()),
+                Err(IngestError::Busy) => tokio::time::sleep(BUSY_RETRY).await,
+                Err(error @ IngestError::Stopped) => {
+                    return Err(common::IngestError::new(error.to_string()))
+                }
+            }
+        }
+    }
+
+    fn shutdown(&self) {
+        if let Some(installed) = self.installed() {
+            installed.stop();
+        }
+    }
+}
+
+/// How long [`common::IngestEngine::ingest`] waits before offering a batch
+/// the queues refused again.
+const BUSY_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// The threads running the installed plan: the `ingest-N` shards, the
+/// `ingest` coordinator, the precompute pool and committer, and (with
+/// persisted views) the `persist-N` threads and the `view-cache` monitor.
+#[derive(Clone)]
+pub struct InstalledPrecompute {
     commands: Sender<Command>,
     /// Each ingest shard's queue; a sample goes to the shard of its series.
     shards: Vec<Sender<ShardMessage>>,
@@ -264,15 +384,14 @@ pub struct PrecomputeEngine {
     max_queued_samples: u64,
 }
 
-impl PrecomputeEngine {
+impl InstalledPrecompute {
     /// Starts the threads that run `ingestion` and `precompute`, compiled
-    /// from the installed plan, whose queries are `query_texts`; they
-    /// publish what query runs read to `published`. With `persisted`, the
-    /// views stored in its files are indexed first.
-    pub fn start(
+    /// from the installed plan; they publish what query runs read to
+    /// `published`. With `persisted`, the views stored in its files are
+    /// indexed first.
+    fn start(
         mut ingestion: Ingestion,
         precompute: Precompute,
-        query_texts: &[String],
         options: &PrecomputeOptions,
         persisted: Option<PersistedViews>,
         published: Arc<PublishedStore>,
@@ -336,7 +455,7 @@ impl PrecomputeEngine {
             .into_iter()
             .map(|(width_ms, views)| (width_ms, views.iter().map(ToString::to_string).collect()))
             .collect();
-        let mut metrics = Metrics::new(&groups, query_texts);
+        let mut metrics = Metrics::new(&groups);
         if options.precompute_mode == PrecomputeMode::Push {
             metrics.push = Some(PushMetrics::new(groups.len(), shard_count));
         }
@@ -2067,5 +2186,83 @@ mod tests {
         };
         let routed = ingestion.routing().route(vec![sample], 25_000);
         assert_eq!(routed.accepted.len(), 1, "{:?}", routed.stats);
+    }
+
+    fn plan(query: &str) -> InstallablePlan {
+        let workload = serde_json::from_value(serde_json::json!({
+            "query_workload": {"language": "promql", "repeating_queries": [{
+                "query": query,
+                "demand": {"fixed_interval_at": {"interval": 10000, "evaluation_phase": 0}},
+                "requirements": {},
+                "predictability": {"predictable": {"known_at": null}},
+            }]},
+            "data_workload": {"arrival": {"ingesting": {"rows_per_second": 1.0}},
+              "sources": {"data": {"series_count": 1, "sample_interval": 1000,
+                "metric_type": "gauge", "column_signs": {"value": "non_negative"}}}},
+        }))
+        .unwrap();
+        let mut inputs = control_plane::DeploymentInputs::default();
+        inputs.deployment_capabilities.raw_data_retained = false;
+        control_plane::plan_workload(&workload, &inputs).unwrap().0
+    }
+
+    fn engine() -> PrecomputeEngine {
+        let options = PrecomputeOptions {
+            ingestion: IngestionOptions {
+                allowed_lateness_ms: 0,
+                stream_start_ms: Some(0),
+                ..Default::default()
+            },
+            run_memory_limit_bytes: 1 << 30,
+            max_queued_samples: 1000,
+            max_precompute_backlog: 16,
+            ingest_threads: 2,
+            precompute_threads: 1,
+            slow_refreshes: Vec::new(),
+            check_task_inputs: false,
+            shard_delay_ms: 0,
+            precompute_mode: PrecomputeMode::Window,
+            push_batching: crate::push::MorselBatching::default(),
+            precompute_memory_budget_bytes: None,
+            panic_in_combine_of_window_end_ms: None,
+        };
+        PrecomputeEngine::new(options, None, Arc::new(PublishedStore::new(Arc::default())))
+    }
+
+    fn batch(seconds: i64) -> RawDataBatch {
+        let labels = [("__name__", "data"), ("job", "a")]
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .into();
+        let points = (1..=seconds).map(|s| (s * 1000, 1.0)).collect();
+        RawDataBatch::TimeSeries {
+            series: vec![(labels, points)],
+        }
+    }
+
+    /// Through `IngestEngine`: a batch before the install is discarded; the
+    /// plan installs once; batches after it are ingested; `shutdown` stops
+    /// the engine.
+    #[tokio::test]
+    async fn the_ingest_engine_installs_once_and_ingests_after_it() {
+        use common::{IngestEngine as _, PlanId};
+        let engine = engine();
+        assert_eq!(engine.ingest(batch(5)).await, Ok(()));
+        let installed = |id| InstalledPlan {
+            id: PlanId(id),
+            plan: plan("sum_over_time(data[10s])"),
+        };
+        assert_eq!(engine.install(installed(1)), Ok(()));
+        assert!(engine.install(installed(2)).is_err());
+        assert_eq!(engine.ingest(batch(20)).await, Ok(()));
+        let running = engine.installed().unwrap();
+        running.advance_watermark(20_000).await.unwrap();
+        assert_eq!(running.stats().samples_accepted, 20);
+        assert!(running.stats().windows_refreshed > 0);
+        engine.shutdown();
+        let stopped = Instant::now();
+        while running.is_running() {
+            assert!(stopped.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }

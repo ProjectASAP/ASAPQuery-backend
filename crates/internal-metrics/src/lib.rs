@@ -300,8 +300,6 @@ pub struct Metrics {
     pub precompute_busy_ns: AtomicU64,
     /// Threads computing windows (`--precompute-threads`).
     pub precompute_threads: AtomicU64,
-    /// Each planned query's runs, by query text.
-    pub queries: BTreeMap<String, QueryMetrics>,
     /// The watermark, `i64::MIN` before the first.
     pub watermark_ms: AtomicI64,
     pub raw_data_bytes: AtomicU64,
@@ -326,8 +324,9 @@ pub struct Metrics {
 
 impl Metrics {
     /// Measurements for refresh groups described by `groups` (window width
-    /// and view ids) and the planned `queries`.
-    pub fn new(groups: &[(i64, Vec<String>)], queries: &[String]) -> Self {
+    /// and view ids). The planned queries' measurements are the query
+    /// engine's ([`QueryMetrics`]).
+    pub fn new(groups: &[(i64, Vec<String>)]) -> Self {
         Self {
             push: None,
             remote_write_decode: PhaseStats::default(),
@@ -346,10 +345,6 @@ impl Metrics {
             precompute_windows: groups.iter().map(|_| WindowLatency::default()).collect(),
             precompute_busy_ns: AtomicU64::new(0),
             precompute_threads: AtomicU64::new(1),
-            queries: queries
-                .iter()
-                .map(|query| (query.trim().to_string(), QueryMetrics::default()))
-                .collect(),
             watermark_ms: AtomicI64::new(i64::MIN),
             raw_data_bytes: AtomicU64::new(0),
             raw_data_samples: AtomicU64::new(0),
@@ -363,11 +358,6 @@ impl Metrics {
             view_file_bytes: AtomicU64::new(0),
             view_segments_marked_cold: AtomicU64::new(0),
         }
-    }
-
-    /// The query's measurements, if it is planned.
-    pub fn query(&self, query: &str) -> Option<&QueryMetrics> {
-        self.queries.get(query.trim())
     }
 }
 

@@ -17,6 +17,10 @@
 //! slots, and each `Scan` it reaches outside them as a raw data slot. A
 //! query the engine cannot answer returns [`Unanswered`]; the caller then
 //! forwards it to Prometheus (or refuses it).
+//!
+//! [`ExecutorQueryEngine`] runs the compiled queries ([`CompiledQueries`])
+//! on the `query-N` workers ([`workers`]) and implements
+//! [`common::QueryEngine`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -33,12 +37,16 @@ use asap_executor::values::{Batch, Value};
 use common::InstallablePlan;
 use futures::executor::block_on;
 use futures::StreamExt;
+use internal_metrics::QueryMetrics;
 use storage::store::{PublishedStore, QueryTimeResults, RawReads, RawShards, RunStore, ViewStore};
 
 use crate::result_cache::{Answer, ResultCache};
 
+mod engine;
 pub mod result_cache;
 pub mod workers;
+
+pub use engine::{ExecutorQueryEngine, QueryOptions};
 
 /// One series of an instant-query result.
 #[derive(Debug, Clone, PartialEq)]
@@ -54,8 +62,9 @@ pub struct ResultSample {
 /// Why the engine does not answer a query.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum Unanswered {
-    #[error("the installed plan has no query {0:?}")]
-    NotPlanned(String),
+    /// The query was resolved against another plan than the one installed.
+    #[error("the plan changed since the query was resolved")]
+    PlanChanged,
     #[error("the data plane cannot run this query: {0}")]
     Unsupported(String),
     /// Rows the run reads are not stored: a view's window (e.g. the first
@@ -74,9 +83,15 @@ struct Run {
     reads: Vec<PhysicalASAPNodeId>,
 }
 
-pub struct QueryEngine {
+/// The installed plan's queries, compiled.
+pub struct CompiledQueries {
     /// Each query and its root, or why it cannot run.
     roots: Vec<(String, Result<PhysicalASAPNodeId, String>)>,
+    /// Each planned root: whether its run, and every shared node's run it
+    /// reads, compiled.
+    runnable: HashMap<PhysicalASAPNodeId, Result<(), String>>,
+    /// Each planned query's measurements, by query text (trimmed), sorted.
+    metrics: Vec<(String, QueryMetrics)>,
     /// The run of each query root and shared node.
     runs: BTreeMap<PhysicalASAPNodeId, Run>,
     /// The shared nodes: their outputs live in `results`.
@@ -90,7 +105,7 @@ pub struct QueryEngine {
     result_cache: Option<ResultCache>,
 }
 
-impl QueryEngine {
+impl CompiledQueries {
     /// Compiles each query's root of `plan`, whose views are `views`, and
     /// each query-time `OneEvaluation` node shared by several queries'
     /// runs, whose outputs `results` keeps. With `share_one_evaluation`
@@ -144,7 +159,7 @@ impl QueryEngine {
                 .map_err(|e| e.to_string());
             compiled.insert(node, run);
         }
-        let roots = plan
+        let roots: Vec<(String, Result<PhysicalASAPNodeId, String>)> = plan
             .query_texts
             .iter()
             .zip(&dag.roots)
@@ -153,12 +168,24 @@ impl QueryEngine {
                 (query.trim().to_string(), runnable)
             })
             .collect();
+        let runnable_roots = dag
+            .roots
+            .iter()
+            .map(|&root| (root, runnable(root, &compiled)))
+            .collect();
+        let metrics: BTreeSet<&String> = roots.iter().map(|(query, _)| query).collect();
+        let metrics = metrics
+            .into_iter()
+            .map(|query| (query.clone(), QueryMetrics::default()))
+            .collect();
         let runs = compiled
             .into_iter()
             .filter_map(|(node, run)| Some((node, run.ok()?)))
             .collect();
         Ok(Self {
             roots,
+            runnable: runnable_roots,
+            metrics,
             runs,
             shared,
             results,
@@ -186,23 +213,34 @@ impl QueryEngine {
         &self.shared
     }
 
-    /// The planned `query`'s root.
-    fn root(&self, query: &str) -> Result<PhysicalASAPNodeId, Unanswered> {
-        let query = query.trim();
-        Ok(*self
-            .roots
-            .iter()
-            .find(|(planned, _)| planned == query)
-            .ok_or_else(|| Unanswered::NotPlanned(query.to_string()))?
-            .1
-            .as_ref()
-            .map_err(|reason| Unanswered::Unsupported(reason.clone()))?)
+    /// Each planned query's measurements, by query text, sorted.
+    pub fn metrics(&self) -> &[(String, QueryMetrics)] {
+        &self.metrics
     }
 
-    /// The result cache's answer to `query` at `time_ms`, if it keeps one.
-    pub fn cached(&self, query: &str, time_ms: i64) -> Option<Answer> {
+    /// Where the planned `query`'s measurements are in [`Self::metrics`].
+    pub fn metrics_index(&self, query: &str) -> Option<usize> {
+        let query = query.trim();
+        self.metrics
+            .binary_search_by(|(planned, _)| planned.as_str().cmp(query))
+            .ok()
+    }
+
+    /// Planned root `root`, if its run compiled; `PlanChanged` if it is no
+    /// root of this plan.
+    fn root(&self, root: PhysicalASAPNodeId) -> Result<PhysicalASAPNodeId, Unanswered> {
+        match self.runnable.get(&root) {
+            Some(Ok(())) => Ok(root),
+            Some(Err(reason)) => Err(Unanswered::Unsupported(reason.clone())),
+            None => Err(Unanswered::PlanChanged),
+        }
+    }
+
+    /// The result cache's answer at `time_ms` of the query planned at
+    /// `root`, if it keeps one.
+    pub fn cached(&self, root: PhysicalASAPNodeId, time_ms: i64) -> Option<Answer> {
         let cache = self.result_cache.as_ref()?;
-        cache.get(self.root(query).ok()?, time_ms)
+        cache.get(self.root(root).ok()?, time_ms)
     }
 
     /// The result cache, when it is on.
@@ -227,7 +265,7 @@ impl QueryEngine {
         }
     }
 
-    /// Answers `query` at `time_ms` from `snapshot`, and keeps the answer in the result cache when it is final: the run
+    /// Answers the query planned at `root` at `time_ms` from `snapshot`, and keeps the answer in the result cache when it is final: the run
     /// succeeded, so every view window it read was stored (a window is
     /// appended once, when the watermark closes it, and never changes),
     /// and, when the root reads raw data through a `Scan`, `time_ms` is at
@@ -236,11 +274,11 @@ impl QueryEngine {
     /// read here: callers read it first ([`Self::cached`]).
     pub fn evaluate(
         &self,
-        query: &str,
+        root: PhysicalASAPNodeId,
         time_ms: i64,
         snapshot: &Snapshot,
     ) -> Result<Answer, Unanswered> {
-        let root = self.root(query)?;
+        let root = self.root(root)?;
         let watermark_ms = snapshot.watermark_ms;
         let batches = self.output(root, time_ms, snapshot)?;
         let compiled = &self.runs[&root].compiled;
@@ -310,7 +348,7 @@ impl QueryEngine {
 #[allow(dead_code)]
 fn assert_send_sync<T: Send + Sync>() {}
 const _: fn() = || {
-    assert_send_sync::<QueryEngine>();
+    assert_send_sync::<CompiledQueries>();
     assert_send_sync::<RunStore>();
 };
 

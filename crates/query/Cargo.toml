@@ -11,8 +11,13 @@ common.workspace = true
 internal_metrics.workspace = true
 storage.workspace = true
 anyhow.workspace = true
+# `common::QueryEngine`'s async methods.
+async-trait.workspace = true
 futures = "0.3"
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+control_plane.workspace = true

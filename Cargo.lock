@@ -967,6 +967,7 @@ dependencies = [
  "asap-executor",
  "asap-planner",
  "asap_sketchlib",
+ "async-trait",
  "axum",
  "clap",
  "common",
@@ -2840,6 +2841,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "asap-executor",
+ "async-trait",
  "clap",
  "common",
  "control_plane",
@@ -2924,7 +2926,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "asap-executor",
+ "async-trait",
  "common",
+ "control_plane",
  "futures",
  "internal_metrics",
  "serde_json",
@@ -3514,6 +3518,7 @@ dependencies = [
  "asap-executor",
  "asap_sketchlib",
  "clap",
+ "common",
  "futures",
  "internal_metrics",
  "libc",
