@@ -1,6 +1,7 @@
 # Design: repository layout and engine boundaries
 
-Status: proposal, for review. Decisions are recorded at the end.
+Status: accepted; the layout below is in place. Decisions are recorded at
+the end.
 
 ## Audience and context
 
@@ -14,21 +15,22 @@ This document is for developers of the backend. It decides two things:
    (ProjectASAP/ASAPQuery#935), so that the protocol adapters ASAPQuery has
    today (Prometheus, VictoriaMetrics and OTLP ingest; Prometheus, ClickHouse
    and Elastic query endpoints and fallback clients) can move here against
-   the same traits.
+   the same types.
 
-Today the workspace has two crates:
+The starting point: before this work the workspace had two crates.
 
 | Crate | Lines | Holds |
 |---|---|---|
 | `control_plane` | about 200 | `plan_installable` on a `PlanningWorkload`, writes the plan file |
 | `data_plane` | about 17,000 | everything else: Remote Write decoding, ingest shards, push precompute, the engine around `asap-executor`, the view store (hot tier, segments, persistence, codecs), queries, result cache, raw forward, the Prometheus HTTP API, `/metrics`, the binary |
 
-Measurement code is in three places: `bench/demo` (the comparison against
-VictoriaMetrics, the live demo, Grafana monitoring), `data_plane/examples/*_bench.rs`
-(nine micro benchmarks) and `scripts/`.
+Measurement code was in three places: `bench/demo` (the comparison against
+VictoriaMetrics, the live demo, Grafana monitoring), `data_plane/examples/`
+(eight micro benchmarks and the `remote_write_load` load generator) and
+`scripts/`.
 
-One crate for the whole data plane means nothing enforces which part may use
-which. For example, the query code can reach into the store's internals. A
+One crate for the whole data plane meant nothing enforced which part may use
+which. For example, the query code could reach into the store's internals. A
 crate per part makes the dependency direction a compile-time rule, and it
 speeds up incremental builds.
 
@@ -38,17 +40,17 @@ speeds up incremental builds.
 ASAPQuery-backend/
 ├── Cargo.toml                    # workspace
 ├── crates/
-│   ├── common/                   # engine boundary types and traits (see Boundaries)
+│   ├── common/                   # boundary types and the FallbackClient trait (see Boundaries)
 │   ├── control-plane/            # workload → asap-planner → InstallablePlan
-│   ├── precompute/               # IngestEngine: ingest shards, push pipelines, asap-executor ingestion
-│   ├── storage/                  # ViewStore + RawDataStore: hot tier, segments, persistence, codecs
-│   ├── query/                    # QueryEngine: planned queries over the stores, result cache
-│   ├── internal-metrics/         # the backend's own measurements, exported on /metrics
-│   ├── data-plane/               # the binary: CLI, PlanInstaller, QueryDispatcher, HTTP routes, wiring
+│   ├── precompute/               # the ingest engine: ingest shards, push pipelines, asap-executor ingestion
+│   ├── storage/                  # view and raw-data stores: hot tier, segments, persistence, codecs
+│   ├── query/                    # the query engine: planned queries over the stores, result cache
+│   ├── internal-metrics/         # the backend's own measurements (data-plane renders /metrics)
+│   ├── data-plane/               # the binary: CLI, PlanInstaller, QueryDispatcher, HTTP routes, /metrics, wiring
 │   └── adapters/
 │       ├── ingest/               # prometheus-remote-write, victoriametrics-remote-write, otlp
 │       └── query/                # prometheus-http, clickhouse-http, elastic-http, fallback clients
-├── benchmarks/                   # the backend alone: micro (criterion) and system ingest/query
+├── benchmarks/                   # the backend alone: micro/ (benchmark binaries), scripts/ (profiling)
 ├── eval/                         # cross-system experiments for the paper
 │   ├── baselines/<system>/       # compared systems that run as their own service (compose files)
 │   ├── workloads/
@@ -62,6 +64,9 @@ ASAPQuery-backend/
 ```
 
 ### Names
+
+Folders use hyphens (`crates/control-plane`); package names use underscores
+(`control_plane`), as Rust identifiers need.
 
 - **`control-plane`, not `planner`.** Planning is ASAPPlanner's
   (`asap-planner`, a pinned git dependency). This crate only builds the
@@ -95,14 +100,14 @@ ASAPQuery-backend/
 ```text
 crate          depends on
 -------------  --------------------------------------------------
-control-plane  common, asap-planner
+control-plane  asap-planner
 adapters/*     common, nothing, or the adapter whose wire format they extend
 precompute     common, storage, internal-metrics, asap-executor
-storage        common, internal-metrics, asap-executor
+storage        internal-metrics, asap-executor, asap_sketchlib
 query          common, storage, internal-metrics, asap-executor
 common         asap-planner and asap-types (plan types; asap-planner itself builds on the executor)
 internal-metrics  nothing in this workspace (a leaf)
-data-plane     every crate above (wiring only)
+data-plane     common, precompute, storage, query, internal-metrics, every adapter (wiring only)
 ```
 
 - `common` depends on ASAPPlanner's plan types only (`InstallablePlan`,
@@ -115,13 +120,15 @@ data-plane     every crate above (wiring only)
   `otlp` depend on nothing in the workspace, and
   `victoriametrics-remote-write` only on `prometheus-remote-write`, whose
   protobuf it reads (zstd-compressed instead of snappy).
+- `control-plane` is a dev-dependency of `data-plane`, `precompute` and
+  `query` only: their tests plan workloads with it.
 - `precompute` and `query` do not depend on each other. Both depend on
-  `storage`: they read its copy-on-write snapshot and the executor's record
-  batches, which the `ViewStore` and `RawDataStore` traits cannot express
-  without copying. The traits remain the boundary for other implementations;
-  `storage` provides adapters for them.
-- Only `data-plane` knows every implementation. It builds the stores, injects
-  them into both engines, and owns `PlanInstaller` and `QueryDispatcher`.
+  `storage` directly: they read its copy-on-write snapshot and the
+  executor's record batches. There is no store trait, and no engine trait:
+  each has one implementation, and a trait is added with its second
+  implementation (decision 4).
+- Only `data-plane` knows every crate. It builds the stores, hands them to
+  both engines, and owns `PlanInstaller` and `QueryDispatcher`.
 
 ### Control plane → data plane
 
@@ -133,9 +140,9 @@ file, and the data plane installs it at startup with `--plan`. This stays:
 // crates/data-plane
 struct PlanInstaller { /* the two engines and the dispatcher */ }
 impl PlanInstaller {
-    /// Validates the plan (supported operators, sources), then installs it
-    /// into the ingest engine, the query engine and the dispatcher, all or
-    /// nothing. On failure the current plan stays.
+    /// Validates the plan, then installs it into the query engine, the
+    /// ingest engine and the dispatcher, in that order. Queries see the plan
+    /// only after every engine accepts it; on failure the current plan stays.
     fn install(&self, plan: InstallablePlan) -> Result<PlanId, InstallError>;
 }
 ```
@@ -153,55 +160,68 @@ They are not part of the data plane's interface.
 
 ### Data plane parts (`crates/common`)
 
-These are #935's interfaces, with the same names, so adapters move unchanged:
+These are #935's types, with the same names, so adapters move unchanged:
 
 ```rust
+// Plans (installer → engines)
+struct PlanId(u64);
+struct InstalledPlan { id: PlanId, plan: InstallablePlan }
+struct InstallError { message: String }
+
 // Requests and results (adapters ↔ dispatcher)
 struct QueryRequest { language: QueryLanguage, query: String, eval: QueryEval }
 enum QueryEval { Instant { time_ms: i64 }, Range { start_ms: i64, end_ms: i64, step_ms: i64 } }
-enum QueryResult { Vector(..), Matrix(..), Scalar(..), Table { columns, rows } }
+enum QueryResult { Vector(InstantVector), Matrix(RangeVector), Scalar(Sample), Table(Table) }
 type Answer = Arc<Vec<ResultSample>>;   // an instant answer as the query engine returns it natively
 struct ResultSample { labels: Arc<LabelSet>, value: f64 }   // labels shared with the stored series: no copy
 
-// Ingest (data-plane → precompute)
-enum RawDataBatch { TimeSeries { series: Vec<(LabelSet, Vec<(i64, f64)>)> } }
-trait IngestEngine {
-    fn install(&self, plan: InstalledPlan) -> Result<(), InstallError>;
-    async fn ingest(&self, batch: RawDataBatch) -> Result<(), IngestError>;  // waits under backpressure
-    fn shutdown(&self);
-}
-
-// Query (dispatcher → query)
+// Query (dispatcher → query engine)
 enum AnswerSource { Planned { plan: PlanId, root: PhysicalASAPNodeId } }
 enum EngineQueryResult { Ready { result: QueryResult }, NotReady }
-trait QueryEngine {
-    fn install(&self, plan: InstalledPlan) -> Result<(), InstallError>;
-    async fn execute_batch(&self, queries: &[(AnswerSource, QueryRequest)])
-        -> Vec<Result<EngineQueryResult, QueryEngineError>>;
-}
-
-// Stores (precompute writes, query reads)
-struct ViewId { plan: PlanId, node: PhysicalASAPNodeId }
-struct ViewInstanceKey { view: ViewId, window_ms: (i64, i64) }   // (start, end]
-trait ViewStore { put, get, instances, evict_before, timestamp_range_per_view }
-trait RawDataStore { append, read /* None if the range reaches evicted data */, evict }
+struct QueryEngineError { message: String }
 
 // Fallback (data-plane → query adapters)
 trait FallbackClient {
     async fn execute(&self, req: &QueryRequest, headers: &[(String, String)])
         -> Result<FallbackResponse, FallbackError>;   // status, content type, body: no HTTP crates
 }
+
+// Re-exported, so callers need no direct Planner dependency
+type LabelSet = BTreeMap<String, String>;
+const MAX_TIME_MS: i64;   // the largest time, either side of the epoch, the data plane takes
+use asap_planner::{InstallablePlan, PhysicalASAPNodeId};
+use asap_types::{QueryLanguage, SqlDialect};
 ```
+
+The engines are concrete types with inherent methods, called by
+`data-plane`:
+
+```rust
+// crates/precompute
+impl PrecomputeEngine { fn install(&self, plan: InstalledPlan) -> Result<(), InstallError>; }
+// crates/query
+impl ExecutorQueryEngine {
+    fn install(&self, plan: InstalledPlan) -> Result<(), InstallError>;
+    async fn execute(&self, source: &AnswerSource, request: &QueryRequest)
+        -> Result<EngineQueryResult, QueryEngineError>;
+}
+```
+
+#935 also has `IngestEngine`, `QueryEngine`, `ViewStore` and
+`RawDataStore` traits. The backend has one implementation of each, so it
+has no trait; each is added with its second implementation (decision 4).
+Ingest routes hand samples to the precompute engine directly, and the
+engines read and write `storage`'s stores directly.
 
 `QueryDispatcher` (in `data-plane`) resolves each request against the
 installed plan's query texts, runs the query engine, and falls back on
 `Unmatched`, `NotReady` or an engine error, as #935 specifies. On the hot
 path it calls the query engine's native answer type (`Answer`) instead of
-`QueryEngine::execute_batch`, so a query does not copy every series'
+`ExecutorQueryEngine::execute`, so a query does not copy every series'
 labels into a `QueryResult`.
 
-The same holds on the ingest side. An ingest adapter does not build a
-`RawDataBatch`: its decoder takes the caller's series and sample types
+The same holds on the ingest side. An ingest adapter builds no boundary
+batch type: its decoder takes the caller's series and sample types
 (the Remote Write decoder's `SampleBuilder`, which
 `victoriametrics-remote-write` reuses), so `data-plane` interns each new series into the store's series
 table and a Remote Write request decodes straight into the ingest engine's
@@ -216,7 +236,8 @@ server's. `PrometheusHttpFallback` also implements `FallbackClient`.
 
 The ClickHouse and Elasticsearch routes have no request to forward verbatim,
 so they use the seam: each parses its request into a `QueryRequest`, calls
-`QueryDispatcher::dispatch` (through `QueryEngine`, with `QueryResult`), and
+`QueryDispatcher::dispatch` (through `ExecutorQueryEngine::execute`, with
+`QueryResult`), and
 sends what the plan does not answer to its protocol's `FallbackClient`
 (`ClickHouseHttpFallback`, `ElasticHttpFallback`). Only a PromQL request can
 be the plan's: the control plane plans PromQL workloads, and `storage` holds
@@ -224,21 +245,39 @@ time series, while ASAPPlanner lowers SQL to `Table` scans and has no
 Elasticsearch frontend. So today every ClickHouse and Elasticsearch query is
 forwarded, even one whose text equals a planned PromQL query.
 
-`PlanInstaller` installs once, as #935's I14 does; a retryable install
-comes with tracker-delivered plans.
+`PlanInstaller` installs once, as #935's I14 does: the engines refuse a
+second plan. A retryable install comes with tracker-delivered plans.
+
+### Routes
+
+`data-plane` serves:
+
+- always: `POST /api/v1/write` (Remote Write), `/api/v1/query` and
+  `/api/v1/query_range`, `/api/v1/status/asap` (the installed plan and
+  ingestion counters), `/metrics`, `POST /api/v1/precompute/watermark` (an
+  event-time barrier) and `/-/ready`;
+- with forward mode off: `POST /api/v1/import` (VictoriaMetrics Remote
+  Write) and `POST /v1/metrics` (OTLP over HTTP). Forward mode delivers
+  only Remote Write bodies to the raw store, which would miss their samples;
+- with forward mode on: every other path, proxied to the raw store;
+- with `--clickhouse-url`: `/clickhouse/query`; with `--elastic-url`:
+  `POST /_sql` and `/_search`.
+
+`/metrics` is rendered in `data-plane` (`metrics_endpoint.rs`) from the
+measurements `internal-metrics` keeps, so `internal-metrics` stays a leaf.
 
 ### Where the backend differs from #935
 
 | Topic | #935 (ASAPQuery) | Backend | Proposal |
 |---|---|---|---|
-| Query engine | ASAPPlanner's DataFusion query-time engine (ProjectASAP/ASAPPlanner#1468, a merged proposal, not yet code) | `asap-executor` | Keep `asap-executor` behind `QueryEngine`. Switching later changes only `crates/query` |
-| Ingest engine | a new push engine modeled on ASAPQuery's precompute engine | ingest shards + push precompute + the executor's ingestion (docs/design/parallel-precompute.md) | Keep ours behind `IngestEngine` |
-| View state | opaque `Arc<dyn Any>`, in memory only, durability deferred | hot tier of decoded windows plus compact on-disk segments | `storage` keeps its own state codecs; an encode/decode hook joins `ViewStore` only when a second implementer needs it |
-| View id | `(PlanId, PhysicalASAPNodeId)` | directories per refresh group and retention | Key the store by `ViewId`. On-disk recovery across plans needs ProjectASAP/ASAPPlanner#1429, as in #935 |
-| Raw data | `RawDataStore` in memory | raw samples in `store.rs`, plus optional forward to a raw store | `RawDataStore` trait over both; the forward becomes a `FallbackClient` plus an ingest tee in `data-plane` |
+| Query engine | ASAPPlanner's DataFusion query-time engine (ProjectASAP/ASAPPlanner#1468, a merged proposal, not yet code) | `asap-executor` | Keep `asap-executor` inside `crates/query`'s `ExecutorQueryEngine`. Switching later changes only `crates/query`; a `QueryEngine` trait comes if both engines are kept |
+| Ingest engine | a new push engine modeled on ASAPQuery's precompute engine | ingest shards + push precompute + the executor's ingestion (docs/design/parallel-precompute.md) | Keep ours, `crates/precompute`'s `PrecomputeEngine` |
+| View state | opaque `Arc<dyn Any>` behind a `ViewStore` trait, in memory only, durability deferred | hot tier of decoded windows plus compact on-disk segments | `storage` keeps its own state codecs; no `ViewStore` trait until a second store exists |
+| View id | `(PlanId, PhysicalASAPNodeId)` | the plan file's hash, the refresh group and the node id | Keep it; a `PlanId` in the key comes with a second installed plan. On-disk recovery across plans needs ProjectASAP/ASAPPlanner#1429, as in #935 |
+| Raw data | `RawDataStore` in memory | raw samples in `storage`'s store, plus optional forward to a raw store | No `RawDataStore` trait; the forward is `PrometheusHttpFallback::forward` plus an ingest tee in `data-plane` |
 | Sketch kernels | move out of `asap-executor` into a shared ASAPPlanner crate (#935's decision 48) | through `asap-executor` and `asap_sketchlib` | No change until that crate exists |
 | Adapters' dependency | the whole engine crate | `common` only | as in the dependency graph above |
-| SQL and Query DSL queries | planned and answered from views | the control plane plans PromQL only; `storage` holds no tables | The ClickHouse and Elasticsearch routes forward every query; planned answers need table sources (ingest, `RawDataStore`, a SQL catalog for the control plane) |
+| SQL and Query DSL queries | planned and answered from views | the control plane plans PromQL only; `storage` holds no tables | The ClickHouse and Elasticsearch routes forward every query; planned answers need table sources (ingest, a raw table store, a SQL catalog for the control plane) |
 
 ## Where the current files go
 
@@ -252,13 +291,13 @@ comes with tracker-delivered plans.
 | `data_plane/src/{query,result_cache}.rs` | `crates/query/` |
 | `data_plane/src/raw_forward.rs` | split: the tee into `crates/data-plane/`, the proxy into `crates/adapters/query/` |
 | `data_plane/src/remote_write.rs` | `crates/adapters/ingest/prometheus-remote-write/` (the series interning stays in `crates/data-plane/`) |
-| ASAPQuery's VictoriaMetrics Remote Write and OTLP decoders | `crates/adapters/ingest/{victoriametrics-remote-write,otlp}/`, served on ASAPQuery's routes (`/api/v1/import`, `/v1/metrics`) |
+| ASAPQuery's VictoriaMetrics Remote Write and OTLP decoders | `crates/adapters/ingest/{victoriametrics-remote-write,otlp}/`, served on ASAPQuery's routes (`/api/v1/import`, `/v1/metrics`) when forward mode is off |
 | `data_plane/src/prometheus.rs` | `crates/adapters/query/prometheus-http/` |
 | ASAPQuery's ClickHouse and Elastic query adapters and fallback clients | `crates/adapters/query/{clickhouse-http,elastic-http}/`, served on ASAPQuery's routes (`/clickhouse/query`, `/_sql`, `/_search`) when their server is given |
-| `data_plane/src/metrics.rs` | `crates/internal-metrics/` |
+| `data_plane/src/metrics.rs` | `crates/internal-metrics/` (the `/metrics` renderer, `metrics_endpoint.rs`, stays in `crates/data-plane/`) |
 | `data_plane/src/{lib,main}.rs` | `crates/data-plane/` |
-| `data_plane/tests/` | the crate whose behavior each test checks; end-to-end tests in `crates/data-plane/tests/` |
-| `data_plane/examples/*_bench.rs` | `benchmarks/micro/` |
+| `data_plane/tests/` | `crates/data-plane/tests/`: each starts the engine or the HTTP routes. Unit tests move with their code, and tests of one crate alone go to that crate's `tests/` (`crates/storage/tests/`) |
+| `data_plane/examples/*_bench.rs` | `benchmarks/micro/`; the load generator `remote_write_load.rs` stays in `crates/data-plane/examples/` |
 | `bench/demo/{campaign,harness,workloads}` | `eval/` |
 | `bench/demo/{live,run_live_demo.sh}` | `eval/demo/` |
 | `bench/demo/monitoring/` | `deployment/monitoring/` |
@@ -276,14 +315,15 @@ executes it:
 | Part of `engine.rs` | New home |
 |---|---|
 | ingest shards, the `ingest` coordinator, the precompute pool and committer | `crates/precompute/` |
-| `persist-N` threads and the view-cache monitor | `crates/storage/` |
+| `persist-N` threads and the view-cache monitor | `crates/storage/` (the code; the precompute engine's install starts them) |
 | `query-N` workers | `crates/query/` |
 | `EngineHandle`, `EngineOptions`, install | `crates/data-plane/` |
 
 ## Migration order
 
-Every step keeps behavior and all tests passing. The steps are separate PRs,
-each reviewed on its own:
+Steps 2–6 keep behavior and all tests passing; steps 7–9 only add (routes,
+flags, an image) and keep every existing behavior. The steps are separate
+PRs, each reviewed on its own:
 
 1. This document.
 2. Folder moves only: `control_plane` → `crates/control-plane`, `data_plane` →
@@ -291,11 +331,11 @@ each reviewed on its own:
    `deployment/monitoring`, micro benchmarks → `benchmarks/micro`. Paths in
    scripts, CI and docs are updated.
 3. Split leaf crates out of `data-plane`: `internal-metrics`, then `storage`.
-4. `common` with the boundary types and traits, no implementations.
-5. Split `precompute` and `query` out of `data-plane`. `storage` implements
-   `ViewStore` and `RawDataStore`, `precompute` implements `IngestEngine`,
-   and `query` implements `QueryEngine`. `PlanInstaller` and `QueryDispatcher`
-   are added in `data-plane`.
+4. `common` with the boundary types and the `FallbackClient` trait, no
+   implementations.
+5. Split `precompute` and `query` out of `data-plane`, with
+   `PrecomputeEngine` and `ExecutorQueryEngine` taking `InstalledPlan`.
+   `PlanInstaller` and `QueryDispatcher` are added in `data-plane`.
 6. Move the existing Remote Write decoder and Prometheus HTTP API into
    `crates/adapters/`.
 7. Bring over ASAPQuery's ingest adapters (VictoriaMetrics Remote Write,
@@ -323,9 +363,14 @@ each reviewed on its own:
 ## Decisions
 
 1. **`common` lives in this repository**, in `crates/common`. This work
-   changes neither ASAPPlanner nor ASAPQuery. The traits keep #935's names and
+   changes neither ASAPPlanner nor ASAPQuery. The types keep #935's names and
    shapes, so ASAPQuery's adapters can move here without changes.
 2. **The workload tracker lives in `control-plane`.** It produces a planning
    input. The query adapters only report each query they receive to it.
 3. **No rename for now.** The binary keeps the `data-plane` name; a product
    name can be set later with `[[bin]] name`.
+4. **A trait is added with its second implementation.** `FallbackClient` has
+   three (Prometheus, ClickHouse, Elasticsearch), called through `dyn` per
+   forwarded request. The engines and stores have one each, so they are
+   concrete types; #935's `IngestEngine`, `QueryEngine`, `ViewStore` and
+   `RawDataStore` come back when a second engine or store does.
