@@ -246,7 +246,7 @@ impl EngineHandle {
     }
 
     /// What the HTTP routes run queries through.
-    pub fn dispatcher(&self) -> &QueryDispatcher {
+    pub(crate) fn dispatcher(&self) -> &QueryDispatcher {
         &self.dispatcher
     }
 
@@ -341,7 +341,7 @@ impl EngineHandle {
 
 impl EngineOptions {
     /// The options of the precompute engine.
-    fn precompute(&self) -> PrecomputeOptions {
+    pub(crate) fn precompute(&self) -> PrecomputeOptions {
         PrecomputeOptions {
             ingestion: self.ingestion,
             run_memory_limit_bytes: self.run_memory_limit_bytes,
@@ -360,7 +360,7 @@ impl EngineOptions {
     }
 
     /// The options of the query engine.
-    fn query(&self) -> QueryOptions {
+    pub(crate) fn query(&self) -> QueryOptions {
         QueryOptions {
             run_memory_limit_bytes: self.run_memory_limit_bytes,
             threads: self.query_threads,

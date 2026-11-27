@@ -19,8 +19,7 @@
 //! forwards it to Prometheus (or refuses it).
 //!
 //! [`ExecutorQueryEngine`] runs the compiled queries ([`CompiledQueries`])
-//! on the `query-N` workers ([`workers`]) and implements
-//! [`common::QueryEngine`].
+//! on the `query-N` workers ([`workers`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -203,7 +202,7 @@ impl CompiledQueries {
     }
 
     /// The planned queries the engine cannot run, with why.
-    pub fn unexecutable(&self) -> &[(String, String)] {
+    pub(crate) fn unexecutable(&self) -> &[(String, String)] {
         &self.unexecutable
     }
 

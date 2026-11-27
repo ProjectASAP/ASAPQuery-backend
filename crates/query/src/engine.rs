@@ -1,12 +1,11 @@
-//! [`ExecutorQueryEngine`]: the query engine over the Planner's executor,
-//! behind [`common::QueryEngine`]. It is created before any plan; its
-//! install compiles the plan's queries and starts the query workers.
+//! [`ExecutorQueryEngine`]: the query engine over the Planner's executor.
+//! It is created before any plan; its install compiles the plan's queries
+//! and starts the query workers.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use asap_executor::runtime::Limits;
-use async_trait::async_trait;
 use common::{
     AnswerSource, EngineQueryResult, InstallError, InstalledPlan, InstantVector,
     InstantVectorElement, LabelSet, QueryEngineError, QueryEval, QueryRequest, QueryResult,
@@ -117,8 +116,10 @@ impl ExecutorQueryEngine {
         )?)
     }
 
-    /// One request's answer, as the boundary reports it.
-    async fn execute_one(
+    /// One query's answer, resolved by the dispatcher to `source`: not
+    /// ready before the install, for another plan, or while its data is
+    /// not stored yet.
+    pub async fn execute(
         &self,
         source: &AnswerSource,
         request: &QueryRequest,
@@ -156,11 +157,10 @@ impl ExecutorQueryEngine {
             Err(error) => Err(QueryEngineError::new(error.to_string())),
         }
     }
-}
 
-#[async_trait]
-impl common::QueryEngine for ExecutorQueryEngine {
-    fn install(&self, plan: InstalledPlan) -> Result<(), InstallError> {
+    /// Compiles `plan`'s queries and starts the workers. v1 installs one
+    /// plan: a second is refused and the first stays.
+    pub fn install(&self, plan: InstalledPlan) -> Result<(), InstallError> {
         let _installing = self.installing.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(installed) = self.installed() {
             return Err(InstallError::new(format!(
@@ -173,17 +173,6 @@ impl common::QueryEngine for ExecutorQueryEngine {
             .map_err(|error| InstallError::new(format!("{error:#}")))?;
         let _ = self.installed.set(workers);
         Ok(())
-    }
-
-    async fn execute_batch(
-        &self,
-        queries: &[(AnswerSource, QueryRequest)],
-    ) -> Vec<Result<EngineQueryResult, QueryEngineError>> {
-        let mut results = Vec::with_capacity(queries.len());
-        for (source, request) in queries {
-            results.push(self.execute_one(source, request).await);
-        }
-        results
     }
 }
 
@@ -225,7 +214,7 @@ fn range_vector(steps: &[(i64, Answer)]) -> RangeVector {
 
 #[cfg(test)]
 mod tests {
-    use common::{PlanId, QueryEngine as _, QueryLanguage};
+    use common::{PlanId, QueryLanguage};
 
     use super::*;
 
@@ -249,7 +238,7 @@ mod tests {
 
     const QUERY: &str = "sum_over_time(data[10s])";
 
-    /// Through `QueryEngine`: nothing is ready before the install, the plan
+    /// Nothing is ready before the install, the plan
     /// installs once, a query resolved against another plan is not ready,
     /// and neither is one whose views are not stored yet. Its measurements
     /// are found by its trimmed text.
@@ -299,14 +288,12 @@ mod tests {
             end_ms: 30_000,
             step_ms: 10_000,
         });
-        let results = engine
-            .execute_batch(&[
-                (source(2), instant.clone()),
-                (source(1), instant),
-                (source(1), range),
-            ])
-            .await;
-        assert_eq!(results, vec![Ok(EngineQueryResult::NotReady); 3]);
+        for (plan, request) in [(2, &instant), (1, &instant), (1, &range)] {
+            assert_eq!(
+                engine.execute(&source(plan), request).await,
+                Ok(EngineQueryResult::NotReady)
+            );
+        }
     }
 
     /// Answers become an instant vector, and steps a matrix of each

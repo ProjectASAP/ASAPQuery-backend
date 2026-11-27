@@ -16,7 +16,7 @@
 //! then answers every query the plan does not and every other API path
 //! (labels, series, metadata), proxied with `x-asap-execution: forwarded`.
 
-pub mod dispatcher;
+mod dispatcher;
 pub mod engine;
 mod installer;
 mod metrics_endpoint;

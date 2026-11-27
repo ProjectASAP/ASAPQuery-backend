@@ -32,8 +32,7 @@ use std::time::Instant;
 use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
 use asap_executor::runtime::Limits;
 use asap_executor::values::Batch;
-use async_trait::async_trait;
-use common::{InstallError, InstallablePlan, InstalledPlan, RawDataBatch};
+use common::{InstallError, InstallablePlan, InstalledPlan};
 use internal_metrics::{Metrics, PushMetrics, Timer};
 use storage::memory_budget::serve_view_cache;
 use storage::persist::ViewFiles;
@@ -315,11 +314,10 @@ impl PrecomputeEngine {
             self.published.clone(),
         )
     }
-}
 
-#[async_trait]
-impl common::IngestEngine for PrecomputeEngine {
-    fn install(&self, plan: InstalledPlan) -> Result<(), InstallError> {
+    /// Compiles `plan`'s ingestion and starts its threads. v1 installs one
+    /// plan: a second is refused and the first keeps running.
+    pub fn install(&self, plan: InstalledPlan) -> Result<(), InstallError> {
         let _installing = self.installing.lock().unwrap_or_else(|e| e.into_inner());
         if self.installed().is_some() {
             return Err(InstallError::new(
@@ -332,38 +330,7 @@ impl common::IngestEngine for PrecomputeEngine {
         let _ = self.installed.set(installed);
         Ok(())
     }
-
-    /// Interns each series and queues its samples, waiting while the queues
-    /// are full; discards the batch before the install.
-    async fn ingest(&self, batch: RawDataBatch) -> Result<(), common::IngestError> {
-        let Some(installed) = self.installed() else {
-            return Ok(());
-        };
-        let samples = RawSample::from_batch(&batch);
-        // `try_ingest` takes the samples, so each attempt gets a copy: this
-        // path is for adapters (no HTTP route calls it); Remote Write calls
-        // `try_ingest` directly and answers 503 instead of waiting.
-        loop {
-            match installed.try_ingest(samples.clone()) {
-                Ok(()) => return Ok(()),
-                Err(IngestError::Busy) => tokio::time::sleep(BUSY_RETRY).await,
-                Err(error @ IngestError::Stopped) => {
-                    return Err(common::IngestError::new(error.to_string()))
-                }
-            }
-        }
-    }
-
-    fn shutdown(&self) {
-        if let Some(installed) = self.installed() {
-            installed.stop();
-        }
-    }
 }
-
-/// How long [`common::IngestEngine::ingest`] waits before offering a batch
-/// the queues refused again.
-const BUSY_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// The threads running the installed plan: the `ingest-N` shards, the
 /// `ingest` coordinator, the precompute pool and committer, and (with
@@ -2222,36 +2189,36 @@ mod tests {
         PrecomputeEngine::new(options, None, Arc::new(PublishedStore::new(Arc::default())))
     }
 
-    fn batch(seconds: i64) -> RawDataBatch {
-        let labels = [("__name__", "data"), ("job", "a")]
-            .map(|(name, value)| (name.to_string(), value.to_string()))
-            .into();
-        let points = (1..=seconds).map(|s| (s * 1000, 1.0)).collect();
-        RawDataBatch::TimeSeries {
-            series: vec![(labels, points)],
-        }
+    fn samples(seconds: i64) -> Vec<RawSample> {
+        let series = storage::series_ids::intern_pairs(&[("__name__", "data"), ("job", "a")]);
+        (1..=seconds)
+            .map(|s| RawSample {
+                labels: series,
+                timestamp_ms: s * 1000,
+                value: 1.0,
+            })
+            .collect()
     }
 
-    /// Through `IngestEngine`: a batch before the install is discarded; the
-    /// plan installs once; batches after it are ingested; `shutdown` stops
+    /// The plan installs once; samples after it are ingested; `stop` stops
     /// the engine.
     #[tokio::test]
     async fn the_ingest_engine_installs_once_and_ingests_after_it() {
-        use common::{IngestEngine as _, PlanId};
+        use common::PlanId;
         let engine = engine();
-        assert_eq!(engine.ingest(batch(5)).await, Ok(()));
+        assert!(engine.installed().is_none());
         let installed = |id| InstalledPlan {
             id: PlanId(id),
             plan: plan("sum_over_time(data[10s])"),
         };
         assert_eq!(engine.install(installed(1)), Ok(()));
         assert!(engine.install(installed(2)).is_err());
-        assert_eq!(engine.ingest(batch(20)).await, Ok(()));
         let running = engine.installed().unwrap();
+        assert_eq!(running.try_ingest(samples(20)), Ok(()));
         running.advance_watermark(20_000).await.unwrap();
         assert_eq!(running.stats().samples_accepted, 20);
         assert!(running.stats().windows_refreshed > 0);
-        engine.shutdown();
+        running.stop();
         let stopped = Instant::now();
         while running.is_running() {
             assert!(stopped.elapsed() < std::time::Duration::from_secs(10));

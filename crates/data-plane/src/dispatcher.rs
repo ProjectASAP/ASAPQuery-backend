@@ -5,8 +5,8 @@
 //! The Prometheus routes run queries through the query engine's own
 //! answers ([`query::result_cache::Answer`]: labels shared with the
 //! interned series and the result cache), not through
-//! [`common::QueryEngine`]'s [`common::QueryResult`], which would copy
-//! every series' labels per query.
+//! [`ExecutorQueryEngine::execute`]'s [`common::QueryResult`], which would
+//! copy every series' labels per query.
 
 use std::sync::{Arc, OnceLock};
 
@@ -16,7 +16,7 @@ use query::{ExecutorQueryEngine, Unanswered};
 
 /// The dispatcher's verdict on one query.
 #[derive(Debug, Clone, PartialEq)]
-pub enum QueryOutcome<T> {
+pub(crate) enum QueryOutcome<T> {
     /// The plan answered.
     Ready(T),
     NotAnswerable(NotAnswerableReason),
@@ -24,7 +24,7 @@ pub enum QueryOutcome<T> {
 
 /// Why the plan did not answer a query; the query falls back.
 #[derive(Debug, Clone, PartialEq)]
-pub enum NotAnswerableReason {
+pub(crate) enum NotAnswerableReason {
     /// No plan is installed, or its query texts hold no such query.
     Unmatched,
     /// The stored data does not cover the query, or the plan changed since
@@ -45,7 +45,7 @@ impl NotAnswerableReason {
     }
 
     /// What a client is told: `query` was not answered because of this.
-    pub fn into_message(self, query: &str) -> String {
+    pub(crate) fn into_message(self, query: &str) -> String {
         match self {
             Self::Unmatched => format!("the installed plan has no query {:?}", query.trim()),
             Self::NotReady(reason) => reason,
@@ -90,13 +90,13 @@ struct Planned {
 }
 
 /// Resolves and runs queries; set up by the plan installer.
-pub struct QueryDispatcher {
+pub(crate) struct QueryDispatcher {
     engine: Arc<ExecutorQueryEngine>,
     plan: OnceLock<Planned>,
 }
 
 impl QueryDispatcher {
-    pub fn new(engine: Arc<ExecutorQueryEngine>) -> Self {
+    pub(crate) fn new(engine: Arc<ExecutorQueryEngine>) -> Self {
         Self {
             engine,
             plan: OnceLock::new(),
@@ -131,7 +131,7 @@ impl QueryDispatcher {
     }
 
     /// `query` at `time_ms`.
-    pub async fn instant(&self, query: &str, time_ms: i64) -> QueryOutcome<Answer> {
+    pub(crate) async fn instant(&self, query: &str, time_ms: i64) -> QueryOutcome<Answer> {
         let (Some(source), Some(engine)) = (self.resolve(query), self.engine.installed()) else {
             return QueryOutcome::NotAnswerable(NotAnswerableReason::Unmatched);
         };
@@ -143,7 +143,7 @@ impl QueryDispatcher {
 
     /// `query` at each of `times_ms`: every step's answer, or why some step
     /// has none.
-    pub async fn range(
+    pub(crate) async fn range(
         &self,
         query: &str,
         times_ms: impl Iterator<Item = i64>,

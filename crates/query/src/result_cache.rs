@@ -79,7 +79,7 @@ impl ResultCache {
     /// longest retention (every view and raw-data `Scan` keeps its rows
     /// that far back from the newest evaluation time) plus `margin_ms`;
     /// `None` when a `Scan` reads its rows unbounded.
-    pub fn horizon_ms(dag: &PhysicalASAPDAG, margin_ms: u64) -> Option<i64> {
+    pub(crate) fn horizon_ms(dag: &PhysicalASAPDAG, margin_ms: u64) -> Option<i64> {
         let unbounded_scan = dag.nodes.iter().any(|node| {
             node.retention_ms.is_none()
                 && matches!(node.payload, Operator::NonASAP(NonASAPOp::Scan { .. }))

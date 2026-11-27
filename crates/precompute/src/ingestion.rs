@@ -112,7 +112,7 @@ pub struct IngestionStats {
 
 /// Why a plan cannot be ingested.
 #[derive(Debug, thiserror::Error)]
-pub enum IngestionError {
+pub(crate) enum IngestionError {
     #[error("{0}")]
     Unsupported(String),
     #[error("refresh group of views {views:?}: {error}")]
@@ -129,7 +129,7 @@ const MAX_PANE_WIDTH_MS: i64 = 60_000;
 /// A refresh group's window `(end_ms - W, end_ms]` that the watermark has
 /// passed, to refresh; `group` indexes the plan's ingestion refresh groups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClosedWindow {
+pub(crate) struct ClosedWindow {
     pub group: usize,
     pub end_ms: i64,
 }
@@ -174,7 +174,7 @@ impl RefreshGroup {
     }
 }
 
-pub struct Ingestion {
+pub(crate) struct Ingestion {
     groups: Vec<RefreshGroup>,
     /// Every metric a `Scan` reads; samples of others are not stored.
     scanned_metrics: Arc<BTreeSet<String>>,
@@ -702,7 +702,7 @@ impl Ingestion {
 /// What an ingest shard routes samples by: a snapshot of the ingestion's
 /// state, published after every change.
 #[derive(Debug, Clone, Default)]
-pub struct Routing {
+pub(crate) struct Routing {
     scanned_metrics: Arc<BTreeSet<String>>,
     max_future_ms: i64,
     /// Each scanned metric's eviction cutoff (`None`: all are kept).
@@ -828,7 +828,7 @@ pub enum Refreshed {
 
 /// A window's ingestion run, computed and not yet stored.
 #[derive(Debug)]
-pub enum Computed {
+pub(crate) enum Computed {
     /// The rows of each view of the group that did not store the window
     /// yet, by its index in the group.
     Ran(Vec<(usize, Vec<Batch>)>),
@@ -919,7 +919,7 @@ fn carries_state_across_windows<C>(operator: &Operator<C>) -> bool {
 }
 
 /// The ingestion runs of the plan's refresh groups.
-pub struct Precompute {
+pub(crate) struct Precompute {
     runs: Vec<RefreshGroupRun>,
     tasks: RefreshTaskGraph,
     limits: Limits,
