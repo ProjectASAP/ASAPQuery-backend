@@ -230,7 +230,7 @@ not stored) with a Prometheus `execution` error (422,
 | Path | Holds |
 |---|---|
 | `crates/control-plane/` | package `control_plane`: workload → `asap-planner` → plan file |
-| `crates/common/` | package `common`: the engine boundary's types and traits |
+| `crates/common/` | package `common`: the engine boundary's types and the `FallbackClient` trait |
 | `crates/data-plane/` | package `data_plane`: the binary, its CLI and HTTP routes, and the engine that wires the crates below |
 | `crates/precompute/` | package `precompute`: ingest shards, the ingest coordinator, push pipelines and the precompute pool |
 | `crates/query/` | package `query`: planned queries on the query workers, and the result cache |
