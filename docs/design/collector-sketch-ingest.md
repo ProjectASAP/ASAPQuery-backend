@@ -124,7 +124,7 @@ Decoding is not an identity check: θ is already in the key.
 
 `asap-types` brings `serde`, `serde_json`, `thiserror` 2 and
 `asap_sketchlib` into the collector build; no executor, frontend or solver
-(open question 4).
+(open question 2).
 
 ## Algorithm
 
@@ -184,7 +184,7 @@ decision 6):
 **Known limitation: sparse series.** The rule ignores size. A series with
 few samples per window can produce a state larger than its raw samples (a
 DDSketch with one sample still carries its header, mapping and bins,
-against about 16 bytes for the raw sample). Step 4 of the plan measures
+against about 16 bytes for the raw sample). Step 5 of the plan measures
 where this happens. Cost-based choice of collector views is future work; it needs a general
 planner capability (costing where a view is built).
 
@@ -207,7 +207,7 @@ one edge between them, and sets `roots = [view node]`, `scalar_roots =
 - `commit_grace_ms` is computed as in §6.
 
 The collector loads the file once at start (a plan change is a collector
-restart, open question 3). The data plane takes the same file with
+restart, open question 1). The data plane takes the same file with
 `--collector-views` and refuses it, at start and on each install, when its
 `plan_id` differs from the installed plan's. The precompute engine then
 compiles each refresh group without the collector views (and without a `Scan`
@@ -304,7 +304,7 @@ accepts OTLP HTTP (every collector deployment exports with
 `urn:otel:exporter:otlp_http` today, and the backend already serves
 `/v1/metrics`); the OTLP adapter builds the nesting above, and the series
 cache still interns each series once per stream. A later OTAP Arrow
-adapter fills the same `ViewStateBatch` (open question 5).
+adapter fills the same `ViewStateBatch` (open question 3).
 
 **Collector restart.** A restart starts a new stream: new `stream_id`, and
 `series_id` starts again at 1. The backend never reuses a translation
@@ -418,7 +418,7 @@ committer, the same path that commits a window it built (readers,
   each collector view's retention must exceed it.
 - **No states.** A window with no staged state at commit time is not
   stored; a query that reads it gets `NotReady` and is forwarded to the
-  fallback (open question 9).
+  fallback (open question 7).
 - **Late states.** A state that arrives after its window committed is
   dropped and counted (`late_dropped`), whatever its reason: an export
   slower than the grace, or a collector clock behind the backend's by more
@@ -706,13 +706,18 @@ reach the backend: 50 samples per series per window become one state.
 ## Plan
 
 Separate PRs, each reviewed on its own. Backend implementation starts after
-the planner's view state key and plan id merge; the backend and collector
-then bump their planner pin to that revision.
+the planner's view state key and plan id merge and step 1 has bumped the
+pins to a planner revision that has them.
+
+Pins (all three repositories):
+
+1. Bump the ASAPPlanner and `asap_sketchlib` pins to the latest main
+   (Decision 13), in the planner, then the backend, then the collector.
 
 Backend:
 
-1. This document.
-2. `ViewStateBatch` and `ViewStateIngest` in `common`; the
+2. This document.
+3. `ViewStateBatch` and `ViewStateIngest` in `common`; the
    `asap-sketch-otlp` adapter; the `/v1/metrics` split; lookup by key and
    selection, the series cache, staging, the hash set, merge before commit,
    commit at grace, late drop. Test data: real ASAPv1 records the collector
@@ -720,7 +725,7 @@ Backend:
    wrote them), for each of the six sketch types, including one unknown key
    (other θ), one duplicate after a merge, one late state and one restart
    (new `stream_id`, reused `series_id`).
-3. The control plane's rule with `--collector-capabilities`,
+4. The control plane's rule with `--collector-capabilities`,
    `--emit-collector-views` (sub-DAGs, `plan_id`, `backend_reads_raw`,
    `commit_grace_ms`); the data plane's `--collector-views` with the plan-id
    check; precompute skips collector views. Tests: the benchmark plan
@@ -729,7 +734,7 @@ Backend:
    leaf gives no collector view; a file of another plan id is refused; the written
    file deserializes and `materialized_views()` on each sub-DAG gives the
    installed view's key.
-4. End-to-end comparison, collector + backend against backend only, on the
+5. End-to-end comparison, collector + backend against backend only, on the
    same feed, for two workloads: the five-query benchmark set (expected
    benefit about zero, above) and q01 alone (the metric has only collector-view
    readers, so its raw samples stay at the collector). Answers equal
@@ -739,20 +744,20 @@ Backend:
 
 Collector (ASAPCollector-public):
 
-5. `--print-capabilities`, printed from the config validation code.
-6. `asap-types` as a pinned git dependency (the backend's planner pin); the
+6. `--print-capabilities`, printed from the config validation code.
+7. `asap-types` as a pinned git dependency (the backend's planner pin); the
    `planner_views` loader with the executability check; key and selection
    stamping (`sketch.view_state_key`, `sketch.selection`, `sketch.stream_id`
    on the Resource, replacing `sketch.agg_id`); `series_id` per (view,
    series); config errors for the per-sketch fields when it is set.
-7. The window boundary `(e − w, e]` in `SketchEnvelope` and the point
+8. The window boundary `(e − w, e]` in `SketchEnvelope` and the point
    times (window attributes removed), placement by sample timestamp with
-   drop-and-count after close, and matchers (§5). It lands before step 4,
+   drop-and-count after close, and matchers (§5). It lands before step 5,
    which needs equal windows.
-8. The raw-forward filter by `backend_reads_raw`.
+9. The raw-forward filter by `backend_reads_raw`.
 
 **Future work.** Late merge into a committed window (a store `replace`, a
-view-file rewrite and result-cache invalidation), only if step 4 or
+view-file rewrite and result-cache invalidation), only if step 5 or
 production shows a late rate worth it, measured by `late_dropped` and the
 arrival-delay histogram. Cost-based choice of collector views. The OTAP Arrow adapter.
 
@@ -799,55 +804,52 @@ arrival-delay histogram. Cost-based choice of collector views. The OTAP Arrow ad
 12. **`ViewStateBatch` is nested by OTAP tier** (stream → view → series →
     records); the OTLP adapter builds the nesting, an OTAP adapter fills the
     same type.
+13. **One planner and one sketchlib, the latest.** The backend and the
+    collector pin the same ASAPPlanner revision, the latest main; the
+    planner, the backend and the collector pin the same `asap_sketchlib`
+    revision, the latest main. All three are bumped together. Both sides
+    read the same JSON with `deny_unknown_fields`, versioned by
+    `INSTALLABLE_PLAN_WIRE_VERSION`, and the collector refuses a
+    collector-views file with another `planner_wire_version`. PR 3's
+    captured records stay the compatibility test, one per sketch type, and
+    PR 4 checks in the benchmark's `collector-views.json` and tests that it
+    deserializes, so a format change fails a test. No sketch type, HLL
+    included, is left out on version grounds.
 
 ## Open questions
 
 Each with a recommendation.
 
-1. **sketchlib versions differ.** The collector pins `asap_sketchlib`
-   `60101c6`, the backend `355093f`, and the planner `389530c`; the
-   collector's HLL is an Ertl HLL, the backend's kernel Classic.
-   *Recommend:* PR 2's captured records are the compatibility test, one per
-   sketch type. Until the pins agree, leave HLL out of the collector's
-   printed capabilities if its envelope does not decode into the backend
-   kernel.
-2. **Planner pin and file format.** Both sides read the same JSON with
-   `deny_unknown_fields`, versioned by `INSTALLABLE_PLAN_WIRE_VERSION`
-   (15 today), with no promise across versions. *Recommend:* the collector
-   pins the backend's planner rev and is bumped in the same change; the
-   loader refuses another `planner_wire_version`; PR 3 checks in the
-   benchmark's `collector-views.json` and tests that it deserializes, so a
-   format change fails a test.
-3. **Plan reinstall.** A view whose definition, θ and width did not change
+1. **Plan reinstall.** A view whose definition, θ and width did not change
    keeps its key across plans. *Recommend:* the control plane rewrites the
    file and the collector restarts on every reinstall. Until then, states
    of unchanged views keep matching, states of removed views are
    `unknown_view`, and new views are `NotReady` (forwarded). A live reload
    is later work.
-4. **Dependency weight on the collector build.** `asap-types` adds
-   `serde_json`, `thiserror` 2 and a second `asap_sketchlib` rev.
-   *Recommend:* accept it; it shrinks with question 1's single pin. Measure
-   the collector's clean build time before and after in PR 6.
-5. **Transport: OTLP HTTP or OTAP Arrow.** *Recommend:* v1 accepts OTLP
+2. **Dependency weight on the collector build.** `asap-types` adds
+   `serde_json` and `thiserror` 2; with one `asap_sketchlib` pin
+   (Decision 13) it adds no second sketchlib. *Recommend:* accept it.
+   Measure the collector's clean build time before and after in PR 7.
+3. **Transport: OTLP HTTP or OTAP Arrow.** *Recommend:* v1 accepts OTLP
    HTTP. Next, an OTAP Arrow adapter fed by `urn:otel:exporter:otap`,
    decoding with the `arrow-ipc` and `tonic` the backend already builds,
    rather than the collector's `otel-arrow-dfe-*` crates, which would add a
    second `datafusion` (53 next to 54) and `tonic` (0.14 next to 0.12).
-6. **Stream identity on OTLP.** OTLP HTTP has no stream. *Recommend:*
+4. **Stream identity on OTLP.** OTLP HTTP has no stream. *Recommend:*
    `sketch.stream_id`, a random 128-bit value drawn at collector start; on
    OTAP Arrow the gRPC stream is the stream.
-7. **Sub-DAG validity.** No planner function extracts a sub-DAG.
+5. **Sub-DAG validity.** No planner function extracts a sub-DAG.
    *Recommend:* the loader calls `materialized_views()` on each sub-DAG,
-   which validates it, and PR 3 tests this on the benchmark plan. If the
+   which validates it, and PR 4 tests this on the benchmark plan. If the
    planner refuses such a DAG, file the need against the planner in its
    terms.
-8. **One processor for all views, or one per view.** *Recommend:* one
+6. **One processor for all views, or one per view.** *Recommend:* one
    `asap_sketches` node that builds every view in the file, keyed by (view,
    series); the pipeline YAML never changes with the plan.
-9. **A window with no state at commit time.** It may mean the collector
+7. **A window with no state at commit time.** It may mean the collector
    was down, or that no series had samples. *Recommend:* do not store it;
    queries over it are `NotReady` and forwarded to the fallback, which is
    correct in both cases. Revisit if idle views forward often.
-10. **Clock-skew allowance.** *Recommend:* 2 s by default (hosts run NTP,
+8. **Clock-skew allowance.** *Recommend:* 2 s by default (hosts run NTP,
     which keeps them within milliseconds); raise it if the arrival-delay
     histogram or `late_dropped` shows skew.
