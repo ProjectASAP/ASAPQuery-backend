@@ -237,7 +237,7 @@ not stored) with a Prometheus `execution` error (422,
 | `docs/` | design documents and `examples/` workloads |
 | `scripts/` | CI and the Planner dependency updater |
 
-The target layout and its migration steps are in `docs/design/repo-layout.md`
+The layout, its boundaries and its migration steps are in `docs/design/repo-layout.md`
 (#874).
 
 ## Development
