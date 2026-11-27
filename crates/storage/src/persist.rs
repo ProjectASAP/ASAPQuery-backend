@@ -288,7 +288,7 @@ impl ViewFiles {
 
     /// Syncs every file written since the last sync when the sync interval
     /// has passed; returns the nanoseconds spent syncing.
-    pub fn sync_if_due(&mut self) -> std::io::Result<u64> {
+    pub(crate) fn sync_if_due(&mut self) -> std::io::Result<u64> {
         if self.last_sync.elapsed() < self.sync_interval {
             return Ok(0);
         }
@@ -333,7 +333,11 @@ impl ViewFiles {
     /// views' retention of `newest_end_ms` (ends at or before
     /// `newest_end_ms - retention`); returns how many. A reader still
     /// holding one keeps reading it (the file stays open until it is done).
-    pub fn delete_expired(&mut self, group: usize, newest_end_ms: i64) -> std::io::Result<usize> {
+    pub(crate) fn delete_expired(
+        &mut self,
+        group: usize,
+        newest_end_ms: i64,
+    ) -> std::io::Result<usize> {
         let mut deleted = 0;
         for (&(_, retention_ms), files) in
             self.files.range_mut((group, i64::MIN)..=(group, i64::MAX))

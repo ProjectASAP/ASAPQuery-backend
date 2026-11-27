@@ -57,7 +57,7 @@ use crate::ingestion::{ClosedWindow, Computed, Precompute};
 /// every open window reading that metric in that schema gets the same
 /// batches (the executor re-applies each slot's time range and
 /// predicates, so the conversion ignores them).
-pub struct Morsel {
+pub(crate) struct Morsel {
     raw: RawData,
     converted: RefCell<HashMap<(String, String), Vec<Batch>>>,
 }
@@ -114,7 +114,7 @@ impl Reader {
 
 /// The raw data slots of one instance, fed by its shard.
 #[derive(Default)]
-pub struct Feed {
+pub(crate) struct Feed {
     readers: RefCell<Vec<Reader>>,
     /// `Scan`s per metric the run opens (from the install probe); while
     /// fewer are open, morsels are kept to replay to the late ones.
@@ -153,7 +153,7 @@ impl Feed {
 
 /// The data store of a push instance: raw data slots are the shard's
 /// streams; it reads no view (a group built by push reads none).
-pub struct PushStore {
+pub(crate) struct PushStore {
     feed: Rc<Feed>,
 }
 
@@ -202,7 +202,7 @@ impl DataStore for PushStore {
 
 /// What a group built by push needs on every shard, decided at install.
 #[derive(Debug, Clone)]
-pub struct PushGroup {
+pub(crate) struct PushGroup {
     pub width_ms: i64,
     pub phase_ms: i64,
     pub metrics: BTreeSet<String>,
@@ -217,7 +217,7 @@ impl PushGroup {
 }
 
 /// A shard's partial of one sealed window, for the committer.
-pub struct Partial {
+pub(crate) struct Partial {
     pub window: ClosedWindow,
     pub shard: u32,
     pub result: Result<Computed, String>,
@@ -230,7 +230,7 @@ pub struct Partial {
 /// `(phase, phase + W]` opens only `Scan`s reading exactly that window, all
 /// before its first stall, and finishes once they end. `None` for a group
 /// kept on the window path.
-pub fn probe(
+pub(crate) fn probe(
     precompute: &Arc<Precompute>,
     candidates: &[bool],
     windows: &[(i64, i64)],
@@ -306,7 +306,7 @@ struct Instance {
 
 /// A shard's push state: its open instances and how far each group is
 /// sealed.
-pub struct PushShard {
+pub(crate) struct PushShard {
     shard: u32,
     precompute: Arc<Precompute>,
     groups: Vec<Option<PushGroup>>,
