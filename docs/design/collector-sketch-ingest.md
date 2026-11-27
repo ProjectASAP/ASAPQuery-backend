@@ -61,9 +61,10 @@ Terms, as in ASAPPlanner (`asap-types`):
 
 Scope:
 
-- The design needs the planner's view state key and plan id, which the
-  planner is adding; implementation starts after they merge. It needs no
-  other planner change.
+- The design needs the planner's view state key and plan id, which are on
+  the planner's main. The remaining prerequisite is the backend's planner
+  and `asap_sketchlib` pin bump (Plan, step 1). It needs no other planner
+  change.
 - The backend changes in four places: a new ingest adapter, new `common`
   types, the collector-state ingest in precompute, and the control plane.
 - The collector changes in its own repository: a capabilities command, the
@@ -124,7 +125,7 @@ Decoding is not an identity check: θ is already in the key.
 
 `asap-types` brings `serde`, `serde_json`, `thiserror` 2 and
 `asap_sketchlib` into the collector build; no executor, frontend or solver
-(open question 2).
+(decision 15).
 
 ## Algorithm
 
@@ -207,7 +208,7 @@ one edge between them, and sets `roots = [view node]`, `scalar_roots =
 - `commit_grace_ms` is computed as in §6.
 
 The collector loads the file once at start (a plan change is a collector
-restart, open question 1). The data plane takes the same file with
+restart, decision 14). The data plane takes the same file with
 `--collector-views` and refuses it, at start and on each install, when its
 `plan_id` differs from the installed plan's. The precompute engine then
 compiles each refresh group without the collector views (and without a `Scan`
@@ -304,7 +305,7 @@ accepts OTLP HTTP (every collector deployment exports with
 `urn:otel:exporter:otlp_http` today, and the backend already serves
 `/v1/metrics`); the OTLP adapter builds the nesting above, and the series
 cache still interns each series once per stream. A later OTAP Arrow
-adapter fills the same `ViewStateBatch` (open question 3).
+adapter fills the same `ViewStateBatch` (decision 16).
 
 **Collector restart.** A restart starts a new stream: new `stream_id`, and
 `series_id` starts again at 1. The backend never reuses a translation
@@ -418,7 +419,7 @@ committer, the same path that commits a window it built (readers,
   each collector view's retention must exceed it.
 - **No states.** A window with no staged state at commit time is not
   stored; a query that reads it gets `NotReady` and is forwarded to the
-  fallback (open question 7).
+  fallback (decision 20).
 - **Late states.** A state that arrives after its window committed is
   dropped and counted (`late_dropped`), whatever its reason: an export
   slower than the grace, or a collector clock behind the backend's by more
@@ -705,9 +706,9 @@ reach the backend: 50 samples per series per window become one state.
 
 ## Plan
 
-Separate PRs, each reviewed on its own. Backend implementation starts after
-the planner's view state key and plan id merge and step 1 has bumped the
-pins to a planner revision that has them.
+Separate PRs, each reviewed on its own. The planner's view state key and
+plan id are on its main; backend implementation starts once step 1 has
+bumped the pins to a planner revision that has them.
 
 Pins (all three repositories):
 
@@ -810,46 +811,43 @@ arrival-delay histogram. Cost-based choice of collector views. The OTAP Arrow ad
     revision, the latest main. All three are bumped together. Both sides
     read the same JSON with `deny_unknown_fields`, versioned by
     `INSTALLABLE_PLAN_WIRE_VERSION`, and the collector refuses a
-    collector-views file with another `planner_wire_version`. PR 3's
+    collector-views file with another `planner_wire_version`. Step 3's
     captured records stay the compatibility test, one per sketch type, and
-    PR 4 checks in the benchmark's `collector-views.json` and tests that it
+    step 4 checks in the benchmark's `collector-views.json` and tests that it
     deserializes, so a format change fails a test. No sketch type, HLL
     included, is left out on version grounds.
+14. **Plan reinstall.** A view whose definition, θ and width did not change
+    keeps its key across plans. The control plane rewrites the file and the
+    collector restarts on every reinstall. Until then, states of unchanged
+    views keep matching, states of removed views are `unknown_view`, and new
+    views are `NotReady` (forwarded). A live reload is later work.
+15. **Dependency weight on the collector build.** `asap-types` adds
+    `serde_json` and `thiserror` 2; with one `asap_sketchlib` pin (Decision
+    13) it adds no second sketchlib. Accept it. Measure the collector's clean build
+    time before and after in step 7.
+16. **Transport: OTLP HTTP or OTAP Arrow.** V1 accepts OTLP HTTP. Next, an
+    OTAP Arrow adapter fed by `urn:otel:exporter:otap`, decoding with the
+    `arrow-ipc` and `tonic` the backend already builds, rather than the
+    collector's `otel-arrow-dfe-*` crates, which would add a second
+    `datafusion` (53 next to 54) and `tonic` (0.14 next to 0.12).
+17. **Stream identity on OTLP.** OTLP HTTP has no stream.
+    `sketch.stream_id`, a random 128-bit value drawn at collector start; on
+    OTAP Arrow the gRPC stream is the stream.
+18. **Sub-DAG validity.** No planner function extracts a sub-DAG. The loader
+    calls `materialized_views()` on each sub-DAG, which validates it, and
+    step 4 tests this on the benchmark plan. If the planner refuses such a DAG,
+    file the need against the planner in its terms.
+19. **One processor for all views, or one per view.** One `asap_sketches`
+    node that builds every view in the file, keyed by (view, series); the
+    pipeline YAML never changes with the plan.
+20. **A window with no state at commit time.** It may mean the collector was
+    down, or that no series had samples. Do not store it; queries over it
+    are `NotReady` and forwarded to the fallback, which is correct in both
+    cases. Revisit if idle views forward often.
+21. **Clock-skew allowance.** 2 s by default (hosts run NTP, which keeps
+    them within milliseconds); raise it if the arrival-delay histogram or
+    `late_dropped` shows skew.
 
 ## Open questions
 
-Each with a recommendation.
-
-1. **Plan reinstall.** A view whose definition, θ and width did not change
-   keeps its key across plans. *Recommend:* the control plane rewrites the
-   file and the collector restarts on every reinstall. Until then, states
-   of unchanged views keep matching, states of removed views are
-   `unknown_view`, and new views are `NotReady` (forwarded). A live reload
-   is later work.
-2. **Dependency weight on the collector build.** `asap-types` adds
-   `serde_json` and `thiserror` 2; with one `asap_sketchlib` pin
-   (Decision 13) it adds no second sketchlib. *Recommend:* accept it.
-   Measure the collector's clean build time before and after in PR 7.
-3. **Transport: OTLP HTTP or OTAP Arrow.** *Recommend:* v1 accepts OTLP
-   HTTP. Next, an OTAP Arrow adapter fed by `urn:otel:exporter:otap`,
-   decoding with the `arrow-ipc` and `tonic` the backend already builds,
-   rather than the collector's `otel-arrow-dfe-*` crates, which would add a
-   second `datafusion` (53 next to 54) and `tonic` (0.14 next to 0.12).
-4. **Stream identity on OTLP.** OTLP HTTP has no stream. *Recommend:*
-   `sketch.stream_id`, a random 128-bit value drawn at collector start; on
-   OTAP Arrow the gRPC stream is the stream.
-5. **Sub-DAG validity.** No planner function extracts a sub-DAG.
-   *Recommend:* the loader calls `materialized_views()` on each sub-DAG,
-   which validates it, and PR 4 tests this on the benchmark plan. If the
-   planner refuses such a DAG, file the need against the planner in its
-   terms.
-6. **One processor for all views, or one per view.** *Recommend:* one
-   `asap_sketches` node that builds every view in the file, keyed by (view,
-   series); the pipeline YAML never changes with the plan.
-7. **A window with no state at commit time.** It may mean the collector
-   was down, or that no series had samples. *Recommend:* do not store it;
-   queries over it are `NotReady` and forwarded to the fallback, which is
-   correct in both cases. Revisit if idle views forward often.
-8. **Clock-skew allowance.** *Recommend:* 2 s by default (hosts run NTP,
-    which keeps them within milliseconds); raise it if the arrival-delay
-    histogram or `late_dropped` shows skew.
+None open.
