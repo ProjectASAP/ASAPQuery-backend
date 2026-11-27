@@ -1,7 +1,7 @@
 use asap_planner::InstallablePlan;
 
 /// The installed plan's version for the workload: a counter the installer
-/// increments per install. Part of every view's id ([`crate::ViewId`]).
+/// increments per install.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PlanId(pub u64);
 

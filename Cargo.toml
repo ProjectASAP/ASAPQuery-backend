@@ -15,7 +15,7 @@ version = "0.1.0"
 [workspace.dependencies]
 # The backend depends on three Planner crates, at one immutable revision:
 # `asap-planner` to plan, `asap-executor` to execute, and `asap-types` for
-# the plan types `common`'s boundary names (`QueryLanguage`, `Source`).
+# the plan types `common`'s boundary names (such as `QueryLanguage`).
 # Elsewhere, Planner IR types are reached through `asap_executor::planner`.
 asap-planner = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "1d527bca445b6372f0eb72aafd725d04a3a77dfb" }
 asap-executor = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "1d527bca445b6372f0eb72aafd725d04a3a77dfb" }
