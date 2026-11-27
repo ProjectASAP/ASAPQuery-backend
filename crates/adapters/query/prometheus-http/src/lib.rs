@@ -328,10 +328,9 @@ impl Serialize for VectorResponse {
 /// many series is mostly cached step answers (241 steps of 2,800 series
 /// in a dashboard's 1 h panel), and grouping them by comparing label maps,
 /// then formatting each value into its own `String`, cost about a second.
-/// Each series' labels are one `Arc` shared by every step's answer (the
-/// interned series, or `series_ids::result_labels`), so a series is
-/// found by that pointer and its labels compared only once; each step's
-/// time and each series' labels are formatted once.
+/// Each series' labels are one `Arc` shared by every step's answer, so a
+/// series is found by that pointer and its labels compared only once;
+/// each step's time and each series' labels are formatted once.
 pub fn range_response_body(steps: &[(i64, Answer)]) -> Result<Vec<u8>, serde_json::Error> {
     type Labels = LabelSet;
     // Each series' points as (step, value), in step order.
