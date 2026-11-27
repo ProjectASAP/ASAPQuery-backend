@@ -20,7 +20,7 @@ sampled at 10 Hz, 50 samples become one state. When no other reader needs a
 metric's raw samples, the collector stops sending them to the backend.
 
 The collector is told what to build in the planner's own terms: for each
-pushed view the control plane sends the view's sub-DAG of the installed
+collector view the control plane sends the view's sub-DAG of the installed
 ASAPPlanner plan, and the collector depends on ASAPPlanner's types crate to
 read it. Every state carries the planner's **view state key**, so the backend
 finds the view by what the state is, not by a number both sides agree on.
@@ -55,8 +55,9 @@ Terms, as in ASAPPlanner (`asap-types`):
   window ending at `e` covers `(e − w, e]`.
 - **State**: the summary of one series in one window; a sketch state is
   `asap_sketchlib`'s ASAPv1 bytes.
-- **Pushed view**: a leaf view the collector builds; the backend only stores
-  and reads it.
+- **Collector view**: a materialized view of the installed plan that the
+  collector builds instead of the backend (here always a leaf view); the
+  backend only stores and reads it.
 
 Scope:
 
@@ -64,7 +65,7 @@ Scope:
   planner is adding; implementation starts after they merge. It needs no
   other planner change.
 - The backend changes in four places: a new ingest adapter, new `common`
-  types, the pushed-state ingest in precompute, and the control plane.
+  types, the collector-state ingest in precompute, and the control plane.
 - The collector changes in its own repository: a capabilities command, the
   `asap-types` dependency and a sub-DAG loader, key stamping, the
   window-boundary, out-of-order and matcher fixes, and a raw-forward filter.
@@ -76,29 +77,29 @@ Scope:
  application ─ OTLP ─▶│ receiver ─┬─▶ asap_sketches (planner_views) ───────────────────▶ OTLP exporter│─┐ sketch path
                       │           └─▶ raw forward (drops metrics with backend_reads_raw = false) ─▶ ...│─┤ raw path
                       └─────────────────────────────────────────────────────────────────────────────┘ │
-   asap_sketches --print-capabilities ─▶ capabilities.json            ▲ pushed-views.json             │
+   asap_sketches --print-capabilities ─▶ capabilities.json            ▲ collector-views.json          │
                                                │                      │                               ▼
  workload ─▶ control-plane ─▶ InstallablePlan ─┼──────────────────────┼──────▶ data-plane  POST /v1/metrics
               │ (asap-planner)                 ▼                      │         ├─ point without sketch.envelope ─▶ otlp ─▶ IngestEngine
-              └─ push-down rule (reads capabilities.json) ────────────┘         └─ point with sketch.envelope ─▶ asap-sketch-otlp ─▶ ViewStateBatch
-                 (same pushed-views.json) ───────────────────────────────▶ data-plane      ─▶ ViewStateIngest ─▶ precompute committer ─▶ view store
+              └─ collector view rule (reads capabilities.json) ───────┘         └─ point with sketch.envelope ─▶ asap-sketch-otlp ─▶ ViewStateBatch
+                 (same collector-views.json) ────────────────────────────▶ data-plane      ─▶ ViewStateIngest ─▶ precompute committer ─▶ view store
 ```
 
 | Component | Crate or repository | Role |
 |---|---|---|
 | Capabilities | ASAPCollector-public (`asap_sketches --print-capabilities`) | Declares what the collector can build (§1) |
-| Push-down rule | `crates/control-plane` | Picks the pushable leaf views of the installed plan against the capabilities; the only copy of the rule |
-| Pushed-views file | `crates/control-plane` (`--emit-pushed-views`) | Each pushed view's sub-DAG, the plan id, which metrics the backend still reads raw, the commit grace |
+| Collector view rule | `crates/control-plane` | Picks the leaf views of the installed plan the collector can build against the capabilities; the only copy of the rule |
+| Collector-views file | `crates/control-plane` (`--emit-collector-views`) | Each collector view's sub-DAG, the plan id, which metrics the backend still reads raw, the commit grace |
 | `asap_sketches` processor | ASAPCollector-public | Loads the file at start, builds each view's per-series states, stamps the view state key, exports OTLP summary points with `sketch.envelope` |
 | Raw forward | ASAPCollector-public | Forwards raw samples to the backend, except metrics the file marks `false` |
 | `asap-sketch-otlp` | `crates/adapters/ingest/asap-sketch-otlp` (new) | Turns those points into `common::ViewStateBatch`es; never reads the sketch bytes |
-| Pushed-state ingest | `crates/precompute` | Finds the view by key and selection, stages, deduplicates and merges until commit, drops late states |
+| Collector-state ingest | `crates/precompute` | Finds the view by key and selection, stages, deduplicates and merges until commit, drops late states |
 
 **Raw path.** The raw path stays (decision 3) for every metric the backend
 still reads raw: a metric is marked `backend_reads_raw: true` when a `Scan`
-of it feeds a view that is not pushed or runs at query time. A metric whose
-only readers are pushed views is marked `false`, and the collector's raw
-forward to the backend drops it. When a pushed view misses a window (the
+of it feeds a view that is not a collector view or runs at query time. A metric whose
+only readers are collector views is marked `false`, and the collector's raw
+forward to the backend drops it. When a collector view misses a window (the
 collector was down), the query engine reports `NotReady` and the dispatcher
 forwards the query to the fallback store, which receives raw samples on its
 own path, not through this forward.
@@ -127,7 +128,7 @@ Decoding is not an identity check: θ is already in the key.
 
 ## Algorithm
 
-### 1. Capabilities and the push-down rule (control plane)
+### 1. Capabilities and the collector view rule (control plane)
 
 The collector declares what it can build; the backend holds no table of the
 collector's sketches. `asap_sketches --print-capabilities` prints, for
@@ -159,7 +160,7 @@ today's collector (planner names; the collector maps them to its own):
 
 The control plane reads the file with `--collector-capabilities <file>`
 and refuses a `capabilities_version` it does not know. A node of the
-installed plan's `dag` is pushed if and only if all of these hold, read
+installed plan's `dag` is a collector view if and only if all of these hold, read
 from its planner fields (no cost comparison,
 decision 6):
 
@@ -170,7 +171,7 @@ decision 6):
    node in between, and the chain's `filter` is `null`.
 3. **Within the capabilities.** `summary_type`, `input` and every
    `parameters` value match one `summaries` entry; `reduction` is in
-   `reductions` (`PerEntity`: a `Reduce [...]` view is not pushed, because
+   `reductions` (`PerEntity`: a `Reduce [...]` view is not a collector view, because
    one collector does not see every series of a group); the window kind is
    in `windows`; the `Scan`'s `predicates` are a conjunction of
    `predicate_ops` comparisons.
@@ -178,18 +179,18 @@ decision 6):
 **Exact aggregates stay in the backend.** The collector's `Exact` type
 (`EXv1`, every value of a window) is a baseline for comparisons, not a
 `sum`, `max` or counter state, and it is not in the capabilities. Views of
-`ExactAggregate` become pushable when the collector declares them.
+`ExactAggregate` become collector views when the collector declares them.
 
 **Known limitation: sparse series.** The rule ignores size. A series with
 few samples per window can produce a state larger than its raw samples (a
 DDSketch with one sample still carries its header, mapping and bins,
 against about 16 bytes for the raw sample). Step 4 of the plan measures
-where this happens. Cost-based push-down is future work; it needs a general
+where this happens. Cost-based choice of collector views is future work; it needs a general
 planner capability (costing where a view is built).
 
-### 2. The pushed-views file (control plane)
+### 2. The collector-views file (control plane)
 
-For each pushed view the control plane copies, from the installed `dag`,
+For each collector view the control plane copies, from the installed `dag`,
 the view node and its `Scan` node (unchanged, node ids included) and the
 one edge between them, and sets `roots = [view node]`, `scalar_roots =
 []`. It writes one JSON file, with the planner types' own serde:
@@ -207,10 +208,10 @@ one edge between them, and sets `roots = [view node]`, `scalar_roots =
 
 The collector loads the file once at start (a plan change is a collector
 restart, open question 3). The data plane takes the same file with
-`--pushed-views` and refuses it, at start and on each install, when its
+`--collector-views` and refuses it, at start and on each install, when its
 `plan_id` differs from the installed plan's. The precompute engine then
-compiles each refresh group without the pushed views (and without a `Scan`
-only they read). The query engine is unchanged; it reads a pushed view
+compiles each refresh group without the collector views (and without a `Scan`
+only they read). The query engine is unchanged; it reads a collector view
 from the store like any other.
 
 ### 3. The collector: load, check, build, stamp
@@ -226,7 +227,7 @@ At start, with `planner_views: <path>` in its processor config, the
    `TimeSeries { metric }`, and its summary, parameters, reduction, window
    and predicates are within the collector's own capabilities (the same
    table `--print-capabilities` prints). It does not check *whether* the
-   view should be pushed (timing, lifetime): that is the control plane's
+   view should be a collector view (timing, lifetime): that is the control plane's
    rule, written once.
 3. **Reads each view's key** with `materialized_views()` on the sub-DAG and
    `view_state_key()`: the key depends only on the view node, so it equals
@@ -354,10 +355,10 @@ The collector change:
 ### 6. The sketch path in the data plane
 
 `POST /v1/metrics` decodes the request once. Each summary data point that
-carries a `sketch.envelope` bytes attribute is a pushed state; every other
+carries a `sketch.envelope` bytes attribute is a collector state; every other
 point is a raw sample, as today. A request may carry both.
 
-The adapter groups the pushed points by `sketch.stream_id`, then by
+The adapter groups the collector-state points by `sketch.stream_id`, then by
 (`sketch.view_state_key`, `sketch.selection`), into one `ViewStateBatch`
 per stream. It refuses the request (400) when a Resource lacks one of these
 attributes or they do not parse, or `sketch.schema_version` is newer than
@@ -385,12 +386,12 @@ The ingest engine then, per view and record:
    rejected (`reason="decode"`).
 5. **Stage, dedup, merge, commit**, below.
 
-Every rejection increments `asap_pushed_states_rejected_total{view,
+Every rejection increments `asap_collector_states_rejected_total{view,
 reason}` and logs once per view and reason per minute; the request still
 returns 200 with the counts, as the raw OTLP route reports `rejected`.
 
 **Staging.** The view store appends a view's windows in order and each
-window once, so a pushed window is committed once and whole. The engine
+window once, so a collector view's window is committed once and whole. The engine
 stages states per `(view, window)` and commits through the precompute
 committer, the same path that commits a window it built (readers,
 `RefreshTaskGraph` ordering, persistence and the memory budget all apply).
@@ -404,7 +405,7 @@ committer, the same path that commits a window it built (readers,
   is merged into the staged one (sketch merge): a collector that restarted
   inside a window, or two collectors that each saw part of one series.
   States are full, not deltas, and each partial covers other samples.
-- **Commit time.** No raw samples of a pushed view's metric need reach the
+- **Commit time.** No raw samples of a collector view's metric need reach the
   backend, so the raw watermark cannot close its windows. A window commits
   when the backend's wall clock passes `end + commit_grace_ms`, with
 
@@ -414,7 +415,7 @@ committer, the same path that commits a window it built (readers,
   interval (`--collector-export-interval-ms`, default 0: today's pipelines
   export each processor message at once), and an allowance for clock skew
   (default 2 s). Default: 8 s. The control plane writes it into the file;
-  each pushed view's retention must exceed it.
+  each collector view's retention must exceed it.
 - **No states.** A window with no staged state at commit time is not
   stored; a query that reads it gets `NotReady` and is forwarded to the
   fallback (open question 9).
@@ -433,19 +434,19 @@ committer, the same path that commits a window it built (readers,
 use asap_types::plan::materialized_view::ViewStateKey;
 use asap_types::ir::properties::selection::SelectionBox;
 
-/// Pushed states from one collector stream: what the sketch-path ingest
+/// Collector states from one collector stream: what the sketch-path ingest
 /// adapter hands the ingest engine. Nested by OTAP tier, so a view's key and
 /// a series' labels appear once, not per record. Never data between operators.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewStateBatch {
     /// Random per collector start; scopes `series_id`.
     pub stream_id: u128,
-    pub views: Vec<PushedViewStates>,
+    pub views: Vec<CollectorViewStates>,
 }
 
-/// One pushed view's states in the batch.
+/// One collector view's states in the batch.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PushedViewStates {
+pub struct CollectorViewStates {
     pub key: ViewStateKey,
     /// The view's coverage selection, as the planner serializes it.
     pub selection: Vec<SelectionBox>,
@@ -477,7 +478,7 @@ pub struct ViewStateIngestReport {
     pub rejected: BTreeMap<&'static str, u64>,
 }
 
-/// Takes pushed states. Implemented by the ingest engine, next to `IngestEngine`.
+/// Takes collector states. Implemented by the ingest engine, next to `IngestEngine`.
 #[async_trait]
 pub trait ViewStateIngest: Send + Sync {
     /// Checks, stages or merges each record; waits under backpressure as
@@ -487,12 +488,12 @@ pub trait ViewStateIngest: Send + Sync {
 }
 ```
 
-`ViewStore` is unchanged: every pushed window is `put` once, at commit.
+`ViewStore` is unchanged: every collector view window is `put` once, at commit.
 
 ### `crates/adapters/ingest/asap-sketch-otlp`
 
 ```rust
-/// Why a request's pushed states could not be read; the whole request is
+/// Why a request's collector states could not be read; the whole request is
 /// refused with 400. Per-record problems are counted, not errors.
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum SketchOtlpError {
@@ -506,11 +507,11 @@ pub enum SketchOtlpError {
     SchemaVersion(u64),
 }
 
-/// Whether an OTLP data point carries a pushed state (a `sketch.envelope`
+/// Whether an OTLP data point carries a collector state (a `sketch.envelope`
 /// bytes attribute): the route's test for the sketch path.
 pub fn is_sketch_point(attributes: &[KeyValue]) -> bool;
 
-/// The pushed states of a decoded OTLP request, one batch per stream; points
+/// The collector states of a decoded OTLP request, one batch per stream; points
 /// without `sketch.envelope` are left to the raw `otlp` decoder.
 pub fn decode_view_states(
     request: &ExportMetricsServiceRequest,
@@ -547,39 +548,39 @@ pub struct SummaryCapability {
 /// The file the collector and the data plane load.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PushedViewsFile {
+pub struct CollectorViewsFile {
     pub planner_wire_version: u32,
     /// `PhysicalASAPDAG::plan_id()` of the installed plan.
     pub plan_id: String,
     pub commit_grace_ms: u64,
-    /// Per metric a `Scan` reads: whether a view that is not pushed, or a
+    /// Per metric a `Scan` reads: whether a view that is not a collector view, or a
     /// query-time `Scan`, still reads its raw samples.
     pub backend_reads_raw: BTreeMap<String, bool>,
-    /// One sub-DAG per pushed view; `roots = [view node]`.
+    /// One sub-DAG per collector view; `roots = [view node]`.
     pub views: Vec<PhysicalASAPDAG>,
 }
 
-/// Why a leaf view is not pushed, for the command's report.
+/// Why a leaf view is not a collector view, for the command's report.
 #[derive(Debug, Clone, PartialEq)]
-pub enum NotPushed {
+pub enum NotCollectorView {
     NotOnRawScan,
     NotInCapabilities(String),
 }
 
-/// The installed plan's pushed views and why each other view is not pushed.
-pub fn pushed_view_dags(
+/// The installed plan's collector views and why each other view is not.
+pub fn collector_view_dags(
     plan: &InstallablePlan,
     capabilities: &CollectorCapabilities,
     export_interval_ms: u64,
-) -> (PushedViewsFile, Vec<(PhysicalASAPNodeId, NotPushed)>);
+) -> (CollectorViewsFile, Vec<(PhysicalASAPNodeId, NotCollectorView)>);
 ```
 
 `FieldDataType` (the chain's `summary_type`) and `CompareOpKind` are the
 planner's types. CLI:
 `control_plane --plan <plan.json> --collector-capabilities
 <capabilities.json> [--collector-export-interval-ms <ms>]
---emit-pushed-views <pushed-views.json>`; the data plane takes
-`--pushed-views <pushed-views.json>`.
+--emit-collector-views <collector-views.json>`; the data plane takes
+`--collector-views <collector-views.json>`.
 
 ## Worked example: q01
 
@@ -596,7 +597,7 @@ n4  SummaryEstimate Quantile(q=0.99)
 n5  Project                       (root)
 ```
 
-n1 passes the rule. Its sub-DAG in `pushed-views.json` (schemas
+n1 passes the rule. Its sub-DAG in `collector-views.json` (schemas
 shortened to their field names; the file carries them in full):
 
 ```json
@@ -647,7 +648,7 @@ per series. Its pipeline config names only the file:
 sketch:
   type: urn:asap:processor:asap_sketches
   config:
-    planner_views: /etc/asap/pushed-views.json
+    planner_views: /etc/asap/collector-views.json
 ```
 
 For one series `data{region="r0",service="s0",job="j0",label_0="l0"}`, the
@@ -669,7 +670,7 @@ DDSketch and exports one summary point:
 | Point (Record) | `sketch.envelope` | ASAPv1 bytes |
 | Point (Record) | `count` | `50` |
 
-The adapter makes one `ViewStateBatch` with one `PushedViewStates` (n1's
+The adapter makes one `ViewStateBatch` with one `CollectorViewStates` (n1's
 key and selection), one series `(17, labels)` and one record `(17, T,
 bytes, 50)`. The backend finds n1 by key and selection, checks that `T` is
 a multiple of 5 s, translates `(stream_id, n1, 17)` to its series id,
@@ -686,7 +687,7 @@ also feeds q02's and q03's chains (`backend_reads_raw.data = true`).
 All five are evaluated every 5 s over 1 m ranges; the planner builds each
 one's leaf as a 5 s tumbling chain over its `Scan`:
 
-| Query | Leaf view (summary type, reduction) | Pushed | Why |
+| Query | Leaf view (summary type, reduction) | Collector view | Why |
 |---|---|---|---|
 | q01 `quantile_over_time(0.99, data[1m])` | `Sketch: DDSketch` α 0.05, `PerEntity` | yes | passes every rule |
 | q02 `max_over_time(data[1m])` | `ExactAggregate: Max`, `PerEntity` | no | not in the capabilities |
@@ -698,7 +699,7 @@ For this workload the collector builds one view, the backend still builds
 four, and both metrics are `backend_reads_raw: true`, so every raw sample
 still reaches the backend. The expected benefit here is about zero: the
 backend saves only n1's DDSketch updates, and the network carries the
-pushed states on top of the unchanged raw samples. With q01 alone, `data`
+collector states on top of the unchanged raw samples. With q01 alone, `data`
 is read only by n1, so it is marked `false` and its raw samples no longer
 reach the backend: 50 samples per series per window become one state.
 
@@ -720,18 +721,18 @@ Backend:
    (other θ), one duplicate after a merge, one late state and one restart
    (new `stream_id`, reused `series_id`).
 3. The control plane's rule with `--collector-capabilities`,
-   `--emit-pushed-views` (sub-DAGs, `plan_id`, `backend_reads_raw`,
-   `commit_grace_ms`); the data plane's `--pushed-views` with the plan-id
-   check; precompute skips pushed views. Tests: the benchmark plan pushes
-   exactly q01's sub-DAG and marks both metrics raw; a q01-only plan marks
+   `--emit-collector-views` (sub-DAGs, `plan_id`, `backend_reads_raw`,
+   `commit_grace_ms`); the data plane's `--collector-views` with the plan-id
+   check; precompute skips collector views. Tests: the benchmark plan
+   gives exactly q01's sub-DAG as a collector view and marks both metrics raw; a q01-only plan marks
    `data` `false`; a regex matcher, a `Reduce` leaf or an `ExactAggregate`
-   leaf pushes nothing; a file of another plan id is refused; the written
+   leaf gives no collector view; a file of another plan id is refused; the written
    file deserializes and `materialized_views()` on each sub-DAG gives the
    installed view's key.
 4. End-to-end comparison, collector + backend against backend only, on the
    same feed, for two workloads: the five-query benchmark set (expected
-   benefit about zero, above) and q01 alone (the pushed metric has only
-   pushed readers, so its raw samples stay at the collector). Answers equal
+   benefit about zero, above) and q01 alone (the metric has only collector-view
+   readers, so its raw samples stay at the collector). Answers equal
    (exact views) or within the plan's error (sketch views) at every
    evaluation; backend ingest CPU, network bytes between collector and
    backend, collector CPU, `late_dropped`; including a sparse-series case.
@@ -753,11 +754,11 @@ Collector (ASAPCollector-public):
 **Future work.** Late merge into a committed window (a store `replace`, a
 view-file rewrite and result-cache invalidation), only if step 4 or
 production shows a late rate worth it, measured by `late_dropped` and the
-arrival-delay histogram. Cost-based push-down. The OTAP Arrow adapter.
+arrival-delay histogram. Cost-based choice of collector views. The OTAP Arrow adapter.
 
 ## Decisions
 
-1. **The planner's identity, no other planner change.** A pushed state is
+1. **The planner's identity, no other planner change.** A collector state is
    identified by the planner's view state key plus its concrete selection;
    within the installed plan a view is `(plan_id, node_id)`. θ and window
    width are in the key, so a state of another θ or width is simply
@@ -767,7 +768,7 @@ arrival-delay histogram. Cost-based push-down. The OTAP Arrow adapter.
    states.** No deltas: each record holds the whole state of one series in
    one window.
 3. **Two paths.** The raw path stays for every metric the backend still
-   reads raw. The sketch path carries pushed states on the same
+   reads raw. The sketch path carries collector states on the same
    `/v1/metrics` route; a point with `sketch.envelope` takes it.
 4. **Prometheus window semantics on both sides**: `(t − range, t]`. The
    backend already uses it; the collector changes in its own PR. The window
@@ -775,14 +776,14 @@ arrival-delay histogram. Cost-based push-down. The OTAP Arrow adapter.
 5. **Dedup and merge before commit.** A state whose envelope hash was
    already seen for its view, series and window is ignored and counted; a
    state with a new hash is merged.
-6. **Rule-based push-down first**, against the collector's declared
+6. **Rule-based choice of collector views first**, against the collector's declared
    capabilities. No cost comparison. Exact aggregates stay in the backend
    until the collector declares them.
 7. **The collector receives the planner's own view definitions**: each
-   pushed view's sub-DAG, in the planner's serde; the collector depends on
+   collector view's sub-DAG, in the planner's serde; the collector depends on
    the planner's types crate, pinned. This replaces a numeric `agg_id` and
-   a hand-written collector config. The backend's precompute skips pushed
-   views. The data plane refuses a pushed-views file of another `plan_id`.
+   a hand-written collector config. The backend's precompute skips collector
+   views. The data plane refuses a collector-views file of another `plan_id`.
 8. **The collector declares its capabilities** (`--print-capabilities`);
    the control plane's rule reads them. The rule exists once, in the control
    plane; the collector checks only that it can execute each sub-DAG.
@@ -815,7 +816,7 @@ Each with a recommendation.
    (15 today), with no promise across versions. *Recommend:* the collector
    pins the backend's planner rev and is bumped in the same change; the
    loader refuses another `planner_wire_version`; PR 3 checks in the
-   benchmark's `pushed-views.json` and tests that it deserializes, so a
+   benchmark's `collector-views.json` and tests that it deserializes, so a
    format change fails a test.
 3. **Plan reinstall.** A view whose definition, θ and width did not change
    keeps its key across plans. *Recommend:* the control plane rewrites the
