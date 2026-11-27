@@ -452,7 +452,7 @@ pub(crate) fn render(metrics: &Metrics, gauges: &Gauges) -> String {
             let _ = writeln!(out, "{name} {value}");
         }
     }
-    if let Some(rss) = resident_bytes() {
+    if let Some(rss) = internal_metrics::resident_bytes() {
         gauge(
             &mut out,
             "process_resident_memory_bytes",
@@ -482,15 +482,6 @@ fn escape(text: &str) -> String {
     text.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
-}
-
-/// Resident set size, from `/proc/self/statm`.
-fn resident_bytes() -> Option<u64> {
-    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-    let pages: u64 = statm.split(' ').nth(1)?.parse().ok()?;
-    // SAFETY: sysconf has no preconditions.
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    Some(pages * u64::try_from(page_size).ok()?)
 }
 
 #[cfg(test)]

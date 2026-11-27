@@ -371,6 +371,15 @@ impl Metrics {
     }
 }
 
+/// The process's resident set size, from `/proc/self/statm`.
+pub fn resident_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = statm.split(' ').nth(1)?.parse().ok()?;
+    // SAFETY: sysconf has no preconditions.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    Some(pages * u64::try_from(page_size).ok()?)
+}
+
 /// CPU seconds of each live thread, summed by name with trailing digits
 /// removed (`query-0`, `query-1`, … are `query-`).
 pub fn thread_cpu_seconds() -> BTreeMap<String, f64> {

@@ -14,7 +14,6 @@ ahash = "0.8"
 hashbrown = "0.15"
 # Shortest round-trip float digits for range responses (prometheus.rs).
 ryu = "1"
-libc = "0.2"
 # The data plane's allocator (main.rs): many small per-request allocations.
 tikv-jemallocator = "0.6"
 serde.workspace = true
@@ -37,6 +36,8 @@ control_plane.workspace = true
 asap_sketchlib.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# posix_fadvise in the tier and view-read benchmarks (cold reads).
+libc = "0.2"
 
 # The micro benchmarks live in benchmarks/micro/ and build as examples of this
 # crate (`cargo run --release -p data_plane --example <name>`).

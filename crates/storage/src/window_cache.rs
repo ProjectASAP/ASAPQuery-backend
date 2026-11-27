@@ -194,7 +194,7 @@ impl WindowCache {
     /// `key`'s batches: cached, or decoded by `load` (its batches and
     /// bytes) and inserted. Concurrent callers for one key run `load` once
     /// and share its result or error; an error is not kept.
-    pub fn get_or_load(
+    pub(crate) fn get_or_load(
         &self,
         key: WindowKey,
         now: Instant,
@@ -251,7 +251,7 @@ impl WindowCache {
     }
 
     /// Drops the entries not read since `now - idle`.
-    pub fn evict_idle(&self, now: Instant) {
+    pub(crate) fn evict_idle(&self, now: Instant) {
         let Some(idle) = self.idle else {
             return;
         };

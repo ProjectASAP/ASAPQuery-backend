@@ -50,7 +50,7 @@ use crate::state_codec::{
 };
 
 /// The view file format version these segments are.
-pub const FORMAT_VERSION: u32 = 4;
+pub(crate) const FORMAT_VERSION: u32 = 4;
 
 /// Frame kinds.
 const HEADER_FRAME: u32 = 0;
@@ -398,12 +398,12 @@ impl Segment {
         self.len() == 0
     }
 
-    pub fn is_sealed(&self) -> bool {
+    pub(crate) fn is_sealed(&self) -> bool {
         self.sealed.load(Ordering::SeqCst)
     }
 
     /// The newest window end of its records.
-    pub fn max_end_ms(&self) -> i64 {
+    pub(crate) fn max_end_ms(&self) -> i64 {
         self.max_end_ms.load(Ordering::SeqCst)
     }
 
@@ -841,7 +841,7 @@ impl SegmentTexts<'_> {
     }
 
     /// Drops the new texts after the first `mark` (a fragment left out).
-    pub fn forget_after(&mut self, mark: usize) {
+    pub(crate) fn forget_after(&mut self, mark: usize) {
         for text in self.new.drain(mark..) {
             self.new_index.remove(&text);
         }
