@@ -244,7 +244,7 @@ fn walk<B: SampleBuilder>(
         key_buffer,
         options,
         max_points: limits.max_points,
-        states: 0,
+        point_limit: limits.max_points,
         series_of_state: HashMap::new(),
         decoded: Decoded {
             // Room for one sample per 50 encoded bytes, about one gauge
@@ -385,9 +385,10 @@ struct Walk<'a, B: SampleBuilder> {
     key_buffer: &'a mut Vec<u8>,
     options: &'a LabelOptions,
     max_points: usize,
-    /// Collector states decoded so far; with the samples, at most
-    /// `max_points`.
-    states: usize,
+    /// The request's point limit, for its error; `max_points` is what is
+    /// left of it for samples once the collector states decoded so far
+    /// took their share (so the samples' check stays one compare).
+    point_limit: usize,
     /// Each series' place in `decoded.view_states`: by view index and
     /// labels, its index in the view's series.
     series_of_state: HashMap<(usize, LabelSet), usize>,
@@ -461,7 +462,12 @@ impl<B: SampleBuilder> Walk<'_, B> {
             10 => PointKind::ExponentialHistogram,
             _ => PointKind::Summary,
         };
-        if let Some(view) = self.view_of(name, &metadata)? {
+        let view = if metadata.is_empty() {
+            None
+        } else {
+            self.view_of(name, &metadata)?
+        };
+        if let Some(view) = view {
             let source_metric = name
                 .split_once(NAME_INFIX)
                 .map_or(name, |(source, _)| source);
@@ -606,8 +612,8 @@ impl<B: SampleBuilder> Walk<'_, B> {
                     series
                 }
             };
-            if self.decoded.samples.len() + self.states >= self.max_points {
-                return Err(OtlpError::TooManyPoints(self.max_points));
+            if self.decoded.samples.len() >= self.max_points {
+                return Err(OtlpError::TooManyPoints(self.point_limit));
             }
             self.decoded
                 .samples
@@ -645,18 +651,13 @@ impl<B: SampleBuilder> Walk<'_, B> {
                 pairs.push(key_value(attribute)?);
             }
         }
-        if pairs.iter().any(|(key, _)| *key == ENVELOPE_ATTRIBUTE) {
-            return Err(OtlpError::ViewIdentity {
-                metric: name.to_string(),
-                reason: format!(
-                    "a point has {ENVELOPE_ATTRIBUTE}, but the metric's metadata names no view"
-                ),
-            });
-        }
-        if pairs
+        if let Some((key, _)) = pairs
             .iter()
-            .any(|(key, value)| is_sketch_payload(key, value))
+            .find(|(key, value)| is_sketch_payload(key, value))
         {
+            if *key == ENVELOPE_ATTRIBUTE {
+                return Err(not_a_view(name));
+            }
             return Ok(None);
         }
         let labels = series_labels(resource, &format!("{name}{suffix}"), &mut pairs);
@@ -778,10 +779,10 @@ impl<B: SampleBuilder> Walk<'_, B> {
                 reason: format!("a point has no {ENVELOPE_ATTRIBUTE} bytes"),
             });
         };
-        if self.decoded.samples.len() + self.states >= self.max_points {
-            return Err(OtlpError::TooManyPoints(self.max_points));
+        if self.decoded.samples.len() >= self.max_points {
+            return Err(OtlpError::TooManyPoints(self.point_limit));
         }
-        self.states += 1;
+        self.max_points -= 1;
         let labels: LabelSet = series_labels(resource, source_metric, &mut pairs)
             .into_iter()
             .map(|(name, value)| (name.into_owned(), value))
@@ -807,12 +808,26 @@ impl<B: SampleBuilder> Walk<'_, B> {
     }
 }
 
-/// Whether an attribute is a sketch payload: bytes under one of the
-/// sketch payload keys.
+/// The error of a `sketch.envelope` point under a metric naming no view.
+#[cold]
+fn not_a_view(name: &str) -> OtlpError {
+    OtlpError::ViewIdentity {
+        metric: name.to_string(),
+        reason: format!(
+            "a point has {ENVELOPE_ATTRIBUTE}, but the metric's metadata names no view"
+        ),
+    }
+}
+
+/// Whether an attribute is a sketch payload (a collector state's
+/// `sketch.envelope` included): bytes under one of the sketch payload keys.
 fn is_sketch_payload(key: &str, value: &AttributeValue) -> bool {
     matches!(
         key,
-        "kll.sketch_payload" | "cms.sketch_payload" | "countsketch.sketch_payload"
+        "kll.sketch_payload"
+            | "cms.sketch_payload"
+            | "countsketch.sketch_payload"
+            | ENVELOPE_ATTRIBUTE
     ) && matches!(value, AttributeValue::Bytes(_))
 }
 
