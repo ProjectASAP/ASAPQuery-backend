@@ -3,8 +3,8 @@
 # $BIN_DIR (required), each checked against its pinned sha256.
 # Already-present binaries are kept. Linux amd64 only.
 #
-#   BIN_DIR=$BIN_DIR ./fetch_binaries.sh            # everything
-#   ./fetch_binaries.sh victoriametrics prometheus     # only these
+#   BIN_DIR=$BIN_DIR scripts/fetch_binaries.sh            # everything
+#   scripts/fetch_binaries.sh victoriametrics prometheus   # only these
 set -euo pipefail
 BIN_DIR=${BIN_DIR:?set BIN_DIR}
 mkdir -p "$BIN_DIR"

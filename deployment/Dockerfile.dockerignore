@@ -1,0 +1,9 @@
+# Build context for deployment/Dockerfile (the repository root): only what
+# `cargo build` needs. BuildKit reads this file because it sits next to the
+# Dockerfile.
+**/target
+.git
+.worktrees
+eval
+deployment
+docs

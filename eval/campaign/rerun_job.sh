@@ -33,10 +33,10 @@ rm -rf "$B"/runs/$RUN_TAG.* "$B"/runs/$RUN_TAG.done
 meta=$B/runs/$RUN_TAG.meta
 { echo "cfg=$cfg round=$round host=$(hostname) backend_commit=$(cat $BIN_DIR/BACKEND_COMMIT) start=$(date -u +%FT%TZ)"
   echo "SERIES=$SERIES MODES=$MODES RANGE=${RANGE:-} WORKLOADS=$WORKLOADS ARMS=$ARMS CONCURRENT=$CONCURRENT QUERY_DELAY_S=$QUERY_DELAY_S KEEP_VM_DATA=$KEEP_VM_DATA ARM_CORES=$ARM_CORES QUERY_PHASE_S=$QUERY_PHASE_S QUERY_USERS=${QUERY_USERS:-} PLANNER_COST_INPUTS=${PLANNER_COST_INPUTS:-} PRECOMPUTE_THREADS=$PRECOMPUTE_THREADS FEEDER_VALUES=${FEEDER_VALUES:-original} ZIPF_S=$ZIPF_S ZIPF_N=$ZIPF_N FEEDER_BIN=${FEEDER_BIN:-}"
-  echo "harness_sha256_16=$(cd $B && cat harness/*.py run_vm_demo.sh fetch_binaries.sh | sha256sum | cut -c1-16)"
+  echo "harness_sha256_16=$(cd $B && cat harness/*.py scripts/run_vm_demo.sh scripts/fetch_binaries.sh | sha256sum | cut -c1-16)"
   echo "victoriametrics: $("$vm" -version 2>&1 | head -1)"
   sha256sum $BIN_DIR/data_plane $BIN_DIR/control_plane "$vm"; } > "$meta"
-(cd $B && ./run_vm_demo.sh) > "$B/runs/$RUN_TAG.campaign.log" 2>&1
+(cd $B && ./scripts/run_vm_demo.sh) > "$B/runs/$RUN_TAG.campaign.log" 2>&1
 rc=$?
 for d in "$B"/runs/$RUN_TAG.*/; do
   [ -d "$d" ] || continue

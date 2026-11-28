@@ -1,3 +1,4 @@
-# What the monitoring stack writes (eval/run_vm_demo.sh, eval/demo/run_live_demo.sh).
+# What the monitoring stack writes (eval/scripts/run_vm_demo.sh, eval/demo/run_live_demo.sh).
 /textfile/
+/data/
 /grafana/dashboards/
