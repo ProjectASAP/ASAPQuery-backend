@@ -452,8 +452,8 @@ impl ViewFiles {
         for (view, batches) in views {
             let (mark, grids_mark) = (texts.new.len(), grids.bytes.len());
             let encoded = batches.first().and_then(|first| {
-                let rows = window_rows(batches)?;
-                encode_fragment(first.schema(), &rows, &mut texts, &mut grids)
+                let (rows, sources) = window_rows(batches)?;
+                encode_fragment(first.schema(), &rows, &sources, &mut texts, &mut grids)
             });
             match encoded {
                 Some(fragment) => fragments.push((*view, fragment)),
@@ -636,10 +636,20 @@ impl ViewFiles {
 /// The rows of a window's `batches`. A window split by series is kept as
 /// one batch per part; its rows are written in the order one run over
 /// every series emits them (by their plain columns' values), so a window's
-/// fragment is the same whichever way its run was split. `None` when a
-/// plain value has no order.
-fn window_rows(batches: &[Batch]) -> Option<Vec<Vec<Value>>> {
-    let mut rows: Vec<Vec<Value>> = batches.iter().flat_map(Batch::to_rows).collect();
+/// fragment is the same whichever way its run was split. With each row,
+/// the batch and row it came from ([`crate::segment::RowSource`]). `None`
+/// when a plain value has no order.
+fn window_rows(batches: &[Batch]) -> Option<(Vec<Vec<Value>>, Vec<crate::segment::RowSource<'_>>)> {
+    let mut rows: Vec<(Vec<Value>, crate::segment::RowSource<'_>)> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .to_rows()
+                .into_iter()
+                .enumerate()
+                .map(move |(row, values)| (values, (batch, row)))
+        })
+        .collect();
     if batches.len() > 1 {
         let plain: Vec<usize> = batches[0]
             .schema()
@@ -659,7 +669,7 @@ fn window_rows(batches: &[Batch]) -> Option<Vec<Vec<Value>>> {
             .map(|row| {
                 let key = plain
                     .iter()
-                    .map(|&column| row[column].key())
+                    .map(|&column| row.0[column].key())
                     .collect::<Result<Vec<_>, _>>()
                     .ok()?;
                 Some((key, row))
@@ -668,7 +678,7 @@ fn window_rows(batches: &[Batch]) -> Option<Vec<Vec<Value>>> {
         keyed.sort_by(|a, b| a.0.cmp(&b.0));
         rows = keyed.into_iter().map(|(_, row)| row).collect();
     }
-    Some(rows)
+    Some(rows.into_iter().unzip())
 }
 
 /// The state `value` stores, with the record's rebuilt `grids`.
@@ -1121,7 +1131,11 @@ mod tests {
         DataType, Field, FieldDataType, Schema, PROMQL_SERIES_IDENTITY,
     };
     use asap_executor::planner::summary_type::{ExactKind, ExactParams, SketchAlgorithm};
-    use asap_executor::values::state_view_bytes;
+
+    /// Each row of `batch` as a fragment row's source.
+    fn sources_of(batch: &Batch) -> Vec<crate::segment::RowSource<'_>> {
+        (0..batch.num_rows()).map(|row| (batch, row)).collect()
+    }
 
     /// A fresh directory for one test's segments.
     fn segment_dir(test: &str) -> PathBuf {
@@ -1136,11 +1150,11 @@ mod tests {
         use SketchAlgorithm as A;
         Some(FieldDataType::Sketch(match kernel {
             SketchKernel::DDSketch => A::DDSketch,
-            SketchKernel::Kll => A::Kll,
-            SketchKernel::CountMin => A::Cms,
-            SketchKernel::Kmv => A::Kmv,
-            SketchKernel::Hll(_) => A::Hll,
-            SketchKernel::WeightedFrequency(FrequencyKind::CmsHeap) => A::CmsWithHeap,
+            SketchKernel::Kll => A::KLL,
+            SketchKernel::CountMin => A::CountMinSketch,
+            SketchKernel::Kmv => A::KMV,
+            SketchKernel::Hll(_) => A::HLL,
+            SketchKernel::WeightedFrequency(FrequencyKind::CmsHeap) => A::CountMinSketchWithHeap,
             SketchKernel::WeightedFrequency(FrequencyKind::CountSketchHeap) => {
                 A::CountSketchWithHeap
             }
@@ -1320,7 +1334,11 @@ mod tests {
             .collect();
         out.push((
             "HydraCms".into(),
-            window_batch(10, FieldDataType::Sketch(SketchAlgorithm::HydraCms), groups),
+            window_batch(
+                10,
+                FieldDataType::Sketch(SketchAlgorithm::HydraCountMinSketch),
+                groups,
+            ),
         ));
         out
     }
@@ -1354,9 +1372,9 @@ mod tests {
         )
     }
 
-    /// The window of [`ten_sample_ddsketch_window`] takes 30.2 kB on disk
-    /// (30 B a series, most of it the full-precision sum, min and max), not
-    /// the 126 kB of the mapped layout (106 kB of DDSketch views alone).
+    /// The window of [`ten_sample_ddsketch_window`] takes 8.3 kB on disk
+    /// (8 B a series), not the 82 kB its DDSketch views alone take in the
+    /// view layout.
     #[test]
     fn a_ten_sample_ddsketch_window_is_stored_compact() {
         let dir = segment_dir("dd-bytes");
@@ -1365,16 +1383,14 @@ mod tests {
         let written = files
             .append(0, (0, 1_000), &[(1, std::slice::from_ref(&batch))])
             .unwrap();
-        let views: usize = batch
-            .to_rows()
-            .iter()
-            .map(|row| match &row[4] {
-                Value::Summary { state, .. } => state_view_bytes(state.as_ref()).unwrap().len(),
-                _ => unreachable!(),
-            })
-            .sum();
-        assert_eq!(views, 106_176);
-        assert_eq!(location_of(&written, 1).len(), 30_196);
+        let views: usize =
+            crate::segment::view_bytes(&batch.schema().fields[4].dtype, &sources_of(&batch), 4)
+                .unwrap()
+                .iter()
+                .map(|view| view.len())
+                .sum();
+        assert_eq!(views, 82_176);
+        assert_eq!(location_of(&written, 1).len(), 8_309);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1477,15 +1493,20 @@ mod tests {
         let dir = segment_dir("cold-read");
         let (_, a, b) = states().remove(1);
         let (a, b): (Arc<dyn AggregateCore>, Arc<dyn AggregateCore>) = (Arc::from(a), Arc::from(b));
-        let kll = FieldDataType::Sketch(SketchAlgorithm::Kll);
+        let kll = FieldDataType::Sketch(SketchAlgorithm::KLL);
         let states: Vec<Arc<dyn AggregateCore>> = (0..1000)
             .map(|i| if i % 2 == 0 { a.clone() } else { b.clone() })
             .collect();
         let held = 4 * (states.len() + 1)
-            + states
-                .iter()
-                .map(|s| state_view_bytes(s.as_ref()).unwrap().len().div_ceil(8) * 8)
-                .sum::<usize>();
+            + crate::segment::view_bytes(
+                &kll,
+                &sources_of(&window_batch(10, kll.clone(), states.clone())),
+                4,
+            )
+            .unwrap()
+            .iter()
+            .map(|view| view.len().div_ceil(8) * 8)
+            .sum::<usize>();
         let (first, second) = (
             window_batch(10, kll.clone(), states.clone()),
             window_batch(20, kll, states),
@@ -1503,7 +1524,10 @@ mod tests {
         let (r2, _) = l2.read(second.schema(), ViewRead::Mmap).unwrap();
         assert_same_rows(&first, &r1, "mapped");
         assert_eq!(state_bytes, held);
-        assert_eq!(r1.state_column(4).unwrap().state_memory_bytes(), 0);
+        // The column reports the bytes its views span, but a run reading
+        // it is charged none of them: they are the store's.
+        assert_eq!(r1.state_column(4).unwrap().state_memory_bytes(), held);
+        assert_eq!(r1.memory_bytes() + held, r1.stored_bytes());
         let identity = |batch: &Batch| {
             batch
                 .column(1)
@@ -1636,6 +1660,9 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "node_id": id,
                 "refresh": "at_ingestion",
+                "plan_id": "test-plan",
+                "view_state_key": {"definition_id": format!("v{id}"), "window": null,
+                    "logical_properties": {"parameters": null}},
                 "coverage": {"definition_id": format!("v{id}"), "selection": []},
                 "inputs": {"materialized_views": []},
                 "retention_ms": 1_000_000,
@@ -1667,6 +1694,9 @@ mod tests {
         let view: MaterializedView = serde_json::from_value(serde_json::json!({
             "node_id": 1,
             "refresh": "at_ingestion",
+            "plan_id": "test-plan",
+            "view_state_key": {"definition_id": "v", "window": null,
+                "logical_properties": {"parameters": null}},
             "coverage": {"definition_id": "v", "selection": []},
             "inputs": {"materialized_views": []},
             "retention_ms": 1_000_000,
@@ -1863,6 +1893,9 @@ mod tests {
         let view: MaterializedView = serde_json::from_value(serde_json::json!({
             "node_id": 1,
             "refresh": "at_ingestion",
+            "plan_id": "test-plan",
+            "view_state_key": {"definition_id": "v", "window": null,
+                "logical_properties": {"parameters": null}},
             "coverage": {"definition_id": "v", "selection": []},
             "inputs": {"materialized_views": []},
             "retention_ms": 1_000_000,
@@ -1914,6 +1947,9 @@ mod tests {
         let view: MaterializedView = serde_json::from_value(serde_json::json!({
             "node_id": 1,
             "refresh": "at_ingestion",
+            "plan_id": "test-plan",
+            "view_state_key": {"definition_id": "v", "window": null,
+                "logical_properties": {"parameters": null}},
             "coverage": {"definition_id": "v", "selection": []},
             "inputs": {"materialized_views": []},
             "retention_ms": 1_000_000,
@@ -1961,6 +1997,9 @@ mod tests {
         let view: MaterializedView = serde_json::from_value(serde_json::json!({
             "node_id": 1,
             "refresh": "at_ingestion",
+            "plan_id": "test-plan",
+            "view_state_key": {"definition_id": "v", "window": null,
+                "logical_properties": {"parameters": null}},
             "coverage": {"definition_id": "v", "selection": []},
             "inputs": {"materialized_views": []},
             "retention_ms": 1_000_000,
@@ -2003,6 +2042,9 @@ mod tests {
         let view: MaterializedView = serde_json::from_value(serde_json::json!({
             "node_id": 1,
             "refresh": "at_ingestion",
+            "plan_id": "test-plan",
+            "view_state_key": {"definition_id": "v", "window": null,
+                "logical_properties": {"parameters": null}},
             "coverage": {"definition_id": "v", "selection": []},
             "inputs": {"materialized_views": []},
             "retention_ms": 1_000_000,

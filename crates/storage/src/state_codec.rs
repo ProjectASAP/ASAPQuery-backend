@@ -1,12 +1,12 @@
 //! Compact encodings of a fragment's state and text columns
 //! (docs/design/tiered-view-storage.md, "On-disk format").
 //!
-//! A state column is written in the executor's mapped layout
-//! ([`asap_executor::values::state_view_bytes`]): fixed-width fields and
-//! 8-byte-aligned arrays. That layout is large for the small
-//! states of narrow panes: a DDSketch of ten samples is an 88-byte header
+//! A state column is written in the executor's view layout
+//! ([`asap_executor::values::StateColumn::view_bytes`]): fixed-width fields
+//! and 8-byte-aligned arrays. That layout is large for the small
+//! states of narrow panes: a DDSketch of ten samples is a 64-byte header
 //! plus a dense run of 1-byte bucket counts, most of them empty. This module
-//! stores the same states in a compact form and rebuilds the mapped layout,
+//! stores the same states in a compact form and rebuilds the view layout,
 //! byte for byte, when a window is read cold:
 //!
 //! - DDSketch: only non-empty buckets, as a varint gap from the previous
@@ -19,12 +19,12 @@
 //! - Text keys: each row's dictionary key as a signed varint delta from
 //!   the previous row's.
 //!
-//! Everything here is lossless: decoding gives the bytes the mapped layout
+//! Everything here is lossless: decoding gives the bytes the view layout
 //! held, so every answer read from a compact column is the one read from
-//! the mapped column. A state the encoder does not recognize as canonical
+//! the view-layout column. A state the encoder does not recognize as canonical
 //! is kept whole (a raw-record tag), never approximated.
 
-/// The state families with a compact form, as the mapped layout names
+/// The state families with a compact form, as the view layout names
 /// them: which fixed-size exact record, or which sketch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompactKind {
@@ -68,7 +68,7 @@ impl CompactKind {
         })
     }
 
-    /// The bytes of one record in the mapped layout, for an exact kind.
+    /// The bytes of one record in the view layout, for an exact kind.
     fn record_bytes(self) -> Option<usize> {
         Some(match self {
             Self::DDSketch => return None,
@@ -138,9 +138,18 @@ fn padded(n: usize) -> usize {
 
 const DD_MAGIC: [u8; 4] = *b"DDV1";
 const VIEW_LAYOUT_VERSION: u32 = 1;
-/// Bytes of a DDSketch view before its arrays: magic and version, seven
+/// Bytes of a DDSketch view before its arrays: magic and version, four
 /// 8-byte fields, six 4-byte fields.
-const DD_HEAD_BYTES: usize = 88;
+const DD_HEAD_BYTES: usize = 64;
+/// Where a DDSketch view's 4-byte fields lie in its head: the count width,
+/// the store form (1 sparse), and each store's first bucket index and
+/// entry count.
+const DD_WIDTH_AT: usize = 40;
+const DD_SPARSE_AT: usize = 44;
+const DD_POSITIVE_OFFSET_AT: usize = 48;
+const DD_POSITIVE_ENTRIES_AT: usize = 52;
+const DD_NEGATIVE_OFFSET_AT: usize = 56;
+const DD_NEGATIVE_ENTRIES_AT: usize = 60;
 /// The widest store a DDSketch view may span, in buckets (the view
 /// reader's limit): bucket index arithmetic stays far inside `i32`.
 const MAX_SPAN: i64 = 1 << 20;
@@ -152,9 +161,6 @@ type Buckets = Vec<(i32, u64)>;
 #[derive(Debug, Default, Clone, PartialEq)]
 struct DdContents {
     alpha: u64,
-    sum: u64,
-    min: u64,
-    max: u64,
     zero_count: u64,
     admission_rate: u64,
     positive: Buckets,
@@ -194,13 +200,10 @@ fn read_dd(view: &[u8], dd: &mut DdContents) -> Option<()> {
     let mut at = 8;
     let alpha = u64_at(view, &mut at)?;
     let count = u64_at(view, &mut at)?;
-    let sum = u64_at(view, &mut at)?;
-    let min = u64_at(view, &mut at)?;
-    let max = u64_at(view, &mut at)?;
     let zero_count = u64_at(view, &mut at)?;
     let admission_rate = u64_at(view, &mut at)?;
-    let width = u32_at(view, 64)? as usize;
-    let sparse = match u32_at(view, 68)? {
+    let width = u32_at(view, DD_WIDTH_AT)? as usize;
+    let sparse = match u32_at(view, DD_SPARSE_AT)? {
         0 => false,
         1 => true,
         _ => return None,
@@ -245,21 +248,16 @@ fn read_dd(view: &[u8], dd: &mut DdContents) -> Option<()> {
         }
         Some(())
     };
-    let (positive_offset, negative_offset) = (u32_at(view, 72)? as i32, u32_at(view, 80)? as i32);
-    store(
-        positive_offset,
-        u32_at(view, 76)? as usize,
-        &mut dd.positive,
-    )?;
-    store(
-        negative_offset,
-        u32_at(view, 84)? as usize,
-        &mut dd.negative,
-    )?;
+    let positive_offset = u32_at(view, DD_POSITIVE_OFFSET_AT)? as i32;
+    let positive_entries = u32_at(view, DD_POSITIVE_ENTRIES_AT)? as usize;
+    let negative_offset = u32_at(view, DD_NEGATIVE_OFFSET_AT)? as i32;
+    let negative_entries = u32_at(view, DD_NEGATIVE_ENTRIES_AT)? as usize;
+    store(positive_offset, positive_entries, &mut dd.positive)?;
+    store(negative_offset, negative_entries, &mut dd.negative)?;
     if at != view.len() {
         return None;
     }
-    (dd.alpha, dd.sum, dd.min, dd.max) = (alpha, sum, min, max);
+    dd.alpha = alpha;
     (dd.zero_count, dd.admission_rate) = (zero_count, admission_rate);
     let contents = &*dd;
     // Only the form the view writer writes, so the compact form rebuilds
@@ -276,16 +274,8 @@ fn read_dd(view: &[u8], dd: &mut DdContents) -> Option<()> {
         && span(&contents.positive) as i64 <= MAX_SPAN
         && span(&contents.negative) as i64 <= MAX_SPAN
         && sparse == form_sparse
-        && trimmed(
-            &contents.positive,
-            positive_offset,
-            u32_at(view, 76)? as usize,
-        )
-        && trimmed(
-            &contents.negative,
-            negative_offset,
-            u32_at(view, 84)? as usize,
-        );
+        && trimmed(&contents.positive, positive_offset, positive_entries)
+        && trimmed(&contents.negative, negative_offset, negative_entries);
     (canonical && contents.count()? == count).then_some(())
 }
 
@@ -330,9 +320,6 @@ impl DdContents {
         for word in [
             self.alpha,
             self.count()?,
-            self.sum,
-            self.min,
-            self.max,
             self.zero_count,
             self.admission_rate,
         ] {
@@ -585,10 +572,10 @@ fn buckets(reader: &mut StreamReader, previous_first: &mut i32, out: &mut Bucket
 
 // ------------------------------------------------------------ the columns
 
-/// The tag of an exact record kept whole, in its mapped layout.
+/// The tag of an exact record kept whole, in its view layout.
 const RAW: u8 = 0xff;
 
-/// A column of `states` (each the mapped-layout bytes of one state of
+/// A column of `states` (each the view-layout bytes of one state of
 /// `kind`) in compact form; `None` when the column has no compact form
 /// (its sketches differ in index mapping or admission rate, or a state is
 /// not of `kind`'s layout).
@@ -614,9 +601,6 @@ pub(crate) fn encode_states(
                     Some(_) => {}
                 }
                 put_uvarint(&mut out.ints, dd.zero_count);
-                out.floats[0].push(dd.sum);
-                out.floats[1].push(dd.min);
-                out.floats[2].push(dd.max);
                 put_buckets(&mut out.ints, &dd.positive, &mut previous.0);
                 put_buckets(&mut out.ints, &dd.negative, &mut previous.1);
             }
@@ -716,7 +700,7 @@ fn put_record(
     true
 }
 
-/// Decodes `rows` states of `kind` from their compact form into the mapped
+/// Decodes `rows` states of `kind` from their compact form into the view
 /// layout: the states back to back in 8-byte words (each state starting on
 /// a word), and their byte offsets (`rows + 1`). `None` when the bytes are
 /// damaged.
@@ -749,8 +733,6 @@ pub(crate) fn decode_states(
                     dd.zero_count = reader.uvarint()?;
                     buckets(&mut reader, &mut previous.0, &mut dd.positive)?;
                     buckets(&mut reader, &mut previous.1, &mut dd.negative)?;
-                    (dd.sum, dd.min, dd.max) =
-                        (reader.float(0)?, reader.float(1)?, reader.float(2)?);
                     view.clear();
                     dd.view_bytes(&mut view)?;
                     let (view_words, _) = view.as_chunks::<8>();
@@ -774,7 +756,7 @@ pub(crate) fn decode_states(
     reader.finished().then_some((words, offsets))
 }
 
-/// One exact record of `kind`, appended to `view` in its mapped layout.
+/// One exact record of `kind`, appended to `view` in its view layout.
 fn record(
     kind: CompactKind,
     reader: &mut StreamReader,
@@ -919,28 +901,28 @@ mod tests {
     }
 
     /// Ten samples per series in a 1 s pane at alpha 0.02 (the demo's
-    /// finest DDSketch view): the mapped layout takes 120 bytes a state (an
-    /// 88-byte head and a dense run of 1-byte counts, half of them empty),
-    /// the compact column 47 before compression.
+    /// finest DDSketch view): the view layout takes 96 bytes a state (a
+    /// 64-byte head and a dense run of 1-byte counts, half of them empty),
+    /// the compact column 23 before compression.
     #[test]
-    fn a_ten_sample_ddsketch_state_takes_47_compact_bytes() {
+    fn a_ten_sample_ddsketch_state_takes_23_compact_bytes() {
         let samples: Vec<f64> = (0..10).map(|i| 40.0 + 7.3 * f64::from(i)).collect();
         let view = dd(0.02, &samples);
-        assert_eq!(view.len(), 120);
+        assert_eq!(view.len(), 96);
         let rows = 1000;
         let states = vec![view; rows];
         let compact =
             encode_states(CompactKind::DDSketch, states.iter().map(Vec::as_slice)).unwrap();
         // Per row, 23 varint bytes (the zero count, two store headers, the
-        // first bucket's delta from the previous row's, 9 gaps, 10 counts)
-        // and 24 float bytes (sum, min, max); per column, alpha and the
-        // admission rate (16), the stream lengths (9), and one more byte
-        // for the first row's first bucket (no previous row).
-        assert_eq!(compact.len(), rows * (23 + 24) + 16 + 9 + 1);
+        // first bucket's delta from the previous row's, 9 gaps, 10 counts);
+        // per column, alpha and the admission rate (16), the stream lengths
+        // (6: the int stream's, and the three empty float streams'), and one
+        // more byte for the first row's first bucket (no previous row).
+        assert_eq!(compact.len(), rows * 23 + 16 + 6 + 1);
     }
 
-    /// Decoding gives the mapped layout's bytes exactly, so every answer
-    /// read from a compact column is the answer read from the mapped one:
+    /// Decoding gives the view layout's bytes exactly, so every answer
+    /// read from a compact column is the answer read from the view-layout one:
     /// empty sketches, zeros, negative samples, counts past one byte,
     /// dense and sparse stores.
     #[test]
@@ -957,7 +939,10 @@ mod tests {
             dd(0.02, &dense),
             dd(0.02, &[-1e300, 1e-300, 7.0]),
         ];
-        assert_ne!(states[4][68], states[5][68], "both store forms are covered");
+        assert_ne!(
+            states[4][DD_SPARSE_AT], states[5][DD_SPARSE_AT],
+            "both store forms are covered"
+        );
         let back = round_trip(CompactKind::DDSketch, &states);
         assert_eq!(back, states);
         for (a, b) in states.iter().zip(&back) {
@@ -970,7 +955,7 @@ mod tests {
     }
 
     /// Sketches of different index mappings have no shared column head:
-    /// the column keeps its mapped layout.
+    /// the column keeps its view layout.
     #[test]
     fn ddsketches_of_two_alphas_have_no_compact_column() {
         let states = [dd(0.02, &[1.0]), dd(0.05, &[1.0])];
@@ -978,13 +963,13 @@ mod tests {
     }
 
     /// Views the writer never writes (keys out of order, non-zero padding)
-    /// have no compact form: their column keeps the mapped layout rather
+    /// have no compact form: their column keeps the view layout rather
     /// than being rebuilt differently.
     #[test]
     fn non_writer_ddsketch_views_have_no_compact_form() {
         let spread: Vec<f64> = (0..5).map(|i| 1.5f64.powi(i * 3)).collect();
         let view = dd(0.02, &spread);
-        assert_eq!(view[68], 1, "a sparse store");
+        assert_eq!(view[DD_SPARSE_AT], 1, "a sparse store");
         assert!(dd_contents(&view).is_some());
         let mut swapped = view.clone();
         // Swap the second and third sparse keys.
@@ -1048,7 +1033,7 @@ mod tests {
         }
     }
 
-    /// A counter takes 56 bytes in the mapped layout and 20 in a compact
+    /// A counter takes 56 bytes in the view layout and 20 in a compact
     /// column: a tag, two timestamp deltas from the previous row's, the
     /// sample count, and the start and last value; the increase is their
     /// difference (no reset), so it is left out.

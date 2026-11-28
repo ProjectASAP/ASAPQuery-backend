@@ -711,7 +711,7 @@ fn same_within(a: &[Answer], b: &[Answer], relative: f64) -> bool {
 fn tolerance(plan: &InstallablePlan) -> f64 {
     let randomized = serde_json::to_string(&plan.dag)
         .unwrap()
-        .contains("\"Kll\"");
+        .contains("\"KLL\"");
     if randomized {
         0.05
     } else {
@@ -1055,26 +1055,41 @@ fn shapes(views: &BTreeMap<String, Vec<StoredWindow>>) -> BTreeMap<String, Vec<W
         .collect()
 }
 
-/// `served`'s windows of each view from the oldest window `expected` holds
-/// of it. Windows past a view's retention leave the store lazily (at the
-/// view's next append), and a narrower level is held until its readers
-/// commit, so how many such windows linger at the end of a run depends on
-/// the order windows were committed in, which differs between push and the
-/// window path; and windows that far back are skipped when the watermark
-/// jumps past them, which depends on when each shard reports. Neither is
-/// read by a query.
-fn from_oldest_of(
-    served: BTreeMap<String, Vec<StoredWindow>>,
-    expected: &BTreeMap<String, Vec<StoredWindow>>,
+/// Each view's windows within its retention of its newest window: those
+/// ending less than `retention_ms` before it, and the newest itself (the
+/// windows the store keeps by retention, `storage::store`'s
+/// `oldest_kept_end`). Both data planes must hold exactly these: no window
+/// that recent is skipped as expired or evicted. Older windows leave the
+/// store lazily (at the view's next append), and a narrower level is held
+/// until its readers commit, so how many such windows linger at the end of
+/// a run depends on the order windows were committed in and on when each
+/// shard reported, which differ between push and the window path and from
+/// run to run; and no query reads them.
+fn within_retention(
+    views: BTreeMap<String, Vec<StoredWindow>>,
+    plan: &InstallablePlan,
 ) -> BTreeMap<String, Vec<StoredWindow>> {
-    served
+    let retention_ms: BTreeMap<String, i64> = plan
+        .ingestion_refresh_groups()
+        .unwrap()
+        .iter()
+        .flat_map(|group| &group.views)
+        .map(|view| {
+            let retention = i64::try_from(view.retention_ms()).unwrap_or(i64::MAX);
+            (format!("{}", view.node_id), retention)
+        })
+        .collect();
+    views
         .into_iter()
         .map(|(view, windows)| {
-            let oldest = expected
-                .get(&view)
-                .and_then(|w| w.first())
-                .map_or(i64::MIN, |w| w.0 .1);
-            let windows = windows.into_iter().filter(|w| w.0 .1 >= oldest).collect();
+            let newest_end = windows.last().map_or(i64::MIN, |w| w.0 .1);
+            // A view of no refresh group keeps every window.
+            let retention = retention_ms.get(&view).copied().unwrap_or(i64::MAX);
+            let oldest_kept_end = newest_end.saturating_sub(retention);
+            let windows = windows
+                .into_iter()
+                .filter(|w| w.0 .1 > oldest_kept_end || w.0 .1 == newest_end)
+                .collect();
             (view, windows)
         })
         .collect()
@@ -1120,8 +1135,9 @@ fn first_difference(
     "shapes differ".into()
 }
 
-/// T2. Push precompute stores the same view rows as the window path: per
-/// (view, window), the same keys and the same states (exact values, or
+/// T2. Push precompute stores the same view rows as the window path: the
+/// same windows within each view's retention, and per (view, window) the
+/// same keys and the same states (exact values, or
 /// sketch bytes). KLL plans store the same windows and keys; their states
 /// may differ within the target, which T1 checks through the answers.
 #[tokio::test(flavor = "multi_thread")]
@@ -1148,8 +1164,8 @@ async fn push_precompute_stores_the_window_paths_view_rows() {
                 data_plane_over(&plan, &points, start_ms, false, window, Views::InMemory).await;
             let (_, by_push) =
                 data_plane_over(&plan, &points, start_ms, false, push, Views::InMemory).await;
-            let expected = stored_views(&by_window);
-            let served = from_oldest_of(stored_views(&by_push), &expected);
+            let expected = within_retention(stored_views(&by_window), &plan);
+            let served = within_retention(stored_views(&by_push), &plan);
             compared_views += expected.len();
             let equal = if tolerance(&plan) > 1e-9 {
                 shapes(&expected) == shapes(&served)

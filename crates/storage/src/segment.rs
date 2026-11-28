@@ -12,10 +12,11 @@
 //! A fragment holds one view's rows of one window by column, compressed
 //! (zstd), so a cold read decodes one (view, window) without the record's
 //! other views. State and text columns are stored compact
-//! ([`crate::state_codec`]) and rebuilt in the executor's mapped state
+//! ([`crate::state_codec`]) and rebuilt in the executor's view
 //! layout when read. A text column holding each row's series label is not
 //! stored: it is rebuilt from the series identity column.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -38,7 +39,7 @@ use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
 use asap_executor::planner::summary_type::{ExactKind, SketchAlgorithm};
 use asap_executor::summary_kernels::HydraCms;
 use asap_executor::values::{
-    family_has_mapped_form, state_view_bytes, Batch, BatchColumn, SchemaRef, Value,
+    family_has_view_layout, Batch, BatchColumn, SchemaRef, StateColumn, Value,
 };
 use asap_executor::Error;
 use serde::{Deserialize, Serialize};
@@ -50,7 +51,11 @@ use crate::state_codec::{
 };
 
 /// The view file format version these segments are.
-pub(crate) const FORMAT_VERSION: u32 = 4;
+///
+/// 5: DDSketch states without `sum`, `min` and `max` (`asap_sketchlib`
+/// ASAPv1 kind `0x05 0x01`; a 64-byte view head). A version 4 segment is
+/// set aside on open, never read.
+pub(crate) const FORMAT_VERSION: u32 = 5;
 
 /// Frame kinds.
 const HEADER_FRAME: u32 = 0;
@@ -69,16 +74,16 @@ const TIMESTAMP: u32 = 4;
 /// Any other plain column: MessagePack of its values.
 const GENERIC: u32 = 5;
 const STATES: u32 = 6;
-/// A state column in the executor's mapped layout: `u32` offsets in the
+/// A state column in the executor's view layout: `u32` offsets in the
 /// data section, the states (each 8-byte aligned) in the second section.
-/// For a family with a mapped form but no compact one (KLL, Count-Min).
-const MAPPED_STATES: u32 = 7;
+/// For a family with a view layout but no compact form (KLL, Count-Min).
+const VIEW_STATES: u32 = 7;
 /// A text column whose every row holds its series identity's label of the
 /// column's name (`""` when the series has none): no data, rebuilt on read
 /// from the identity column, whose index is the descriptor's flags.
 const IDENTITY_LABEL: u32 = 8;
 /// A state column in compact form ([`crate::state_codec`]); its flags are
-/// the [`CompactKind`] code. Read back into the mapped layout.
+/// the [`CompactKind`] code. Read back into the view layout.
 const COMPACT_STATES: u32 = 9;
 /// Flag: a timestamp column whose rows all hold one value, stored once.
 const CONSTANT: u32 = 1;
@@ -762,7 +767,7 @@ impl WindowLocation {
     }
 
     /// The fragment's rows as one batch of `schema`, and the bytes its
-    /// state columns hold: they are rebuilt in the mapped layout, which
+    /// state columns hold: they are rebuilt in the view layout, which
     /// [`Batch::memory_bytes`] counts as held outside the run, so a cache
     /// holding the batch charges them itself.
     pub fn read(&self, schema: &SchemaRef, how: ViewRead) -> Result<(Batch, usize), Error> {
@@ -870,11 +875,15 @@ fn validity(nulls: &[bool]) -> Option<Vec<u8>> {
     Some(bits)
 }
 
-/// `rows` (of `schema`) as one compressed columnar fragment; `None` when a
-/// state has no byte encoding.
+/// Where a fragment row came from: a window's batch and its row there.
+pub(crate) type RowSource<'a> = (&'a Batch, usize);
+
+/// `rows` (of `schema`) as one compressed columnar fragment, row `i` read
+/// from `sources[i]`; `None` when a state has no byte encoding.
 pub(crate) fn encode_fragment(
     schema: &Schema,
     rows: &[Vec<Value>],
+    sources: &[RowSource<'_>],
     texts: &mut SegmentTexts,
     grids: &mut Grids,
 ) -> Option<Vec<u8>> {
@@ -891,7 +900,7 @@ pub(crate) fn encode_fragment(
             .iter()
             .map(|row| matches!(row[column], Value::Null))
             .collect();
-        // The second section: the validity bitmap, or a mapped state
+        // The second section: the validity bitmap, or a view-layout state
         // column's states.
         let mut second: Option<Vec<u8>> = None;
         // The identity column, when this column holds its series' label.
@@ -902,24 +911,17 @@ pub(crate) fn encode_fragment(
                     && labels.holds_label(rows, column, &field.name)
             })
             .map(|labels| labels.column as u32);
+        // Each state in its view layout (`None` when a state has none, e.g.
+        // a keyed exact state, or the family has no view layout).
+        let views = view_bytes(&field.dtype, sources, column);
         // A state column of a family with a compact form, compacted from
-        // each state's mapped layout (`None` when a state has none, e.g. a
-        // keyed exact state, or the column has no compact form).
-        let mut compact = compact_kind(&field.dtype).and_then(|kind| {
-            let views = rows
-                .iter()
-                .map(|row| match &row[column] {
-                    Value::Summary { state, .. } => state_view_bytes(state.as_ref()),
-                    _ => None,
-                })
-                .collect::<Option<Vec<_>>>()?;
-            Some((kind, encode_states(kind, views.iter())?))
-        });
-        // Otherwise the column in the mapped layout, when it has one.
-        let mut mapped = match &field.dtype {
-            FieldDataType::Plain(_) => None,
-            _ if compact.is_some() => None,
-            family if family_has_mapped_form(family) => mapped_states(rows, column),
+        // the views (`None` when the column has no compact form).
+        let mut compact = compact_kind(&field.dtype)
+            .zip(views.as_ref())
+            .and_then(|(kind, views)| Some((kind, encode_states(kind, views.iter())?)));
+        // Otherwise the column in the view layout, when it has one.
+        let mut view_column = match views {
+            Some(views) if compact.is_none() => view_column_of(views),
             _ => None,
         };
         let (kind, mut flags, data): (u32, u32, Vec<u8>) = match &field.dtype {
@@ -982,10 +984,10 @@ pub(crate) fn encode_fragment(
                 let (compact_kind, compact) = compact.take().expect("checked");
                 (COMPACT_STATES, compact_kind.code(), compact)
             }
-            _ if mapped.is_some() => {
-                let (offsets, states) = mapped.take().expect("checked");
+            _ if view_column.is_some() => {
+                let (offsets, states) = view_column.take().expect("checked");
                 second = Some(states);
-                (MAPPED_STATES, 0, offsets)
+                (VIEW_STATES, 0, offsets)
             }
             _ => {
                 // States: u32 offsets[rows + 1], then each state's stored bytes.
@@ -1007,7 +1009,7 @@ pub(crate) fn encode_fragment(
         };
         let (data_offset, data_len) = section(&mut out, &data);
         let (valid_offset, valid_len) = match (kind, validity(&nulls)) {
-            (MAPPED_STATES, _) => section(&mut out, &second.take().expect("states")),
+            (VIEW_STATES, _) => section(&mut out, &second.take().expect("states")),
             (STATES | GENERIC | COMPACT_STATES, _) => (0, 0),
             (_, Some(bits)) => section(&mut out, &bits),
             (_, None) => (0, 0),
@@ -1102,18 +1104,45 @@ impl IdentityLabels {
     }
 }
 
-/// Column `column` of `rows` in the executor's mapped state layout: the
-/// `u32` offsets (`rows + 1`) and the states back to back, each padded to 8
-/// bytes; `None` when a state has no mapped form.
-fn mapped_states(rows: &[Vec<Value>], column: usize) -> Option<(Vec<u8>, Vec<u8>)> {
-    let mut offsets = Vec::with_capacity((rows.len() + 1) * 4);
-    let mut states = Vec::new();
+/// Each source row's state in column `column` (of `family`) in the
+/// executor's view layout, read from its batch's state column
+/// ([`StateColumn::view_bytes`]: borrowed where that column holds views);
+/// `None` when a row holds no state, the family has no view layout, or a
+/// state has none (a keyed exact state).
+pub(crate) fn view_bytes<'a>(
+    family: &FieldDataType,
+    sources: &[RowSource<'a>],
+    column: usize,
+) -> Option<Vec<Cow<'a, [u8]>>> {
+    if !family_has_view_layout(family) {
+        return None;
+    }
+    sources
+        .iter()
+        .map(|&(batch, row)| {
+            let states = batch.state_column(column)?;
+            let indices = batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<UInt32Array>()?;
+            if indices.is_null(row) {
+                return None;
+            }
+            states.view_bytes(indices.value(row) as usize)
+        })
+        .collect()
+}
+
+/// State `views` in the executor's view layout as one column: the `u32`
+/// offsets (`rows + 1`) and the states back to back, each padded to 8
+/// bytes. Each view is dropped once copied, so the column and the views
+/// are not both held whole.
+fn view_column_of(views: Vec<Cow<'_, [u8]>>) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut offsets = Vec::with_capacity((views.len() + 1) * 4);
+    let mut states = Vec::with_capacity(views.iter().map(|view| padded(view.len())).sum());
     offsets.extend_from_slice(&0u32.to_le_bytes());
-    for row in rows {
-        let Value::Summary { state, .. } = &row[column] else {
-            return None;
-        };
-        states.extend(state_view_bytes(state.as_ref())?);
+    for view in views {
+        states.extend_from_slice(&view);
         states.resize(padded(states.len()), 0);
         offsets.extend_from_slice(&u32::try_from(states.len()).ok()?.to_le_bytes());
     }
@@ -1277,7 +1306,7 @@ fn decode_fragment(
             data,
             valid,
         } = descriptor(bytes, column)?;
-        let nulls = if valid.1 == 0 || kind == MAPPED_STATES || kind == COMPACT_STATES {
+        let nulls = if valid.1 == 0 || kind == VIEW_STATES || kind == COMPACT_STATES {
             None
         } else {
             if valid.1 != rows.div_ceil(8) {
@@ -1369,7 +1398,7 @@ fn decode_fragment(
                     decode_states(compact, &bytes[data.0..data.0 + data.1], rows)
                         .ok_or_else(damaged)?;
                 state_bytes += states.len() * 8 + offsets.len() * 4;
-                let column = asap_executor::values::StateColumn::from_mapped(
+                let column = StateColumn::from_views(
                     field.dtype.clone(),
                     Buffer::from(states),
                     ScalarBuffer::from(offsets),
@@ -1380,18 +1409,14 @@ fn decode_fragment(
                 });
                 continue;
             }
-            MAPPED_STATES => {
+            VIEW_STATES => {
                 if data.1 != (rows + 1) * 4 {
                     return Err(damaged());
                 }
                 state_bytes += data.1 + valid.1;
                 let offsets = ScalarBuffer::<u32>::new(buffer(bytes, data.0, data.1)?, 0, rows + 1);
                 let states = buffer(bytes, valid.0, valid.1)?;
-                let column = asap_executor::values::StateColumn::from_mapped(
-                    field.dtype.clone(),
-                    states,
-                    offsets,
-                )?;
+                let column = StateColumn::from_views(field.dtype.clone(), states, offsets)?;
                 out.push(BatchColumn::States {
                     indices: UInt32Array::from_iter_values(0..rows as u32),
                     states: Arc::new(column),
