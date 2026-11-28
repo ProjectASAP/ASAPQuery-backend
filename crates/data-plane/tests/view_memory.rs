@@ -8,8 +8,8 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use axum::Router;
 use data_plane::engine::EngineOptions;
-use data_plane::remote_write::{Label, Sample, TimeSeries};
 use data_plane::{router, DataPlane};
+use prometheus_remote_write::{Label, Sample, TimeSeries};
 use serde_json::{json, Value};
 
 const QUANTILE: &str = "quantile_over_time(0.9, data[1m])";

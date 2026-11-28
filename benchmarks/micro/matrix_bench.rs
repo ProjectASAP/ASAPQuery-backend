@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use data_plane::prometheus::range_response_body;
-use query::ResultSample;
+use common::ResultSample;
+use prometheus_http::range_response_body;
 
 fn main() {
     let args: Vec<usize> = std::env::args()

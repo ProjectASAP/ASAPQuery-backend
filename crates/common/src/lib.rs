@@ -19,8 +19,8 @@ pub use plan::{InstallError, InstalledPlan, PlanId};
 pub use query_engine::{AnswerSource, EngineQueryResult, QueryEngineError};
 pub use query_request::{QueryEval, QueryRequest};
 pub use query_result::{
-    InstantVector, InstantVectorElement, QueryResult, RangeVector, RangeVectorElement, Sample,
-    Table, TableValue,
+    Answer, InstantVector, InstantVectorElement, QueryResult, RangeVector, RangeVectorElement,
+    ResultSample, Sample, Table, TableValue,
 };
 
 /// The largest time, in milliseconds either side of the epoch, the data
@@ -36,4 +36,4 @@ pub type LabelSet = std::collections::BTreeMap<String, String>;
 // The plan types the boundary names, so callers need no direct Planner
 // dependency to use it.
 pub use asap_planner::{InstallablePlan, PhysicalASAPNodeId};
-pub use asap_types::workload::QueryLanguage;
+pub use asap_types::workload::{QueryLanguage, SqlDialect};

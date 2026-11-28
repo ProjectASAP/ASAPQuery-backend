@@ -33,30 +33,19 @@ use asap_executor::planner::plan::physical_asap_dag::{PhysicalASAPDAG, PhysicalA
 use asap_executor::planner::stages::Lifetime;
 use asap_executor::runtime::{Limits, RunContext, Scope};
 use asap_executor::values::{Batch, Value};
-use common::InstallablePlan;
+use common::{Answer, InstallablePlan, ResultSample};
 use futures::executor::block_on;
 use futures::StreamExt;
 use internal_metrics::QueryMetrics;
 use storage::store::{PublishedStore, QueryTimeResults, RawReads, RawShards, RunStore, ViewStore};
 
-use crate::result_cache::{Answer, ResultCache};
+use crate::result_cache::ResultCache;
 
 mod engine;
 pub mod result_cache;
 pub mod workers;
 
 pub use engine::{ExecutorQueryEngine, QueryOptions};
-
-/// One series of an instant-query result.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ResultSample {
-    /// Shared with the interned series (an input series) or with every
-    /// other row of the same result series (`series_ids::result_labels`)
-    /// when the row has no other label column, so results and the result
-    /// cache hold no copy of it.
-    pub labels: Arc<BTreeMap<String, String>>,
-    pub value: f64,
-}
 
 /// Why the engine does not answer a query.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

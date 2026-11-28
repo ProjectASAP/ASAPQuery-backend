@@ -1,6 +1,11 @@
 //! Backend data plane: receives Prometheus Remote Write samples and serves
 //! the Prometheus query API for an installed plan.
 //!
+//! The protocols are adapters: `prometheus_remote_write` decodes Remote
+//! Write requests ([`remote_write`] interns their series into the store),
+//! and `prometheus_http` reads query parameters, writes responses and
+//! sends what the plan does not answer to Prometheus.
+//!
 //! The installed plan is ASAPPlanner's `InstallablePlan`: one selected
 //! physical ASAP DAG. The precompute engine's ingest shards store the raw
 //! samples its `Scan`s read and its precompute pool refreshes the
@@ -20,7 +25,6 @@ mod dispatcher;
 pub mod engine;
 mod installer;
 mod metrics_endpoint;
-pub mod prometheus;
 pub mod raw_forward;
 pub mod remote_write;
 #[cfg(test)]
@@ -38,7 +42,8 @@ use axum::Router;
 use dispatcher::{Fallback, NotAnswerableReason, QueryOutcome};
 use engine::{EngineHandle, EngineOptions};
 use precompute::engine::IngestError;
-use prometheus::{InstantQuery, RangeQuery};
+use prometheus_http::fallback::PrometheusHttpFallback;
+use prometheus_http::{InstantQuery, RangeQuery};
 use query::Unanswered;
 
 /// Response header naming what answered a query: `plan` or `forwarded`, or
@@ -55,13 +60,13 @@ pub struct DataPlane {
     /// The installed plan's queries, in root order.
     pub queries: Vec<String>,
     pub engine: EngineHandle,
-    /// Base URL of the Prometheus that answers forwarded queries.
-    pub prometheus_url: String,
-    pub limits: remote_write::Limits,
+    pub limits: prometheus_remote_write::Limits,
     /// Never forward a query to Prometheus: a query the plan cannot answer
     /// gets an error with the reason ([`EngineOptions::no_forward`]).
     pub no_forward: bool,
-    client: reqwest::Client,
+    /// The Prometheus that answers forwarded queries (the raw store in
+    /// forward mode).
+    fallback: PrometheusHttpFallback,
     /// Forward mode: delivers accepted Remote Write bodies to the raw store,
     /// which also answers what the plan does not. `None`: off.
     pub raw_forward: Option<raw_forward::RawForwarder>,
@@ -93,17 +98,16 @@ impl DataPlane {
             no_forward,
             queries,
             engine,
-            prometheus_url: prometheus_url.trim_end_matches('/').to_string(),
-            limits: remote_write::Limits::default(),
-            client: forward_client(DEFAULT_FORWARD_TIMEOUT),
+            limits: prometheus_remote_write::Limits::default(),
+            fallback: PrometheusHttpFallback::new(&prometheus_url, DEFAULT_FORWARD_TIMEOUT),
             raw_forward: None,
         })
     }
 
     /// Turns forward mode on: accepted Remote Write bodies are delivered to
     /// the raw store at `options.url`, and queries the plan does not answer,
-    /// as well as any other path, are proxied to it (in place of
-    /// `prometheus_url`). Refused with `--no-forward`, which forbids proxying.
+    /// as well as any other path, are proxied to it (in place of the
+    /// Prometheus URL). Refused with `--no-forward`, which forbids proxying.
     pub fn with_raw_forward(
         mut self,
         options: raw_forward::RawForwardOptions,
@@ -111,7 +115,7 @@ impl DataPlane {
         if self.no_forward {
             anyhow::bail!("--raw-store-url proxies unplanned queries, which --no-forward refuses");
         }
-        self.prometheus_url = options.url.clone();
+        self.fallback = self.fallback.with_base_url(&options.url);
         self.raw_forward = Some(raw_forward::RawForwarder::start(options)?);
         Ok(self)
     }
@@ -119,16 +123,9 @@ impl DataPlane {
     /// Bounds each forwarded query by `timeout`, from sending the request to
     /// reading the whole response (default [`DEFAULT_FORWARD_TIMEOUT`]).
     pub fn with_forward_timeout(mut self, timeout: Duration) -> Self {
-        self.client = forward_client(timeout);
+        self.fallback = self.fallback.with_timeout(timeout);
         self
     }
-}
-
-fn forward_client(timeout: Duration) -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .expect("reqwest client with only a timeout set")
 }
 
 pub fn router(state: Arc<DataPlane>) -> Router {
@@ -248,7 +245,7 @@ async fn watermark(State(state): State<Arc<DataPlane>>, RawQuery(query): RawQuer
             );
             return (
                 StatusCode::BAD_REQUEST,
-                axum::Json(prometheus::bad_data(&reason)),
+                axum::Json(prometheus_http::bad_data(&reason)),
             )
                 .into_response();
         }
@@ -256,7 +253,7 @@ async fn watermark(State(state): State<Arc<DataPlane>>, RawQuery(query): RawQuer
             let reason = "missing parameter \"time_ms\" (integer milliseconds)";
             return (
                 StatusCode::BAD_REQUEST,
-                axum::Json(prometheus::bad_data(reason)),
+                axum::Json(prometheus_http::bad_data(reason)),
             )
                 .into_response();
         }
@@ -344,7 +341,7 @@ async fn query(
         }
         Ok(None) => return forward(state, "query", method, query, headers, body).await,
         Err(bad) => {
-            let body = axum::Json(prometheus::bad_data(&bad.to_string()));
+            let body = axum::Json(prometheus_http::bad_data(&bad.to_string()));
             return (StatusCode::BAD_REQUEST, body).into_response();
         }
     };
@@ -355,7 +352,7 @@ async fn query(
     let dispatcher = state.engine.dispatcher();
     let reason = match dispatcher.instant(&instant.query, time_ms).await {
         QueryOutcome::Ready(samples) => {
-            let response = prometheus::VectorResponse { time_ms, samples };
+            let response = prometheus_http::VectorResponse { time_ms, samples };
             let mut response = axum::Json(response).into_response();
             response
                 .headers_mut()
@@ -394,7 +391,7 @@ async fn query_range(
         }
         Ok(None) => return forward(state, "query_range", method, query, headers, body).await,
         Err(bad) => {
-            let body = axum::Json(prometheus::bad_data(&bad.to_string()));
+            let body = axum::Json(prometheus_http::bad_data(&bad.to_string()));
             return (StatusCode::BAD_REQUEST, body).into_response();
         }
     };
@@ -462,7 +459,7 @@ async fn answer_range(
     // blocking pool instead.
     let failed = |error: String| NotAnswerableReason::new(Unanswered::Execution(error));
     tokio::task::spawn_blocking(move || {
-        prometheus::range_response_body(&steps)
+        prometheus_http::range_response_body(&steps)
             .map_err(|error| failed(format!("the range response: {error}")))
     })
     .await
@@ -482,47 +479,7 @@ fn not_answered(reason: &str) -> Response {
     response
 }
 
-/// Request headers not forwarded: hop-by-hop headers (RFC 9110 section 7.6.1),
-/// `Host` and `Content-Length`, which the client sets for the new request,
-/// and `Accept-Encoding`, because only the response's `Content-Type` is
-/// copied back, so the response must not be compressed.
-const NOT_FORWARDED: [header::HeaderName; 11] = [
-    header::CONNECTION,
-    header::HeaderName::from_static("keep-alive"),
-    header::PROXY_AUTHENTICATE,
-    header::PROXY_AUTHORIZATION,
-    header::TE,
-    header::TRAILER,
-    header::TRANSFER_ENCODING,
-    header::UPGRADE,
-    header::HOST,
-    header::CONTENT_LENGTH,
-    header::ACCEPT_ENCODING,
-];
-
-/// Copies every request header except those in `NOT_FORWARDED` and any
-/// named by `Connection`.
-fn forwarded_headers(headers: &HeaderMap) -> HeaderMap {
-    let named_by_connection: Vec<String> = headers
-        .get_all(header::CONNECTION)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(|name| name.trim().to_ascii_lowercase())
-        .collect();
-    let mut forwarded = HeaderMap::new();
-    for (name, value) in headers {
-        if NOT_FORWARDED.contains(name) || named_by_connection.iter().any(|n| n == name.as_str()) {
-            continue;
-        }
-        forwarded.append(name.clone(), value.clone());
-    }
-    forwarded
-}
-
-/// Sends the request to Prometheus with its end-to-end headers (including
-/// `Authorization` and tenancy headers such as `X-Scope-OrgID`) and returns
-/// Prometheus's status, body and `Content-Type`.
+/// Forwards the request to Prometheus' `/api/v1/{endpoint}` ([`forward_path`]).
 async fn forward(
     state: State<Arc<DataPlane>>,
     endpoint: &str,
@@ -535,7 +492,10 @@ async fn forward(
     forward_path(state, &path, method, query, headers, body).await
 }
 
-/// [`forward`] for any `path` of the Prometheus (or raw store) server.
+/// Forwards the request, as received, to `path` of the Prometheus (or raw
+/// store) server ([`PrometheusHttpFallback::forward`]) and answers with its
+/// status, body and `Content-Type`; 502 with the reason when the server
+/// cannot be reached or its response cannot be read.
 async fn forward_path(
     State(state): State<Arc<DataPlane>>,
     path: &str,
@@ -544,39 +504,16 @@ async fn forward_path(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let mut url = format!("{}{path}", state.prometheus_url);
-    if let Some(query) = query {
-        url = format!("{url}?{query}");
-    }
-    let request = state
-        .client
-        .request(method, url)
-        .headers(forwarded_headers(&headers))
-        .body(body);
-    let upstream = match request.send().await {
+    let upstream = match state
+        .fallback
+        .forward(method, path, query.as_deref(), &headers, body)
+        .await
+    {
         Ok(upstream) => upstream,
-        Err(error) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("forwarding to Prometheus: {error}"),
-            )
-                .into_response()
-        }
+        Err(error) => return (StatusCode::BAD_GATEWAY, error.message).into_response(),
     };
-    let status = upstream.status();
-    let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
-    let body = match upstream.bytes().await {
-        Ok(body) => body,
-        Err(error) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("reading Prometheus response: {error}"),
-            )
-                .into_response()
-        }
-    };
-    let mut response = (status, body).into_response();
-    if let Some(content_type) = content_type {
+    let mut response = (upstream.status, upstream.body).into_response();
+    if let Some(content_type) = upstream.content_type {
         response
             .headers_mut()
             .insert(header::CONTENT_TYPE, content_type);

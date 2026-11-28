@@ -7,13 +7,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use asap_executor::runtime::Limits;
 use common::{
-    AnswerSource, EngineQueryResult, InstallError, InstalledPlan, InstantVector,
+    Answer, AnswerSource, EngineQueryResult, InstallError, InstalledPlan, InstantVector,
     InstantVectorElement, LabelSet, QueryEngineError, QueryEval, QueryRequest, QueryResult,
     RangeVector, RangeVectorElement, Sample,
 };
 use storage::store::{PublishedStore, QueryTimeResults};
 
-use crate::result_cache::{Answer, ResultCache};
+use crate::result_cache::ResultCache;
 use crate::workers::InstalledQueries;
 use crate::CompiledQueries;
 
@@ -302,7 +302,7 @@ mod tests {
     fn answers_convert_to_boundary_results() {
         let labels = |job: &str| Arc::new(LabelSet::from([("job".to_string(), job.to_string())]));
         let (a, b) = (labels("a"), labels("b"));
-        let sample = |labels: &Arc<LabelSet>, value| crate::ResultSample {
+        let sample = |labels: &Arc<LabelSet>, value| common::ResultSample {
             labels: labels.clone(),
             value,
         };

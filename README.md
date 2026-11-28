@@ -236,6 +236,8 @@ not stored) with a Prometheus `execution` error (422,
 | `crates/query/` | package `query`: planned queries on the query workers, and the result cache |
 | `crates/storage/` | package `storage`: raw samples and views in memory, the view cache, segments, persistence and the persist threads |
 | `crates/internal-metrics/` | package `internal_metrics`: the backend's measurements of itself, exported on `/metrics` |
+| `crates/adapters/ingest/prometheus-remote-write/` | package `prometheus_remote_write`: Remote Write v1 decoding and validation |
+| `crates/adapters/query/prometheus-http/` | package `prometheus_http`: query parameters, response bodies and the fallback client of a Prometheus-compatible server |
 | `benchmarks/` | the backend alone: `micro/` benchmarks (examples of `data_plane`) and `scripts/` |
 | `eval/` | comparisons with other systems and the live demo; see [eval/README.md](eval/README.md) |
 | `deployment/monitoring/` | Prometheus, exporters and Grafana for the demo and the comparisons |

@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use axum::Router;
-use data_plane::remote_write::{Label, Sample, TimeSeries};
 use data_plane::{router, DataPlane};
+use prometheus_remote_write::{Label, Sample, TimeSeries};
 use serde_json::{json, Value};
 
 const QUERY: &str = "sum(sum_over_time(data[10s]))";

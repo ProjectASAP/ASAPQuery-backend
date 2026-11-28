@@ -1,5 +1,7 @@
 //! A query's answer. Every variant carries its own label or column names.
 
+use std::sync::Arc;
+
 use crate::LabelSet;
 
 /// The result of a query. A response adapter returns an error for a
@@ -60,4 +62,18 @@ pub struct Table {
 pub enum TableValue {
     String(String),
     Float(f64),
+}
+
+/// One instant query's answer as the query engine returns it natively, one
+/// row per series: what the HTTP routes write, with no label copied.
+pub type Answer = Arc<Vec<ResultSample>>;
+
+/// One row of an [`Answer`]: a series' labels and its value. Unlike
+/// [`InstantVectorElement`], the labels are an `Arc` shared with the stored
+/// series or with every other row of the same series, so answers and
+/// caches hold no copy of them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResultSample {
+    pub labels: Arc<LabelSet>,
+    pub value: f64,
 }

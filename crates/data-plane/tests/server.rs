@@ -9,9 +9,9 @@ use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::routing::get;
 use axum::Router;
 use data_plane::engine::EngineOptions;
-use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use data_plane::{router, DataPlane, EXECUTION_HEADER};
 use http_body_util::BodyExt;
+use prometheus_remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use tower::ServiceExt;
 
 /// A stand-in Prometheus that echoes the method, query string and body it

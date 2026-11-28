@@ -12,9 +12,8 @@ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::time::Instant;
 
-use data_plane::remote_write::{
-    decode_samples, encode, Label, Limits, Sample, TimeSeries, WriteRequest,
-};
+use data_plane::remote_write::decode_samples;
+use prometheus_remote_write::{encode, Label, Limits, Sample, TimeSeries, WriteRequest};
 
 fn request(series: usize, samples_per_series: usize) -> Vec<u8> {
     let timeseries = (0..series)

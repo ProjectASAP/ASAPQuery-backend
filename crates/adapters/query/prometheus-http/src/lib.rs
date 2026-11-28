@@ -1,14 +1,16 @@
 //! The Prometheus HTTP API as the data plane speaks it: instant- and
-//! range-query parameters and results.
+//! range-query parameters and results, and the [`fallback`] client that
+//! sends a request the data plane does not answer to a Prometheus-
+//! compatible server. An adapter: it depends on `common` only.
 
 use std::collections::BTreeMap;
 
 use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
 
-use common::MAX_TIME_MS;
-use query::result_cache::Answer;
-use query::ResultSample;
+use common::{Answer, LabelSet, ResultSample, MAX_TIME_MS};
+
+pub mod fallback;
 
 /// Parameters of an instant query, from its URL query and form body.
 pub struct InstantQuery {
@@ -20,7 +22,7 @@ pub struct InstantQuery {
 /// Why a query's parameters are refused (400, `bad_data`): the error text.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
-pub(crate) struct BadParameter(pub(crate) String);
+pub struct BadParameter(String);
 
 impl InstantQuery {
     /// Reads `query` and `time` ([`parse_time_ms`]; empty or missing:
@@ -28,10 +30,7 @@ impl InstantQuery {
     /// or max time (the request is then forwarded, or refused without
     /// forwarding); `Err` if `time` is not a parsable time or is beyond
     /// [`MAX_TIME_MS`].
-    pub(crate) fn parse(
-        url_query: Option<&str>,
-        form: &[u8],
-    ) -> Result<Option<Self>, BadParameter> {
+    pub fn parse(url_query: Option<&str>, form: &[u8]) -> Result<Option<Self>, BadParameter> {
         let params: BTreeMap<String, String> =
             form_urlencoded::parse(url_query.unwrap_or_default().as_bytes())
                 .chain(form_urlencoded::parse(form))
@@ -55,7 +54,7 @@ impl InstantQuery {
 }
 
 /// The most steps one range query may have, as Prometheus allows.
-pub(crate) const MAX_RANGE_STEPS: i64 = 11_000;
+const MAX_RANGE_STEPS: i64 = 11_000;
 
 /// Parameters of a range query: evaluated at `start_ms` and every
 /// `step_ms` after, up to and including `end_ms`.
@@ -76,10 +75,7 @@ impl RangeQuery {
     /// parsable or is beyond [`MAX_TIME_MS`], a step that is not positive or
     /// is beyond [`MAX_TIME_MS`], an end before the start, or more than
     /// [`MAX_RANGE_STEPS`] steps.
-    pub(crate) fn parse(
-        url_query: Option<&str>,
-        form: &[u8],
-    ) -> Result<Option<Self>, BadParameter> {
+    pub fn parse(url_query: Option<&str>, form: &[u8]) -> Result<Option<Self>, BadParameter> {
         let params: BTreeMap<String, String> =
             form_urlencoded::parse(url_query.unwrap_or_default().as_bytes())
                 .chain(form_urlencoded::parse(form))
@@ -175,7 +171,7 @@ const PROMETHEUS_MAX_TIME: &str = "292277025-08-17T07:12:55.999999999Z";
 /// for Prometheus' min or max time, which the data plane does not evaluate
 /// at. `Err` is the 400 error text: Prometheus' for a value in neither
 /// form, or a time beyond [`MAX_TIME_MS`].
-pub(crate) fn parse_time_ms(name: &str, text: &str) -> Result<Option<i64>, BadParameter> {
+fn parse_time_ms(name: &str, text: &str) -> Result<Option<i64>, BadParameter> {
     if text == PROMETHEUS_MIN_TIME || text == PROMETHEUS_MAX_TIME {
         return Ok(None);
     }
@@ -332,12 +328,11 @@ impl Serialize for VectorResponse {
 /// many series is mostly cached step answers (241 steps of 2,800 series
 /// in a dashboard's 1 h panel), and grouping them by comparing label maps,
 /// then formatting each value into its own `String`, cost about a second.
-/// Each series' labels are one `Arc` shared by every step's answer (the
-/// interned series, or `series_ids::result_labels`), so a series is
-/// found by that pointer and its labels compared only once; each step's
-/// time and each series' labels are formatted once.
+/// Each series' labels are one `Arc` shared by every step's answer, so a
+/// series is found by that pointer and its labels compared only once;
+/// each step's time and each series' labels are formatted once.
 pub fn range_response_body(steps: &[(i64, Answer)]) -> Result<Vec<u8>, serde_json::Error> {
-    type Labels = BTreeMap<String, String>;
+    type Labels = LabelSet;
     // Each series' points as (step, value), in step order.
     let mut series: Vec<(&Labels, Vec<(u32, f64)>)> = Vec::new();
     let mut by_labels: BTreeMap<&Labels, usize> = BTreeMap::new();
