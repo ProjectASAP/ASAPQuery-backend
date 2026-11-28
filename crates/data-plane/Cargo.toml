@@ -6,7 +6,10 @@ edition.workspace = true
 [dependencies]
 asap-planner.workspace = true
 asap-executor.workspace = true
+common.workspace = true
 internal_metrics.workspace = true
+precompute.workspace = true
+query.workspace = true
 storage.workspace = true
 ahash = "0.8"
 # The per-thread series cache of the Remote Write decoder (a table of

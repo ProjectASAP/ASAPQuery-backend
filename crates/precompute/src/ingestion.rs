@@ -45,7 +45,7 @@ use storage::store::{
     millis, window_end, RawData, RawSample, RawShards, RunStore, SeriesPartition, ViewStore,
 };
 
-use crate::prometheus::MAX_TIME_MS;
+use common::MAX_TIME_MS;
 
 /// How ingestion treats sample times.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,7 +112,7 @@ pub struct IngestionStats {
 
 /// Why a plan cannot be ingested.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum IngestionError {
+pub enum IngestionError {
     #[error("{0}")]
     Unsupported(String),
     #[error("refresh group of views {views:?}: {error}")]
@@ -203,7 +203,7 @@ impl Ingestion {
     /// for the [`Precompute`] returned with the ingestion. Refuses views
     /// refreshed on first read, which the data plane does not refresh yet,
     /// and groups without a bounded window.
-    pub(crate) fn new(
+    pub fn new(
         dag: &PhysicalASAPDAG,
         views: &[MaterializedView],
         groups: Vec<IngestionRefreshGroup>,
@@ -402,7 +402,7 @@ impl Ingestion {
 
     /// Builds groups `push` (by index) by push: their windows read no raw
     /// data. Call before [`Self::raw_data`].
-    pub fn set_push_groups(&mut self, push: Vec<bool>) {
+    pub(crate) fn set_push_groups(&mut self, push: Vec<bool>) {
         self.push_groups = push;
     }
 
@@ -411,7 +411,7 @@ impl Ingestion {
     }
 
     /// Each group's window width and phase.
-    pub fn group_windows(&self) -> Vec<(i64, i64)> {
+    pub(crate) fn group_windows(&self) -> Vec<(i64, i64)> {
         self.groups
             .iter()
             .map(|g| (g.width_ms, g.phase_ms))
@@ -419,18 +419,18 @@ impl Ingestion {
     }
 
     /// Each group's metrics.
-    pub fn group_metrics(&self) -> Vec<BTreeSet<String>> {
+    pub(crate) fn group_metrics(&self) -> Vec<BTreeSet<String>> {
         self.groups.iter().map(|g| g.metrics.clone()).collect()
     }
 
     /// Each group's newest window closed or skipped.
-    pub fn refreshed_through(&self) -> Vec<Option<i64>> {
+    pub(crate) fn refreshed_through(&self) -> Vec<Option<i64>> {
         self.groups.iter().map(|g| g.refreshed_through).collect()
     }
 
     /// Whether a query run reads raw samples (a query-time `Scan`); if not,
     /// only the refresh windows read them.
-    pub fn queries_read_raw_data(&self) -> bool {
+    pub(crate) fn queries_read_raw_data(&self) -> bool {
         !self.query_time_lookback_ms.is_empty()
     }
 
@@ -533,25 +533,20 @@ impl Ingestion {
     /// back): the time every shard was last flushed. A request admitted
     /// after that time holds samples stamped after it, and a request
     /// admitted before it was run by every shard.
-    pub fn advance_clock(&mut self, now_ms: i64) {
+    pub(crate) fn advance_clock(&mut self, now_ms: i64) {
         self.newest_clock_ms = self.newest_clock_ms.max(Some(now_ms));
-    }
-
-    /// The newest sample time the watermark follows.
-    pub fn newest_sample_ms(&self) -> Option<i64> {
-        self.newest_sample_ms
     }
 
     /// Sets the newest sample time the watermark follows (it never goes
     /// back): the newest sample any shard ran by the last flush.
-    pub fn advance_newest_sample(&mut self, newest_ms: Option<i64>) {
+    pub(crate) fn advance_newest_sample(&mut self, newest_ms: Option<i64>) {
         self.newest_sample_ms = self.newest_sample_ms.max(newest_ms);
     }
 
     /// Closes and returns every window the watermark has passed, oldest
     /// first within each group, groups in plan order (a group may read the
     /// views of an earlier one).
-    pub fn close(&mut self) -> Vec<ClosedWindow> {
+    pub(crate) fn close(&mut self) -> Vec<ClosedWindow> {
         self.close_windows()
     }
 
@@ -565,7 +560,7 @@ impl Ingestion {
     /// before it closes without a later sample. Capped at `now_ms`; a
     /// repeated or lower barrier does nothing. Returns the barrier in force
     /// and the windows it closed, as [`Self::close`] does.
-    pub fn advance_watermark_at(
+    pub(crate) fn advance_watermark_at(
         &mut self,
         barrier_ms: i64,
         now_ms: i64,
@@ -809,7 +804,7 @@ impl Routing {
     /// Seals and evicts `raw_data` as the ingestion stands: compacts the
     /// panes the watermark has passed and drops the panes at or before
     /// each metric's cutoff.
-    pub fn maintain(&self, raw_data: &mut RawData, watermark_ms: Option<i64>) {
+    pub(crate) fn maintain(&self, raw_data: &mut RawData, watermark_ms: Option<i64>) {
         if let Some(watermark_ms) = watermark_ms {
             raw_data.seal_through(watermark_ms);
         }
@@ -862,7 +857,7 @@ pub enum Computed {
 /// window to the next (`serial`) computes one window at a time, in order;
 /// other groups stay parallel.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RefreshTaskGraph {
+pub(crate) struct RefreshTaskGraph {
     /// For each refresh group, the other groups whose views its runs read.
     pub reads: Vec<Vec<usize>>,
     /// For each refresh group, whether its windows must be computed one at
@@ -933,22 +928,8 @@ pub struct Precompute {
 impl Precompute {
     /// Runs `window`'s group's views in one ingestion run over
     /// `(end - W, end]`, reading `raw_data` (as it was when the window
-    /// closed) and `views`, and appends each view's rows to `views`. A view
-    /// that already stores the window (loaded from files at startup) is not
-    /// appended to again; a window every view of the group stores is not
-    /// run.
-    pub fn refresh(
-        &self,
-        window: ClosedWindow,
-        raw_data: RawShards,
-        views: &mut Arc<ViewStore>,
-    ) -> Result<Refreshed, asap_executor::Error> {
-        let computed = self.compute(window, raw_data, views.clone(), None)?;
-        self.commit(window, computed, views)
-    }
-
-    /// The first half of [`Self::refresh`]: runs the window over
-    /// `raw_data` and `views` without storing its rows. Windows of one
+    /// closed) and `views`, without storing its rows ([`Self::commit`]
+    /// stores them). Windows of one
     /// group may be computed at once on several threads ([`RefreshTaskGraph`]);
     /// their rows must be committed in window order, and a window must be
     /// computed over views that store the windows it reads.
@@ -1026,7 +1007,7 @@ impl Precompute {
     /// whose raw data slots are fed as samples arrive: it finishes once
     /// every slot's stream ends (the window is sealed), with the rows of
     /// every view of the group.
-    pub fn push_run(
+    pub(crate) fn push_run(
         self: &Arc<Self>,
         group: usize,
         store: Arc<dyn asap_executor::sources::DataStore>,
@@ -1045,7 +1026,7 @@ impl Precompute {
 
     /// A pushed window's rows less those of views that already store the
     /// window (loaded from files at startup).
-    pub fn missing_only(
+    pub(crate) fn missing_only(
         &self,
         window: ClosedWindow,
         computed: Computed,
@@ -1143,7 +1124,7 @@ impl Precompute {
     }
 
     /// Which windows may be computed at once.
-    pub fn tasks(&self) -> &RefreshTaskGraph {
+    pub(crate) fn tasks(&self) -> &RefreshTaskGraph {
         &self.tasks
     }
 

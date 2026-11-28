@@ -4,7 +4,7 @@
 //! An instant query at `T` and a range step at `T` share one entry.
 //!
 //! Only a final answer is kept: one whose inputs can no longer change
-//! ([`crate::query::QueryEngine`] decides). Entries are dropped once `T`
+//! ([`crate::QueryEngine`] decides). Entries are dropped once `T`
 //! falls further behind the watermark than any planned evaluation reaches
 //! back (the plan's longest retention plus the view retention margin), and
 //! the least recently used while more than `max_bytes` are held.
@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use asap_executor::planner::ir::{NonASAPOp, Operator};
 use asap_executor::planner::plan::physical_asap_dag::{PhysicalASAPDAG, PhysicalASAPNodeId};
 
-use crate::query::ResultSample;
+use crate::ResultSample;
 
 /// One evaluation's answer, shared by every request that reads it.
 pub type Answer = Arc<Vec<ResultSample>>;

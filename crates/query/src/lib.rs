@@ -30,12 +30,15 @@ use asap_executor::planner::plan::physical_asap_dag::{PhysicalASAPDAG, PhysicalA
 use asap_executor::planner::stages::Lifetime;
 use asap_executor::runtime::{Limits, RunContext, Scope};
 use asap_executor::values::{Batch, Value};
-use asap_planner::InstallablePlan;
+use common::InstallablePlan;
 use futures::executor::block_on;
 use futures::StreamExt;
 use storage::store::{PublishedStore, QueryTimeResults, RawReads, RawShards, RunStore, ViewStore};
 
 use crate::result_cache::{Answer, ResultCache};
+
+pub mod result_cache;
+pub mod workers;
 
 /// One series of an instant-query result.
 #[derive(Debug, Clone, PartialEq)]
@@ -301,6 +304,15 @@ impl QueryEngine {
         })
     }
 }
+
+/// What crosses threads: the compiled queries and the store each run
+/// reads.
+#[allow(dead_code)]
+fn assert_send_sync<T: Send + Sync>() {}
+const _: fn() = || {
+    assert_send_sync::<QueryEngine>();
+    assert_send_sync::<RunStore>();
+};
 
 /// What evaluations read: the raw data and views published when they
 /// started, the watermark then, and the raw chunks they converted so far.

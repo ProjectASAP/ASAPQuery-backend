@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use data_plane::prometheus::range_response_body;
-use data_plane::query::ResultSample;
+use query::ResultSample;
 
 fn main() {
     let args: Vec<usize> = std::env::args()

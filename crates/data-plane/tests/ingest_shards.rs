@@ -11,9 +11,9 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use control_plane::plan_workload;
 use data_plane::engine::EngineOptions;
-use data_plane::ingestion::IngestionOptions;
 use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use data_plane::{router, DataPlane};
+use precompute::ingestion::IngestionOptions;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -321,16 +321,16 @@ fn clock_data_plane(
 /// still hold every sample: the watermark moves only behind a flush.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_watermark_capped_at_the_clock_moves_only_behind_a_flush() {
-    let start_ms = (data_plane::ingestion::wall_clock_ms() / 1000 + 1) * 1000;
+    let start_ms = (precompute::ingestion::wall_clock_ms() / 1000 + 1) * 1000;
     let (app, state) = clock_data_plane(4, 250, start_ms);
-    while data_plane::ingestion::wall_clock_ms() < start_ms {
+    while precompute::ingestion::wall_clock_ms() < start_ms {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     // Every 100 ms for 3 s: each series one sample, series i stamped
     // (i + 1) / 64 s after the send time.
     let mut sent: Vec<(usize, i64)> = Vec::new();
     for _ in 0..30 {
-        let now_ms = data_plane::ingestion::wall_clock_ms();
+        let now_ms = precompute::ingestion::wall_clock_ms();
         let timeseries = (0..64usize)
             .map(|i| {
                 let timestamp = now_ms + (i as i64 + 1) * 1000 / 64;
@@ -358,7 +358,7 @@ async fn a_watermark_capped_at_the_clock_moves_only_behind_a_flush() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     let last_ms = sent.iter().map(|(_, t)| *t).max().unwrap();
-    while data_plane::ingestion::wall_clock_ms() <= last_ms {
+    while precompute::ingestion::wall_clock_ms() <= last_ms {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     common::barrier(&app, last_ms).await;
@@ -412,7 +412,7 @@ async fn a_precompute_that_cannot_keep_up_reaches_remote_write() {
         max_queued_samples: 2_000,
         max_precompute_backlog: 1,
         view_dir: Some(dir.clone()),
-        slow_refreshes: vec![data_plane::engine::SlowRefresh {
+        slow_refreshes: vec![precompute::engine::SlowRefresh {
             group: None,
             end_ms: None,
             part: None,
@@ -504,7 +504,7 @@ async fn barriers_during_one_flush_all_answer() {
 }
 
 /// A sample stamped further from the epoch than the data plane evaluates
-/// (`prometheus::MAX_TIME_MS`) is dropped and counted, so window
+/// (`common::MAX_TIME_MS`) is dropped and counted, so window
 /// arithmetic over it cannot overflow; later samples are ingested as
 /// usual.
 #[tokio::test(flavor = "multi_thread")]

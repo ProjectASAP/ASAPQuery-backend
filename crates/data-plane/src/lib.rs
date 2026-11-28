@@ -15,14 +15,10 @@
 //! (labels, series, metadata), proxied with `x-asap-execution: forwarded`.
 
 pub mod engine;
-pub mod ingestion;
 mod metrics_endpoint;
 pub mod prometheus;
-pub mod push;
-pub mod query;
 pub mod raw_forward;
 pub mod remote_write;
-pub mod result_cache;
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -34,7 +30,8 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use engine::{EngineHandle, EngineOptions, IngestError};
+use engine::{EngineHandle, EngineOptions};
+use precompute::engine::IngestError;
 use prometheus::{InstantQuery, RangeQuery};
 use query::Unanswered;
 
@@ -372,7 +369,9 @@ async fn answer(
     state: &DataPlane,
     query: InstantQuery,
 ) -> Result<prometheus::VectorResponse, Unanswered> {
-    let time_ms = query.time_ms.unwrap_or_else(ingestion::wall_clock_ms);
+    let time_ms = query
+        .time_ms
+        .unwrap_or_else(precompute::ingestion::wall_clock_ms);
     let samples = match state.engine.cached(&query.query, time_ms) {
         Some(samples) => samples,
         None => state.engine.evaluate(query.query, time_ms).await?,

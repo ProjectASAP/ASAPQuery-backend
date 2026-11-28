@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use internal_metrics::{thread_cpu_seconds, Metrics, QueryMetrics, WindowLatency};
 use storage::store::{QueryTimeResults, ViewTier};
 
-use crate::ingestion::IngestionStats;
-use crate::query::Unanswered;
-use crate::result_cache::ResultCache;
+use precompute::ingestion::IngestionStats;
+use query::result_cache::ResultCache;
+use query::Unanswered;
 
 /// What `/metrics` reports beside [`Metrics`].
 pub(crate) struct Gauges<'a> {

@@ -23,12 +23,13 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use control_plane::plan_workload;
-use data_plane::engine::{EngineOptions, PrecomputeMode, SlowRefresh};
-use data_plane::ingestion::IngestionOptions;
+use data_plane::engine::EngineOptions;
 use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use data_plane::{router, DataPlane};
 use http_body_util::BodyExt;
 use pipelines::{combine_rules, CombineRule};
+use precompute::engine::{PrecomputeMode, SlowRefresh};
+use precompute::ingestion::IngestionOptions;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -1088,8 +1089,8 @@ async fn peak_state_bytes(app: &Router, requests: Vec<Vec<u8>>) -> f64 {
 
 /// Push folding every request's samples as they come, so open state grows
 /// request by request (the default batches them into larger morsels).
-fn per_request() -> data_plane::push::MorselBatching {
-    data_plane::push::MorselBatching {
+fn per_request() -> precompute::push::MorselBatching {
+    precompute::push::MorselBatching {
         max_samples: 0,
         max_age_ms: 0,
     }
