@@ -1,30 +1,9 @@
-//! Plans and options for the unit tests.
+//! Options and samples for the unit tests.
 
-use common::InstallablePlan;
 use precompute::ingestion::IngestionOptions;
 use storage::store::RawSample;
 
 use crate::engine::EngineOptions;
-
-/// The plan of `query`, evaluated every 10 s over the gauge `data` (one
-/// sample a second), for a deployment that keeps raw data or not.
-pub(crate) fn plan(query: &str, raw_data_retained: bool) -> InstallablePlan {
-    let workload = serde_json::from_value(serde_json::json!({
-        "query_workload": {"language": "promql", "repeating_queries": [{
-            "query": query,
-            "demand": {"fixed_interval_at": {"interval": 10000, "evaluation_phase": 0}},
-            "requirements": {},
-            "predictability": {"predictable": {"known_at": null}},
-        }]},
-        "data_workload": {"arrival": {"ingesting": {"rows_per_second": 1.0}},
-          "sources": {"data": {"series_count": 1, "sample_interval": 1000,
-            "metric_type": "gauge", "column_signs": {"value": "non_negative"}}}},
-    }))
-    .unwrap();
-    let mut inputs = control_plane::DeploymentInputs::default();
-    inputs.deployment_capabilities.raw_data_retained = raw_data_retained;
-    control_plane::plan_workload(&workload, &inputs).unwrap().0
-}
 
 /// Options that refresh every window: no allowed lateness, and the stream
 /// starting at 0.

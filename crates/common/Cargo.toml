@@ -16,6 +16,3 @@ asap-types.workspace = true
 # object safe; native `async fn` in traits is not.
 async-trait.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
-tokio.workspace = true

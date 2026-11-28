@@ -3,6 +3,11 @@ name = "control_plane"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# `test_support`: a plan for the other crates' unit tests; enabled by their
+# dev-dependency on this crate only.
+test-support = []
+
 [dependencies]
 asap-planner.workspace = true
 futures = "0.3"

@@ -45,7 +45,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use common::{FallbackClient, QueryRequest, QueryResult};
-use dispatcher::{Fallback, NotAnswerableReason, QueryOutcome};
+use dispatcher::{Fallback, NotAnswerableReason};
 use engine::{EngineHandle, EngineOptions};
 use precompute::engine::IngestError;
 use prometheus_http::fallback::PrometheusHttpFallback;
@@ -347,7 +347,7 @@ async fn answer_or_forward(
     encode: impl FnOnce(&QueryResult) -> Result<Response, String>,
 ) -> Response {
     let reason = match route.plane.engine.dispatcher().dispatch(request).await {
-        QueryOutcome::Ready(result) => {
+        Ok(result) => {
             return match encode(&result) {
                 Ok(mut response) => {
                     response
@@ -358,7 +358,7 @@ async fn answer_or_forward(
                 Err(reason) => (StatusCode::NOT_IMPLEMENTED, reason).into_response(),
             };
         }
-        QueryOutcome::NotAnswerable(reason) => {
+        Err(reason) => {
             match Fallback::new(reason, &request.query, route.plane.no_forward) {
                 Fallback::Forward { reason } => reason,
                 // A route with a fallback is never served with --no-forward.
@@ -673,7 +673,7 @@ async fn query(
         .unwrap_or_else(precompute::ingestion::wall_clock_ms);
     let dispatcher = state.engine.dispatcher();
     let reason = match dispatcher.instant(&instant.query, time_ms).await {
-        QueryOutcome::Ready(samples) => {
+        Ok(samples) => {
             let response = prometheus_http::VectorResponse { time_ms, samples };
             let mut response = axum::Json(response).into_response();
             response
@@ -681,7 +681,7 @@ async fn query(
                 .insert(EXECUTION_HEADER, HeaderValue::from_static("plan"));
             return response;
         }
-        QueryOutcome::NotAnswerable(reason) => reason,
+        Err(reason) => reason,
     };
     match Fallback::new(reason, &instant.query, state.no_forward) {
         Fallback::Refuse { reason } => not_answered(&reason),
@@ -763,15 +763,11 @@ async fn answer_range(
     state: &DataPlane,
     range: &RangeQuery,
 ) -> Result<Vec<u8>, NotAnswerableReason> {
-    let steps = match state
+    let steps = state
         .engine
         .dispatcher()
         .range(&range.query, range.times_ms())
-        .await
-    {
-        QueryOutcome::Ready(steps) => steps,
-        QueryOutcome::NotAnswerable(reason) => return Err(reason),
-    };
+        .await?;
     // Grouping every step's answer by series and writing the JSON takes
     // long for a long range of many series (241 steps of 2,800 series:
     // about 0.85 s), all of it without an await, even when every step is

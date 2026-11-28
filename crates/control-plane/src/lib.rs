@@ -10,6 +10,9 @@
 
 use std::path::Path;
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 use asap_planner::{
     plan_installable, CostInputs, DeploymentCapabilities, FrontendInput, InstallablePlan,
     InstallablePlanError, PlanningModels, PlanningWorkload, SelectedPlanReport, UserInput,

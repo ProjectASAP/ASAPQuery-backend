@@ -61,6 +61,7 @@ mod tests {
 
     use super::*;
     use crate::test_support;
+    use control_plane::test_support::one_query_plan;
 
     const QUERY: &str = "sum_over_time(data[10s])";
 
@@ -93,10 +94,10 @@ mod tests {
     fn installs_one_plan_into_both_engines_and_the_dispatcher() {
         let (precompute, query, dispatcher) = parts();
         let installer = PlanInstaller::new(precompute.clone(), query.clone(), dispatcher.clone());
-        let plan = test_support::plan(QUERY, false);
+        let plan = one_query_plan(QUERY, false);
         let root = plan.dag.roots[0];
         assert_eq!(installer.install(plan), Ok(PlanId(1)));
-        let other = test_support::plan("count_over_time(data[10s])", false);
+        let other = one_query_plan("count_over_time(data[10s])", false);
         assert!(installer.install(other).is_err());
         assert!(precompute.installed().is_some());
         assert_eq!(plan_of(&query), Some(PlanId(1)));
@@ -117,9 +118,9 @@ mod tests {
     fn a_failed_install_leaves_the_plan_as_it_was() {
         let held = || InstalledPlan {
             id: PlanId(7),
-            plan: test_support::plan("count_over_time(data[10s])", false),
+            plan: one_query_plan("count_over_time(data[10s])", false),
         };
-        let mut invalid = test_support::plan(QUERY, false);
+        let mut invalid = one_query_plan(QUERY, false);
         invalid.query_texts.push("up".into());
         // An invalid plan: neither engine gets it.
         let (precompute, query, dispatcher) = parts();
@@ -132,7 +133,7 @@ mod tests {
         let (precompute, query, dispatcher) = parts();
         query.install(held()).unwrap();
         let installer = PlanInstaller::new(precompute.clone(), query.clone(), dispatcher.clone());
-        assert!(installer.install(test_support::plan(QUERY, false)).is_err());
+        assert!(installer.install(one_query_plan(QUERY, false)).is_err());
         assert!(precompute.installed().is_none());
         assert_eq!(plan_of(&query), Some(PlanId(7)));
         assert!(dispatcher.resolve(QUERY).is_none());
@@ -140,7 +141,7 @@ mod tests {
         let (precompute, query, dispatcher) = parts();
         precompute.install(held()).unwrap();
         let installer = PlanInstaller::new(precompute.clone(), query.clone(), dispatcher.clone());
-        assert!(installer.install(test_support::plan(QUERY, false)).is_err());
+        assert!(installer.install(one_query_plan(QUERY, false)).is_err());
         assert_eq!(plan_of(&query), Some(PlanId(1)));
         assert!(dispatcher.resolve(QUERY).is_none());
     }

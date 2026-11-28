@@ -22,4 +22,4 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-control_plane.workspace = true
+control_plane = { workspace = true, features = ["test-support"] }
