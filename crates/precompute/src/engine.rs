@@ -43,7 +43,7 @@ use storage::store::{
 use tokio::sync::oneshot;
 
 use crate::ingestion::{
-    ClosedWindow, Computed, Ingestion, IngestionOptions, IngestionStats, Precompute,
+    ClockReading, ClosedWindow, Computed, Ingestion, IngestionOptions, IngestionStats, Precompute,
     RefreshTaskGraph, Refreshed, Routing, WallClock,
 };
 use crate::push::{Partial, PushGroup, PushShard};
@@ -756,15 +756,15 @@ const _: fn() = || {
 
 /// Sends every shard a flush, with no request half sent: each request
 /// already admitted is wholly before it in its shards' queues. Returns
-/// the wall-clock time it was sent: every request admitted later holds
-/// samples stamped later (a sender stamps before it sends).
-fn flush(shards: &[Sender<ShardMessage>], shared: &Shared) -> i64 {
+/// when it was sent: every request admitted later holds samples stamped
+/// later than its wall-clock time (a sender stamps before it sends).
+fn flush(shards: &[Sender<ShardMessage>], shared: &Shared) -> ClockReading {
     let _admission = shared.admission.write().unwrap_or_else(|e| e.into_inner());
-    let sent_ms = shared.clock.now_ms();
+    let sent = shared.clock.read();
     for shard in shards {
         let _ = shard.send(ShardMessage::Flush);
     }
-    sent_ms
+    sent
 }
 
 /// An ingest shard: routes and appends the samples of its series to its
@@ -979,13 +979,13 @@ fn serve_ingest(
         // An idle stream: when the idle watermark would close a window, the
         // shards are flushed first and it is taken at that flush, so
         // samples still queued count before it.
-        moved = moved || ingestion.idle_closes_at(shared.clock.now_ms());
+        moved = moved || ingestion.idle_closes_at(shared.clock.monotonic_ms());
         // Before the watermark moves, every shard runs the samples queued to
         // it, so the windows it closes hold every sample admitted so far
         // and the raw data they read is every shard's as of then.
         let mut flushed_at = None;
         if moved {
-            let flushed_ms = flush(&shards, shared);
+            let flush_sent = flush(&shards, shared);
             let mut flushed = vec![false; shards.len()];
             while !flushed.iter().all(|&f| f) {
                 match commands.recv_timeout(TICK) {
@@ -1016,16 +1016,16 @@ fn serve_ingest(
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'serve,
                 }
             }
-            ingestion.advance_clock(flushed_ms);
+            ingestion.advance_clock(flush_sent.wall_ms);
             if arrived {
-                ingestion.sample_arrived(flushed_ms);
+                ingestion.sample_arrived(flush_sent);
             }
-            flushed_at = Some(flushed_ms);
+            flushed_at = Some(flush_sent);
         }
         let newest_ms = newest.iter().flatten().copied().max();
         ingestion.advance_newest_sample(newest_ms);
-        if let Some(flushed_ms) = flushed_at {
-            ingestion.advance_idle(flushed_ms);
+        if let Some(flushed) = flushed_at {
+            ingestion.advance_idle(flushed.monotonic_ms);
         }
         // The barriers first, so a window one of them closes is not
         // counted as closed by wall-clock time.

@@ -612,6 +612,23 @@ async fn a_lagging_stream_closes_no_window_early() {
     wait_for_answer_at_40s(&app, &state).await;
 }
 
+/// The system clock steps 15 min forward (NTP, a resumed VM) while real
+/// time does not move: the idle time is measured on the monotonic clock,
+/// so the window `(30, 40]` does not close early; it closes once 1 s of
+/// real time has passed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wall_clock_step_closes_no_window_early() {
+    let clock = WallClock::manual(0);
+    let (app, state) = idle_data_plane(&clock);
+    write_through_40s(&app, &clock, 40_000).await;
+    clock.step_wall_clock(40_000 + 15 * 60_000);
+    pass(&app).await;
+    assert_ne!(status_and_answer(&app, 40).await.0, StatusCode::OK);
+    assert_eq!(state.engine.stats().windows_closed_by_wall_clock, 0);
+    clock.set(41_000 + 15 * 60_000);
+    wait_for_answer_at_40s(&app, &state).await;
+}
+
 /// A sample for a window closed by wall-clock time is late: dropped and
 /// counted, and the window keeps its answer.
 #[tokio::test(flavor = "multi_thread")]

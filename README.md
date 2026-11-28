@@ -96,8 +96,9 @@ When no sample arrives at all, the last windows still close by wall-clock
 time: event time is taken to advance with the wall clock from the newest
 sample, so a window closes once no sample has come for `e - t` plus
 `--allowed-lateness-ms` plus 1 s, `e` the window's end and `t` the newest
-sample time. A stream behind the wall clock (a replay) waits as long as a
-live one. A later sample for such a window is late. These windows are
+sample time; that time is measured on a monotonic clock, so a step of the
+system clock does not shorten it. A stream behind the wall clock (a
+replay) waits as long as a live one. A later sample for such a window is late. These windows are
 counted in `asap_windows_closed_by_wall_clock_total`.
 
 **Queries.** An instant query whose text is one of the plan's queries is
