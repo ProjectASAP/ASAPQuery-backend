@@ -15,7 +15,7 @@ use control_plane::plan_workload;
 use data_plane::engine::EngineOptions;
 use data_plane::{router, DataPlane, EXECUTION_HEADER};
 use http_body_util::BodyExt;
-use precompute::ingestion::IngestionOptions;
+use precompute::ingestion::{IngestionOptions, WallClock};
 use prometheus_remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -41,6 +41,7 @@ fn data_plane() -> Router {
     .unwrap();
     let plan = plan_workload(&workload, &common::inputs(false)).unwrap().0;
     let options = EngineOptions {
+        clock: WallClock::stopped(),
         no_forward: true,
         view_dir: None,
         ingestion: IngestionOptions {

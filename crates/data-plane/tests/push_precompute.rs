@@ -28,7 +28,7 @@ use data_plane::{router, DataPlane};
 use http_body_util::BodyExt;
 use pipelines::{combine_rules, CombineRule};
 use precompute::engine::{PrecomputeMode, SlowRefresh};
-use precompute::ingestion::IngestionOptions;
+use precompute::ingestion::{IngestionOptions, WallClock};
 use prometheus_remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -117,6 +117,7 @@ fn workload_file(name: &str, series: usize) -> asap_planner::PlanningWorkload {
 /// windows from 0, no lateness unless a test sets it.
 fn options(mode: PrecomputeMode, shards: usize) -> EngineOptions {
     EngineOptions {
+        clock: WallClock::stopped(),
         no_forward: true,
         ingest_threads: shards,
         precompute_mode: mode,
@@ -834,6 +835,7 @@ async fn seal_is_exact_under_shard_skew() {
     let (skewed, state) = install(
         &plan,
         EngineOptions {
+            clock: WallClock::stopped(),
             shard_delay_ms: 20,
             ingestion: IngestionOptions {
                 allowed_lateness_ms: 0,
@@ -953,6 +955,7 @@ async fn late_samples_count_in_the_window_paths_windows() {
             let (app, _) = install(
                 &plan,
                 EngineOptions {
+                    clock: WallClock::stopped(),
                     ingestion: IngestionOptions {
                         allowed_lateness_ms: 5_000,
                         stream_start_ms: Some(0),
@@ -1132,6 +1135,7 @@ async fn memory_reservations_wait_then_fail_only_a_lone_window() {
     let (app, state) = install(
         &plan,
         EngineOptions {
+            clock: WallClock::stopped(),
             precompute_memory_budget_bytes: Some((one_small * 1.5) as u64),
             push_batching: per_request(),
             ingestion: IngestionOptions {

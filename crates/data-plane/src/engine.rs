@@ -11,7 +11,7 @@ use precompute::engine::{
     IngestError, InstalledPrecompute, PersistedViews, PrecomputeEngine, PrecomputeMode,
     PrecomputeOptions, SlowRefresh,
 };
-use precompute::ingestion::{IngestionOptions, IngestionStats};
+use precompute::ingestion::{IngestionOptions, IngestionStats, WallClock};
 use query::workers::InstalledQueries;
 use query::{ExecutorQueryEngine, QueryOptions, Unanswered};
 use storage::persist::{plan_hash, ViewRead};
@@ -135,6 +135,9 @@ pub struct EngineOptions {
     /// (ms) panics.
     #[doc(hidden)]
     pub panic_in_combine_of_window_end_ms: Option<i64>,
+    /// For tests: the wall clock ingestion reads, set by the test.
+    #[doc(hidden)]
+    pub clock: WallClock,
 }
 
 /// The default `view_cache_idle_ms`: a minute, four 15 s dashboard
@@ -180,6 +183,7 @@ impl Default for EngineOptions {
             precompute_memory_budget_bytes: None,
             push_batching: precompute::push::MorselBatching::default(),
             panic_in_combine_of_window_end_ms: None,
+            clock: WallClock::default(),
         }
     }
 }
@@ -356,6 +360,7 @@ impl EngineOptions {
             push_batching: self.push_batching,
             precompute_memory_budget_bytes: self.precompute_memory_budget_bytes,
             panic_in_combine_of_window_end_ms: self.panic_in_combine_of_window_end_ms,
+            clock: self.clock.clone(),
         }
     }
 

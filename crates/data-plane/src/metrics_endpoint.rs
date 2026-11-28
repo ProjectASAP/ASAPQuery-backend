@@ -159,6 +159,17 @@ pub(crate) fn render(metrics: &Metrics, gauges: &Gauges) -> String {
     ] {
         let _ = writeln!(out, "asap_windows_total{{outcome=\"{outcome}\"}} {count}");
     }
+    family(
+        &mut out,
+        "asap_windows_closed_by_wall_clock_total",
+        "counter",
+        "Refresh windows closed by wall-clock time while no sample arrived, ahead of the samples and barriers.",
+    );
+    let _ = writeln!(
+        out,
+        "asap_windows_closed_by_wall_clock_total {}",
+        stats.windows_closed_by_wall_clock
+    );
 
     let gauge = |out: &mut String, name: &str, help: &str, value: f64| {
         let _ = writeln!(

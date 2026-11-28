@@ -1,14 +1,15 @@
 //! Options and samples for the unit tests.
 
-use precompute::ingestion::IngestionOptions;
+use precompute::ingestion::{IngestionOptions, WallClock};
 use storage::store::RawSample;
 
 use crate::engine::EngineOptions;
 
-/// Options that refresh every window: no allowed lateness, and the stream
-/// starting at 0.
+/// Options that refresh every window: no allowed lateness, the stream
+/// starting at 0, and the clock stopped ([`WallClock::stopped`]).
 pub(crate) fn options() -> EngineOptions {
     EngineOptions {
+        clock: WallClock::stopped(),
         ingestion: IngestionOptions {
             allowed_lateness_ms: 0,
             stream_start_ms: Some(0),

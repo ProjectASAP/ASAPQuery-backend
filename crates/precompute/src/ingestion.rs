@@ -19,6 +19,10 @@
 //! When the watermark jumps past a view's retention, the windows that would
 //! already be dropped are skipped.
 //!
+//! When no sample arrives, the watermark also follows the idle watermark:
+//! event time taken to advance with the wall clock from the newest sample,
+//! so the last windows of a stream that stopped close without a barrier.
+//!
 //! Raw samples are kept while a window still to be closed or a query-time
 //! `Scan` (back to its `retention_ms`) reads them.
 //!
@@ -29,6 +33,7 @@
 //! are those a serial engine would read.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use asap_executor::physical_planner::{compile, CompiledPhysicalDAG};
@@ -105,6 +110,9 @@ pub struct IngestionStats {
     pub windows_skipped_first: u64,
     /// Windows not refreshed because they would already be dropped.
     pub windows_skipped_expired: u64,
+    /// Windows closed by wall-clock time while no sample arrived, ahead of
+    /// the samples and barriers.
+    pub windows_closed_by_wall_clock: u64,
     /// Windows not refreshed because every view of the group already
     /// stores them (loaded from the view files at startup).
     pub windows_already_stored: u64,
@@ -125,6 +133,10 @@ pub(crate) enum IngestionError {
 /// Raw-data panes are never wider than this, so eviction frees memory at
 /// least this often.
 const MAX_PANE_WIDTH_MS: i64 = 60_000;
+
+/// How much longer than the allowed lateness past a window's end the idle
+/// watermark waits before closing it ([`Ingestion::idle_watermark_at`]).
+const IDLE_GRACE_MS: i64 = 1_000;
 
 /// A refresh group's window `(end_ms - W, end_ms]` that the watermark has
 /// passed, to refresh; `group` indexes the plan's ingestion refresh groups.
@@ -192,6 +204,11 @@ pub(crate) struct Ingestion {
     newest_clock_ms: Option<i64>,
     /// The newest event-time barrier a producer declared.
     barrier_ms: Option<i64>,
+    /// When the newest flush that ran a sample was sent: a sample last
+    /// arrived at or before it.
+    arrived: Option<ClockReading>,
+    /// The newest idle watermark ([`Self::advance_idle`]).
+    idle_watermark_ms: Option<i64>,
     /// Groups whose windows the ingest shards build by push: they read no
     /// raw data, so they keep none.
     push_groups: Vec<bool>,
@@ -347,6 +364,8 @@ impl Ingestion {
             newest_sample_ms: None,
             newest_clock_ms: None,
             barrier_ms: None,
+            arrived: None,
+            idle_watermark_ms: None,
             push_groups: Vec::new(),
             stats: IngestionStats::default(),
         };
@@ -448,8 +467,14 @@ impl Ingestion {
     /// for them. A barrier states every sample at or before it was written,
     /// so it counts whole when later. (Closing a window only once event
     /// time is past its end follows the ASAPQuery precompute engine's
-    /// window manager, `closed_windows`.)
+    /// window manager, `closed_windows`.) The idle watermark counts when
+    /// later.
     pub fn watermark_ms(&self) -> Option<i64> {
+        self.event_watermark_ms().max(self.idle_watermark_ms)
+    }
+
+    /// The watermark from the samples and barriers alone.
+    fn event_watermark_ms(&self) -> Option<i64> {
         let newest = match self.newest_clock_ms {
             Some(clock) => self.newest_sample_ms.map(|newest| newest.min(clock)),
             None => self.newest_sample_ms,
@@ -457,6 +482,56 @@ impl Ingestion {
         let lateness = millis(self.options.allowed_lateness_ms);
         let from_samples = newest.map(|newest| newest.saturating_sub(lateness).saturating_sub(1));
         from_samples.max(self.barrier_ms)
+    }
+
+    /// The idle watermark at monotonic `now_monotonic_ms`: while no sample
+    /// arrives, event time is taken to advance with real time, so it is
+    /// the newest sample time (capped at the wall-clock time of the flush
+    /// that ran it) plus the time since a sample last arrived, less the
+    /// allowed lateness and [`IDLE_GRACE_MS`]. That time is measured on the
+    /// monotonic clock, so a step of the wall clock does not move it.
+    /// Counted from the newest sample, not from the wall clock, a stream
+    /// behind the wall clock (a replay) closes no window earlier than if it
+    /// kept sending. `None` before the first sample.
+    fn idle_watermark_at(&self, now_monotonic_ms: i64) -> Option<i64> {
+        let arrived = self.arrived?;
+        let newest = self.newest_sample_ms?.min(arrived.wall_ms);
+        let lateness = millis(self.options.allowed_lateness_ms);
+        Some(
+            newest
+                .saturating_add(now_monotonic_ms.saturating_sub(arrived.monotonic_ms))
+                .saturating_sub(lateness)
+                .saturating_sub(IDLE_GRACE_MS),
+        )
+    }
+
+    /// Whether the idle watermark at monotonic `now_monotonic_ms` would
+    /// close a window: the coordinator then flushes every shard and moves it
+    /// at that flush ([`Self::advance_idle`]), so samples still queued
+    /// count first.
+    pub(crate) fn idle_closes_at(&self, now_monotonic_ms: i64) -> bool {
+        let Some(idle) = self.idle_watermark_at(now_monotonic_ms) else {
+            return false;
+        };
+        self.groups.iter().any(|group| {
+            group
+                .refreshed_through
+                .is_some_and(|through| through.saturating_add(group.width_ms) <= idle)
+        })
+    }
+
+    /// Notes that the flush sent at `flushed` ran a sample.
+    pub(crate) fn sample_arrived(&mut self, flushed: ClockReading) {
+        self.arrived = Some(flushed);
+    }
+
+    /// Moves the idle watermark to the flush sent at monotonic
+    /// `flushed_monotonic_ms` (it never goes back); call after the flush's
+    /// samples are taken in.
+    pub(crate) fn advance_idle(&mut self, flushed_monotonic_ms: i64) {
+        self.idle_watermark_ms = self
+            .idle_watermark_ms
+            .max(self.idle_watermark_at(flushed_monotonic_ms));
     }
 
     /// What the ingest shards need to route samples now: the metrics a
@@ -550,11 +625,6 @@ impl Ingestion {
         self.close_windows()
     }
 
-    /// [`Self::advance_watermark_at`] the current wall-clock time.
-    pub fn advance_watermark(&mut self, barrier_ms: i64) -> (i64, Vec<ClosedWindow>) {
-        self.advance_watermark_at(barrier_ms, wall_clock_ms())
-    }
-
     /// An event-time barrier: the producer states that every sample at or
     /// before `barrier_ms` has been written, so every window ending at or
     /// before it closes without a later sample. Capped at `now_ms`; a
@@ -639,6 +709,8 @@ impl Ingestion {
         let Some(watermark) = self.watermark_ms() else {
             return Vec::new();
         };
+        // Windows ending after this close only by the idle watermark.
+        let event_watermark = self.event_watermark_ms();
         // Per group, the windows ending at or before this would already be
         // dropped (they are past its retention). A group whose views
         // another group reads (a narrower level of a window chain) keeps
@@ -687,6 +759,9 @@ impl Ingestion {
                 .checked_add(group.width_ms)
                 .filter(|e| *e <= watermark)
             {
+                if event_watermark.is_none_or(|w| end > w) {
+                    self.stats.windows_closed_by_wall_clock += 1;
+                }
                 closed.push(ClosedWindow {
                     group: index,
                     end_ms: end,
@@ -1230,6 +1305,105 @@ fn gcd(a: i64, b: i64) -> i64 {
         a.abs()
     } else {
         gcd(b, a.rem_euclid(b))
+    }
+}
+
+/// One reading of both clocks of a [`WallClock`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClockReading {
+    pub wall_ms: i64,
+    pub monotonic_ms: i64,
+}
+
+/// The clocks the precompute engine reads: the system's wall clock and a
+/// monotonic clock (`Instant`), or for tests ones they set.
+#[derive(Debug, Clone, Default)]
+pub struct WallClock(Option<Arc<ManualClock>>);
+
+/// A test's clocks, in milliseconds.
+#[derive(Debug)]
+struct ManualClock {
+    wall_ms: AtomicI64,
+    monotonic_ms: AtomicI64,
+}
+
+/// Two clocks are equal when both are the system's or one manual clock.
+impl PartialEq for WallClock {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for WallClock {}
+
+impl WallClock {
+    /// For tests: clocks at `now_ms` that move only by [`Self::set`] and
+    /// [`Self::step_wall_clock`].
+    pub fn manual(now_ms: i64) -> Self {
+        Self(Some(Arc::new(ManualClock {
+            wall_ms: AtomicI64::new(now_ms),
+            monotonic_ms: AtomicI64::new(now_ms),
+        })))
+    }
+
+    /// For tests that replay past event times as fast as they can: the
+    /// time now, stopped, so a pause under load between their writes is
+    /// never taken for an idle stream.
+    pub fn stopped() -> Self {
+        Self::manual(wall_clock_ms())
+    }
+
+    /// Moves a manual wall clock to `now_ms`, and its monotonic clock by
+    /// as much; the system clocks ignore it.
+    pub fn set(&self, now_ms: i64) {
+        if let Some(manual) = &self.0 {
+            let before = manual.wall_ms.swap(now_ms, Ordering::SeqCst);
+            manual
+                .monotonic_ms
+                .fetch_add(now_ms - before, Ordering::SeqCst);
+        }
+    }
+
+    /// Moves a manual wall clock alone to `now_ms`, as a step of the system
+    /// clock (NTP, a resumed VM) does; the system clocks ignore it.
+    pub fn step_wall_clock(&self, now_ms: i64) {
+        if let Some(manual) = &self.0 {
+            manual.wall_ms.store(now_ms, Ordering::SeqCst);
+        }
+    }
+
+    /// Both clocks now.
+    pub(crate) fn read(&self) -> ClockReading {
+        ClockReading {
+            wall_ms: self.now_ms(),
+            monotonic_ms: self.monotonic_ms(),
+        }
+    }
+
+    /// Milliseconds since the Unix epoch.
+    pub fn now_ms(&self) -> i64 {
+        match &self.0 {
+            Some(manual) => manual.wall_ms.load(Ordering::SeqCst),
+            None => wall_clock_ms(),
+        }
+    }
+
+    /// Milliseconds on a clock that only moves forward, at the rate of real
+    /// time, whatever steps the wall clock takes: only differences of two
+    /// readings mean anything.
+    pub fn monotonic_ms(&self) -> i64 {
+        match &self.0 {
+            Some(manual) => manual.monotonic_ms.load(Ordering::SeqCst),
+            None => {
+                static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+                let start = *START.get_or_init(std::time::Instant::now);
+                i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX)
+            }
+        }
     }
 }
 

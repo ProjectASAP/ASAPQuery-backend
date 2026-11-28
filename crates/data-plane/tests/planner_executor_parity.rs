@@ -49,7 +49,7 @@ use data_plane::{router, DataPlane, EXECUTION_HEADER};
 use futures::{executor::block_on, StreamExt};
 use http_body_util::BodyExt;
 use precompute::engine::PrecomputeMode;
-use precompute::ingestion::IngestionOptions;
+use precompute::ingestion::{IngestionOptions, WallClock};
 use prometheus_remote_write::{Label, Sample, TimeSeries};
 use serde_json::Value as Json;
 use tower::ServiceExt;
@@ -243,6 +243,7 @@ async fn data_plane_over(
         Views::EveryReadCold => (Some(fresh_view_dir()), Some(0)),
     };
     let options = EngineOptions {
+        clock: WallClock::stopped(),
         view_dir,
         view_cache_max_bytes,
         no_forward: true,

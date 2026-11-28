@@ -25,7 +25,7 @@ use control_plane::plan_workload;
 use data_plane::engine::EngineOptions;
 use data_plane::{router, DataPlane};
 use precompute::engine::SlowRefresh;
-use precompute::ingestion::IngestionOptions;
+use precompute::ingestion::{IngestionOptions, WallClock};
 use prometheus_remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use tower::ServiceExt;
 
@@ -144,6 +144,7 @@ fn requests(plan: &InstallablePlan, series: usize, from_ms: i64, to_ms: i64) -> 
 
 fn options(threads: usize, view_dir: Option<PathBuf>) -> EngineOptions {
     EngineOptions {
+        clock: WallClock::stopped(),
         no_forward: true,
         precompute_threads: threads,
         view_dir,

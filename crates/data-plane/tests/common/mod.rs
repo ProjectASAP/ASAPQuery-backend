@@ -9,7 +9,7 @@ use control_plane::{plan_workload, DeploymentInputs};
 use data_plane::engine::EngineOptions;
 use data_plane::{DataPlane, EXECUTION_HEADER};
 use http_body_util::BodyExt;
-use precompute::ingestion::IngestionOptions;
+use precompute::ingestion::{IngestionOptions, WallClock};
 use prometheus_remote_write::{encode, TimeSeries, WriteRequest};
 use serde_json::Value;
 use tower::ServiceExt;
@@ -210,11 +210,12 @@ pub fn one_query_plan_json(query: &str, series: usize, extra: Value) -> String {
 }
 
 /// The engine options of a data plane that never forwards a query and
-/// refreshes every window: no allowed lateness, and the producers' stream
-/// starting at 0.
+/// refreshes every window: no allowed lateness, the producers' stream
+/// starting at 0, and the clock stopped (`WallClock::stopped`).
 #[allow(dead_code)]
 pub fn no_forward_options() -> EngineOptions {
     EngineOptions {
+        clock: WallClock::stopped(),
         no_forward: true,
         ingestion: IngestionOptions {
             allowed_lateness_ms: 0,

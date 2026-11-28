@@ -19,7 +19,7 @@ use control_plane::plan_workload;
 use data_plane::engine::EngineOptions;
 use data_plane::{router, DataPlane};
 use http_body_util::BodyExt;
-use precompute::ingestion::IngestionOptions;
+use precompute::ingestion::{IngestionOptions, WallClock};
 use prometheus_remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -66,6 +66,7 @@ fn view_dir(test: &str) -> PathBuf {
 /// (`None`: no budget) and idle time `idle_ms` (`Some(0)`: never).
 fn options(dir: &Path, max_bytes: Option<u64>, idle_ms: Option<u64>) -> EngineOptions {
     EngineOptions {
+        clock: WallClock::stopped(),
         no_forward: true,
         view_dir: Some(dir.to_path_buf()),
         view_cache_max_bytes: max_bytes,
