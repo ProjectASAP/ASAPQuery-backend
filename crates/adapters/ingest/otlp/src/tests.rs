@@ -70,6 +70,7 @@ fn decode_with(
             })
             .collect(),
         rejected_points: decoded.rejected_points,
+        view_states: decoded.view_states,
     })
 }
 
@@ -884,4 +885,201 @@ fn consecutive_points_share_their_series() {
             "__name__=d_count,a=1",
         ]
     );
+}
+
+// Collector view states (docs/design/collector-sketch-ingest.md, §4).
+
+const VIEW_KEY: &str = r#"{"definition_id":"5597d603bdf9f1a148d7c7e5344c1a97","window":{"tumbling":{"width_ms":5000}},"logical_properties":{"parameters":{"DDSketch":{"alpha":0.05}}}}"#;
+const WINDOW_END_MS: u64 = 1_700_000_005_000;
+
+/// The metadata naming view `node` of plan `p1` with key `key`.
+fn view_metadata(node: i64, key: &str) -> Vec<KeyValue> {
+    vec![
+        text("asap.plan_id", "p1"),
+        attribute("asap.node_id", any_value::Value::IntValue(node)),
+        text("asap.view_state_key", key),
+    ]
+}
+
+/// A state point of the window ending at `WINDOW_END_MS`, as the collector
+/// exports one: the series' attributes, then `sketch.envelope`.
+fn state_point(attributes: Vec<KeyValue>, envelope: &[u8], count: u64) -> SummaryDataPoint {
+    let mut attributes = attributes;
+    attributes.push(attribute(
+        "sketch.envelope",
+        any_value::Value::BytesValue(envelope.to_vec()),
+    ));
+    SummaryDataPoint {
+        attributes,
+        start_time_unix_nano: (WINDOW_END_MS - 5_000) * 1_000_000,
+        time_unix_nano: WINDOW_END_MS * 1_000_000,
+        count,
+        sum: 0.0,
+        ..Default::default()
+    }
+}
+
+/// A collector view's metric: `<source>.asap_view.<node>` with `metadata`.
+fn view_metric(
+    source: &str,
+    node: i64,
+    metadata: Vec<KeyValue>,
+    data_points: Vec<SummaryDataPoint>,
+) -> Metric {
+    Metric {
+        metadata,
+        ..metric(
+            &format!("{source}.asap_view.{node}"),
+            Data::Summary(Summary { data_points }),
+        )
+    }
+}
+
+fn decoded(body: &[u8]) -> Result<Decoded<Point>, OtlpError> {
+    decode_with(body, None, &LabelOptions::default(), &LIMITS)
+}
+
+/// A view metric's points become states of their view, by series, with
+/// the window from the point's times, the envelope's bytes and the count;
+/// the series' labels are those a raw sample of the same attributes gets
+/// (`job` from the resource, `__name__` the source metric), and a raw
+/// gauge in the same request is still a sample.
+#[test]
+fn a_view_metrics_points_are_states_labeled_as_raw_samples() {
+    let series = vec![text("region", "r0"), text("label.0", "l0")];
+    let body = encode(&request(vec![
+        view_metric(
+            "data",
+            1,
+            view_metadata(1, VIEW_KEY),
+            vec![state_point(series.clone(), &[1, 2, 3], 50)],
+        ),
+        gauge(
+            "data",
+            vec![number_point(
+                series,
+                WINDOW_END_MS * 1_000_000,
+                number_data_point::Value::AsDouble(2.5),
+            )],
+        ),
+    ]));
+    let decoded = decoded(&body).unwrap();
+    let raw_labels = labels(&[
+        ("__name__", "data"),
+        ("job", "api-gateway"),
+        ("label_0", "l0"),
+        ("region", "r0"),
+    ]);
+    assert_eq!(
+        decoded.samples,
+        vec![Point {
+            labels: raw_labels.clone(),
+            timestamp_ms: WINDOW_END_MS as i64,
+            value: 2.5,
+        }]
+    );
+    let key: ViewStateKey = serde_json::from_str(VIEW_KEY).unwrap();
+    assert_eq!(
+        decoded.view_states,
+        ViewStateBatch {
+            views: vec![CollectorViewStates {
+                plan_id: "p1".into(),
+                node_id: 1,
+                key,
+                series: vec![CollectorSeriesStates {
+                    labels: raw_labels.into_iter().collect(),
+                    records: vec![ViewStateRecord {
+                        window_start_ms: WINDOW_END_MS as i64 - 5_000,
+                        window_end_ms: WINDOW_END_MS as i64,
+                        asapv1: vec![1, 2, 3],
+                        sample_count: 50,
+                    }],
+                }],
+            }],
+        }
+    );
+}
+
+/// Two views over one metric are two entries; one series' states of one
+/// view are one series, its records in request order.
+#[test]
+fn states_group_by_view_then_series() {
+    let other_key = VIEW_KEY.replace("0.05", "0.01");
+    let a = vec![text("region", "a")];
+    let b = vec![text("region", "b")];
+    let body = encode(&request(vec![
+        view_metric(
+            "data",
+            1,
+            view_metadata(1, VIEW_KEY),
+            vec![
+                state_point(a.clone(), &[1], 1),
+                state_point(b, &[2], 1),
+                state_point(a.clone(), &[3], 1),
+            ],
+        ),
+        view_metric(
+            "data",
+            2,
+            view_metadata(2, &other_key),
+            vec![state_point(a, &[4], 1)],
+        ),
+    ]));
+    let views = decoded(&body).unwrap().view_states.views;
+    let shape: Vec<(usize, Vec<Vec<Vec<u8>>>)> = views
+        .iter()
+        .map(|view| {
+            (
+                view.node_id,
+                view.series
+                    .iter()
+                    .map(|s| s.records.iter().map(|r| r.asapv1.clone()).collect())
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            (1, vec![vec![vec![1], vec![3]], vec![vec![2]]]),
+            (2, vec![vec![vec![4]]]),
+        ]
+    );
+}
+
+/// A view identity missing in part or not parsing, a view point without
+/// `sketch.envelope`, and a `sketch.envelope` point under a metric naming
+/// no view refuse the whole request.
+#[test]
+fn a_bad_view_identity_refuses_the_request() {
+    let point = || vec![state_point(vec![text("region", "a")], &[1], 1)];
+    let refused = |metric: Metric| match decoded(&encode(&request(vec![metric]))) {
+        Err(OtlpError::ViewIdentity { reason, .. }) => reason,
+        other => panic!("not refused: {other:?}"),
+    };
+    let mut partial = view_metadata(1, VIEW_KEY);
+    partial.remove(0);
+    assert!(refused(view_metric("data", 1, partial, point())).contains("asap.plan_id"));
+    assert!(
+        refused(view_metric("data", 1, view_metadata(1, "{"), point()))
+            .contains("asap.view_state_key")
+    );
+    let mut no_envelope = point();
+    no_envelope[0].attributes.pop();
+    assert!(refused(view_metric(
+        "data",
+        1,
+        view_metadata(1, VIEW_KEY),
+        no_envelope
+    ))
+    .contains("sketch.envelope"));
+    let misnamed = view_metric("data", 2, view_metadata(1, VIEW_KEY), point());
+    assert!(refused(misnamed).contains("asap_view.1"));
+    let unnamed = metric(
+        "data",
+        Data::Summary(Summary {
+            data_points: point(),
+        }),
+    );
+    assert!(refused(unnamed).contains("names no view"));
 }

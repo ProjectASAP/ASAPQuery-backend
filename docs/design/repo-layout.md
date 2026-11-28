@@ -115,13 +115,14 @@ data-plane     common, precompute, storage, query, internal-metrics, every adapt
   This is #935's decision 1.
 - Adapters never see an engine or a store. In ASAPQuery, adapters depend
   on the whole engine crate (#935, "Not solved"); a separate `common` crate
-  closes that here. The ingest adapters need not even `common`: each
-  decodes into the caller's types (below), so `prometheus-remote-write`
-  depends on nothing in the workspace, `victoriametrics-remote-write` only
-  on `prometheus-remote-write`, whose protobuf it reads (zstd-compressed
-  instead of snappy), and `otlp` only on `prometheus-remote-write`, whose
+  closes that here. The ingest adapters decode samples into the caller's
+  types (below), so `prometheus-remote-write` depends on nothing in the
+  workspace, `victoriametrics-remote-write` only on
+  `prometheus-remote-write`, whose protobuf it reads (zstd-compressed
+  instead of snappy), and `otlp` on `prometheus-remote-write`, whose
   `SampleBuilder`, in-place protobuf reader and series cache its decoder
-  uses.
+  uses, and on `common`, for the collector view states it decodes
+  (`ViewStateBatch`, docs/design/collector-sketch-ingest.md).
 - `control-plane` is a dev-dependency of `data-plane`, `precompute` and
   `query` only: their tests plan workloads with it.
 - `precompute` and `query` do not depend on each other. Both depend on

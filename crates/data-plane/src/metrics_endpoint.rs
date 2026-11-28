@@ -496,6 +496,7 @@ pub(crate) fn render(metrics: &Metrics, gauges: &Gauges) -> String {
             escape(&thread)
         );
     }
+    metrics.collector_states.render(&mut out);
     out
 }
 

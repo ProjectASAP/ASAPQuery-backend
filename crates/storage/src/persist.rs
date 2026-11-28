@@ -825,6 +825,30 @@ pub(crate) fn encode_state(state: &dyn AggregateCore, grids: &mut Grids) -> Opti
     }
 }
 
+/// Rebuilds sketch states of one kernel from ASAPv1 bytes, as the view
+/// files rebuild a stored state: for states built elsewhere (a collector's)
+/// into the kernel the executor builds for their view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Asapv1Decoder(SketchKernel);
+
+impl Asapv1Decoder {
+    /// The decoder of `template`'s kernel (an empty state the executor
+    /// built); `None` for a state not stored as ASAPv1 bytes (an exact
+    /// state, a Hydra-Count-Min group).
+    pub fn of_state(template: &dyn AggregateCore) -> Option<Self> {
+        match encode_state(template, &mut Grids::default())? {
+            StoredValue::Sketch { kernel, .. } => Some(Self(kernel)),
+            _ => None,
+        }
+    }
+
+    /// The state `asapv1` encodes; `None` when the bytes are not this
+    /// kernel's.
+    pub fn decode(&self, asapv1: &[u8]) -> Option<Arc<dyn AggregateCore>> {
+        decode_sketch(self.0, asapv1)
+    }
+}
+
 /// The kernel state `kernel` rebuilds from `asapv1`.
 pub(crate) fn decode_sketch(kernel: SketchKernel, asapv1: &[u8]) -> Option<Arc<dyn AggregateCore>> {
     Some(match kernel {

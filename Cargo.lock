@@ -2775,6 +2775,7 @@ dependencies = [
 name = "otlp"
 version = "0.1.0"
 dependencies = [
+ "common",
  "flate2",
  "opentelemetry-proto",
  "prometheus_remote_write",

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use common::{InstallablePlan, PhysicalASAPNodeId};
 use internal_metrics::{Metrics, QueryMetrics};
+use precompute::collector::{CollectorStateIngestReport, CollectorViewOptions};
 use precompute::engine::{
     IngestError, InstalledPrecompute, PersistedViews, PrecomputeEngine, PrecomputeMode,
     PrecomputeOptions, SlowRefresh,
@@ -138,6 +139,21 @@ pub struct EngineOptions {
     /// For tests: the wall clock ingestion reads, set by the test.
     #[doc(hidden)]
     pub clock: WallClock,
+    /// The plan's views a collector builds: their states arrive on
+    /// `/v1/metrics`, and the precompute engine does not build them.
+    pub collector: CollectorViewOptions,
+}
+
+/// What names the view files of `plan_json` installed with `collector`'s
+/// views built by a collector: the plan file's hash, with the collector
+/// views mixed in when there are any (they change the refresh groups the
+/// files are laid out by).
+fn views_plan_hash(plan_json: &str, collector: &CollectorViewOptions) -> u64 {
+    if collector.views.is_empty() {
+        return plan_hash(plan_json.as_bytes());
+    }
+    let views: Vec<String> = collector.views.iter().map(ToString::to_string).collect();
+    plan_hash(format!("{plan_json}\ncollector views: {}", views.join(",")).as_bytes())
 }
 
 /// The default `view_cache_idle_ms`: a minute, four 15 s dashboard
@@ -184,6 +200,7 @@ impl Default for EngineOptions {
             push_batching: precompute::push::MorselBatching::default(),
             panic_in_combine_of_window_end_ms: None,
             clock: WallClock::default(),
+            collector: CollectorViewOptions::default(),
         }
     }
 }
@@ -215,7 +232,7 @@ impl EngineHandle {
             .zip(view_tier.clone())
             .map(|(dir, tier)| PersistedViews {
                 dir,
-                plan_hash: plan_hash(plan_json.as_bytes()),
+                plan_hash: views_plan_hash(&plan_json, &options.collector),
                 sync_interval: std::time::Duration::from_millis(options.view_sync_interval_ms),
                 segment_ms: options.view_segment_ms,
                 persist: PersistOptions {
@@ -247,6 +264,15 @@ impl EngineHandle {
     /// Queues `samples` for ingestion; see [`InstalledPrecompute::try_ingest`].
     pub fn try_ingest(&self, samples: Vec<RawSample>) -> Result<(), IngestError> {
         self.precompute.try_ingest(samples)
+    }
+
+    /// Stages collector states; see
+    /// [`InstalledPrecompute::ingest_collector_states`].
+    pub async fn ingest_collector_states(
+        &self,
+        batch: common::ViewStateBatch,
+    ) -> Result<CollectorStateIngestReport, IngestError> {
+        self.precompute.ingest_collector_states(batch).await
     }
 
     /// What the HTTP routes run queries through.
@@ -361,6 +387,7 @@ impl EngineOptions {
             precompute_memory_budget_bytes: self.precompute_memory_budget_bytes,
             panic_in_combine_of_window_end_ms: self.panic_in_combine_of_window_end_ms,
             clock: self.clock.clone(),
+            collector: self.collector.clone(),
         }
     }
 
