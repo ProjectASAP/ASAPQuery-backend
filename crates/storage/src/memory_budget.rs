@@ -8,6 +8,10 @@
 //! as headroom for page cache of the segments being written and read.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use crate::store::ViewTier;
 
 /// What a cgroup v2 directory reports about memory.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -85,11 +89,7 @@ pub fn default_view_cache_budget(cgroup: &CgroupMemory, other_pools_bytes: u64) 
 /// The cache's target for the next second: `budget` while anonymous
 /// memory stays within `memory.max` less the headroom; otherwise the
 /// cached bytes less the excess (at least zero).
-pub fn monitored_target(
-    budget: Option<u64>,
-    cgroup: &CgroupMemory,
-    cached_bytes: u64,
-) -> Option<u64> {
+fn monitored_target(budget: Option<u64>, cgroup: &CgroupMemory, cached_bytes: u64) -> Option<u64> {
     let Some(max) = cgroup.max_bytes else {
         return budget;
     };
@@ -99,6 +99,22 @@ pub fn monitored_target(
     }
     let lowered = cached_bytes.saturating_sub(cgroup.anon_bytes - allowed);
     Some(budget.map_or(lowered, |budget| budget.min(lowered)))
+}
+
+/// The view cache's monitor: once a second, drops idle windows and, under
+/// a cgroup memory limit, lowers the cache's target while anonymous memory
+/// runs higher than its budget assumed.
+pub fn serve_view_cache(tier: Arc<ViewTier>, budget: Option<u64>, running: Arc<AtomicBool>) {
+    let cgroup = own_cgroup();
+    while running.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        tier.cache.evict_idle(std::time::Instant::now());
+        if let Some(memory) = cgroup.as_ref().and_then(|dir| read_cgroup(dir).ok()) {
+            let cached = tier.cache.stats().bytes;
+            tier.cache
+                .set_target_bytes(monitored_target(budget, &memory, cached));
+        }
+    }
 }
 
 #[cfg(test)]

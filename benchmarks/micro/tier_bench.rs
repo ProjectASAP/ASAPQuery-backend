@@ -39,10 +39,10 @@ use axum::Router;
 use control_plane::{plan_workload, DeploymentInputs};
 use data_plane::engine::EngineOptions;
 use data_plane::ingestion::IngestionOptions;
-use data_plane::persist::ViewRead;
 use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use data_plane::{router, DataPlane};
 use http_body_util::BodyExt;
+use storage::persist::ViewRead;
 use tower::ServiceExt;
 
 const WINDOW_MS: i64 = 15_000;

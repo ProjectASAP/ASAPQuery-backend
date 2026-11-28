@@ -33,28 +33,28 @@ use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::time::Instant;
 
+use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
 use asap_executor::runtime::Limits;
+use asap_executor::values::Batch;
 use asap_planner::InstallablePlan;
-
+use internal_metrics::{Metrics, PushMetrics, Timer};
+use storage::memory_budget::serve_view_cache;
+use storage::persist::{plan_hash, ViewFiles, ViewRead};
+use storage::store::{
+    PublishedStore, QueryTimeResults, RawData, RawSample, RawShards, RunStore, SeriesPartition,
+    ViewStore, ViewTier, WindowSlot,
+};
+use storage::window_cache::WindowCache;
 use tokio::sync::oneshot;
 
 use crate::ingestion::{
     ClosedWindow, Computed, Ingestion, IngestionOptions, IngestionStats, Precompute,
     RefreshTaskGraph, Refreshed, Routing,
 };
-use crate::metrics::{Gauges, Metrics, PushMetrics, Timer};
-use crate::persist::{plan_hash, ViewFiles, ViewRead};
+use crate::metrics_endpoint::Gauges;
 use crate::push::{Partial, PushGroup, PushShard};
 use crate::query::{QueryEngine, Snapshot, Unanswered};
 use crate::result_cache::{Answer, ResultCache};
-use crate::store::SeriesPartition;
-use crate::store::{
-    PublishedStore, QueryTimeResults, RawData, RawSample, RawShards, RunStore, ViewStore, ViewTier,
-    WindowSlot,
-};
-use crate::window_cache::WindowCache;
-use asap_executor::planner::plan::physical_asap_dag::PhysicalASAPNodeId;
-use asap_executor::values::Batch;
 
 /// How the views of a closed refresh window are built
 /// (docs/design/parallel-precompute.md). The `data_plane` binary defaults
@@ -145,7 +145,7 @@ pub struct EngineOptions {
     /// recently used are dropped first.
     pub result_cache_max_bytes: usize,
     /// Where the materialized views are persisted and loaded from at
-    /// startup ([`crate::persist`]); `None`: kept in memory only.
+    /// startup ([`storage::persist`]); `None`: kept in memory only.
     pub view_dir: Option<std::path::PathBuf>,
     /// How often the view files are synced to disk: a refreshed window is
     /// durable within this long. 0 syncs after every window.
@@ -223,7 +223,7 @@ impl Default for EngineOptions {
             view_sync_interval_ms: 5_000,
             view_cache_max_bytes: None,
             view_cache_idle_ms: None,
-            view_segment_ms: crate::persist::DEFAULT_SEGMENT_MS,
+            view_segment_ms: storage::persist::DEFAULT_SEGMENT_MS,
             view_read: ViewRead::Mmap,
             cold_decode_delay_ms: 0,
             unpersistable_views: Vec::new(),
@@ -385,6 +385,8 @@ struct Shared {
     /// keep a refresh from finishing.
     precompute_gate: Mutex<()>,
     metrics: Metrics,
+    /// The views' cold tier, when they are persisted.
+    view_tier: Option<Arc<ViewTier>>,
 }
 
 /// Marks the engine stopped when its thread exits, panics included.
@@ -466,9 +468,6 @@ impl EngineHandle {
             .map(|(width_ms, views)| (width_ms, views.iter().map(ToString::to_string).collect()))
             .collect();
         let mut metrics = Metrics::new(&groups, &query_texts);
-        if let Some(tier) = &tier {
-            let _ = metrics.view_tier.set(tier.clone());
-        }
         if options.precompute_mode == PrecomputeMode::Push {
             metrics.push = Some(PushMetrics::new(groups.len(), shard_count));
         }
@@ -504,6 +503,7 @@ impl EngineHandle {
             published: PublishedStore::new(Arc::new(raw_shards.clone())),
             precompute_gate: Mutex::new(()),
             metrics,
+            view_tier: tier.clone(),
         });
         let (commands, command_receiver) = channel();
         let (jobs, job_receiver) = sync_channel(options.max_precompute_backlog.max(1));
@@ -771,7 +771,7 @@ impl EngineHandle {
     }
 
     /// The query-time partition of the view store.
-    pub fn query_time_results(&self) -> &QueryTimeResults {
+    pub fn query_time_results(&self) -> &QueryTimeResults<Unanswered> {
         self.query.query_time_results()
     }
 
@@ -783,7 +783,7 @@ impl EngineHandle {
     /// The engine's measurements and counters in the Prometheus text
     /// format.
     pub fn render_metrics(&self) -> String {
-        crate::metrics::render(
+        crate::metrics_endpoint::render(
             &self.shared.metrics,
             &Gauges {
                 stats: self.stats(),
@@ -798,6 +798,7 @@ impl EngineHandle {
                 now_ms: crate::ingestion::wall_clock_ms(),
                 query_time_results: self.query.query_time_results(),
                 result_cache: self.query.result_cache(),
+                view_tier: self.shared.view_tier.as_deref(),
             },
         )
     }
@@ -1002,7 +1003,7 @@ fn install(
         "materialized views"
     );
     let results = QueryTimeResults::new(
-        crate::ingestion::millis(options.query_time_results_retention_ms),
+        storage::store::millis(options.query_time_results_retention_ms),
         options.query_time_results_max_bytes,
     );
     let query = QueryEngine::new(
@@ -2440,15 +2441,15 @@ fn serve_persist(
 /// with its budget (the option, else from the cgroup's `memory.max`, else
 /// none) and idle time.
 fn view_tier(options: &EngineOptions) -> ViewTier {
-    let cgroup = crate::memory_budget::own_cgroup()
-        .and_then(|dir| crate::memory_budget::read_cgroup(&dir).ok());
+    let cgroup = storage::memory_budget::own_cgroup()
+        .and_then(|dir| storage::memory_budget::read_cgroup(&dir).ok());
     let other_pools = (options.result_cache_max_bytes + options.query_time_results_max_bytes)
         as u64
         + options.max_persist_backlog_bytes;
     let budget = options.view_cache_max_bytes.or_else(|| {
-        cgroup
-            .as_ref()
-            .and_then(|cgroup| crate::memory_budget::default_view_cache_budget(cgroup, other_pools))
+        cgroup.as_ref().and_then(|cgroup| {
+            storage::memory_budget::default_view_cache_budget(cgroup, other_pools)
+        })
     });
     let idle_ms = options
         .view_cache_idle_ms
@@ -2462,27 +2463,6 @@ fn view_tier(options: &EngineOptions) -> ViewTier {
         options.view_read,
         std::time::Duration::from_millis(options.cold_decode_delay_ms),
     )
-}
-
-/// The view cache's monitor: once a second, drops idle windows and, under
-/// a cgroup memory limit, lowers the cache's target while anonymous memory
-/// runs higher than its budget assumed.
-fn serve_view_cache(tier: Arc<ViewTier>, budget: Option<u64>, running: Arc<AtomicBool>) {
-    let cgroup = crate::memory_budget::own_cgroup();
-    while running.load(Ordering::SeqCst) {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        tier.cache.evict_idle(std::time::Instant::now());
-        if let Some(memory) = cgroup
-            .as_ref()
-            .and_then(|dir| crate::memory_budget::read_cgroup(dir).ok())
-        {
-            let cached = tier.cache.stats().bytes;
-            tier.cache
-                .set_target_bytes(crate::memory_budget::monitored_target(
-                    budget, &memory, cached,
-                ));
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2697,7 +2677,7 @@ mod tests {
         let widths: Vec<i64> = ingestion.group_windows().iter().map(|w| w.0).collect();
         assert_eq!(widths, [60_000, 10_000]);
         ingestion.set_push_groups(vec![true, false]);
-        let series = crate::series_ids::intern_pairs(&[("__name__", "m_engine_push_late")]);
+        let series = storage::series_ids::intern_pairs(&[("__name__", "m_engine_push_late")]);
         ingestion.observe(&[(series.metric.clone(), 1_000)]);
         ingestion.advance_newest_sample(Some(25_000));
         ingestion.advance_clock(25_000);

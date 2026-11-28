@@ -27,7 +27,7 @@
 /// The state families with a compact form, as the mapped layout names
 /// them: which fixed-size exact record, or which sketch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompactKind {
+pub(crate) enum CompactKind {
     DDSketch,
     /// Exact sum: `sum`, `compensation` (f64), `seen` (0 or 1).
     Sum,
@@ -45,7 +45,7 @@ pub enum CompactKind {
 
 impl CompactKind {
     /// Its code in a fragment's column descriptor.
-    pub fn code(self) -> u32 {
+    pub(crate) fn code(self) -> u32 {
         match self {
             Self::DDSketch => 1,
             Self::Sum => 2,
@@ -56,7 +56,7 @@ impl CompactKind {
         }
     }
 
-    pub fn from_code(code: u32) -> Option<Self> {
+    pub(crate) fn from_code(code: u32) -> Option<Self> {
         Some(match code {
             1 => Self::DDSketch,
             2 => Self::Sum,
@@ -592,7 +592,7 @@ const RAW: u8 = 0xff;
 /// `kind`) in compact form; `None` when the column has no compact form
 /// (its sketches differ in index mapping or admission rate, or a state is
 /// not of `kind`'s layout).
-pub fn encode_states(
+pub(crate) fn encode_states(
     kind: CompactKind,
     states: impl Iterator<Item = impl AsRef<[u8]>>,
 ) -> Option<Vec<u8>> {
@@ -720,7 +720,11 @@ fn put_record(
 /// layout: the states back to back in 8-byte words (each state starting on
 /// a word), and their byte offsets (`rows + 1`). `None` when the bytes are
 /// damaged.
-pub fn decode_states(kind: CompactKind, bytes: &[u8], rows: usize) -> Option<(Vec<u64>, Vec<u32>)> {
+pub(crate) fn decode_states(
+    kind: CompactKind,
+    bytes: &[u8],
+    rows: usize,
+) -> Option<(Vec<u64>, Vec<u32>)> {
     let mut reader = StreamReader::new(bytes)?;
     // Every row takes at least a byte: `rows` past that is damage, and must
     // not size an allocation.
@@ -844,7 +848,7 @@ fn record(
 
 /// A column of text keys in compact form: each a signed varint delta from
 /// the previous row's.
-pub fn encode_text_keys(keys: impl ExactSizeIterator<Item = u32>) -> Vec<u8> {
+pub(crate) fn encode_text_keys(keys: impl ExactSizeIterator<Item = u32>) -> Vec<u8> {
     let mut out = Vec::with_capacity(keys.len());
     let mut previous = 0i64;
     for key in keys {
@@ -855,7 +859,7 @@ pub fn encode_text_keys(keys: impl ExactSizeIterator<Item = u32>) -> Vec<u8> {
 }
 
 /// `rows` text keys from their compact form.
-pub fn decode_text_keys(bytes: &[u8], rows: usize) -> Option<Vec<u32>> {
+pub(crate) fn decode_text_keys(bytes: &[u8], rows: usize) -> Option<Vec<u32>> {
     if rows > bytes.len() {
         return None;
     }

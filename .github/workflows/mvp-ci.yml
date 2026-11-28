@@ -53,7 +53,7 @@ jobs:
 
       - name: Check workspace formatting
         working-directory: ASAPQuery-backend
-        run: cargo fmt -p control_plane -p data_plane -- --check
+        run: cargo fmt --all -- --check
 
       - name: Check workspace
         env:

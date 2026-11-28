@@ -41,9 +41,11 @@ use asap_executor::planner::plan::physical_asap_dag::{PhysicalASAPDAG, PhysicalA
 use asap_executor::runtime::{Limits, RunContext, Scope};
 use asap_executor::values::{Batch, SchemaRef};
 use futures::executor::block_on;
+use storage::store::{
+    millis, window_end, RawData, RawSample, RawShards, RunStore, SeriesPartition, ViewStore,
+};
 
 use crate::prometheus::MAX_TIME_MS;
-use crate::store::{RawData, RawSample, RawShards, RunStore, SeriesPartition, ViewStore};
 
 /// How ingestion treats sample times.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,7 +340,7 @@ impl Ingestion {
         }
         let ingestion = Self {
             groups: clocks,
-            scanned_metrics: Arc::new(crate::store::scanned_metrics(&dag.nodes)),
+            scanned_metrics: Arc::new(storage::store::scanned_metrics(&dag.nodes)),
             pane_width_ms,
             query_time_lookback_ms,
             options,
@@ -1223,7 +1225,7 @@ impl<'a> DagIndex<'a> {
         read_views: &BTreeSet<PhysicalASAPNodeId>,
     ) -> BTreeSet<String> {
         let stop: HashSet<PhysicalASAPNodeId> = read_views.iter().copied().collect();
-        crate::store::scanned_metrics(self.below(views, &stop).iter().map(|id| self.nodes[id]))
+        storage::store::scanned_metrics(self.below(views, &stop).iter().map(|id| self.nodes[id]))
     }
 }
 
@@ -1250,21 +1252,9 @@ fn gcd(a: i64, b: i64) -> i64 {
     }
 }
 
-/// A duration option in milliseconds as a time offset, saturating.
-pub(crate) fn millis(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
-}
-
 /// Milliseconds since the Unix epoch.
 pub fn wall_clock_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-}
-
-/// End of the tumbling window of width `width_ms` (on multiples of it)
-/// that holds `timestamp_ms`. Windows are `(end - width_ms, end]`, like
-/// PromQL ranges: a sample at a boundary belongs to the window it ends.
-pub fn window_end(timestamp_ms: i64, width_ms: i64) -> i64 {
-    -((-timestamp_ms).div_euclid(width_ms)) * width_ms
 }

@@ -26,10 +26,10 @@ use axum::Router;
 use control_plane::{plan_workload, DeploymentInputs};
 use data_plane::engine::EngineOptions;
 use data_plane::ingestion::IngestionOptions;
-use data_plane::metrics::thread_cpu_seconds;
 use data_plane::remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use data_plane::{router, DataPlane, EXECUTION_HEADER};
 use http_body_util::BodyExt;
+use internal_metrics::thread_cpu_seconds;
 use tower::ServiceExt;
 
 const STEP_MS: i64 = 15_000;

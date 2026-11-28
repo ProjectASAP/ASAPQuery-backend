@@ -58,8 +58,9 @@ use asap_sketchlib::{
 };
 use serde::{Deserialize, Serialize};
 
+pub(crate) use crate::segment::FORMAT_VERSION;
 use crate::segment::{encode_fragment, RecordHead, Segment, SegmentHeader, SegmentTexts};
-pub use crate::segment::{ViewRead, WindowLocation, FORMAT_VERSION};
+pub use crate::segment::{ViewRead, WindowLocation};
 
 /// The kernels whose sketch state is stored as ASAPv1 bytes, with what
 /// rebuilding one needs beyond the bytes.
@@ -123,7 +124,7 @@ pub struct Written {
 
 /// The windows indexed at startup, by view: each window's range and
 /// location, oldest first.
-pub type ViewIndex = BTreeMap<PhysicalASAPNodeId, Vec<((i64, i64), WindowLocation)>>;
+pub(crate) type ViewIndex = BTreeMap<PhysicalASAPNodeId, Vec<((i64, i64), WindowLocation)>>;
 
 /// The segment being appended to, with its texts by text.
 struct ActiveSegment {
@@ -536,7 +537,7 @@ impl ViewFiles {
         &mut self,
         groups: &[Vec<(MaterializedView, SchemaRef)>],
     ) -> std::io::Result<ViewIndex> {
-        let millis = |view: &MaterializedView| crate::ingestion::millis(view.retention_ms());
+        let millis = |view: &MaterializedView| crate::store::millis(view.retention_ms());
         for (view, _) in groups.iter().flatten() {
             self.view_retention_ms.insert(view.node_id, millis(view));
         }

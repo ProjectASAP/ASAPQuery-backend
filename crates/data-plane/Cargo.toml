@@ -6,17 +6,14 @@ edition.workspace = true
 [dependencies]
 asap-planner.workspace = true
 asap-executor.workspace = true
-asap_sketchlib.workspace = true
-serde_bytes = "0.11"
-# Each view fragment is compressed (segment.rs).
-zstd = "0.13"
+internal_metrics.workspace = true
+storage.workspace = true
 ahash = "0.8"
 # The per-thread series cache of the Remote Write decoder (a table of
 # indices hashed by the keys they point to).
 hashbrown = "0.15"
 # Shortest round-trip float digits for range responses (prometheus.rs).
 ryu = "1"
-libc = "0.2"
 # The data plane's allocator (main.rs): many small per-request allocations.
 tikv-jemallocator = "0.6"
 serde.workspace = true
@@ -30,15 +27,17 @@ tokio.workspace = true
 axum.workspace = true
 reqwest.workspace = true
 prost = "0.13"
-rmp-serde = "1"
 snap = "1.1"
 futures = "0.3"
 form_urlencoded = "1"
 
 [dev-dependencies]
 control_plane.workspace = true
+asap_sketchlib.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# posix_fadvise in the tier and view-read benchmarks (cold reads).
+libc = "0.2"
 
 # The micro benchmarks live in benchmarks/micro/ and build as examples of this
 # crate (`cargo run --release -p data_plane --example <name>`).

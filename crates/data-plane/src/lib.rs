@@ -16,20 +16,13 @@
 
 pub mod engine;
 pub mod ingestion;
-pub mod memory_budget;
-pub mod metrics;
-pub mod persist;
+mod metrics_endpoint;
 pub mod prometheus;
 pub mod push;
 pub mod query;
 pub mod raw_forward;
 pub mod remote_write;
 pub mod result_cache;
-pub mod segment;
-pub mod series_ids;
-mod state_codec;
-pub mod store;
-pub mod window_cache;
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -179,7 +172,7 @@ async fn proxy(
 }
 
 async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
-    let timer = metrics::Timer::start();
+    let timer = internal_metrics::Timer::start();
     match remote_write::decode_samples(&body, &state.limits) {
         Ok(samples) => {
             state.engine.metrics().remote_write_decode.record(timer);
@@ -306,7 +299,7 @@ async fn status(State(state): State<Arc<DataPlane>>) -> Response {
 
 /// The data plane's measurements in the Prometheus text format: per-phase
 /// thread CPU and wall time, query latency, counters, backlogs, watermark
-/// lag, bytes held and each thread's CPU time ([`metrics`]).
+/// lag, bytes held and each thread's CPU time ([`metrics_endpoint`]).
 async fn metrics(State(state): State<Arc<DataPlane>>) -> Response {
     let mut text = state.engine.render_metrics();
     if let Some(forwarder) = &state.raw_forward {
