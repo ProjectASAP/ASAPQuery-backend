@@ -457,14 +457,15 @@ PRs, each reviewed on its own:
 5. **An idle stream's last windows close by wall-clock time.** While no
    sample arrives, event time is taken to advance with the wall clock. The
    coordinator keeps an idle watermark `t + (now − a) − L − G`: `t` the
-   newest sample time (capped at the wall clock), `a` the wall-clock time a
-   sample last arrived, `L` `--allowed-lateness-ms`, `G` a 1 s grace. A
+   newest sample time (capped at `a`), `a` the wall-clock time of the flush
+   that last ran a sample, `L` `--allowed-lateness-ms`, `G` a 1 s grace. A
    window `(e − W, e]` so closes once no sample has come for
    `e − t + L + G`, at most `W + L + G`. Counting from `t`, not from `now`,
    a stream whose event time lags the wall clock (a replay or backfill)
    closes no window earlier than if it kept sending.
-   - One idle watermark over all shards, kept by the coordinator; a sample
-     on any shard resets `a`.
+   - One idle watermark over all shards, kept by the coordinator. A sample
+     ingestion keeps, on any shard, resets `a`; unrouted, late and future
+     samples do not.
    - The coordinator checks it every tick (100 ms). When it would close a
      window, the coordinator first flushes every shard, as for a barrier,
      and takes `now` and `a` at that flush, so samples still queued reset
