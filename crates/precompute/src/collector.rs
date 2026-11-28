@@ -20,25 +20,24 @@
 //!    is not stored, so a query reading it is not answered from the plan.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use asap_executor::planner::ir::operator::Source;
 use asap_executor::planner::ir::schema::{FieldDataType, PROMQL_SERIES_IDENTITY};
-use asap_executor::planner::ir::{ASAPOp, NonASAPOp, Operator};
-use asap_executor::planner::plan::materialized_view::{MaterializedView, ViewStateKey};
+use asap_executor::planner::ir::{ASAPOp, Operator};
+use asap_executor::planner::plan::materialized_view::ViewStateKey;
 use asap_executor::planner::plan::physical_asap_dag::{PhysicalASAPDAG, PhysicalASAPNodeId};
 use asap_executor::summary_kernels::factory::create_planner_accumulator;
 use asap_executor::values::{Batch, SchemaRef, Value};
 use asap_executor::AggregateCore;
-use common::{view_identity, ViewStateBatch, MAX_TIME_MS};
+use common::{ViewStateBatch, MAX_TIME_MS};
 use internal_metrics::Metrics;
 use storage::persist::Asapv1Decoder;
 use storage::series_ids::{intern_pairs, Series};
 
-use crate::ingestion::{ClosedWindow, Computed, Ingestion};
+use crate::ingestion::{ClosedWindow, Computed, DagIndex, Ingestion, Precompute};
 
 /// Which views of the installed plan a collector builds, and how long after
 /// its end such a view's window is committed.
@@ -71,7 +70,8 @@ pub mod reject {
     pub const UNKNOWN_VIEW: &str = "unknown_view";
     /// The view's state key differs from the installed view's.
     pub const KEY_MISMATCH: &str = "key_mismatch";
-    /// The metric is not `<source metric>.asap_view.<node id>`.
+    /// The series' metric (`__name__`) is not the one the view's `Scan`
+    /// reads.
     pub const NAME: &str = "name";
     /// The window is not one of the view's, or too far ahead of the clock.
     pub const WINDOW: &str = "window";
@@ -104,6 +104,34 @@ impl CollectorStateIngestReport {
     }
 }
 
+impl std::ops::AddAssign for CollectorStateIngestReport {
+    fn add_assign(&mut self, other: Self) {
+        self.staged += other.staged;
+        self.duplicate += other.duplicate;
+        self.merged += other.merged;
+        self.late_dropped += other.late_dropped;
+        for (reason, count) in other.rejected {
+            *self.rejected.entry(reason).or_default() += count;
+        }
+    }
+}
+
+/// What happened to a staged state or a window, as the
+/// `asap_collector_states_*` series' `outcome`.
+pub mod outcome {
+    pub const STAGED: &str = "staged";
+    pub const DUPLICATE: &str = "duplicate";
+    pub const MERGED: &str = "merged";
+    /// Its window was already committed when it arrived.
+    pub const LATE_DROPPED: &str = "late_dropped";
+    /// Staged for a window skipped as past the view's retention.
+    pub const EXPIRED: &str = "expired";
+    /// A window committed with its staged states.
+    pub const COMMITTED: &str = "committed";
+    /// A window with no state at commit: not stored.
+    pub const EMPTY: &str = "empty";
+}
+
 /// One state that passed the checks, for the coordinator to stage.
 pub(crate) struct ArrivedState {
     pub group: usize,
@@ -119,8 +147,6 @@ pub(crate) struct ArrivedState {
 struct CollectorView {
     group: usize,
     key: ViewStateKey,
-    /// The metric its states come under: `<source metric>.asap_view.<id>`.
-    metric_name: String,
     /// The metric its `Scan` reads: its rows' `__name__`.
     source_metric: String,
     width_ms: i64,
@@ -143,53 +169,35 @@ pub(crate) struct CollectorViews {
     view_of_group: HashMap<usize, PhysicalASAPNodeId>,
     max_future_ms: i64,
     /// When each (view, reason) rejection was last logged.
-    logged: Mutex<HashMap<(PhysicalASAPNodeId, &'static str), Instant>>,
+    logged: Mutex<HashMap<(Option<PhysicalASAPNodeId>, &'static str), Instant>>,
 }
 
 /// How often a rejection of one view and reason is logged.
 const LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 impl CollectorViews {
-    /// The collector views `ids` of `dag` (`views` its materialized views),
-    /// each in its group of `groups` (each group's views and their output
-    /// schemas, as `Precompute::views` lists them). Errs for a view whose
-    /// state has no ASAPv1 encoding, that does not read exactly one metric,
-    /// or whose rows hold more than a window end, a series identity and a
-    /// state.
+    /// The collector views of `dag`: the views of `ingestion`'s collector
+    /// view groups (one view each, in `precompute`'s groups). Errs for a
+    /// view that builds no sketch with an ASAPv1 encoding, that does not
+    /// read exactly one metric, or whose rows hold more than a window end,
+    /// a series identity and a state.
     pub fn new(
         dag: &PhysicalASAPDAG,
-        views: &[MaterializedView],
-        groups: &[Vec<(MaterializedView, SchemaRef)>],
-        ids: &BTreeSet<PhysicalASAPNodeId>,
+        ingestion: &Ingestion,
+        precompute: &Precompute,
         max_future_ms: u64,
     ) -> anyhow::Result<Self> {
-        let nodes: HashMap<PhysicalASAPNodeId, _> = dag.nodes.iter().map(|n| (n.id, n)).collect();
-        let mut inputs: HashMap<PhysicalASAPNodeId, Vec<PhysicalASAPNodeId>> = HashMap::new();
-        for edge in &dag.edges {
-            inputs.entry(edge.consumer).or_default().push(edge.producer);
-        }
+        let index = DagIndex::new(dag);
+        let groups = precompute.views();
         let mut installed = HashMap::new();
-        for &id in ids {
-            let fail = |why: String| anyhow::anyhow!("collector view {id}: {why}");
-            let view = views
-                .iter()
-                .find(|view| view.node_id == id)
-                .ok_or_else(|| fail("not a materialized view".into()))?;
-            let (group, schema) = groups
-                .iter()
-                .enumerate()
-                .find_map(|(group, views)| {
-                    views
-                        .iter()
-                        .find(|(view, _)| view.node_id == id)
-                        .map(|(_, schema)| (group, schema.clone()))
-                })
-                .ok_or_else(|| fail("not refreshed at ingestion".into()))?;
-            let width_ms = match view.view_state_key().window {
-                Some(common::ViewWindow::Tumbling { width_ms }) => storage::store::millis(width_ms),
-                _ => return Err(fail("its rows are not tumbling windows".into())),
+        for group in (0..groups.len()).filter(|&group| ingestion.is_collector(group)) {
+            let [(view, schema)] = groups[group].as_slice() else {
+                unreachable!("a collector view's group holds that view alone")
             };
-            let node = nodes[&id];
+            let (id, schema) = (view.node_id, schema.clone());
+            let fail = |why: String| anyhow::anyhow!("collector view {id}: {why}");
+            let width_ms = precompute.width_ms(group);
+            let node = index.nodes[&id];
             let (summary_type, input) = match &node.payload {
                 Operator::ASAP(
                     ASAPOp::SummaryTumblingWindowChain {
@@ -211,7 +219,7 @@ impl CollectorViews {
                     .snapshot_accumulator();
             let decoder = Asapv1Decoder::of_state(&*template)
                 .ok_or_else(|| fail("its state has no ASAPv1 encoding".into()))?;
-            let metrics = scanned_metrics_below(id, &nodes, &inputs);
+            let metrics = index.metrics_below(&[id], &BTreeSet::new());
             let [source_metric] = <[String; 1]>::try_from(metrics.into_iter().collect::<Vec<_>>())
                 .map_err(|metrics| fail(format!("reads metrics {metrics:?}, not one")))?;
             let mut identity_column = None;
@@ -242,7 +250,6 @@ impl CollectorViews {
                 CollectorView {
                     group,
                     key: view.view_state_key().clone(),
-                    metric_name: view_identity::metric_name(&source_metric, id),
                     source_metric,
                     width_ms,
                     decoder,
@@ -283,8 +290,11 @@ impl CollectorViews {
                     return;
                 }
                 *report.rejected.entry(reason).or_default() += count;
-                metrics.collector_states.rejected(node_id, reason, count);
-                self.log_rejection(node_id, reason, detail);
+                // A view the installed plan has not is counted and logged
+                // as one, whatever node id it names.
+                let view = self.views.contains_key(&node_id).then_some(node_id);
+                metrics.collector_states.rejected(view, reason, count);
+                self.log_rejection(view, reason, detail);
             };
             let count = |series: &[common::CollectorSeriesStates]| -> u64 {
                 series.iter().map(|s| s.records.len() as u64).sum()
@@ -308,12 +318,6 @@ impl CollectorViews {
                             "view state key {:?} differs from the installed view's",
                             states.key
                         )
-                    });
-                    continue;
-                }
-                Some(view) if view.metric_name != states.metric => {
-                    reject(reject::NAME, count(&states.series), &|| {
-                        format!("metric {} is not {}", states.metric, view.metric_name)
                     });
                     continue;
                 }
@@ -374,7 +378,7 @@ impl CollectorViews {
 
     fn log_rejection(
         &self,
-        view: PhysicalASAPNodeId,
+        view: Option<PhysicalASAPNodeId>,
         reason: &'static str,
         detail: &dyn Fn() -> String,
     ) {
@@ -387,22 +391,19 @@ impl CollectorViews {
             return;
         }
         logged.insert((view, reason), now);
-        tracing::warn!(view, reason, detail = %detail(), "collector states rejected");
+        tracing::warn!(?view, reason, detail = %detail(), "collector states rejected");
     }
 
-    /// The collector view refresh group `group` builds.
-    pub fn view_of_group(&self, group: usize) -> Option<PhysicalASAPNodeId> {
-        self.view_of_group.get(&group).copied()
+    /// The view collector view group `group` builds.
+    pub fn view_of_group(&self, group: usize) -> PhysicalASAPNodeId {
+        self.view_of_group[&group]
     }
 
     /// The rows of `window` of a collector view's group holding `states`,
     /// one row per series, as the view's own run writes them.
     pub fn rows(&self, window: ClosedWindow, states: Vec<Staged>) -> Result<Computed, String> {
         let group = window.group;
-        let view = self
-            .view_of_group(group)
-            .and_then(|id| self.views.get(&id))
-            .ok_or_else(|| format!("refresh group {group} is no collector view"))?;
+        let view = &self.views[&self.view_of_group(group)];
         let family = view.schema.fields[view.state_column].dtype.clone();
         let rows = states
             .into_iter()
@@ -422,34 +423,6 @@ impl CollectorViews {
         let batch = Batch::try_new(view.schema.clone(), rows).map_err(|e| e.to_string())?;
         Ok(Computed::Ran(vec![(0, vec![batch])]))
     }
-}
-
-/// The `TimeSeries` metrics scanned below `id`.
-fn scanned_metrics_below(
-    id: PhysicalASAPNodeId,
-    nodes: &HashMap<
-        PhysicalASAPNodeId,
-        &asap_executor::planner::plan::physical_asap_dag::PhysicalASAPDAGNode,
-    >,
-    inputs: &HashMap<PhysicalASAPNodeId, Vec<PhysicalASAPNodeId>>,
-) -> BTreeSet<String> {
-    let mut seen = HashSet::new();
-    let mut pending = vec![id];
-    let mut metrics = BTreeSet::new();
-    while let Some(id) = pending.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        if let Operator::NonASAP(NonASAPOp::Scan {
-            source: Source::TimeSeries { metric },
-            ..
-        }) = &nodes[&id].payload
-        {
-            metrics.insert(metric.clone());
-        }
-        pending.extend(inputs.get(&id).into_iter().flatten().copied());
-    }
-    metrics
 }
 
 /// One series' state of one window, staged until the window commits.
@@ -478,6 +451,7 @@ impl Staging {
         &mut self,
         states: Vec<ArrivedState>,
         ingestion: &mut Ingestion,
+        now_ms: i64,
         metrics: &Metrics,
     ) -> CollectorStateIngestReport {
         let mut report = CollectorStateIngestReport::default();
@@ -487,7 +461,7 @@ impl Staging {
             *end = (*end).min(state.end_ms);
         }
         for (group, end_ms) in oldest {
-            ingestion.start_collector_group(group, end_ms);
+            ingestion.start_collector_group(group, end_ms, now_ms);
         }
         for arrived in states {
             let view = arrived.node_id;
@@ -496,7 +470,9 @@ impl Staging {
                 .is_some_and(|through| arrived.end_ms <= through)
             {
                 report.late_dropped += 1;
-                metrics.collector_states.outcome(view, "late_dropped", 1);
+                metrics
+                    .collector_states
+                    .outcome(view, outcome::LATE_DROPPED, 1);
                 continue;
             }
             let window = self
@@ -513,12 +489,14 @@ impl Staging {
                     },
                 );
                 report.staged += 1;
-                metrics.collector_states.outcome(view, "staged", 1);
+                metrics.collector_states.outcome(view, outcome::STAGED, 1);
                 continue;
             };
             if staged.hashes.contains(&arrived.hash) {
                 report.duplicate += 1;
-                metrics.collector_states.outcome(view, "duplicate", 1);
+                metrics
+                    .collector_states
+                    .outcome(view, outcome::DUPLICATE, 1);
                 continue;
             }
             match staged.state.merge_with(&*arrived.state) {
@@ -526,11 +504,13 @@ impl Staging {
                     staged.state = Arc::from(merged);
                     staged.hashes.push(arrived.hash);
                     report.merged += 1;
-                    metrics.collector_states.outcome(view, "merged", 1);
+                    metrics.collector_states.outcome(view, outcome::MERGED, 1);
                 }
                 Err(error) => {
                     *report.rejected.entry(reject::MERGE).or_default() += 1;
-                    metrics.collector_states.rejected(view, reject::MERGE, 1);
+                    metrics
+                        .collector_states
+                        .rejected(Some(view), reject::MERGE, 1);
                     tracing::warn!(view, %error, "a collector state does not merge with the staged one");
                 }
             }
@@ -549,14 +529,96 @@ impl Staging {
     /// Drops the states staged for windows of `group` ending at or before
     /// `through` (windows skipped as expired), returning how many.
     pub fn drop_through(&mut self, group: usize, through: i64) -> u64 {
-        let mut dropped = 0;
-        self.windows.retain(|&(g, end_ms), series| {
-            let expired = g == group && end_ms <= through;
-            if expired {
-                dropped += series.len() as u64;
-            }
-            !expired
-        });
-        dropped
+        let expired: Vec<(usize, i64)> = self
+            .windows
+            .range((group, i64::MIN)..=(group, through))
+            .map(|(&window, _)| window)
+            .collect();
+        expired
+            .into_iter()
+            .filter_map(|window| self.windows.remove(&window))
+            .map(|series| series.len() as u64)
+            .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use asap_executor::summary_kernels::DDSketchAccumulator;
+    use control_plane::test_support::one_query_plan;
+
+    use super::*;
+    use crate::ingestion::IngestionOptions;
+
+    /// The ingestion of a one-chain plan whose chain a collector builds,
+    /// committed `grace_ms` after each window's end, and the chain's
+    /// window width.
+    fn ingestion(grace_ms: u64) -> (Ingestion, i64) {
+        let plan = one_query_plan("sum_over_time(data[1m])", false);
+        let views = plan.materialized_views().unwrap();
+        let chain = views[0].node_id;
+        let collector = CollectorViewOptions {
+            views: BTreeSet::from([chain]),
+            commit_grace_ms: grace_ms,
+        };
+        let (ingestion, precompute) = Ingestion::new(
+            &plan.dag,
+            &views,
+            plan.ingestion_refresh_groups().unwrap(),
+            IngestionOptions::default(),
+            asap_executor::runtime::Limits { max_bytes: 1 << 30 },
+            &collector,
+        )
+        .unwrap();
+        assert!(ingestion.is_collector(0));
+        (ingestion, precompute.width_ms(0))
+    }
+
+    fn state(group: usize, end_ms: i64, hash: u64) -> ArrivedState {
+        ArrivedState {
+            group,
+            node_id: 0,
+            series: intern_pairs(&[("__name__", "data"), ("job", "collector-unit")]),
+            end_ms,
+            hash,
+            state: Arc::new(DDSketchAccumulator::new(0.05)),
+        }
+    }
+
+    /// A view's first states being of a window still open by the clock, an
+    /// earlier window still open is not taken as closed: its state arriving
+    /// later is staged, not dropped as late. Windows close once the clock
+    /// passes their end by the grace; a state of a closed window is late.
+    #[test]
+    fn windows_open_by_the_clock_take_states_in_any_order() {
+        let grace_ms = 8_000;
+        let (mut ingestion, width) = ingestion(grace_ms as u64);
+        let metrics = Metrics::new(&[]);
+        let mut staging = Staging::default();
+        // Windows ending at `earlier` and `newest`; at `now` the clock has
+        // not passed `earlier` by the grace yet.
+        let earlier = 100 * width;
+        let newest = earlier + width;
+        let now = earlier + grace_ms / 2;
+        // The newest window first, then the earlier one.
+        let first = staging.stage(vec![state(0, newest, 1)], &mut ingestion, now, &metrics);
+        assert_eq!(first.staged, 1);
+        let second = staging.stage(vec![state(0, earlier, 2)], &mut ingestion, now, &metrics);
+        assert_eq!((second.staged, second.late_dropped), (1, 0));
+        // The clock passes the earlier window's end by the grace.
+        let closed = ingestion.close_windows_at(earlier + grace_ms);
+        assert_eq!(closed.last().map(|w| w.end_ms), Some(earlier));
+        assert_eq!(staging.take(*closed.last().unwrap()).len(), 1);
+        let late = staging.stage(vec![state(0, earlier, 3)], &mut ingestion, now, &metrics);
+        assert_eq!(late.late_dropped, 1);
+        let now = newest;
+        // Repeats and partials of the open window.
+        let report = staging.stage(
+            vec![state(0, now, 1), state(0, now, 4), state(0, now, 1)],
+            &mut ingestion,
+            now,
+            &metrics,
+        );
+        assert_eq!((report.duplicate, report.merged), (2, 1));
     }
 }

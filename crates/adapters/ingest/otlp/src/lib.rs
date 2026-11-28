@@ -66,7 +66,8 @@
 //! attributes give the series' labels as for a sample, `__name__` being the
 //! metric's name before `.asap_view.`. They are decoded into
 //! [`Decoded::view_states`]; the state bytes are not read. A request whose
-//! view identity is missing in part or does not parse, or that has a
+//! view identity is missing in part or does not parse, whose view metric is
+//! not named `<source metric>.asap_view.<node_id>`, or that has a
 //! `sketch.envelope` point outside such a metric, is refused
 //! ([`OtlpError::ViewIdentity`]).
 //!
@@ -702,20 +703,25 @@ impl<B: SampleBuilder> Walk<'_, B> {
             .map_err(|e| refused(format!("{NODE_ID}: {e}")))?;
         let key: ViewStateKey = serde_json::from_str(&key.ok_or_else(|| missing(VIEW_STATE_KEY))?)
             .map_err(|e| refused(format!("{VIEW_STATE_KEY}: {e}")))?;
+        if !name
+            .strip_suffix(&node_id.to_string())
+            .is_some_and(|source| source.ends_with(NAME_INFIX) && source.len() > NAME_INFIX.len())
+        {
+            return Err(refused(format!(
+                "the name is not <source metric>{NAME_INFIX}{node_id}"
+            )));
+        }
         let views = &mut self.decoded.view_states.views;
-        if let Some(index) = views.iter().position(|view| {
-            view.node_id == node_id
-                && view.plan_id == plan_id
-                && view.key == key
-                && view.metric == name
-        }) {
+        if let Some(index) = views
+            .iter()
+            .position(|view| view.node_id == node_id && view.plan_id == plan_id && view.key == key)
+        {
             return Ok(Some(index));
         }
         views.push(CollectorViewStates {
             plan_id,
             node_id,
             key,
-            metric: name.to_string(),
             series: Vec::new(),
         });
         Ok(Some(views.len() - 1))

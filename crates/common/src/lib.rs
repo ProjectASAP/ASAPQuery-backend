@@ -25,7 +25,7 @@ pub use query_result::{
 };
 pub use view_states::{
     view_identity, CollectorSeriesStates, CollectorViewStates, ViewStateBatch, ViewStateKey,
-    ViewStateRecord, ViewWindow,
+    ViewStateRecord,
 };
 
 /// The largest time, in milliseconds either side of the epoch, the data

@@ -533,9 +533,18 @@ async fn write_otlp(
                 });
             }
             Ok(_) => {}
-            Err(error) => {
-                tracing::error!("OTLP collector states refused: {error}");
-                return failed(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+            Err(IngestError::Busy) => {
+                return failed(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &IngestError::Busy.to_string(),
+                )
+            }
+            Err(IngestError::Stopped) => {
+                tracing::error!("OTLP collector states refused: the engine has stopped");
+                return failed(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &IngestError::Stopped.to_string(),
+                );
             }
         }
     }

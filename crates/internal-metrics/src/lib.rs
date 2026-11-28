@@ -303,42 +303,45 @@ struct CollectorViewCounts {
     delay_sum_ms: u64,
 }
 
-/// What happened to collector view states, per view (by node id); rendered
-/// only once a state has arrived.
+/// What happened to collector view states, per view (by node id; `None`:
+/// a view the installed plan has not, counted as `view="unknown"`);
+/// rendered only once a state has arrived.
 #[derive(Default)]
 pub struct CollectorStateMetrics {
-    views: Mutex<BTreeMap<String, CollectorViewCounts>>,
+    views: Mutex<BTreeMap<Option<usize>, CollectorViewCounts>>,
 }
 
 impl CollectorStateMetrics {
-    fn with(&self, view: impl ToString, update: impl FnOnce(&mut CollectorViewCounts)) {
+    fn with(&self, view: Option<usize>, update: impl FnOnce(&mut CollectorViewCounts)) {
         let mut views = self.views.lock().unwrap_or_else(|e| e.into_inner());
-        update(views.entry(view.to_string()).or_default());
+        update(views.entry(view).or_default());
     }
 
     /// `count` states of `view` with `outcome`.
-    pub fn outcome(&self, view: impl ToString, outcome: &'static str, count: u64) {
-        self.with(view, |v| *v.outcomes.entry(outcome).or_default() += count);
+    pub fn outcome(&self, view: usize, outcome: &'static str, count: u64) {
+        self.with(Some(view), |v| {
+            *v.outcomes.entry(outcome).or_default() += count
+        });
     }
 
     /// `count` states of `view` rejected for `reason`.
-    pub fn rejected(&self, view: impl ToString, reason: &'static str, count: u64) {
+    pub fn rejected(&self, view: Option<usize>, reason: &'static str, count: u64) {
         self.with(view, |v| *v.rejected.entry(reason).or_default() += count);
     }
 
     /// A window of `view` with `outcome`.
-    pub fn window(&self, view: impl ToString, outcome: &'static str) {
-        self.with(view, |v| *v.windows.entry(outcome).or_default() += 1);
+    pub fn window(&self, view: usize, outcome: &'static str) {
+        self.with(Some(view), |v| *v.windows.entry(outcome).or_default() += 1);
     }
 
     /// A state of `view` arrived `delay_ms` after its window's end.
-    pub fn arrived(&self, view: impl ToString, delay_ms: i64) {
+    pub fn arrived(&self, view: usize, delay_ms: i64) {
         let seconds = delay_ms as f64 / 1e3;
         let bucket = ARRIVAL_DELAY_BUCKETS_S
             .iter()
             .position(|bound| seconds <= *bound)
             .unwrap_or(ARRIVAL_DELAY_BUCKETS_S.len());
-        self.with(view, |v| {
+        self.with(Some(view), |v| {
             v.delay_buckets[bucket] += 1;
             v.delay_sum_ms += delay_ms.max(0) as u64;
         });
@@ -351,8 +354,12 @@ impl CollectorStateMetrics {
         if views.is_empty() {
             return;
         }
+        let views: Vec<(String, &CollectorViewCounts)> = views
+            .iter()
+            .map(|(view, counts)| (view.map_or("unknown".into(), |id| id.to_string()), counts))
+            .collect();
         let _ = writeln!(out, "# HELP asap_collector_states_total Collector view states by outcome: staged, duplicate (equal to one staged), merged (into the one staged), late_dropped (after their window committed).\n# TYPE asap_collector_states_total counter");
-        for (view, counts) in views.iter() {
+        for (view, counts) in &views {
             for (outcome, count) in &counts.outcomes {
                 let _ = writeln!(
                     out,
@@ -361,20 +368,20 @@ impl CollectorStateMetrics {
             }
         }
         let _ = writeln!(out, "# HELP asap_collector_states_rejected_total Collector view states rejected, by reason.\n# TYPE asap_collector_states_rejected_total counter");
-        for (view, counts) in views.iter() {
+        for (view, counts) in &views {
             for (reason, count) in &counts.rejected {
                 let _ = writeln!(out, "asap_collector_states_rejected_total{{view=\"{view}\",reason=\"{reason}\"}} {count}");
             }
         }
         let _ = writeln!(out, "# HELP asap_collector_states_windows_total Collector view windows at commit: committed, or empty (no state, not stored).\n# TYPE asap_collector_states_windows_total counter");
-        for (view, counts) in views.iter() {
+        for (view, counts) in &views {
             for (outcome, count) in &counts.windows {
                 let _ = writeln!(out, "asap_collector_states_windows_total{{view=\"{view}\",outcome=\"{outcome}\"}} {count}");
             }
         }
         let name = "asap_collector_states_arrival_delay_seconds";
         let _ = writeln!(out, "# HELP {name} From a collector state's window end to its arrival.\n# TYPE {name} histogram");
-        for (view, counts) in views.iter() {
+        for (view, counts) in &views {
             let mut cumulative = 0;
             for (bound, bucket) in ARRIVAL_DELAY_BUCKETS_S.iter().zip(&counts.delay_buckets) {
                 cumulative += bucket;

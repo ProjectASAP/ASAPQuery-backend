@@ -4,7 +4,7 @@
 //! OTAP tiers they travel in: view (Schema) → series (Dictionary) → state
 //! (Record).
 
-pub use asap_types::plan::materialized_view::{ViewStateKey, ViewWindow};
+pub use asap_types::plan::materialized_view::ViewStateKey;
 
 use crate::{LabelSet, PhysicalASAPNodeId};
 
@@ -20,19 +20,10 @@ impl ViewStateBatch {
     pub fn is_empty(&self) -> bool {
         self.views.is_empty()
     }
-
-    /// The states in the batch.
-    pub fn records(&self) -> usize {
-        self.views
-            .iter()
-            .flat_map(|view| &view.series)
-            .map(|series| series.records.len())
-            .sum()
-    }
 }
 
 /// One collector view's states (Schema tier): the view identity its
-/// metric's metadata carries, and the metric's name.
+/// metric's metadata carries.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CollectorViewStates {
     /// `PhysicalASAPDAG::plan_id()` of the plan the collector loaded.
@@ -41,8 +32,6 @@ pub struct CollectorViewStates {
     /// The view's `MaterializedView::view_state_key()`, as the collector
     /// read it from its copy of the plan.
     pub key: ViewStateKey,
-    /// The metric's name, `<source metric>.asap_view.<node_id>`.
-    pub metric: String,
     pub series: Vec<CollectorSeriesStates>,
 }
 
@@ -76,9 +65,4 @@ pub mod view_identity {
     pub const NAME_INFIX: &str = ".asap_view.";
     /// The data point attribute holding a state's ASAPv1 bytes.
     pub const ENVELOPE_ATTRIBUTE: &str = "sketch.envelope";
-
-    /// The metric name of view `node_id` over `source_metric`.
-    pub fn metric_name(source_metric: &str, node_id: usize) -> String {
-        format!("{source_metric}{NAME_INFIX}{node_id}")
-    }
 }

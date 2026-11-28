@@ -986,7 +986,6 @@ fn a_view_metrics_points_are_states_labeled_as_raw_samples() {
                 plan_id: "p1".into(),
                 node_id: 1,
                 key,
-                metric: "data.asap_view.1".into(),
                 series: vec![CollectorSeriesStates {
                     labels: raw_labels.into_iter().collect(),
                     records: vec![ViewStateRecord {
@@ -1074,6 +1073,8 @@ fn a_bad_view_identity_refuses_the_request() {
         no_envelope
     ))
     .contains("sketch.envelope"));
+    let misnamed = view_metric("data", 2, view_metadata(1, VIEW_KEY), point());
+    assert!(refused(misnamed).contains("asap_view.1"));
     let unnamed = metric(
         "data",
         Data::Summary(Summary {

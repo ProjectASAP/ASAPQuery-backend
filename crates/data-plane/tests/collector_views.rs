@@ -495,7 +495,7 @@ async fn bad_states_are_rejected_and_a_window_without_states_is_missing() {
     assert_eq!(rejected("key_mismatch"), 1.0);
 
     let other_name = edited(good_body(), |metric| {
-        metric.name = "other.asap_view.1".into()
+        metric.name = format!("other.asap_view.{node}")
     });
     assert_eq!(post(&app, other_name).await, 1);
     assert_eq!(rejected("name"), 1.0);
@@ -529,7 +529,10 @@ async fn bad_states_are_rejected_and_a_window_without_states_is_missing() {
     });
     assert_eq!(post(&app, unknown_view).await, 1);
     assert_eq!(
-        metric(&state, &format!("asap_collector_states_rejected_total{{view=\"{unknown}\",reason=\"unknown_view\"}}")),
+        metric(
+            &state,
+            "asap_collector_states_rejected_total{view=\"unknown\",reason=\"unknown_view\"}"
+        ),
         1.0
     );
 

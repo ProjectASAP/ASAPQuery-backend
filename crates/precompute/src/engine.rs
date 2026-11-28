@@ -47,7 +47,8 @@ use storage::store::{
 use tokio::sync::oneshot;
 
 use crate::collector::{
-    ArrivedState, CollectorStateIngestReport, CollectorViewOptions, CollectorViews, Staging,
+    outcome, ArrivedState, CollectorStateIngestReport, CollectorViewOptions, CollectorViews,
+    Staged, Staging,
 };
 use crate::ingestion::{
     ClosedWindow, Computed, Ingestion, IngestionOptions, IngestionStats, Precompute,
@@ -166,10 +167,10 @@ enum PrecomputeJob {
         window: ClosedWindow,
         closed_at: Instant,
     },
-    /// A collector view's window: its rows, from the states staged for it.
+    /// A collector view's window, with the states staged for it.
     Collector {
         window: ClosedWindow,
-        rows: Result<Computed, String>,
+        states: Vec<Staged>,
         closed_at: Instant,
     },
     /// Answers `barrier_ms` once every window queued before is refreshed.
@@ -342,9 +343,8 @@ impl PrecomputeEngine {
         tracing::info!(pane_width_ms = ingestion.pane_width_ms(), "raw data panes");
         let collector = CollectorViews::new(
             &plan.dag,
-            &views,
-            &precompute.views(),
-            &self.options.collector.views,
+            &ingestion,
+            &precompute,
             self.options.ingestion.max_future_ms,
         )?;
         InstalledPrecompute::start(
@@ -384,6 +384,9 @@ pub struct InstalledPrecompute {
     shards: Vec<Sender<ShardMessage>>,
     shared: Arc<Shared>,
     max_queued_samples: u64,
+    /// Closed windows not yet refreshed beyond which collector states are
+    /// refused as `Busy`, as samples are once the queues fill behind them.
+    max_precompute_backlog: u64,
     /// The installed plan's collector views.
     collector: Arc<CollectorViews>,
 }
@@ -606,6 +609,7 @@ impl InstalledPrecompute {
                 check_task_inputs: options.check_task_inputs,
                 push_parts: shard_count as u32,
                 panic_in_combine_of_window_end_ms: options.panic_in_combine_of_window_end_ms,
+                collector: collector.clone(),
             },
             RunningGuard(running),
             &shared,
@@ -615,19 +619,24 @@ impl InstalledPrecompute {
             shards,
             shared,
             max_queued_samples: options.max_queued_samples,
+            max_precompute_backlog: options.max_precompute_backlog as u64,
             collector,
         })
     }
 
     /// Checks, decodes and stages `batch`'s collector states
     /// ([`crate::collector`]), once the ingest coordinator has run the
-    /// commands queued before. `Stopped` when the engine has exited.
+    /// commands queued before. `Busy` while the precompute backlog is full;
+    /// `Stopped` when the engine has exited.
     pub async fn ingest_collector_states(
         &self,
         batch: ViewStateBatch,
     ) -> Result<CollectorStateIngestReport, IngestError> {
         if !self.is_running() {
             return Err(IngestError::Stopped);
+        }
+        if self.precompute_backlog() >= self.max_precompute_backlog {
+            return Err(IngestError::Busy);
         }
         let now_ms = self.shared.clock.now_ms();
         let (states, mut report) = self.collector.check(batch, now_ms, &self.shared.metrics);
@@ -638,14 +647,7 @@ impl InstalledPrecompute {
         self.commands
             .send(Command::CollectorStates { states, reply })
             .map_err(|_| IngestError::Stopped)?;
-        let staged = done.await.map_err(|_| IngestError::Stopped)?;
-        report.staged += staged.staged;
-        report.duplicate += staged.duplicate;
-        report.merged += staged.merged;
-        report.late_dropped += staged.late_dropped;
-        for (reason, count) in staged.rejected {
-            *report.rejected.entry(reason).or_default() += count;
-        }
+        report += done.await.map_err(|_| IngestError::Stopped)?;
         Ok(report)
     }
 
@@ -1031,7 +1033,12 @@ fn serve_ingest(
                     moved = true;
                 }
                 Ok(Command::CollectorStates { states, reply }) => {
-                    let _ = reply.send(staging.stage(states, &mut ingestion, &shared.metrics));
+                    let _ = reply.send(staging.stage(
+                        states,
+                        &mut ingestion,
+                        crate::ingestion::wall_clock_ms(),
+                        &shared.metrics,
+                    ));
                 }
                 Ok(Command::Stop) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -1053,7 +1060,12 @@ fn serve_ingest(
                     moved = true;
                 }
                 Command::CollectorStates { states, reply } => {
-                    let _ = reply.send(staging.stage(states, &mut ingestion, &shared.metrics));
+                    let _ = reply.send(staging.stage(
+                        states,
+                        &mut ingestion,
+                        crate::ingestion::wall_clock_ms(),
+                        &shared.metrics,
+                    ));
                 }
                 Command::Stop => break 'serve,
             }
@@ -1088,7 +1100,12 @@ fn serve_ingest(
                         deferred.push_back((barrier_ms, reply))
                     }
                     Ok(Command::CollectorStates { states, reply }) => {
-                        let _ = reply.send(staging.stage(states, &mut ingestion, &shared.metrics));
+                        let _ = reply.send(staging.stage(
+                            states,
+                            &mut ingestion,
+                            crate::ingestion::wall_clock_ms(),
+                            &shared.metrics,
+                        ));
                     }
                     Ok(Command::Stop) => break 'serve,
                     // A shard that died never answers: stop, failing the
@@ -1138,39 +1155,38 @@ fn serve_ingest(
                 });
             }
         }
-        // Each closed collector view window's rows, from its staged
-        // states; one with none is not stored.
-        let mut collector_rows = HashMap::new();
+        // Each closed collector view window's staged states, for the
+        // committer to make its rows; a window with none is not stored.
+        let mut collector_states = HashMap::new();
+        let collector_states_metrics = &shared.metrics.collector_states;
         for &window in closed.iter().filter(|w| ingestion.is_collector(w.group)) {
-            let view = collector.view_of_group(window.group).unwrap_or_default();
             let states = staging.take(window);
+            let view = collector.view_of_group(window.group);
             if states.is_empty() {
-                shared.metrics.collector_states.window(view, "empty");
-                continue;
+                collector_states_metrics.window(view, outcome::EMPTY);
+            } else {
+                collector_states_metrics.window(view, outcome::COMMITTED);
+                collector_states.insert(window, states);
             }
-            shared.metrics.collector_states.window(view, "committed");
-            collector_rows.insert(window, collector.rows(window, states));
         }
+        // States of windows skipped as past their view's retention.
         for group in (0..pushed.len()).filter(|&g| ingestion.is_collector(g)) {
             if let Some(through) = ingestion.closed_through(group) {
-                let late = staging.drop_through(group, through);
-                if late > 0 {
-                    let view = collector.view_of_group(group).unwrap_or_default();
-                    shared
-                        .metrics
-                        .collector_states
-                        .outcome(view, "late_dropped", late);
+                let expired = staging.drop_through(group, through);
+                if expired > 0 {
+                    let view = collector.view_of_group(group);
+                    collector_states_metrics.outcome(view, outcome::EXPIRED, expired);
                 }
             }
         }
-        closed.retain(|w| !ingestion.is_collector(w.group) || collector_rows.contains_key(w));
+        closed.retain(|w| !ingestion.is_collector(w.group) || collector_states.contains_key(w));
         if !queue_refreshes(
             &closed,
             &snapshot,
             &jobs,
             shared,
             pushed,
-            &mut collector_rows,
+            &mut collector_states,
         ) {
             break;
         }
@@ -1239,22 +1255,22 @@ fn serve_ingest(
 }
 
 /// Queues a refresh of each of `closed` over `raw_data` (a collector view's
-/// window with its rows, from `collector_rows`), waiting while the backlog
-/// is full; `false` once the precompute thread has exited.
+/// window with its states, from `collector_states`), waiting while the
+/// backlog is full; `false` once the precompute thread has exited.
 fn queue_refreshes(
     closed: &[ClosedWindow],
     raw_data: &RawShards,
     jobs: &SyncSender<PrecomputeJob>,
     shared: &Shared,
     pushed: &[bool],
-    collector_rows: &mut HashMap<ClosedWindow, Result<Computed, String>>,
+    collector_states: &mut HashMap<ClosedWindow, Vec<Staged>>,
 ) -> bool {
     for &window in closed {
         shared.precompute_backlog.fetch_add(1, Ordering::SeqCst);
-        let job = if let Some(rows) = collector_rows.remove(&window) {
+        let job = if let Some(states) = collector_states.remove(&window) {
             PrecomputeJob::Collector {
                 window,
-                rows,
+                states,
                 closed_at: Instant::now(),
             }
         } else if pushed.get(window.group).copied().unwrap_or(false) {
@@ -1285,6 +1301,8 @@ struct PoolOptions {
     /// The partials a pushed window combines: one per ingest shard.
     push_parts: u32,
     panic_in_combine_of_window_end_ms: Option<i64>,
+    /// What makes a collector view window's rows from its staged states.
+    collector: Arc<CollectorViews>,
 }
 
 /// What the precompute committer waits for.
@@ -1647,9 +1665,12 @@ fn serve_precompute(
                 }
                 PoolEvent::Job(PrecomputeJob::Collector {
                     window,
-                    rows,
+                    states,
                     closed_at,
-                }) => tasks.collector_window(window, rows, closed_at),
+                }) => {
+                    let rows = options.collector.rows(window, states);
+                    tasks.collector_window(window, rows, closed_at)
+                }
                 PoolEvent::Partial(partial) => tasks.partial(partial),
                 PoolEvent::Job(PrecomputeJob::Barrier { barrier_ms, reply }) => {
                     tasks.barrier(barrier_ms, reply)
