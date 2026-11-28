@@ -43,6 +43,9 @@ use crate::ingestion::{ClosedWindow, Computed, DagIndex, Ingestion, Precompute};
 /// its end such a view's window is committed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectorViewOptions {
+    /// The plan the views were cut from (`PhysicalASAPDAG::plan_id()`):
+    /// installing another plan is refused. `None`: not checked.
+    pub plan_id: Option<String>,
     pub views: BTreeSet<PhysicalASAPNodeId>,
     /// The collector's window close delay, its export interval and an
     /// allowance for clock skew: a state arriving later than this after its
@@ -55,8 +58,20 @@ impl Default for CollectorViewOptions {
     /// delay, no export interval, 2 s skew allowance).
     fn default() -> Self {
         Self {
+            plan_id: None,
             views: BTreeSet::new(),
             commit_grace_ms: 8_000,
+        }
+    }
+}
+
+impl From<&common::CollectorViewsFile> for CollectorViewOptions {
+    /// The collector views a collector-views file lists, of its plan.
+    fn from(file: &common::CollectorViewsFile) -> Self {
+        Self {
+            plan_id: Some(file.plan_id.clone()),
+            views: file.outputs.iter().copied().collect(),
+            commit_grace_ms: file.commit_grace_ms,
         }
     }
 }
@@ -558,6 +573,7 @@ mod tests {
         let views = plan.materialized_views().unwrap();
         let chain = views[0].node_id;
         let collector = CollectorViewOptions {
+            plan_id: None,
             views: BTreeSet::from([chain]),
             commit_grace_ms: grace_ms,
         };

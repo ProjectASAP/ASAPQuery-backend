@@ -21,6 +21,7 @@ use asap_sketchlib::DdSketch;
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
+use control_plane::collector_views::{collector_sub_dag, CollectorCapabilities, CommitGrace};
 use control_plane::plan_workload;
 use data_plane::engine::EngineOptions;
 use data_plane::{router, DataPlane};
@@ -118,6 +119,7 @@ fn collector_data_plane(plan: &InstallablePlan, node: usize) -> (Router, Arc<Dat
     let options = EngineOptions {
         precompute_mode: PrecomputeMode::Push,
         collector: CollectorViewOptions {
+            plan_id: Some(plan.dag.plan_id()),
             views: BTreeSet::from([node]),
             commit_grace_ms: 0,
         },
@@ -555,4 +557,87 @@ fn edited(body: Vec<u8>, edit: impl FnOnce(&mut Metric)) -> Vec<u8> {
     let mut request: ExportMetricsServiceRequest = prost::Message::decode(&body[..]).unwrap();
     edit(&mut request.resource_metrics[0].scope_metrics[0].metrics[0]);
     prost::Message::encode_to_vec(&request)
+}
+
+/// The collector-views file the control plane writes for the plan, from
+/// today's collector's capabilities, read back as the data plane reads
+/// `--collector-views`, makes the chain a collector view: the data plane
+/// does not build it (the samples of `data`, which only it reads, are not
+/// kept) and answers from the collector's states as it does from its own
+/// view.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_collector_views_file_makes_the_chain_a_collector_view() {
+    let (plan, node, width_ms, alpha) = plan();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../control-plane/tests/data/collector-capabilities.json");
+    let capabilities =
+        CollectorCapabilities::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let (file, _) = collector_sub_dag(&plan, &capabilities, CommitGrace::default()).unwrap();
+    let file: ::common::CollectorViewsFile =
+        serde_json::from_str(&serde_json::to_string(&file).unwrap()).unwrap();
+    assert_eq!(file.outputs, [node]);
+    let mut collector = CollectorViewOptions::from(&file);
+    // Commit each window as soon as it ends, for the test's pace.
+    collector.commit_grace_ms = 0;
+    let time_ms = query_time_ms();
+    let expected = built_here(&plan, time_ms).await;
+    let (app, state) = data_plane(
+        &plan,
+        EngineOptions {
+            collector,
+            ..no_forward(0)
+        },
+    );
+    let states = states(alpha, width_ms, time_ms);
+    assert_eq!(post(&app, body(&plan, node, width_ms, &states)).await, 0);
+    let committed =
+        format!("asap_collector_states_windows_total{{view=\"{node}\",outcome=\"committed\"}}");
+    wait_for(&state, &committed, (RANGE_MS / width_ms) as f64).await;
+    let (status, _, answer) = common::get(&app, &common::instant_uri(QUERY, time_ms / 1000)).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer, expected);
+    // `data`'s samples are not kept: only the collector view reads them.
+    common::remote_write(
+        &app,
+        vec![TimeSeries {
+            labels: vec![Label {
+                name: "__name__".into(),
+                value: "data".into(),
+            }],
+            samples: vec![Sample {
+                timestamp: time_ms,
+                value: 1.0,
+            }],
+        }],
+    )
+    .await;
+    for _ in 0..100 {
+        if state.engine.stats().samples_unrouted == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(state.engine.stats().samples_unrouted, 1);
+}
+
+/// A collector-views file of another plan is refused at install.
+#[test]
+fn a_collector_views_file_of_another_plan_is_refused() {
+    let (plan, node, _, _) = plan();
+    let options = EngineOptions {
+        collector: CollectorViewOptions {
+            plan_id: Some("another plan".into()),
+            views: BTreeSet::from([node]),
+            commit_grace_ms: 0,
+        },
+        ..no_forward(0)
+    };
+    let plan = serde_json::to_string(&plan).unwrap();
+    let refused = DataPlane::with_options(plan, "http://127.0.0.1:1".into(), options)
+        .err()
+        .expect("refused");
+    assert!(
+        format!("{refused:#}").contains("another plan"),
+        "{refused:#}"
+    );
 }

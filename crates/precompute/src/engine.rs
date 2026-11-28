@@ -322,6 +322,13 @@ impl PrecomputeEngine {
 
     /// Compiles `plan`'s ingestion and starts its threads.
     fn start(&self, plan: &InstallablePlan) -> anyhow::Result<InstalledPrecompute> {
+        if let Some(collector_plan) = &self.options.collector.plan_id {
+            let installed = plan.dag.plan_id();
+            anyhow::ensure!(
+                *collector_plan == installed,
+                "the collector views are of plan {collector_plan}, not of the plan installed ({installed})"
+            );
+        }
         let views = plan.materialized_views()?;
         let groups = plan.ingestion_refresh_groups()?;
         tracing::info!(

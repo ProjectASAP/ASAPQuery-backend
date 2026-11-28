@@ -876,6 +876,7 @@ dependencies = [
  "asap-planner",
  "asap-types",
  "async-trait",
+ "serde",
  "thiserror 1.0.69",
 ]
 
@@ -905,7 +906,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "asap-planner",
+ "asap-types",
  "clap",
+ "common",
  "futures",
  "serde",
  "serde_json",

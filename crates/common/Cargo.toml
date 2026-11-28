@@ -15,4 +15,6 @@ asap-types.workspace = true
 # `FallbackClient` is used as `Arc<dyn …>`, so its async method must be
 # object safe; native `async fn` in traits is not.
 async-trait.workspace = true
+# The collector-views file (`CollectorViewsFile`) is read and written as JSON.
+serde.workspace = true
 thiserror.workspace = true

@@ -10,6 +10,7 @@
 
 use std::path::Path;
 
+pub mod collector_views;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 

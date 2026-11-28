@@ -10,6 +10,10 @@ test-support = []
 
 [dependencies]
 asap-planner.workspace = true
+# The plan IR the collector view rule reads (operators, predicates,
+# summary inputs), which `asap-planner` does not re-export.
+asap-types.workspace = true
+common.workspace = true
 futures = "0.3"
 serde.workspace = true
 serde_json.workspace = true
