@@ -1,0 +1,20 @@
+[package]
+name = "elastic_http"
+version.workspace = true
+edition.workspace = true
+
+# Elasticsearch's `_sql` and `_search` HTTP APIs: request bodies, `_search`
+# response bodies, and the fallback client of an Elasticsearch server. An
+# adapter: of this workspace it depends on `common` only, never on an
+# engine or a store.
+[dependencies]
+common.workspace = true
+# `common::FallbackClient`'s async method.
+async-trait.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tokio.workspace = true

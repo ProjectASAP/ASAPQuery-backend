@@ -110,6 +110,23 @@ struct Args {
     /// `--no-forward`.
     #[arg(long, conflicts_with = "no_forward")]
     raw_store_url: Option<String>,
+    /// A ClickHouse server's HTTP interface base URL: serves ClickHouse's
+    /// query route, `/clickhouse/query`, which forwards every query the plan
+    /// does not answer to it. Cannot be used with `--no-forward`.
+    #[arg(long, conflicts_with = "no_forward")]
+    clickhouse_url: Option<String>,
+    /// The database forwarded ClickHouse queries run in.
+    #[arg(long, default_value = "default")]
+    clickhouse_database: String,
+    /// An Elasticsearch base URL: serves Elasticsearch's query routes,
+    /// `/_sql` and `/_search`, which forward every query the plan does not
+    /// answer to it. Cannot be used with `--no-forward`.
+    #[arg(long, conflicts_with = "no_forward")]
+    elastic_url: Option<String>,
+    /// The index (or index pattern) forwarded Query DSL searches read;
+    /// empty: every index.
+    #[arg(long, default_value = "")]
+    elastic_index: String,
     /// Forward mode: bytes of Remote Write bodies queued or in flight to the
     /// raw store beyond which writes are refused with 503.
     #[arg(long, default_value_t = data_plane::raw_forward::RawForwardOptions::new("").max_queued_bytes)]
@@ -180,48 +197,64 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     let plan = std::fs::read_to_string(&args.plan)?;
-    let state = Arc::new(
-        DataPlane::with_options(
-            plan,
-            args.prometheus_url,
-            EngineOptions {
-                ingestion: IngestionOptions {
-                    allowed_lateness_ms: args.allowed_lateness_ms,
-                    max_future_ms: args.max_future_ms,
-                    stream_start_ms: args.stream_start_ms,
-                    view_retention_margin_ms: args.view_retention_margin_ms,
-                },
-                max_queued_samples: args.max_queued_samples,
-                max_precompute_backlog: args.max_precompute_backlog,
-                ingest_threads: args.ingest_threads,
-                precompute_threads: args.precompute_threads,
-                persist_threads: args.persist_threads,
-                max_persist_backlog_bytes: args.max_persist_backlog_bytes,
-                no_forward: args.no_forward,
-                run_memory_limit_bytes: args.run_memory_limit_bytes,
-                query_threads: args.query_threads,
-                share_one_evaluation_results: !args.no_shared_results,
-                query_time_results_retention_ms: args.query_time_results_retention_ms,
-                query_time_results_max_bytes: args.query_time_results_max_bytes,
-                result_cache: !args.no_result_cache,
-                result_cache_max_bytes: args.result_cache_bytes,
-                view_dir: (!args.no_view_persistence).then_some(args.view_dir),
-                view_sync_interval_ms: args.view_sync_interval_ms,
-                view_cache_max_bytes: args.view_cache_max_bytes,
-                view_cache_idle_ms: args.view_cache_idle_ms,
-                view_segment_ms: args.view_segment_ms,
-                view_read: args.view_read,
-                precompute_mode: args.precompute_mode,
-                precompute_memory_budget_bytes: args.precompute_memory_budget_bytes,
-                push_batching: precompute::push::MorselBatching {
-                    max_samples: args.push_batch_samples,
-                    max_age_ms: args.push_batch_max_ms,
-                },
-                ..EngineOptions::default()
+    let forward_timeout = Duration::from_secs(args.forward_timeout_seconds);
+    let mut state = DataPlane::with_options(
+        plan,
+        args.prometheus_url,
+        EngineOptions {
+            ingestion: IngestionOptions {
+                allowed_lateness_ms: args.allowed_lateness_ms,
+                max_future_ms: args.max_future_ms,
+                stream_start_ms: args.stream_start_ms,
+                view_retention_margin_ms: args.view_retention_margin_ms,
             },
-        )?
-        .with_forward_timeout(Duration::from_secs(args.forward_timeout_seconds)),
-    );
+            max_queued_samples: args.max_queued_samples,
+            max_precompute_backlog: args.max_precompute_backlog,
+            ingest_threads: args.ingest_threads,
+            precompute_threads: args.precompute_threads,
+            persist_threads: args.persist_threads,
+            max_persist_backlog_bytes: args.max_persist_backlog_bytes,
+            no_forward: args.no_forward,
+            run_memory_limit_bytes: args.run_memory_limit_bytes,
+            query_threads: args.query_threads,
+            share_one_evaluation_results: !args.no_shared_results,
+            query_time_results_retention_ms: args.query_time_results_retention_ms,
+            query_time_results_max_bytes: args.query_time_results_max_bytes,
+            result_cache: !args.no_result_cache,
+            result_cache_max_bytes: args.result_cache_bytes,
+            view_dir: (!args.no_view_persistence).then_some(args.view_dir),
+            view_sync_interval_ms: args.view_sync_interval_ms,
+            view_cache_max_bytes: args.view_cache_max_bytes,
+            view_cache_idle_ms: args.view_cache_idle_ms,
+            view_segment_ms: args.view_segment_ms,
+            view_read: args.view_read,
+            precompute_mode: args.precompute_mode,
+            precompute_memory_budget_bytes: args.precompute_memory_budget_bytes,
+            push_batching: precompute::push::MorselBatching {
+                max_samples: args.push_batch_samples,
+                max_age_ms: args.push_batch_max_ms,
+            },
+            ..EngineOptions::default()
+        },
+    )?
+    .with_forward_timeout(forward_timeout);
+    if let Some(url) = &args.clickhouse_url {
+        let fallback = clickhouse_http::fallback::ClickHouseHttpFallback::new(
+            url,
+            &args.clickhouse_database,
+            forward_timeout,
+        );
+        state = state.with_clickhouse_fallback(fallback)?;
+    }
+    if let Some(url) = &args.elastic_url {
+        let fallback = elastic_http::fallback::ElasticHttpFallback::new(
+            url,
+            &args.elastic_index,
+            forward_timeout,
+        );
+        state = state.with_elastic_fallback(fallback)?;
+    }
+    let state = Arc::new(state);
     let state = match &args.raw_store_url {
         Some(url) => {
             let mut options = data_plane::raw_forward::RawForwardOptions::new(url.clone());
