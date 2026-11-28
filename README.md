@@ -126,9 +126,10 @@ name; the view tier and push precompute add `asap_view_cache_*`,
 `asap_view_cold_read_bytes_total`, `asap_view_segments_marked_cold_total`,
 `phase="view_decode"`, `asap_precompute_state_bytes`,
 `asap_precompute_open_instances`, `asap_window_commit_lag_seconds` and
-`asap_samples_total{outcome="late_for_views"}`. `scripts/profile.sh` records a flamegraph of a running data plane;
+`asap_samples_total{outcome="late_for_views"}`. `benchmarks/scripts/profile.sh` records a flamegraph of a running data plane;
 `cargo run --release -p data_plane --example ingest_bench -- 10000 300`
-measures ingest throughput in process.
+measures ingest throughput in process (the micro benchmarks are in
+`benchmarks/micro/`).
 
 A range query (`/api/v1/query_range`) whose text is one of the plan's
 queries is answered with one evaluation per step, at most one step per
@@ -190,7 +191,7 @@ Not supported yet: views refreshed on first read (so the backend declares
 ```sh
 # Plan the planner-layering Example 1 with this backend's capabilities.
 cargo run -p control_plane -- \
-  --workload examples/planner-layering-example1.json --out plan.json --report report.json
+  --workload docs/examples/planner-layering-example1.json --out plan.json --report report.json
 
 # Serve Remote Write on /api/v1/write and the query API on /api/v1/query[_range].
 cargo run -p data_plane -- --plan plan.json --prometheus-url http://localhost:9090
@@ -223,6 +224,21 @@ run, and answers any query the plan does not answer (not planned, a window
 not stored) with a Prometheus `execution` error (422,
 `x-asap-execution: refused`) whose `error` is the reason a forwarded query's
 `x-asap-forward-reason` would give.
+
+## Repository layout
+
+| Path | Holds |
+|---|---|
+| `crates/control-plane/` | package `control_plane`: workload → `asap-planner` → plan file |
+| `crates/data-plane/` | package `data_plane`: the data plane and its binary |
+| `benchmarks/` | the backend alone: `micro/` benchmarks (examples of `data_plane`) and `scripts/` |
+| `eval/` | comparisons with other systems and the live demo; see [eval/README.md](eval/README.md) |
+| `deployment/monitoring/` | Prometheus, exporters and Grafana for the demo and the comparisons |
+| `docs/` | design documents and `examples/` workloads |
+| `scripts/` | CI and the Planner dependency updater |
+
+The layout, its boundaries and its migration steps are in `docs/design/repo-layout.md`
+(#874).
 
 ## Development
 

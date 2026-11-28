@@ -1,5 +1,14 @@
 # Design: tiered view storage (hot windows in the heap, cold windows in files)
 
+> **Paths.** This document predates the folder moves of
+> `docs/design/repo-layout.md` and keeps its original paths: `data_plane/` is
+> now `crates/data-plane/`, `control_plane/` is `crates/control-plane/`,
+> `examples/*_bench.rs` are in `benchmarks/micro/` (`remote_write_load.rs`
+> stays in `crates/data-plane/examples/`), the workloads in `examples/` are in
+> `docs/examples/`, `scripts/profile.sh` and `scripts/tiered_views_cgroup.sh`
+> are in `benchmarks/scripts/`, and `bench/demo/` is split into `eval/`,
+> `eval/demo/` and `deployment/monitoring/`.
+
 ## Audience and context
 
 This document is for developers and architects of the backend data plane.
