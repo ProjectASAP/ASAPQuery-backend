@@ -1,4 +1,4 @@
-# Design: leaf sketch views precomputed in the collector
+# Design: plan sub-DAGs precomputed in the collector (v1: leaf sketch views)
 
 Status: proposal, for review. Decisions are recorded at the end.
 
@@ -7,9 +7,12 @@ Status: proposal, for review. Decisions are recorded at the end.
 This document is for developers of the backend and of ASAPCollector-public,
 the collector built on OTAP Dataflow (OpenTelemetry Arrow's dataflow engine)
 whose `asap_sketches` processor builds windowed sketches at the edge. It
-decides how the collector builds some of a plan's leaf views and how the
-backend ingests the resulting states, so that the backend stores and answers
-them as if its own precompute had built them.
+decides which part of a plan the collector runs, how it is told, and how
+the backend ingests what it sends, so that the backend stores and answers
+the results as if its own precompute had built them. The rule is general:
+the collector runs the largest bottom-up sub-DAG of the plan that its
+declared capabilities and data partition allow. v1 implements it for
+today's collector, whose capabilities make that sub-DAG a leaf view.
 
 Today every sample travels raw to the backend: the collector (or the
 application) sends OTLP or Remote Write, and the backend's precompute builds
@@ -19,9 +22,9 @@ the collector can build exactly that state before the network. For a series
 sampled at 10 Hz, 50 samples become one state. When no other reader needs a
 metric's raw samples, the collector stops sending them to the backend.
 
-The collector is told what to build in the planner's own terms: for each
-collector view the control plane sends the view's sub-DAG of the installed
-ASAPPlanner plan, and the collector depends on ASAPPlanner's types crate to
+The collector is told what to build in the planner's own terms: the
+control plane sends the collector's sub-DAG of the installed ASAPPlanner
+plan and the nodes whose results leave it, and the collector depends on ASAPPlanner's types crate to
 read it. Collector view states travel in exactly the OTAP structure of raw
 samples: the same Schema, Dictionary and Record tiers, with the same
 Dictionary entries; only the Record content differs (a window state instead
@@ -53,16 +56,20 @@ Terms, as in ASAPPlanner (`asap-types`):
 - **View identity**: `(plan_id, node_id, view state key)`, what a collector
   state carries. `(plan_id, node_id)` finds the view; the key must equal
   that node's key.
-- **Leaf view**: a view whose child is a raw `Scan`.
-- **Sub-DAG**: a leaf view's node, its `Scan` node and the edge between
-  them, as a `PhysicalASAPDAG` with `roots = [view node]`.
+- **Collector sub-DAG**: the nodes of the installed plan assigned to the
+  collector (§1) and the edges between them, as a `PhysicalASAPDAG` whose
+  `roots` are its outputs.
+- **Cut edge**: an edge whose producer is in the collector sub-DAG and whose
+  consumer is not. Its producer is an **output** of the sub-DAG.
+- **Leaf view**: a view whose only inputs, down to a raw `Scan`, are
+  per-series filters; v1's collector sub-DAGs are leaf views.
 - **Tumbling window**: a window of fixed width `w` on multiples of `w`; the
   window ending at `e` covers `(e − w, e]`.
 - **State**: the summary of one series in one window; a sketch state is
   `asap_sketchlib`'s ASAPv1 bytes.
-- **Collector view**: a materialized view of the installed plan that the
-  collector builds instead of the backend (here always a leaf view); the
-  backend only stores and reads it.
+- **Collector view**: an output of the collector sub-DAG that is not a
+  `Scan`: a materialized view the collector builds instead of the backend;
+  the backend only stores and reads it. A `Scan` output is the raw path.
 
 Scope:
 
@@ -74,7 +81,7 @@ Scope:
   branch), new `common` types, the collector-state ingest in precompute, and
   the control plane.
 - The collector changes in its own repository: a capabilities command, the
-  `asap-types` dependency and a sub-DAG loader, view identity in metric
+  `asap-types` dependency and a sub-DAG loader (later `asap-executor`, §7), view identity in metric
   metadata, the window-boundary, out-of-order and matcher fixes, and a
   raw-forward filter.
 
@@ -96,18 +103,19 @@ Scope:
 
 | Component | Crate or repository | Role |
 |---|---|---|
-| Capabilities | ASAPCollector-public (`asap_sketches --print-capabilities`) | Declares what the collector can build (§1) |
-| Collector view rule | `crates/control-plane` | Picks the leaf views of the installed plan the collector can build against the capabilities; the only copy of the rule |
-| Collector-views file | `crates/control-plane` (`--emit-collector-views`) | Each collector view's sub-DAG, the plan id, which metrics the backend still reads raw, the commit grace |
-| `asap_sketches` processor | ASAPCollector-public | Loads the file at start, builds each view's per-series states, writes the view identity into metric metadata, exports summary points with `sketch.envelope` |
+| Capabilities | ASAPCollector-public (`asap_sketches --print-capabilities`) | Declares, in the planner's vocabulary, what the collector can run and how series are placed on its instances (§1) |
+| Collector view rule | `crates/control-plane` | Assigns nodes of the installed plan to the collector bottom-up against the capabilities and cuts the collector sub-DAG; the only copy of the rule |
+| Collector-views file | `crates/control-plane` (`--emit-collector-views`) | The collector sub-DAG, its outputs, the plan id, which metrics the backend still reads raw, the commit grace |
+| `asap_sketches` processor | ASAPCollector-public | Loads the file at start, runs the sub-DAG (v1: builds each leaf view's per-series states), writes the view identity into metric metadata, exports summary points with `sketch.envelope` |
 | Raw forward | ASAPCollector-public | Forwards raw samples to the backend, except metrics the file marks `false` |
 | OTLP adapter | `crates/adapters/ingest/otlp` | Decodes Schema and Dictionary as for raw samples; a point with `sketch.envelope` becomes a `common::ViewStateBatch` record; never reads the sketch bytes |
 | Collector-state ingest | `crates/precompute` | Finds the view by `(plan_id, node_id)`, checks the key, stages, deduplicates and merges until commit, drops late states |
 
 **Raw path.** The raw path stays (decision 3) for every metric the backend
 still reads raw: a metric is marked `backend_reads_raw: true` when a `Scan`
-of it feeds a view that is not a collector view or runs at query time. A metric whose
-only readers are collector views is marked `false`, and the collector's raw
+of it has a consumer outside the collector sub-DAG (a cut edge from the
+`Scan`) or runs at query time. A metric whose
+only readers are on the collector is marked `false`, and the collector's raw
 forward to the backend drops it. When a collector view misses a window (the
 collector was down), the query engine reports `NotReady` and the dispatcher
 forwards the query to the fallback store, which receives raw samples on its
@@ -132,63 +140,112 @@ holds engine-native states and a second state of one window is merged.
 Decoding is not an identity check: θ is already in the key.
 
 `asap-types` brings `serde`, `serde_json`, `thiserror` 2 and
-`asap_sketchlib` into the collector build; no executor, frontend or solver
-(decision 15).
+`asap_sketchlib` into the collector build; no frontend or solver
+(decision 15). The executor comes in the step after v1 (§7).
 
 ## Algorithm
 
 ### 1. Capabilities and the collector view rule (control plane)
 
-The collector declares what it can build; the backend holds no table of the
-collector's sketches. `asap_sketches --print-capabilities` prints, for
-today's collector (planner names; the collector maps them to its own):
+The collector declares what it can run, in the planner's own vocabulary;
+the backend holds no table of the collector's operators or sketches.
+`asap_sketches --print-capabilities` prints, for today's collector:
 
 ```json
 {"capabilities_version": 1,
- "summaries": [
-   {"summary_type": {"Sketch": "DDSketch"},    "input": "value", "parameters": {"alpha": {"gt": 0, "lt": 1}}},
-   {"summary_type": {"Sketch": "Kll"},         "input": "value", "parameters": {"k": {"ge": 8, "le": 2147483647}}},
-   {"summary_type": {"Sketch": "Hll"},         "input": "label", "parameters": {"precision": {"ge": 14, "le": 14}}},
-   {"summary_type": {"Sketch": "CountSketch"}, "input": "label", "parameters": {"width": {"ge": 1}, "depth": {"ge": 1}}},
-   {"summary_type": {"Sketch": "Cms"},         "input": "label", "parameters": {"width": {"ge": 1}, "depth": {"ge": 1}}},
-   {"summary_type": {"Sketch": "CmsWithHeap"}, "input": "label", "parameters": {"width": {"ge": 1}, "depth": {"ge": 1}, "heap_size": {"ge": 1}}}],
- "reductions": ["PerEntity"],
- "windows": ["Tumbling"],
- "predicate_ops": ["Eq", "Ne"],
+ "executor": {
+   "supported_summaries": [
+     {"summary_type": "DDSketch",               "readouts": []},
+     {"summary_type": "KLL",                    "readouts": []},
+     {"summary_type": "HLL",                    "readouts": []},
+     {"summary_type": "CountSketch",            "readouts": []},
+     {"summary_type": "CountMinSketch",         "readouts": []},
+     {"summary_type": "CountMinSketchWithHeap", "readouts": []}],
+   "raw_data_retained": false,
+   "query_time_results_retained": false,
+   "counter_semantics": {"reset_handling": false, "extrapolation": false},
+   "state_not_mergeable_across_windows": [],
+   "excluded_candidates": []},
+ "operators": [
+   {"kind": "Scan",   "sources": ["TimeSeries"], "predicate_ops": ["Eq", "Ne"]},
+   {"kind": "Filter", "predicate_ops": ["Eq", "Ne"]},
+   {"kind": "SummaryTumblingWindowChain", "reductions": ["PerEntity"], "predicate_ops": ["Eq", "Ne"],
+    "summaries": [
+      {"summary_type": {"Sketch": "DDSketch"},               "input": "value", "parameters": {"alpha": {"gt": 0, "lt": 1}}},
+      {"summary_type": {"Sketch": "KLL"},                    "input": "value", "parameters": {"k": {"ge": 8, "le": 2147483647}}},
+      {"summary_type": {"Sketch": "HLL"},                    "input": "label", "parameters": {"precision": {"ge": 14, "le": 14}}},
+      {"summary_type": {"Sketch": "CountSketch"},            "input": "label", "parameters": {"width": {"ge": 1}, "depth": {"ge": 1}}},
+      {"summary_type": {"Sketch": "CountMinSketch"},         "input": "label", "parameters": {"width": {"ge": 1}, "depth": {"ge": 1}}},
+      {"summary_type": {"Sketch": "CountMinSketchWithHeap"}, "input": "label", "parameters": {"width": {"ge": 1}, "depth": {"ge": 1}, "heap_size": {"ge": 1}}}]}],
+ "placement": {"partitioned_by": "series"},
  "window_close_delay_ms": 6000}
 ```
 
-- `input: "value"`: the summary's `input` is `{"item": null, "weight":
-  {"Column": "SampleValue"}}`. `input: "label"`: `item` is one label column.
-- `predicate_ops`: `Compare` of a label column with a `Utf8` literal (PromQL
-  `=`, `!=`); regular expressions are not supported.
+- `executor`: ASAPPlanner's `DeploymentCapabilities`, with its own serde
+  (`asap_types::deployment_capabilities`). Today's collector builds states
+  but answers no readout (no `SummaryEstimate`), keeps no raw data and no
+  query-time result, and has no counter functions.
+- `operators`: each entry is a planner `OperatorKind` with the argument
+  constraints the collector accepts; an operator not listed is not run.
+  `predicate_ops` are `CompareOpKind`s of a label column with a `Utf8`
+  literal (PromQL `=`, `!=`; no regular expressions), for a `Scan`'s
+  `predicates`, a `Filter`'s `pred` and a chain's `filter`. A chain's
+  `summary_type`, `input` and every `parameters` value must match one
+  `summaries` entry. `input: "value"`: the summary's `input` is `{"item":
+  null, "weight": {"Column": "SampleValue"}}`; `input: "label"`: `item` is
+  one label column. The ranges are the ones the collector's config
+  validation enforces; the command prints them from that code, so the two
+  cannot drift.
+- `placement`: how series are partitioned across collector instances.
+  `"series"`: all samples of one series reach one instance (a restart or
+  handoff may split a window, which the backend merges, §6).
+  `{"labels": ["service"]}`: all series with equal values of those labels
+  reach one instance.
 - `window_close_delay_ms`: the longest time after a window's end before the
   collector emits it: the 5 s idle-close grace plus the 1 s timer period.
-- The ranges are the ones the collector's config validation enforces; the
-  command prints them from that code, so the two cannot drift.
 
 The control plane reads the file with `--collector-capabilities <file>`
-and refuses a `capabilities_version` it does not know. A node of the
-installed plan's `dag` is a collector view if and only if all of these hold, read
-from its planner fields (no cost comparison,
-decision 6):
+and refuses a `capabilities_version` it does not know. It assigns nodes of
+the installed plan's `dag` to the collector bottom-up from the `Scan`s,
+from their planner fields only (no cost comparison, decision 6). A node is
+assigned if and only if all of these hold:
 
-1. **View at ingestion.** It is a `MaterializedView`, refreshed at
-   ingestion (`output_state.timing` is `ingestion_time`).
-2. **Leaf on raw input.** `payload` is `ASAP.SummaryTumblingWindowChain`
-   whose `child` is a `NonASAP.Scan` of `TimeSeries { metric }`, with no
-   node in between, and the chain's `filter` is `null`.
-3. **Within the capabilities.** `summary_type`, `input` and every
-   `parameters` value match one `summaries` entry; `reduction` is in
-   `reductions` (`PerEntity`: a `Reduce [...]` view is not a collector view, because
-   one collector does not see every series of a group); the window kind is
-   in `windows`; the `Scan`'s `predicates` are a conjunction of
-   `predicate_ops` comparisons.
+1. **Within the capabilities.** Its `OperatorKind` is in `operators` and its
+   arguments meet that entry's constraints; any summary it builds is in
+   `executor.supported_summaries`, and any readout it answers is listed
+   there.
+2. **Inputs on the collector.** Every input is a `Scan` of raw data
+   (`TimeSeries { metric }`) or a node already assigned.
+3. **At ingestion.** It runs at ingestion time (`output_state.timing` is
+   `ingestion_time`).
+4. **Local to the partition.** It is correct on one instance's data per
+   `placement`. Per-series operators (`Scan`, a label `Filter`, a
+   `PerEntity` chain) always are. An operator that groups by `G`
+   (`Reduce(G)`) is local only if each group lands on one instance: with
+   `{"labels": L}`, `L ⊆ G`; with `"series"`, never. A non-local but
+   mergeable aggregate is future work (partial aggregation: the collector
+   sends a partial state, a backend `SummaryMerge` combines them).
+
+The assigned nodes form the maximal collector sub-DAG. Each cut edge's
+producer is an output: a `Scan` output is the raw path (its metric is
+`backend_reads_raw: true`); any other output must be a materialized view
+whose result has a wire encoding, a state (ASAPv1 for a sketch) or an exact
+value. An output that is not a materialized view would have to feed a
+backend run at ingestion time, which is future work with partial
+aggregation; v1 unassigns it and the nodes above it, and repeats until every
+output is a `Scan` or a view.
+
+With today's capabilities the rule gives back the leaf rule: the only
+operators are `Scan`, `Filter` and a `PerEntity` chain, and the chain is a
+view at ingestion, so each collector view is a leaf view (`Scan`, optional
+label `Filter`s, chain), and the `TimeRange`, `SummaryMerge` and
+`SummaryEstimate` above it stay in the backend.
 
 **Exact aggregates stay in the backend.** The collector's `Exact` type
 (`EXv1`, every value of a window) is a baseline for comparisons, not a
 `sum`, `max` or counter state, and it is not in the capabilities. Views of
-`ExactAggregate` become collector views when the collector declares them.
+`ExactAggregate` become collector views when the collector declares them
+(§7: with the executor embedded, it declares what the executor runs).
 
 **Known limitation: sparse series.** The rule ignores size. A series with
 few samples per window can produce a state larger than its raw samples (a
@@ -199,19 +256,24 @@ planner capability (costing where a view is built).
 
 ### 2. The collector-views file (control plane)
 
-For each collector view the control plane copies, from the installed `dag`,
-the view node and its `Scan` node (unchanged, node ids included) and the
-one edge between them, and sets `roots = [view node]`, `scalar_roots =
-[]`. It writes one JSON file, with the planner types' own serde:
+The control plane copies the collector sub-DAG from the installed `dag`
+(nodes unchanged, node ids included, and the edges between them; a `Scan`
+that feeds no collector node is left out), lists its collector views as
+`outputs`, and sets `roots = outputs`, `scalar_roots = []`. It writes one JSON file, with the planner types'
+own serde:
 
 ```json
-{"planner_wire_version": 15,
+{"planner_wire_version": 16,
  "plan_id": "<PhysicalASAPDAG::plan_id() of the installed plan>",
  "commit_grace_ms": 8000,
  "backend_reads_raw": {"data": true, "data_total": true},
- "views": [<PhysicalASAPDAG>, ...]}
+ "outputs": [<node id>, ...],
+ "dag": <PhysicalASAPDAG>}
 ```
 
+- `outputs` are the collector views, named explicitly rather than assumed
+  to be a chain at the root: the backend ingests exactly these nodes'
+  results, and nothing else in `dag` leaves the collector.
 - `backend_reads_raw` lists every metric a `Scan` of the plan reads.
 - `commit_grace_ms` is computed as in §6.
 
@@ -219,8 +281,8 @@ The collector loads the file once at start (a plan change is a collector
 restart, decision 14). The data plane takes the same file with
 `--collector-views` and refuses it, at start and on each install, when its
 `plan_id` differs from the installed plan's. The precompute engine then
-compiles each refresh group without the collector views (and without a `Scan`
-only they read). The query engine is unchanged; it reads a collector view
+compiles each refresh group without the collector sub-DAG's nodes (and
+without a `Scan` only they read). The query engine is unchanged; it reads a collector view
 from the store like any other.
 
 ### 3. The collector: load, check, build, stamp
@@ -230,21 +292,22 @@ At start, with `planner_views: <path>` in its processor config, the
 
 1. **Loads** the file into the planner types. A `planner_wire_version`
    other than its pinned `asap-types` writes is a load error.
-2. **Checks that it can execute each sub-DAG**, and refuses to start,
-   naming the view and the first failing field, unless: it is two nodes and
-   one `Input` edge, root a `SummaryTumblingWindowChain` over a `Scan` of
-   `TimeSeries { metric }`, and its summary, parameters, reduction, window
-   and predicates are within the collector's own capabilities (the same
-   table `--print-capabilities` prints). It does not check *whether* the
-   view should be a collector view (timing, lifetime): that is the control plane's
-   rule, written once.
-3. **Reads each view's key** with `materialized_views()` on the sub-DAG and
-   `view_state_key()`: the key depends only on the view node, so it equals
-   the installed plan's.
-4. **Builds** each view: sketch and parameters from θ (an out-of-range
+2. **Checks that it can execute the sub-DAG**, and refuses to start,
+   naming the node and the first failing field, unless every node and its
+   arguments are within the collector's own capabilities (the same table
+   `--print-capabilities` prints). In v1 that means each output is a
+   `SummaryTumblingWindowChain` over a `Scan` of `TimeSeries { metric }`,
+   with only label `Filter`s between them. It does not check *whether* a
+   node should be on the collector (timing, placement): that is the control
+   plane's rule, written once.
+3. **Reads each output's key** with `materialized_views()` on the sub-DAG
+   and `view_state_key()`: the key depends only on the view node, so it
+   equals the installed plan's.
+4. **Builds** each view (v1, on the existing processor; §7 for the
+   executor): sketch and parameters from θ (an out-of-range
    value is a load error, never replaced by a default), window =
    `ViewWindow::Tumbling.width_ms`, matchers = `__name__ = metric` plus each
-   `Scan` predicate, one state per series. A series is what it is for the
+   `Scan`, `Filter` and chain-`filter` predicate, one state per series. A series is what it is for the
    raw forward: the received Resource, Scope and point attributes, kept as
    received (no flattening, no label dropping).
 5. **Stamps** the view identity: each view is one Metric entry per
@@ -270,9 +333,19 @@ plan does not read).
 ### 4. OTAP tiers: Schema, Dictionary, Record
 
 OTAP splits a metrics stream into three tiers by rate of change: **Schema**
-(per metric), **Dictionary** (per series), **Record** (per point).
-Collector view states use exactly the structure of raw samples; only the
-Record content differs:
+(per metric), **Dictionary** (per series), **Record** (per point). For any
+collector view (any output of the collector sub-DAG) the tiers map as:
+
+- **Schema** = the output node's identity: `(plan_id, node_id,
+  ViewStateKey)`.
+- **Dictionary** = the key columns of the node's `output_schema`. For a
+  per-series view they are the series labels, identical to the raw
+  samples'; for a view grouped by `G` they would be the `G` labels.
+- **Record** = the window and the node's result in it: a state (ASAPv1 for
+  a sketch) or an exact value.
+
+v1's views are per-series, so collector view states use exactly the
+structure of raw samples; only the Record content differs:
 
 | Tier | Raw samples | Collector view states | `ViewStateBatch` | Backend handling |
 |---|---|---|---|---|
@@ -336,20 +409,20 @@ Prometheus's `(t − range, t]` form (§5).
 
 ```mermaid
 erDiagram
-    SCHEMA ||--o{ SERIES : series
-    SERIES ||--o{ RECORD : records
+    SCHEMA ||--o{ KEY : keys
+    KEY ||--o{ RECORD : records
     SCHEMA{
         plan_id string "PhysicalASAPDAG::plan_id()"
-        node_id PhysicalASAPNodeId "the view node"
+        node_id PhysicalASAPNodeId "the output node (collector view)"
         key ViewStateKey "definition_id, window, logical_properties"
         name string "metric.asap_view.node_id"
     }
-    SERIES{
-        labels LabelSet "raw path's label function; __name__ = Scan metric"
+    KEY{
+        labels LabelSet "key columns of output_schema; per-series view: series labels, __name__ = Scan metric"
     }
     RECORD{
         window_end_ms i64 "inclusive; start = end - width"
-        asapv1 bytes "sketch.envelope, the full state"
+        asapv1 bytes "sketch.envelope: the full state (or an exact value)"
         sample_count u64 "count"
     }
 ```
@@ -475,6 +548,25 @@ committer, the same path that commits a window it built (readers,
   A histogram of arrival delay (`end` to arrival) per view shows when the
   grace must grow. v1 has no late merge (decision 9).
 
+### 7. Target: the collector runs `asap-executor`
+
+The target design (decision 25) is that the collector embeds ASAPPlanner's
+`asap-executor` and runs `compile` and `instantiate` on its sub-DAG, as the
+backend does on the whole plan. Its capabilities are then the executor's
+(the same `DeploymentCapabilities` and operator list), and both sides run
+the same code, so a state the collector builds is the state the backend
+would have built, and any sub-DAG the rule assigns can run without
+collector-specific code.
+
+v1 keeps mapping leaf views onto the existing `asap_sketches` processor
+(§3); embedding the executor is the next step. It adds `arrow`, `ahash`,
+`chrono`, `futures`, `regex` and `xxhash-rust` to the collector build
+(`arrow` is already there through OTAP); step 10 measures the build time,
+binary size and resident memory per view before it replaces the processor's
+own sketch code. Partial aggregation (a non-local mergeable aggregate as
+collector partial state plus a backend `SummaryMerge`) is future work on top
+of it.
+
 ## Code interface
 
 ### `crates/common`
@@ -577,12 +669,32 @@ branch.
 #[serde(deny_unknown_fields)]
 pub struct CollectorCapabilities {
     pub capabilities_version: u32,
-    pub summaries: Vec<SummaryCapability>,
-    /// Reduction variant names: `PerEntity`.
-    pub reductions: Vec<String>,
-    pub windows: Vec<String>,
-    pub predicate_ops: Vec<CompareOpKind>,
+    /// The planner's own executor capabilities, unchanged serde.
+    pub executor: DeploymentCapabilities,
+    pub operators: Vec<OperatorCapability>,
+    pub placement: Placement,
     pub window_close_delay_ms: u64,
+}
+
+/// One operator the collector runs, with its argument constraints. A
+/// constraint that does not apply to `kind` is a load error.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorCapability {
+    pub kind: OperatorKind,
+    /// `Scan`: the source variants, e.g. `TimeSeries`.
+    #[serde(default)]
+    pub sources: Vec<String>,
+    /// Label comparisons with a `Utf8` literal, in `Scan.predicates`,
+    /// `Filter.pred` or a chain's `filter`.
+    #[serde(default)]
+    pub predicate_ops: Vec<CompareOpKind>,
+    /// Chain: `Reduction` variant names, e.g. `PerEntity`.
+    #[serde(default)]
+    pub reductions: Vec<String>,
+    /// Chain: the summary types it builds, with parameter ranges.
+    #[serde(default)]
+    pub summaries: Vec<SummaryCapability>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -593,6 +705,20 @@ pub struct SummaryCapability {
     pub parameters: BTreeMap<String, ParameterRange>, // gt, ge, lt, le: Option<f64>
 }
 
+/// How series are partitioned across collector instances.
+/// JSON: `{"partitioned_by": "series"}` or `{"partitioned_by": {"labels": [..]}}`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartitionedBy {
+    Series,
+    Labels(Vec<String>),
+}
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Placement {
+    pub partitioned_by: PartitionedBy,
+}
+
 /// The file the collector and the data plane load.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -601,30 +727,36 @@ pub struct CollectorViewsFile {
     /// `PhysicalASAPDAG::plan_id()` of the installed plan.
     pub plan_id: String,
     pub commit_grace_ms: u64,
-    /// Per metric a `Scan` reads: whether a view that is not a collector view, or a
+    /// Per metric a `Scan` reads: whether a node off the collector, or a
     /// query-time `Scan`, still reads its raw samples.
     pub backend_reads_raw: BTreeMap<String, bool>,
-    /// One sub-DAG per collector view; `roots = [view node]`.
-    pub views: Vec<PhysicalASAPDAG>,
+    /// The collector views: the cut nodes whose results the backend ingests.
+    pub outputs: Vec<PhysicalASAPNodeId>,
+    /// The collector sub-DAG; `roots = outputs`.
+    pub dag: PhysicalASAPDAG,
 }
 
-/// Why a leaf view is not a collector view, for the command's report.
+/// Why a node is not on the collector, for the command's report.
 #[derive(Debug, Clone, PartialEq)]
-pub enum NotCollectorView {
-    NotOnRawScan,
+pub enum NotOnCollector {
     NotInCapabilities(String),
+    InputNotOnCollector,
+    NotAtIngestion,
+    NotLocalToPartition,
+    /// v1: a cut producer that is not a materialized view.
+    OutputNotAView,
 }
 
-/// The installed plan's collector views and why each other view is not.
-pub fn collector_view_dags(
+/// The installed plan's collector sub-DAG and why each other node is not on it.
+pub fn collector_sub_dag(
     plan: &InstallablePlan,
     capabilities: &CollectorCapabilities,
     export_interval_ms: u64,
-) -> (CollectorViewsFile, Vec<(PhysicalASAPNodeId, NotCollectorView)>);
+) -> (CollectorViewsFile, Vec<(PhysicalASAPNodeId, NotOnCollector)>);
 ```
 
-`FieldDataType` (the chain's `summary_type`) and `CompareOpKind` are the
-planner's types. CLI:
+`DeploymentCapabilities`, `OperatorKind`, `FieldDataType` (the chain's
+`summary_type`) and `CompareOpKind` are the planner's types. CLI:
 `control_plane --plan <plan.json> --collector-capabilities
 <capabilities.json> [--collector-export-interval-ms <ms>]
 --emit-collector-views <collector-views.json>`; the data plane takes
@@ -645,13 +777,18 @@ n4  SummaryEstimate Quantile(q=0.99)
 n5  Project                       (root)
 ```
 
-n1 passes the rule. Its sub-DAG in `collector-views.json` (schemas
+n0 and n1 are assigned (n0 a raw `Scan`; n1 a `PerEntity` chain within
+the capabilities, at ingestion); n2 runs at query time, so the edge n1 → n2
+is cut and n1 is the one output. n0 also feeds q02's and q03's chains,
+which are not in the capabilities, so the edges from n0 to them are cut
+too and `data` stays raw. The sub-DAG in `collector-views.json` (schemas
 shortened to their field names; the file carries them in full):
 
 ```json
-{"planner_wire_version": 15, "plan_id": "…", "commit_grace_ms": 8000,
+{"planner_wire_version": 16, "plan_id": "…", "commit_grace_ms": 8000,
  "backend_reads_raw": {"data": true, "data_total": true},
- "views": [{
+ "outputs": [1],
+ "dag": {
   "nodes": [
     {"id": 0,
      "payload": {"NonASAP": {"Scan": {
@@ -682,7 +819,7 @@ shortened to their field names; the file carries them in full):
              "data_state": {"timing": "ingestion_time", "primitive": "Raw"},
              "grouping": "NotApplicable", "window": "NotApplicable"}],
   "roots": [1],
-  "scalar_roots": []}]}
+  "scalar_roots": []}}
 ```
 
 n1's view state key is `{"definition_id":
@@ -785,15 +922,19 @@ Backend:
    metric, one key that differs from the node's (other θ), one state of
    another plan id, one duplicate after a merge, one late state, and one
    series sent raw and as a state that gets equal labels.
-4. The control plane's rule with `--collector-capabilities`,
-   `--emit-collector-views` (sub-DAGs, `plan_id`, `backend_reads_raw`,
-   `commit_grace_ms`); the data plane's `--collector-views` with the plan-id
-   check; precompute skips collector views. Tests: the benchmark plan
-   gives exactly q01's sub-DAG as a collector view and marks both metrics raw; a q01-only plan marks
-   `data` `false`; a regex matcher, a `Reduce` leaf or an `ExactAggregate`
-   leaf gives no collector view; a file of another plan id is refused; the written
-   file deserializes and `materialized_views()` on each sub-DAG gives the
-   installed view's key.
+4. The control plane's bottom-up rule with `--collector-capabilities`
+   (the four conditions, the cut, the view check on outputs),
+   `--emit-collector-views` (sub-DAG, `outputs`, `plan_id`,
+   `backend_reads_raw`, `commit_grace_ms`); the data plane's
+   `--collector-views` with the plan-id check; precompute skips the
+   collector sub-DAG. Tests: the benchmark plan gives exactly `outputs =
+   [n1]` and marks both metrics raw; a q01-only plan marks `data` `false`; a
+   regex matcher, a `Reduce` leaf or an `ExactAggregate` leaf gives no
+   collector view; with capabilities that list `Aggregate`, a `Reduce(G)`
+   is assigned under `{"labels": L}` with `L ⊆ G` and not under `"series"`;
+   a file of another plan id is refused; the written file deserializes and
+   `materialized_views()` on its sub-DAG gives each output's installed
+   key.
 5. End-to-end comparison, collector + backend against backend only, on the
    same feed, for two workloads: the five-query benchmark set (expected
    benefit about zero, above) and q01 alone (the metric has only collector-view
@@ -818,8 +959,14 @@ Collector (ASAPCollector-public):
    drop-and-count after close, and matchers (§5). It lands before step 5,
    which needs equal windows.
 9. The raw-forward filter by `backend_reads_raw`.
+10. Embed `asap-executor` (§7): run `compile` and `instantiate` on the
+    sub-DAG, print the executor's capabilities, and retire the processor's
+    own sketch code once answers match. Measure first: clean build time,
+    binary size, and resident memory per view and per series, against
+    the processor.
 
-**Future work.** Late merge into a committed window (a store `replace`, a
+**Future work.** Partial aggregation (collector partial states of a
+non-local mergeable aggregate, merged by a backend `SummaryMerge`). Late merge into a committed window (a store `replace`, a
 view-file rewrite and result-cache invalidation), only if step 5 or
 production shows a late rate worth it, measured by `late_dropped` and the
 arrival-delay histogram. Cost-based choice of collector views. The OTAP Arrow adapter.
@@ -848,14 +995,14 @@ arrival-delay histogram. Cost-based choice of collector views. The OTAP Arrow ad
 6. **Rule-based choice of collector views first**, against the collector's declared
    capabilities. No cost comparison. Exact aggregates stay in the backend
    until the collector declares them.
-7. **The collector receives the planner's own view definitions**: each
-   collector view's sub-DAG, in the planner's serde; the collector depends on
+7. **The collector receives the planner's own view definitions**: the
+   collector sub-DAG and its `outputs`, in the planner's serde; the collector depends on
    the planner's types crate, pinned. This replaces a numeric `agg_id` and
-   a hand-written collector config. The backend's precompute skips collector
-   views. The data plane refuses a collector-views file of another `plan_id`.
+   a hand-written collector config. The backend's precompute skips the
+   collector sub-DAG. The data plane refuses a collector-views file of another `plan_id`.
 8. **The collector declares its capabilities** (`--print-capabilities`);
    the control plane's rule reads them. The rule exists once, in the control
-   plane; the collector checks only that it can execute each sub-DAG.
+   plane; the collector checks only that it can execute the sub-DAG.
 9. **No late merge in v1.** A state after commit is dropped and counted.
    The store's put-once contract is unchanged.
 10. **Raw forwarding follows the readers.** The file lists, per metric,
@@ -893,7 +1040,8 @@ arrival-delay histogram. Cost-based choice of collector views. The OTAP Arrow ad
 15. **Dependency weight on the collector build.** `asap-types` adds
     `serde_json` and `thiserror` 2; with one `asap_sketchlib` pin (Decision
     13) it adds no second sketchlib. Accept it. Measure the collector's clean build
-    time before and after in step 7.
+    time before and after in step 7. The executor (decision 25) is measured
+    separately in step 10.
 16. **Transport: OTLP HTTP or OTAP Arrow.** V1 accepts OTLP HTTP. Next, an
     OTAP Arrow adapter fed by `urn:otel:exporter:otap`, decoding with the
     `arrow-ipc` and `tonic` the backend already builds, rather than the
@@ -906,7 +1054,7 @@ arrival-delay histogram. Cost-based choice of collector views. The OTAP Arrow ad
     still read from the metadata, and the backend stores the rows under the
     `Scan`'s metric, so queries are unaffected. `.asap_view.` is reserved.
 18. **Sub-DAG validity.** No planner function extracts a sub-DAG. The loader
-    calls `materialized_views()` on each sub-DAG, which validates it, and
+    calls `materialized_views()` on the sub-DAG, which validates it, and
     step 4 tests this on the benchmark plan. If the planner refuses such a DAG,
     file the need against the planner in its terms.
 19. **One processor for all views, or one per view.** One `asap_sketches`
@@ -924,6 +1072,26 @@ arrival-delay histogram. Cost-based choice of collector views. The OTAP Arrow ad
     `service.namespace/`) → `job`, `service.instance.id` → `instance`; an
     optional allow-list promotes named attributes. Equal Dictionary entries
     give equal labels whichever path carried them.
+23. **A generic collector-view rule.** Nodes are assigned bottom-up from
+    the `Scan`s when their operator and arguments are in the capabilities,
+    every input is a raw `Scan` or an assigned node, they run at ingestion,
+    and they are correct on one instance's partition. The maximal such
+    sub-DAG is cut; its outputs are listed in the file. Today's leaf rule is
+    the case of today's capabilities, so v1's scope is unchanged.
+24. **Capabilities in the planner's vocabulary.** `executor` is the
+    planner's `DeploymentCapabilities`, `operators` are `OperatorKind`s with
+    argument constraints, and `placement` says how series are partitioned,
+    so a new collector operator is a capabilities change, not a backend
+    change.
+25. **Target: the collector embeds `asap-executor`.** It compiles and
+    instantiates its sub-DAG as the backend does, so its capabilities are
+    the executor's and both sides run the same code. v1 maps leaf views
+    onto the existing processor; the embedding is the next step, after its
+    dependency and memory cost is measured (step 10).
+26. **Partial aggregation is future work.** A non-local mergeable aggregate
+    (a group spread over instances) would cross the cut as a partial state
+    merged by a backend `SummaryMerge`; v1 keeps it, and every node above
+    it, in the backend.
 
 ## Open questions
 
