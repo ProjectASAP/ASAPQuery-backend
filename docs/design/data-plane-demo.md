@@ -764,7 +764,8 @@ deleted once every window in it is past its views' retention.
   `query-N`; Remote Write is decoded on the HTTP runtime's threads.
 - `GET /metrics` exports, in the Prometheus text format:
   - `asap_phase_cpu_seconds_total`, `asap_phase_wall_seconds_total` and
-    `asap_phase_runs_total` by `phase`: `remote_write_decode`, `append`,
+    `asap_phase_runs_total` by `phase`: `remote_write_decode`,
+    `otlp_decode`, `append`,
     `precompute` (per refresh group: `group`, `window_ms`, `views`) and
     `query` (per `query` text). Thread CPU time comes from
     `CLOCK_THREAD_CPUTIME_ID`. A shared query-time result is counted in the

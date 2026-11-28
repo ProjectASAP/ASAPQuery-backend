@@ -5,7 +5,9 @@ edition.workspace = true
 
 # Prometheus Remote Write v1: request decoding and validation. An adapter:
 # no workspace dependency, so it never sees an engine or a store. The
-# caller interns each series into its own series type (`Decoder`).
+# caller interns each series into its own series type (`Decoder`). Its
+# in-place protobuf reader (`wire`) and series cache (`series_cache`) also
+# serve the `otlp` decoder.
 [dependencies]
 prost = "0.13"
 snap = "1.1"

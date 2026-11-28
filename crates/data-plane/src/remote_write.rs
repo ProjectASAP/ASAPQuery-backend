@@ -35,27 +35,29 @@ pub fn decode_victoriametrics_samples(
     DECODER.with(|decoder| decoder.borrow_mut().decode(body, limits))
 }
 
-/// The samples of an OTLP metrics body ([`otlp::decode`]), each point's
-/// series interned, within Remote Write's decompressed size and sample
-/// limits. `content_encoding` is the request's `Content-Encoding`.
+/// The samples of an OTLP metrics body ([`otlp::Decoder::decode`]), each
+/// point's series interned, within Remote Write's decompressed size and
+/// sample limits, with the points it rejected and dropped.
+/// `content_encoding` is the request's `Content-Encoding`. Each thread
+/// keeps its own decoder, as [`decode_samples`] does.
 pub fn decode_otlp_samples(
     body: &[u8],
     content_encoding: Option<&str>,
+    options: &otlp::LabelOptions,
     limits: &Limits,
-) -> Result<Vec<RawSample>, otlp::OtlpError> {
+) -> Result<otlp::Decoded<RawSample>, otlp::OtlpError> {
+    thread_local! {
+        static DECODER: RefCell<otlp::Decoder<Interned>> = RefCell::new(otlp::Decoder::new(Interned));
+    }
     let limits = otlp::Limits {
         max_decompressed_bytes: limits.max_decompressed_bytes,
         max_points: limits.max_samples,
     };
-    let points = otlp::decode(body, content_encoding, &limits)?;
-    Ok(points
-        .into_iter()
-        .map(|point| RawSample {
-            labels: intern_pairs(&point.labels),
-            timestamp_ms: point.timestamp_ms,
-            value: point.value,
-        })
-        .collect())
+    DECODER.with(|decoder| {
+        decoder
+            .borrow_mut()
+            .decode(body, content_encoding, options, &limits)
+    })
 }
 
 /// Interns each series into the store's series table and builds the

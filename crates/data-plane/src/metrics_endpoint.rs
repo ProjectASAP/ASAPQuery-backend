@@ -58,6 +58,9 @@ pub(crate) fn render(metrics: &Metrics, gauges: &Gauges) -> String {
     metrics
         .remote_write_decode
         .render(&mut out, "phase=\"remote_write_decode\"");
+    metrics
+        .otlp_decode
+        .render(&mut out, "phase=\"otlp_decode\"");
     metrics.append.render(&mut out, "phase=\"append\"");
     if let Some(tier) = gauges.view_tier {
         tier.decode.render(&mut out, "phase=\"view_decode\"");
@@ -313,6 +316,16 @@ pub(crate) fn render(metrics: &Metrics, gauges: &Gauges) -> String {
             "asap_view_windows_loaded_total",
             "View windows loaded from the view files at startup.",
             load(&metrics.view_windows_loaded),
+        ),
+        (
+            "asap_otlp_rejected_points_total",
+            "OTLP data points rejected (reported in the reply's partial_success): points of sums with DELTA aggregation temporality.",
+            load(&metrics.otlp_rejected_points),
+        ),
+        (
+            "asap_otlp_dropped_no_value_points_total",
+            "OTLP data points dropped because they are flagged \"no recorded value\".",
+            load(&metrics.otlp_dropped_no_value_points),
         ),
     ] {
         family(&mut out, name, "counter", help);

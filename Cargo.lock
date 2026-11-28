@@ -2778,7 +2778,9 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "opentelemetry-proto",
+ "prometheus_remote_write",
  "prost",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 

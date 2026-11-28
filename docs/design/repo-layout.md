@@ -101,7 +101,7 @@ Folders use hyphens (`crates/control-plane`); package names use underscores
 crate          depends on
 -------------  --------------------------------------------------
 control-plane  asap-planner
-adapters/*     common, nothing, or the adapter whose wire format they extend
+adapters/*     common, nothing, or prometheus-remote-write (whose wire format victoriametrics-remote-write extends, and whose protobuf reader and series cache otlp reuses)
 precompute     common, storage, internal-metrics, asap-executor
 storage        internal-metrics, asap-executor, asap_sketchlib
 query          common, storage, internal-metrics, asap-executor
@@ -116,10 +116,12 @@ data-plane     common, precompute, storage, query, internal-metrics, every adapt
 - Adapters never see an engine or a store. In ASAPQuery, adapters depend
   on the whole engine crate (#935, "Not solved"); a separate `common` crate
   closes that here. The ingest adapters need not even `common`: each
-  decodes into the caller's types (below), so `prometheus-remote-write` and
-  `otlp` depend on nothing in the workspace, and
-  `victoriametrics-remote-write` only on `prometheus-remote-write`, whose
-  protobuf it reads (zstd-compressed instead of snappy).
+  decodes into the caller's types (below), so `prometheus-remote-write`
+  depends on nothing in the workspace, `victoriametrics-remote-write` only
+  on `prometheus-remote-write`, whose protobuf it reads (zstd-compressed
+  instead of snappy), and `otlp` only on `prometheus-remote-write`, whose
+  `SampleBuilder`, in-place protobuf reader and series cache its decoder
+  uses.
 - `control-plane` is a dev-dependency of `data-plane`, `precompute` and
   `query` only: their tests plan workloads with it.
 - `precompute` and `query` do not depend on each other. Both depend on
@@ -223,11 +225,9 @@ labels into a `QueryResult`.
 The same holds on the ingest side. An ingest adapter builds no boundary
 batch type: its decoder takes the caller's series and sample types
 (the Remote Write decoder's `SampleBuilder`, which
-`victoriametrics-remote-write` reuses), so `data-plane` interns each new series into the store's series
-table and a Remote Write request decodes straight into the ingest engine's
-samples, with no label copied per sample. `otlp` returns each point's
-labels as strings, which `data-plane` interns the same way; OTLP ingest is
-not on the measured path, so it copies them.
+`victoriametrics-remote-write` and `otlp` reuse), so `data-plane` interns each new series into the store's series
+table and a Remote Write or OTLP request decodes straight into the ingest
+engine's samples, with no label copied per sample.
 
 The Prometheus HTTP routes forward what the plan does not answer verbatim:
 `PrometheusHttpFallback::forward` sends the request's method, path, query

@@ -11,11 +11,15 @@ use axum::http::{header, Request, StatusCode};
 use axum::Router;
 use data_plane::{router, DataPlane};
 use http_body_util::BodyExt;
-use otlp::proto::collector::metrics::v1::ExportMetricsServiceRequest;
+use otlp::proto::collector::metrics::v1::{
+    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+};
 use otlp::proto::common::v1::{any_value, AnyValue, KeyValue};
 use otlp::proto::metrics::v1::{
     metric::Data, number_data_point, Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+    Sum,
 };
+use otlp::proto::resource::v1::Resource;
 use prometheus_remote_write::{Label, Sample, TimeSeries, WriteRequest};
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -203,7 +207,8 @@ async fn victoriametrics_and_otlp_ingest_what_remote_write_ingests() {
         };
         let (status, response) = post(&app, "/v1/metrics", encoding, body).await;
         assert_eq!(status, StatusCode::OK, "{response}");
-        assert_eq!(response, r#"{"rejected":0}"#);
+        // An empty `ExportMetricsServiceResponse`: no bytes.
+        assert_eq!(response, "");
         assert_eq!(answers(&state, &app).await, expected, "gzip: {gzipped}");
     }
 }
@@ -241,9 +246,11 @@ fn decoders_give_the_same_series_and_samples() {
         decode_otlp_samples(
             &prost::Message::encode_to_vec(&otlp_request()),
             None,
+            &otlp::LabelOptions::default(),
             &limits,
         )
-        .unwrap(),
+        .unwrap()
+        .samples,
     );
     // The OTLP request lists the same series and samples in the same order.
     assert_eq!(otlp, remote_write);
@@ -263,4 +270,207 @@ async fn rejects_malformed_bodies() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {encoding:?}");
     }
     assert_eq!(state.engine.stats().samples_accepted, 0);
+}
+
+/// An OTLP request posted with `content_type`: the status, the reply's
+/// content type and body.
+async fn post_otlp(
+    app: &Router,
+    content_type: &str,
+    body: Vec<u8>,
+) -> (StatusCode, Option<String>, Vec<u8>) {
+    let request = Request::post("/v1/metrics")
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(body))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let reply_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .map(|value| value.to_str().unwrap().to_string());
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, reply_type, body.to_vec())
+}
+
+fn text_attribute(key: &str, value: &str) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(value.to_string())),
+        }),
+    }
+}
+
+/// A `data` sum of `temporality` with one point per second from 1 s to
+/// `points` s, for each of the six series.
+fn otlp_sum(temporality: i32, points: i64) -> ExportMetricsServiceRequest {
+    let mut request = otlp_request();
+    for metric in &mut request.resource_metrics[0].scope_metrics[0].metrics {
+        let Some(Data::Gauge(gauge)) = metric.data.take() else {
+            unreachable!()
+        };
+        let mut data_points = gauge.data_points;
+        data_points.truncate(points as usize);
+        metric.data = Some(Data::Sum(Sum {
+            data_points,
+            aggregation_temporality: temporality,
+            is_monotonic: true,
+        }));
+    }
+    request
+}
+
+/// The value of the `/metrics` line `name`.
+async fn metric_value(app: &Router, name: &str) -> f64 {
+    let response = app
+        .clone()
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    text.lines()
+        .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .unwrap_or_else(|| panic!("{name} in {text}"))
+        .parse()
+        .unwrap()
+}
+
+/// `/v1/metrics` replies as OTLP/HTTP asks: 200 with an
+/// `ExportMetricsServiceResponse` in protobuf (what OTLP exporters parse),
+/// its `partial_success` counting the rejected points of DELTA sums; 400
+/// with a `google.rpc.Status` for a malformed body; 415 with a JSON
+/// `Status` for an OTLP/JSON body, which is not decoded.
+#[tokio::test(flavor = "multi_thread")]
+async fn otlp_replies_are_otlp_messages() {
+    let (state, app) = data_plane();
+    let protobuf = "application/x-protobuf";
+    let (status, reply_type, body) = post_otlp(
+        &app,
+        protobuf,
+        prost::Message::encode_to_vec(&otlp_request()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reply_type.as_deref(), Some(protobuf));
+    let reply: ExportMetricsServiceResponse = prost::Message::decode(&body[..]).unwrap();
+    assert_eq!(reply, ExportMetricsServiceResponse::default());
+
+    // Six series of 10 cumulative points and 20 delta points each.
+    let (state_delta, app_delta) = data_plane();
+    let cumulative = prost::Message::encode_to_vec(&otlp_sum(2, 10));
+    let (status, _, body) = post_otlp(&app_delta, protobuf, cumulative).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_empty());
+    let delta = prost::Message::encode_to_vec(&otlp_sum(1, 20));
+    let (status, reply_type, body) = post_otlp(&app_delta, protobuf, delta).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reply_type.as_deref(), Some(protobuf));
+    let reply: ExportMetricsServiceResponse = prost::Message::decode(&body[..]).unwrap();
+    let partial = reply.partial_success.unwrap();
+    assert_eq!(partial.rejected_data_points, 6 * 20);
+    assert!(
+        partial.error_message.contains("DELTA"),
+        "{}",
+        partial.error_message
+    );
+    common::barrier(&app_delta, END_S * 1000).await;
+    assert_eq!(state_delta.engine.stats().samples_accepted, 6 * 10);
+    assert_eq!(
+        metric_value(&app_delta, "asap_otlp_rejected_points_total").await,
+        120.0
+    );
+    assert_eq!(
+        metric_value(&app_delta, "asap_phase_runs_total{phase=\"otlp_decode\"}").await,
+        2.0
+    );
+
+    let (status, reply_type, body) = post_otlp(&app, protobuf, vec![0xff; 8]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply_type.as_deref(), Some(protobuf));
+    let error: otlp::Status = prost::Message::decode(&body[..]).unwrap();
+    assert!(error.message.contains("Protobuf"), "{}", error.message);
+
+    let (status, reply_type, body) = post_otlp(
+        &app,
+        "application/json",
+        br#"{"resourceMetrics":[]}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(reply_type.as_deref(), Some("application/json"));
+    let error: Value = serde_json::from_slice(&body).unwrap();
+    assert!(error["message"].as_str().unwrap().contains("OTLP/JSON"));
+    common::barrier(&app, END_S * 1000).await;
+    assert_eq!(
+        state.engine.stats().samples_accepted,
+        SERIES as u64 * END_S as u64
+    );
+}
+
+/// Points flagged "no recorded value" are dropped and counted on
+/// `/metrics`, not ingested as 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn otlp_points_without_a_recorded_value_are_dropped() {
+    let (state, app) = data_plane();
+    let mut request = otlp_request();
+    for metric in &mut request.resource_metrics[0].scope_metrics[0].metrics {
+        let Some(Data::Gauge(gauge)) = &mut metric.data else {
+            unreachable!()
+        };
+        gauge.data_points[0].flags = 1;
+    }
+    let (status, _, _) = post_otlp(
+        &app,
+        "application/x-protobuf",
+        prost::Message::encode_to_vec(&request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    common::barrier(&app, END_S * 1000).await;
+    assert_eq!(
+        state.engine.stats().samples_accepted,
+        SERIES as u64 * (END_S as u64 - 1)
+    );
+    assert_eq!(
+        metric_value(&app, "asap_otlp_dropped_no_value_points_total").await,
+        SERIES as f64
+    );
+}
+
+/// Resource attributes become `job` and `instance` as in Prometheus' OTLP
+/// receiver (the `otlp` crate's tests cover the other rules): the planned
+/// query sums by the `job` the resource names, over the point attributes'.
+#[tokio::test(flavor = "multi_thread")]
+async fn otlp_resource_attributes_give_job_and_instance() {
+    let mut request = otlp_request();
+    let resource_metrics = &mut request.resource_metrics[0];
+    resource_metrics.resource = Some(Resource {
+        attributes: vec![
+            text_attribute("service.name", "cart"),
+            text_attribute("service.namespace", "shop"),
+            text_attribute("service.instance.id", "cart-7"),
+            text_attribute("host.name", "node-1"),
+            text_attribute("deployment.environment", "prod"),
+        ],
+        ..Default::default()
+    });
+    resource_metrics.scope_metrics[0].scope = Some(otlp::proto::common::v1::InstrumentationScope {
+        name: "meter".into(),
+        attributes: vec![text_attribute("scope.attribute", "s")],
+        ..Default::default()
+    });
+    let body = prost::Message::encode_to_vec(&request);
+    // One job, the sum of every series.
+    let (state, app) = data_plane();
+    let (status, _, _) = post_otlp(&app, "application/x-protobuf", body).await;
+    assert_eq!(status, StatusCode::OK);
+    let (answers, accepted) = answers(&state, &app).await;
+    assert_eq!(accepted, SERIES as u64 * END_S as u64);
+    let newest = common::per_job(answers.last().unwrap());
+    let sum: f64 = (0..SERIES)
+        .flat_map(|i| (END_S - 59..=END_S).map(move |s| value(i, s)))
+        .sum();
+    assert_eq!(newest, vec![("shop/cart".to_string(), sum)]);
 }
