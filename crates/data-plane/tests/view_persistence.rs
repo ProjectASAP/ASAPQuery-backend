@@ -140,7 +140,7 @@ async fn kll_views_answer_alike_after_a_restart() {
     .unwrap();
     let plan = plan_workload(&workload, &common::inputs(false)).unwrap().0;
     let plan = serde_json::to_string(&plan).unwrap();
-    assert!(plan.contains("Kll"), "the plan builds no KLL");
+    assert!(plan.contains("\"KLL\""), "the plan builds no KLL");
     answers_alike_after_a_restart("kll", query, &plan).await;
 }
 

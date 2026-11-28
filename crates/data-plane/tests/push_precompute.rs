@@ -463,7 +463,7 @@ async fn per_series_breakers_are_concatenated() {
     }
     let randomized = serde_json::to_string(&plan.dag)
         .unwrap()
-        .contains("\"Kll\"");
+        .contains("\"KLL\"");
     if randomized {
         // KLL compacts at random: same windows and keys, answers within 5%
         // (T1); here only the shape.

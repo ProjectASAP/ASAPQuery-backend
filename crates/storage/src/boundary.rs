@@ -177,6 +177,9 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "node_id": node,
             "refresh": "at_ingestion",
+            "plan_id": "test-plan",
+            "view_state_key": {"definition_id": format!("v{node}"), "window": null,
+                "logical_properties": {"parameters": null}},
             "coverage": {"definition_id": format!("v{node}"), "selection": []},
             "inputs": {"materialized_views": []},
             "retention_ms": 1_000_000,

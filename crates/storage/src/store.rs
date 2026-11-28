@@ -1906,6 +1906,9 @@ mod tests {
         let view: MaterializedView = serde_json::from_value(serde_json::json!({
             "node_id": 1,
             "refresh": "on_first_read",
+            "plan_id": "test-plan",
+            "view_state_key": {"definition_id": "test-view", "window": null,
+                "logical_properties": {"parameters": null}},
             "coverage": {"definition_id": "test-view", "selection": []},
             "inputs": {"materialized_views": []},
             "retention_ms": 1_000_000,
@@ -1972,6 +1975,9 @@ mod tests {
         let view: MaterializedView = serde_json::from_value(serde_json::json!({
             "node_id": 1,
             "refresh": "on_first_read",
+            "plan_id": "test-plan",
+            "view_state_key": {"definition_id": "test-view", "window": null,
+                "logical_properties": {"parameters": null}},
             "coverage": {"definition_id": "test-view", "selection": []},
             "inputs": {"materialized_views": []},
             "retention_ms": 1_000_000,
@@ -2062,6 +2068,9 @@ mod tests {
         let view: MaterializedView = serde_json::from_value(serde_json::json!({
             "node_id": 1,
             "refresh": "on_first_read",
+            "plan_id": "test-plan",
+            "view_state_key": {"definition_id": "test-view", "window": null,
+                "logical_properties": {"parameters": null}},
             "coverage": {"definition_id": "test-view", "selection": []},
             "inputs": {"materialized_views": []},
             "retention_ms": 1_000_000,

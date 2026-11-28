@@ -283,6 +283,6 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-The Planner revision is pinned in `Cargo.toml` (ASAPPlanner `737bfb1`; `asap_sketchlib` patched
-to `355093f`); see
+The Planner revision is pinned in `Cargo.toml` (ASAPPlanner `f2da999`; `asap_sketchlib` at
+the Planner's own pin, `01f3333`); see
 [scripts/ci/README.md](scripts/ci/README.md).

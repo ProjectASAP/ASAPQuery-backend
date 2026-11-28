@@ -711,7 +711,7 @@ fn same_within(a: &[Answer], b: &[Answer], relative: f64) -> bool {
 fn tolerance(plan: &InstallablePlan) -> f64 {
     let randomized = serde_json::to_string(&plan.dag)
         .unwrap()
-        .contains("\"Kll\"");
+        .contains("\"KLL\"");
     if randomized {
         0.05
     } else {

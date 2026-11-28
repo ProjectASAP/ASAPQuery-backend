@@ -131,8 +131,11 @@ impl CompiledQueries {
             BTreeSet::new()
         };
         let mut slots: Vec<MaterializedView> = views.to_vec();
-        for &node in &shared {
-            slots.push(query_time_slot(node)?);
+        if !shared.is_empty() {
+            let plan_id = dag.plan_id();
+            for &node in &shared {
+                slots.push(query_time_slot(&plan_id, node)?);
+            }
         }
         let mut compiled: BTreeMap<PhysicalASAPNodeId, Result<Run, String>> = BTreeMap::new();
         for &node in shared.iter().chain(&dag.roots) {
@@ -472,11 +475,16 @@ fn scans_below(
 }
 
 /// The view slot a shared node is bound as: its whole output at the run's
-/// evaluation time, refreshed on first read and kept for that evaluation.
-fn query_time_slot(node: PhysicalASAPNodeId) -> anyhow::Result<MaterializedView> {
+/// evaluation time, refreshed on first read and kept for that evaluation;
+/// a view of plan `plan_id` (`PhysicalASAPDAG::plan_id`) whose state key
+/// names only that node.
+fn query_time_slot(plan_id: &str, node: PhysicalASAPNodeId) -> anyhow::Result<MaterializedView> {
     Ok(serde_json::from_value(serde_json::json!({
         "node_id": node,
         "refresh": "on_first_read",
+        "plan_id": plan_id,
+        "view_state_key": {"definition_id": format!("query-time-result-{node}"), "window": null,
+            "logical_properties": {"parameters": null}},
         "coverage": {"definition_id": format!("query-time-result-{node}"), "selection": []},
         "inputs": {"materialized_views": []},
         "retention_ms": 0,

@@ -100,8 +100,15 @@ async fn main() {
     let plan_text = serde_json::to_string(&plan).unwrap();
     println!(
         "plan states (mentions): {:?}",
-        ["DDSketch", "\"Kll\"", "Hll", "Cms", "Counter", "Max"]
-            .map(|k| (k, plan_text.matches(k).count()))
+        [
+            "DDSketch",
+            "\"KLL\"",
+            "\"HLL\"",
+            "CountMinSketch",
+            "Counter",
+            "Max"
+        ]
+        .map(|k| (k, plan_text.matches(k).count()))
     );
 
     let now_ms = std::time::SystemTime::now()
