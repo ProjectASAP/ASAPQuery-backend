@@ -301,7 +301,8 @@ measurements `internal-metrics` keeps, so `internal-metrics` stays a leaf.
 
 - **Watermark.** One, kept by the ingest coordinator: the newest sample of
   any shard, capped at the wall clock, less `--allowed-lateness-ms`
-  (default 15 s), or a producer's barrier when that is later. It moves only
+  (default 15 s), a producer's barrier, or the idle watermark (decision 5),
+  whichever is latest; it never goes back. It moves only
   behind a flush that every shard has run, and a shard with nothing queued
   answers the flush at once, so an idle shard does not hold it. A refresh
   group's window `(e − W, e]` closes when the watermark reaches `e`; a
@@ -453,6 +454,32 @@ PRs, each reviewed on its own:
    forwarded request. The engines and stores have one each, so they are
    concrete types; #935's `IngestEngine`, `QueryEngine`, `ViewStore` and
    `RawDataStore` come back when a second engine or store does.
+5. **An idle stream's last windows close by wall-clock time.** While no
+   sample arrives, event time is taken to advance with the wall clock. The
+   coordinator keeps an idle watermark `t + (now − a) − L − G`: `t` the
+   newest sample time (capped at the wall clock), `a` the wall-clock time a
+   sample last arrived, `L` `--allowed-lateness-ms`, `G` a 1 s grace. A
+   window `(e − W, e]` so closes once no sample has come for
+   `e − t + L + G`, at most `W + L + G`. Counting from `t`, not from `now`,
+   a stream whose event time lags the wall clock (a replay or backfill)
+   closes no window earlier than if it kept sending.
+   - One idle watermark over all shards, kept by the coordinator; a sample
+     on any shard resets `a`.
+   - The coordinator checks it every tick (100 ms). When it would close a
+     window, the coordinator first flushes every shard, as for a barrier,
+     and takes `now` and `a` at that flush, so samples still queued reset
+     `a` and close nothing.
+   - The barrier is unchanged; the latest of the three closes.
+   - A sample for a window closed this way is late, dropped and counted as
+     any other (`samples_dropped_late`, `samples_late_for_views`).
+   - Windows closed ahead of the samples and barriers are counted
+     (`asap_windows_closed_by_wall_clock_total`).
+   - Nothing closes before the first sample, and after a restart nothing
+     closes by wall clock until a sample arrives; `--stream-start-ms` only
+     makes the first window complete, as before.
+   - A stream whose event time runs slower than the wall clock with gaps
+     longer than `L + G` breaks the assumption; it needs a larger
+     `--allowed-lateness-ms`.
 
 ## Alternatives considered
 
@@ -474,11 +501,3 @@ PRs, each reviewed on its own:
 - **Storing only raw-data panes.** Rejected: the plan also stores rollups
   and multi-level windows; keeping only panes would recompute them at every
   evaluation or refuse them at install.
-
-## Open questions
-
-- **Idle stream.** An idle shard no longer holds the watermark, but when no
-  producer sends anything, the watermark stops and the last windows stay
-  open until a sample or a barrier arrives. Whether the data plane should
-  also close windows by elapsed wall-clock time, without a barrier, is
-  open.
