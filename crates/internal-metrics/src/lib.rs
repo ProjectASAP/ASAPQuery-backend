@@ -293,8 +293,6 @@ pub struct Metrics {
     pub otlp_decode: PhaseStats,
     /// OTLP data points rejected: points of sums with DELTA temporality.
     pub otlp_rejected_points: AtomicU64,
-    /// OTLP data points dropped: flagged "no recorded value".
-    pub otlp_dropped_no_value_points: AtomicU64,
     /// Storing one ingest command's samples on the ingest thread: routing,
     /// appending, closing windows, compacting and evicting panes.
     pub append: PhaseStats,
@@ -338,7 +336,6 @@ impl Metrics {
             remote_write_decode: PhaseStats::default(),
             otlp_decode: PhaseStats::default(),
             otlp_rejected_points: AtomicU64::new(0),
-            otlp_dropped_no_value_points: AtomicU64::new(0),
             append: PhaseStats::default(),
             precompute: groups
                 .iter()

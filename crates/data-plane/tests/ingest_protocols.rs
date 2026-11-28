@@ -409,17 +409,44 @@ async fn otlp_replies_are_otlp_messages() {
     );
 }
 
-/// Points flagged "no recorded value" are dropped and counted on
-/// `/metrics`, not ingested as 0.
+/// Points flagged "no recorded value" are ingested as Prometheus' stale
+/// marker, as Prometheus' OTLP receiver writes them: the answers and the
+/// samples accepted are those of a Remote Write request with a stale
+/// marker in each place.
 #[tokio::test(flavor = "multi_thread")]
-async fn otlp_points_without_a_recorded_value_are_dropped() {
+async fn otlp_points_without_a_recorded_value_are_stale_markers() {
+    // The second of each series' point flagged, in the last minute.
+    let flagged = |series: usize| END_S - 5 * (series as i64 + 1);
+    let stale = f64::from_bits(0x7ff0_0000_0000_0002);
+    let (state, app) = data_plane();
+    let mut request = remote_write_request();
+    for (series, timeseries) in request.timeseries.iter_mut().enumerate() {
+        timeseries.samples[flagged(series) as usize - 1].value = stale;
+    }
+    let (status, error) = post(
+        &app,
+        "/api/v1/write",
+        None,
+        prometheus_remote_write::encode(&request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{error}");
+    let expected = answers(&state, &app).await;
+    assert_eq!(expected.1, SERIES as u64 * END_S as u64);
+
     let (state, app) = data_plane();
     let mut request = otlp_request();
-    for metric in &mut request.resource_metrics[0].scope_metrics[0].metrics {
+    for (series, metric) in request.resource_metrics[0].scope_metrics[0]
+        .metrics
+        .iter_mut()
+        .enumerate()
+    {
         let Some(Data::Gauge(gauge)) = &mut metric.data else {
             unreachable!()
         };
-        gauge.data_points[0].flags = 1;
+        let point = &mut gauge.data_points[flagged(series) as usize - 1];
+        point.flags = 1;
+        point.value = None;
     }
     let (status, _, _) = post_otlp(
         &app,
@@ -428,15 +455,7 @@ async fn otlp_points_without_a_recorded_value_are_dropped() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    common::barrier(&app, END_S * 1000).await;
-    assert_eq!(
-        state.engine.stats().samples_accepted,
-        SERIES as u64 * (END_S as u64 - 1)
-    );
-    assert_eq!(
-        metric_value(&app, "asap_otlp_dropped_no_value_points_total").await,
-        SERIES as f64
-    );
+    assert_eq!(answers(&state, &app).await, expected);
 }
 
 /// Resource attributes become `job` and `instance` as in Prometheus' OTLP

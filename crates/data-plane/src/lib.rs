@@ -516,9 +516,6 @@ async fn write_otlp(
     metrics
         .otlp_rejected_points
         .fetch_add(decoded.rejected_points, Ordering::Relaxed);
-    metrics
-        .otlp_dropped_no_value_points
-        .fetch_add(decoded.dropped_no_value_points, Ordering::Relaxed);
     ([(header::CONTENT_TYPE, encoding.content_type())], reply).into_response()
 }
 

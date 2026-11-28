@@ -31,9 +31,10 @@
 //! - A sum with DELTA temporality is rejected, each point counted in
 //!   [`Decoded::rejected_points`]: its points are increments, not the
 //!   running total a cumulative sum and `rate` read (Prometheus drops them
-//!   with a warning). A point flagged "no recorded value" is dropped and
-//!   counted in [`Decoded::dropped_no_value_points`] (Prometheus writes a
-//!   stale marker).
+//!   with a warning).
+//! - A point flagged "no recorded value" gives Prometheus' stale marker
+//!   (`StaleNaN`) for each sample it gives, as Prometheus writes it; the
+//!   Remote Write path keeps stale markers the same way.
 //!
 //! Where this differs from Prometheus' defaults:
 //!
@@ -128,8 +129,6 @@ pub struct Decoded<S> {
     /// Data points refused, which the reply reports as rejected: the points
     /// of sums with DELTA temporality.
     pub rejected_points: u64,
-    /// Data points flagged "no recorded value", dropped.
-    pub dropped_no_value_points: u64,
 }
 
 impl<S> Decoded<S> {
@@ -223,7 +222,6 @@ fn walk<B: SampleBuilder>(
             // point with a few short attributes.
             samples: Vec::with_capacity(request.len() / 50),
             rejected_points: 0,
-            dropped_no_value_points: 0,
         },
     };
     walk.request(request)?;
@@ -344,6 +342,9 @@ struct PreviousPoint<'p, S> {
 
 /// `DataPointFlags.FLAG_NO_RECORDED_VALUE_MASK`.
 const FLAG_NO_RECORDED_VALUE: u64 = 1;
+/// Prometheus' stale marker (`value.StaleNaN`), the value of each sample
+/// of a point flagged "no recorded value".
+const STALE_NAN: f64 = f64::from_bits(0x7ff0_0000_0000_0002);
 /// `AggregationTemporality.AGGREGATION_TEMPORALITY_DELTA`.
 const TEMPORALITY_DELTA: u64 = 1;
 
@@ -491,10 +492,6 @@ impl<B: SampleBuilder> Walk<'_, B> {
                 _ => {}
             }
         }
-        if flags & FLAG_NO_RECORDED_VALUE != 0 {
-            self.decoded.dropped_no_value_points += 1;
-            return Ok(());
-        }
         // The encoded attributes: one slice of `point` when contiguous, as
         // senders write them; the metric's previous point's series serve
         // the same slice.
@@ -531,10 +528,17 @@ impl<B: SampleBuilder> Walk<'_, B> {
             }
         };
         let timestamp_ms = (time_nanos / 1_000_000) as i64;
-        let samples: [(&str, Option<f64>); 2] = match kind {
+        let mut samples: [(&str, Option<f64>); 2] = match kind {
             PointKind::Number => [("", Some(number)), ("", None)],
             _ => [("_sum", sum), ("_count", Some(count as f64))],
         };
+        if flags & FLAG_NO_RECORDED_VALUE != 0 {
+            for (_, value) in &mut samples {
+                if value.is_some() {
+                    *value = Some(STALE_NAN);
+                }
+            }
+        }
         for (index, (suffix, value)) in samples.into_iter().enumerate() {
             let Some(value) = value else { continue };
             let known = previous.as_ref().and_then(|last| last.series[index]);

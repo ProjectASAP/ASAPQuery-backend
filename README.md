@@ -213,10 +213,11 @@ plus `job` from the resource's `service.namespace`/`service.name` and
 `instance` from its `service.instance.id`. Other resource attributes are
 labels only when named by `--otlp-promote-resource-attributes a,b` (as
 Prometheus' `promote_resource_attributes`); scope attributes are not labels.
-Sums with DELTA temporality are rejected and points flagged "no recorded
-value" dropped, counted on `/metrics` (`asap_otlp_rejected_points_total`,
-`asap_otlp_dropped_no_value_points_total`); the `otlp` crate's docs list the
-rules and where they differ from Prometheus. `/api/v1/import` answers as
+Sums with DELTA temporality are rejected, counted on `/metrics`
+(`asap_otlp_rejected_points_total`); a point flagged "no recorded value"
+gives Prometheus' stale marker, as Prometheus writes it and as Remote Write
+stale markers are kept. The `otlp` crate's docs list the rules and where
+they differ from Prometheus. `/api/v1/import` answers as
 Remote Write does (400, 503, 500); `/v1/metrics` answers as OTLP/HTTP asks:
 200 with a protobuf `ExportMetricsServiceResponse` (its `partial_success`
 counting rejected points), or a `google.rpc.Status` body with 400, 415

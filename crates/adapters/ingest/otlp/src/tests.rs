@@ -70,7 +70,6 @@ fn decode_with(
             })
             .collect(),
         rejected_points: decoded.rejected_points,
-        dropped_no_value_points: decoded.dropped_no_value_points,
     })
 }
 
@@ -542,37 +541,59 @@ fn delta_sums_are_rejected() {
         ["cumulative", "cumulative", "unspecified", "h_count"]
     );
     assert_eq!(decoded.rejected_points, 3);
-    assert_eq!(decoded.dropped_no_value_points, 0);
     assert!(decoded
         .rejection_message()
         .unwrap()
         .starts_with("3 data points"));
 }
 
-/// Points flagged "no recorded value" are dropped and counted, not read as
-/// 0, whatever their kind.
+/// Prometheus' stale marker (`value.StaleNaN` in Prometheus'
+/// `model/value`), as its bits.
+const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
+
+/// Points flagged "no recorded value" give Prometheus' stale marker for
+/// each sample the point gives, as Prometheus' OTLP receiver writes them
+/// (`otlptranslator/prometheusremotewrite`: the value, a histogram's
+/// `_sum` when set and `_count`, a summary's `_sum` and `_count`), not 0
+/// and not nothing.
 #[test]
-fn no_recorded_value_points_are_dropped() {
+fn no_recorded_value_points_give_stale_markers() {
+    let flagged = |nanos| NumberDataPoint {
+        time_unix_nano: nanos,
+        flags: 1,
+        ..Default::default()
+    };
     let body = encode(&request(vec![
         gauge(
             "g",
             vec![
                 number_point(vec![], NANOS, number_data_point::Value::AsDouble(1.0)),
+                flagged(NANOS + 1_000_000),
+                // A value set on a flagged point is not read.
                 NumberDataPoint {
-                    time_unix_nano: NANOS + 1_000_000,
-                    flags: 1,
-                    ..Default::default()
+                    value: Some(number_data_point::Value::AsDouble(5.0)),
+                    ..flagged(NANOS + 2_000_000)
                 },
             ],
         ),
         metric(
             "h",
             Data::Histogram(Histogram {
-                data_points: vec![HistogramDataPoint {
-                    time_unix_nano: NANOS,
-                    flags: 1,
-                    ..Default::default()
-                }],
+                data_points: vec![
+                    HistogramDataPoint {
+                        time_unix_nano: NANOS,
+                        flags: 1,
+                        ..Default::default()
+                    },
+                    HistogramDataPoint {
+                        attributes: vec![text("method", "GET")],
+                        time_unix_nano: NANOS,
+                        flags: 1,
+                        count: 4,
+                        sum: Some(2.0),
+                        ..Default::default()
+                    },
+                ],
                 aggregation_temporality: 2,
             }),
         ),
@@ -588,9 +609,29 @@ fn no_recorded_value_points_are_dropped() {
         ),
     ]));
     let decoded = decode_with(&body, None, &LabelOptions::default(), &LIMITS).unwrap();
-    assert_eq!(decoded.samples.len(), 1);
-    assert_eq!(decoded.samples[0].value, 1.0);
-    assert_eq!(decoded.dropped_no_value_points, 3);
+    let samples: Vec<(&str, i64, u64)> = decoded
+        .samples
+        .iter()
+        .map(|point| {
+            let name = point.labels.iter().find(|(n, _)| n == "__name__").unwrap();
+            (name.1.as_str(), point.timestamp_ms, point.value.to_bits())
+        })
+        .collect();
+    let ms = (NANOS / 1_000_000) as i64;
+    assert_eq!(
+        samples,
+        [
+            ("g", ms, 1.0f64.to_bits()),
+            ("g", ms + 1, STALE_NAN_BITS),
+            ("g", ms + 2, STALE_NAN_BITS),
+            // No `_sum`: the point has none.
+            ("h_count", ms, STALE_NAN_BITS),
+            ("h_sum", ms, STALE_NAN_BITS),
+            ("h_count", ms, STALE_NAN_BITS),
+            ("s_sum", ms, STALE_NAN_BITS),
+            ("s_count", ms, STALE_NAN_BITS),
+        ]
+    );
     assert_eq!(decoded.rejected_points, 0);
     assert_eq!(decoded.rejection_message(), None);
 }

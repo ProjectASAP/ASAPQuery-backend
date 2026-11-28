@@ -322,11 +322,6 @@ pub(crate) fn render(metrics: &Metrics, gauges: &Gauges) -> String {
             "OTLP data points rejected (reported in the reply's partial_success): points of sums with DELTA aggregation temporality.",
             load(&metrics.otlp_rejected_points),
         ),
-        (
-            "asap_otlp_dropped_no_value_points_total",
-            "OTLP data points dropped because they are flagged \"no recorded value\".",
-            load(&metrics.otlp_dropped_no_value_points),
-        ),
     ] {
         family(&mut out, name, "counter", help);
         let _ = writeln!(out, "{name} {value}");
