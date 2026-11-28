@@ -95,6 +95,37 @@ Folders use hyphens (`crates/control-plane`); package names use underscores
 
 ## Boundaries
 
+### Planner and backend responsibilities
+
+ASAPPlanner decides what to compute, whether at ingestion or at query
+time, and how long to keep it. The backend executes that plan on incoming
+samples and query requests, and never changes it.
+
+| Concern | ASAPPlanner | Backend |
+|---|---|---|
+| Plan search | Stages 1–3 select one `PhysicalASAPDAG` against the cost and accuracy targets | None |
+| Plan contract | `InstallablePlan { wire_version, dag, query_texts }`; the runtime reads `materialized_views()`, `ingestion_refresh_groups()` and `raw_data_retention()` from it | `control-plane` writes it; `PlanInstaller` validates and installs it |
+| Operators | `asap-executor`: `compile`, `instantiate`, and the `DataStore` trait a run reads through | `precompute` runs a refresh group's ingestion run per window; `query` runs a root per evaluation; `storage`'s `RunStore` implements `DataStore` |
+| Views | Each `MaterializedView`: its node, timing, lifetime, retention, `plan_id` and view state key | `storage`: hot tier, segments, persistence, eviction by retention |
+| Raw samples | Which metrics a `Scan` reads and how long a query-time `Scan` looks back (`raw_data_retention()`) | `storage` keeps them by pane while a window still to close or a query-time `Scan` needs them; optional forward to a raw store |
+| Ingestion, watermark, window close, late data | None | `precompute` (Ingestion rules, below) |
+| Threads, scheduling, evaluation times | None | `precompute`'s shards, pool and committer; `query`'s workers |
+| Queries the plan does not answer | None | `QueryDispatcher`: forward or refuse (Query forwarding, below) |
+| Deployment inputs | Consumes `DeploymentCapabilities` and `CostInputs` | `control-plane` supplies them (`backend_capabilities()`) |
+
+Rules:
+
+- The Planner never sees samples, stores, clocks or services; the backend
+  never changes a plan.
+- Every planned query runs the installed DAG through `asap-executor`, for
+  every query shape; each operator has one implementation, the executor's,
+  which the Planner's tests use too.
+- A plan the backend cannot execute fails at install, before any part of
+  it runs: `PlanInstaller` validates it and installs it into the query
+  engine, then the ingest engine, and the first refusal stops it (a query
+  root the query engine cannot compile is refused only under
+  `--no-forward`; otherwise that query is forwarded).
+
 ### Dependency graph
 
 ```text
@@ -266,6 +297,54 @@ second plan. A retryable install comes with tracker-delivered plans.
 `/metrics` is rendered in `data-plane` (`metrics_endpoint.rs`) from the
 measurements `internal-metrics` keeps, so `internal-metrics` stays a leaf.
 
+### Ingestion rules
+
+- **Watermark.** One, kept by the ingest coordinator: the newest sample of
+  any shard, capped at the wall clock, less `--allowed-lateness-ms`
+  (default 15 s), or a producer's barrier when that is later. It moves only
+  behind a flush that every shard has run, and a shard with nothing queued
+  answers the flush at once, so an idle shard does not hold it. A refresh
+  group's window `(e − W, e]` closes when the watermark reaches `e`; a
+  window with no sample is refreshed too, and stored empty.
+- **Future samples.** A sample more than `--max-future-ms` (default 5 min)
+  ahead of the wall clock is dropped and counted
+  (`samples_dropped_future`).
+- **Late samples.** A sample older than every window still to close and
+  every query-time `Scan`'s look-back is dropped (`samples_dropped_late`).
+  One a query-time `Scan` still reads is stored as raw data, but in no
+  view, if every window holding it has closed (`samples_late_for_views`).
+  A committed window is never revised.
+- **First window.** The first window each refresh group sees may have
+  started before the data plane did, so it is skipped
+  (`windows_skipped_first`), unless `--stream-start-ms` says where the
+  producers' stream starts.
+- **Back-pressure.** When more than `--max-queued-samples` (default
+  2,000,000) samples wait for the engine, Remote Write and OTLP get 503
+  (`IngestError::Busy`), which senders retry; a stopped engine gives 500.
+- **Event-time barrier.** `POST /api/v1/precompute/watermark?time_ms=T`
+  states that every sample at or before `T` was written. Once every write
+  acknowledged before it has run, every window with `end <= T` closes, so
+  the last window of a series that stopped sending is refreshed. `T` is
+  capped at the wall clock; a repeated or lower `T` does nothing; input
+  stays open; a later sample for a closed window is late. With several
+  producers, send it only after all of them have written through `T`.
+
+### Query forwarding
+
+`QueryDispatcher` resolves a request against the plan's query texts and
+runs the query engine. What the plan does not answer:
+
+- **Forwarded** (default): to `--prometheus-url`, or to the raw store in
+  forward mode (`--raw-store-url`). The response carries
+  `x-asap-execution: forwarded`; a planned query that was `NotReady` or hit
+  an engine error also carries the reason in `x-asap-forward-reason`. An
+  unmatched query has no reason.
+- **Refused** (`--no-forward`): every answer must come from the plan. A plan
+  with a query the query engine cannot run is refused at install, and an
+  unanswered query returns 422 (`errorType: execution`) with the reason and
+  `x-asap-execution: refused`. `--no-forward` cannot be combined with
+  `--raw-store-url`, `--clickhouse-url` or `--elastic-url`.
+
 ### Where the backend differs from #935
 
 | Topic | #935 (ASAPQuery) | Backend | Proposal |
@@ -374,3 +453,32 @@ PRs, each reviewed on its own:
    forwarded request. The engines and stores have one each, so they are
    concrete types; #935's `IngestEngine`, `QueryEngine`, `ViewStore` and
    `RawDataStore` come back when a second engine or store does.
+
+## Alternatives considered
+
+- **Shape-matched fast paths** (hand-written code for common query shapes
+  beside the DAG). Rejected: every shape would need a second
+  implementation kept in step with the DAG, and they cannot cover arbitrary
+  roots. The data plane always runs the DAG; speed comes from the
+  executor's columnar operators.
+- **View identity, layout and eviction in ASAPPlanner.** Rejected: they are
+  deployment concerns. The Planner states each view's computation, timing
+  and retention; `storage` decides how to keep it.
+- **Row-at-a-time execution.** Replaced: per-row values, clones, grouping
+  keys and memory accounting dominated CPU, while the sketch kernels were a
+  small part. The executor works on Arrow column batches with state
+  columns.
+- **The runtime deriving storage needs from the DAG.** Replaced: the plan's
+  `materialized_views()` and `raw_data_retention()` give each view's
+  retention (range spans included) and each raw metric's look-back.
+- **Storing only raw-data panes.** Rejected: the plan also stores rollups
+  and multi-level windows; keeping only panes would recompute them at every
+  evaluation or refuse them at install.
+
+## Open questions
+
+- **Idle stream.** An idle shard no longer holds the watermark, but when no
+  producer sends anything, the watermark stops and the last windows stay
+  open until a sample or a barrier arrives. Whether the data plane should
+  also close windows by elapsed wall-clock time, without a barrier, is
+  open.
