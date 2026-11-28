@@ -106,7 +106,7 @@ Scope:
 | Capabilities | ASAPCollector-public (`asap_sketches --print-capabilities`) | Declares, in the planner's vocabulary, what the collector can run and how series are placed on its instances (§1) |
 | Collector view rule | `crates/control-plane` | Assigns nodes of the installed plan to the collector bottom-up against the capabilities and cuts the collector sub-DAG; the only copy of the rule |
 | Collector-views file | `crates/control-plane` (`--emit-collector-views`) | The collector sub-DAG, its outputs, the plan id, which metrics the backend still reads raw, the commit grace |
-| `asap_sketches` processor | ASAPCollector-public | Loads the file at start, runs the sub-DAG (v1: builds each leaf view's per-series states), writes the view identity into metric metadata, exports summary points with `sketch.envelope` |
+| `asap_sketches` processor | ASAPCollector-public | Loads the file at start, runs the sub-DAG (v1: builds each leaf view's per-series states with the embedded executor), writes the view identity into metric metadata, exports summary points with `sketch.envelope` |
 | Raw forward | ASAPCollector-public | Forwards raw samples to the backend, except metrics the file marks `false` |
 | OTLP adapter | `crates/adapters/ingest/otlp` | Decodes Schema and Dictionary as for raw samples; a point with `sketch.envelope` becomes a `common::ViewStateBatch` record; never reads the sketch bytes |
 | Collector-state ingest | `crates/precompute` | Finds the view by `(plan_id, node_id)`, checks the key, stages, deduplicates and merges until commit, drops late states |
@@ -141,7 +141,7 @@ Decoding is not an identity check: θ is already in the key.
 
 `asap-types` brings `serde`, `serde_json`, `thiserror` 2 and
 `asap_sketchlib` into the collector build; no frontend or solver
-(decision 15). The executor comes in the step after v1 (§7).
+(decision 15). `asap-executor` adds no third-party crate to the lock (§7).
 
 ## Algorithm
 
@@ -337,8 +337,8 @@ At start, with `planner_views: <path>` in its processor config, the
 3. **Reads each output's key** with `materialized_views()` on the sub-DAG
    and `view_state_key()`: the key depends only on the view node, so it
    equals the installed plan's.
-4. **Builds** each view (v1, on the existing processor; §7 for the
-   executor): sketch and parameters from θ (an out-of-range
+4. **Builds** each view (v1: the executor through a thin driver; §7 for the
+   options): sketch and parameters from θ (an out-of-range
    value is a load error, never replaced by a default), window =
    `ViewWindow::Tumbling.width_ms`, matchers = `__name__ = metric` plus each
    `Scan`, `Filter` and chain-`filter` predicate, one state per series. A series is what it is for the
@@ -582,24 +582,62 @@ committer, the same path that commits a window it built (readers,
   A histogram of arrival delay (`end` to arrival) per view shows when the
   grace must grow. v1 has no late merge (decision 9).
 
-### 7. Target: the collector runs `asap-executor`
+**Envelope hash and implementation.** The envelope hash depends on which
+implementation produced the state: the executor shrinks sealed states, so an
+old-processor collector and an executor collector give different hashes, and
+therefore different bytes, for equal states. In a mixed rollout the
+duplicate check does not recognise such a pair as a duplicate, and the
+second state takes the merge path, which handles it.
 
-The target design (decision 25) is that the collector embeds ASAPPlanner's
-`asap-executor` and runs `compile` and `instantiate` on its sub-DAG, as the
-backend does on the whole plan. Its capabilities are then the executor's
-(the same `DeploymentCapabilities` and operator list), and both sides run
-the same code, so a state the collector builds is the state the backend
-would have built, and any sub-DAG the rule assigns can run without
-collector-specific code.
+### 7. The collector runs `asap-executor`
 
-v1 keeps mapping leaf views onto the existing `asap_sketches` processor
-(§3); embedding the executor is the next step. It adds `arrow`, `ahash`,
-`chrono`, `futures`, `regex` and `xxhash-rust` to the collector build
-(`arrow` is already there through OTAP); step 10 measures the build time,
-binary size and resident memory per view before it replaces the processor's
-own sketch code. Partial aggregation (a non-local mergeable aggregate as
-collector partial state plus a backend `SummaryMerge`) is future work on top
-of it.
+The collector embeds ASAPPlanner's `asap-executor` and runs `compile` and
+`instantiate` on its sub-DAG, as the backend does on the whole plan
+(decision 25). Its capabilities are then the executor's (the same
+`DeploymentCapabilities` and operator list), and a state the collector
+builds is the state the backend would have built.
+
+**Options.**
+
+- **A (v1): a thin collector-side driver over the executor's public APIs.**
+  The driver feeds each raw sample into the per-window run, closes a window
+  at its end, and encodes the resulting state as ASAPv1. It is small and
+  needs nothing from the backend.
+- **C (next): the generic streaming driver moves into the executor as a
+  public API.** That is the streamed raw input, the per-window run holder,
+  the window-end math, and a state-to-ASAPv1 call. The backend keeps
+  interning, sharding and routing, watermark policy, commit, persistence,
+  the memory budget and metrics; the collector and the backend then share
+  one driver.
+- **B (rejected): the collector depends on the backend's precompute
+  crate.** It needs about ten `pub(crate)` items made public, uses a
+  process-wide interner, pulls in storage, `tokio`, `clap` and the full
+  `asap-planner` with its solver, and makes the collector a git dependency
+  on the backend.
+
+**Spike.** A feasibility spike built option A's driver in the collector
+and compared it with the `asap_sketches` processor.
+
+| Measure | Result |
+|---|---|
+| Lock file | only `asap-executor` added; 0 third-party crates (one `arrow` 58.4, one `asap_sketchlib`) |
+| Clean build | +3% wall, +5% CPU |
+| Binary size | +4.6% (stripped +4.7%) |
+| CPU per sample, 5 samples per window | `asap_sketches` 1298 ns; executor DAG run per second 1546 ns (+19%); per window 1410 ns (+9%); kernel only 1113 ns (-14%) |
+| State memory, 10,000 series | 20.8 MB (executor) vs 30.1 MB (`asap_sketches`) |
+
+Correctness, over 120,000 states: the executor's variants are byte-equal to
+each other. Against `asap_sketches` the count and the quantiles are the
+same, but the bytes differ, because the executor shrinks a sealed state
+(typically 69 B against 188 B); shrinking and re-encoding the old
+processor's state gives the executor's bytes. The payload is about 2.7x
+smaller. The worst relative error is 0.0500, within the sketch's
+alpha.
+
+v1 therefore uses option A; step 10 is its implementation, and the spike
+is its measure-first part. Partial aggregation (a non-local mergeable
+aggregate as collector partial state plus a backend `SummaryMerge`) is
+future work on top of it.
 
 ## Code interface
 
@@ -950,6 +988,8 @@ Pins (all three repositories):
 
 1. Bump the ASAPPlanner and `asap_sketchlib` pins to the latest main
    (Decision 13), in the planner, then the backend, then the collector.
+   The pin alignment precedes any byte-for-byte comparison with the
+   deployed backend.
 
 Backend:
 
@@ -998,14 +1038,21 @@ Collector (ASAPCollector-public):
    per-sketch fields when it is set.
 8. The window boundary `(e − w, e]` in `SketchEnvelope` and the point
    times (window attributes removed), placement by sample timestamp with
-   drop-and-count after close, and matchers (§5). It lands before step 5,
+   drop-and-count after close, and matchers (§5). For planner views the
+   executor supplies the window boundary, the placement by timestamp and the
+   matchers (step 10); the processor-side changes in steps 7 and 8 remain
+   for legacy non-planner configurations only. It lands before step 5,
    which needs equal windows.
 9. The raw-forward filter by `backend_reads_raw`.
-10. Embed `asap-executor` (§7): run `compile` and `instantiate` on the
-    sub-DAG, print the executor's capabilities, and retire the processor's
-    own sketch code once answers match. Measure first: clean build time,
-    binary size, and resident memory per view and per series, against
-    the processor.
+10. v1 approach (§7, option A): embed `asap-executor` through a thin
+    collector-side driver over its public APIs: run `compile` and
+    `instantiate` on the sub-DAG, drive the per-window runs from the raw
+    samples, encode each state as ASAPv1, and print the executor's
+    capabilities. The spike is its measure-first part (build time, binary
+    size, CPU and memory against the processor, and state correctness). The
+    processor's own sketch code is retired for planner views once answers
+    match. Next (option C): move the generic streaming driver into the
+    executor as a public API, so the collector and the backend share it.
 
 **Future work.** Partial aggregation (collector partial states of a
 non-local mergeable aggregate, merged by a backend `SummaryMerge`). Late merge into a committed window (a store `replace`, a
@@ -1082,8 +1129,8 @@ arrival-delay histogram. Cost-based choice of collector views. The OTAP Arrow ad
 15. **Dependency weight on the collector build.** `asap-types` adds
     `serde_json` and `thiserror` 2; with one `asap_sketchlib` pin (Decision
     13) it adds no second sketchlib. Accept it. Measure the collector's clean build
-    time before and after in step 7. The executor (decision 25) is measured
-    separately in step 10.
+    time before and after in step 7. The executor (decision 25) was measured
+    separately in the spike (§7).
 16. **Transport: OTLP HTTP or OTAP Arrow.** V1 accepts OTLP HTTP. Next, an
     OTAP Arrow adapter fed by `urn:otel:exporter:otap`, decoding with the
     `arrow-ipc` and `tonic` the backend already builds, rather than the
@@ -1128,11 +1175,21 @@ arrival-delay histogram. Cost-based choice of collector views. The OTAP Arrow ad
     predicate; `operators` are `OperatorKind`s with only their own limits;
     `placement` says how series are partitioned. A new collector operator
     is one line, not a backend change.
-25. **Target: the collector embeds `asap-executor`.** It compiles and
-    instantiates its sub-DAG as the backend does, so its capabilities are
-    the executor's and both sides run the same code. v1 maps leaf views
-    onto the existing processor; the embedding is the next step, after its
-    dependency and memory cost is measured (step 10).
+25. **v1 embeds `asap-executor` through a thin collector-side driver; the
+    shared driver is next; the backend's precompute crate is rejected.**
+    The collector compiles and instantiates its sub-DAG as the backend does,
+    so its capabilities are the executor's and both sides run the same code.
+    v1 (option A) writes a small driver over the executor's public APIs; a
+    spike measured +3% build wall time, +4.6% binary size, 0 new
+    third-party crates and a smaller state memory, with correct answers.
+    Next (option C), the generic streaming driver moves into the executor as
+    a public API; the backend keeps interning, sharding and routing,
+    watermark policy, commit, persistence, the memory budget and metrics.
+    Option B, depending on the backend's precompute crate, is rejected: it
+    needs about ten `pub(crate)` items made public, has a process-wide
+    interner, pulls in storage, `tokio`, `clap` and the full `asap-planner`
+    with its solver, and makes the collector a git dependency on the
+    backend.
 26. **Partial aggregation is future work.** A non-local mergeable aggregate
     (a group spread over instances) would cross the cut as a partial state
     merged by a backend `SummaryMerge`; v1 keeps it, and every node above
