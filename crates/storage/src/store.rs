@@ -983,9 +983,10 @@ pub struct ViewStore {
     /// pool lets a group run ahead of its readers.
     readers: BTreeMap<PhysicalASAPNodeId, BTreeMap<usize, i64>>,
     /// Per view, the start of the first window ever stored. With the
-    /// stream start declared, the view has no data at all before it, so a
-    /// read reaching back past it answers from the rows that exist, as
-    /// PromQL does over a range that starts before the first sample.
+    /// stream start declared, the view has no data at all before it or
+    /// before the stream start, whichever is earlier, so a read reaching
+    /// back past that answers from the rows that exist, as PromQL does over
+    /// a range that starts before the first sample.
     first_start: BTreeMap<PhysicalASAPNodeId, i64>,
     /// Where the producer's stream starts, when declared: no view has data
     /// before it, so a view with no window yet reads as empty there.
@@ -1291,15 +1292,18 @@ impl ViewStore {
     ) -> Result<OutputStream<'_, Batch>, Error> {
         let (requested_start, end) = request.time_range_ms;
         // With the stream start declared (and no restart since), a range
-        // reaching back before the view's first window reads the rows that
-        // exist (PromQL semantics while a window is still filling); a gap
-        // after the first window is still missing data. Otherwise the
-        // skipped first window had data, so it is missing too.
+        // reaching back before the view's first window, and before the
+        // stream start, reads the rows that exist (PromQL semantics while a
+        // window is still filling); a gap after the first window is still
+        // missing data. A first window starting after the stream start
+        // follows windows skipped as already past retention, which had
+        // data: a range reaching into them is missing data. Without a
+        // declared stream start, the skipped first window had data, so it
+        // is missing too.
         let floor = self.stream_start_ms.map(|start| {
             self.first_start
                 .get(&view.node_id)
-                .copied()
-                .unwrap_or(start)
+                .map_or(start, |&first| first.min(start))
         });
         let start = match floor {
             Some(first) if requested_start < first => first.min(end),
@@ -1876,6 +1880,54 @@ mod tests {
                 schema: &schema,
             };
             assert!(views.read(&view, &request, context.clone()).is_err());
+        }
+    }
+
+    /// When the watermark jumps past a view's retention, its windows that
+    /// would already be dropped are never built, so its first stored window
+    /// starts after the stream start: the skipped windows had data, and a
+    /// range reaching back into them is missing data, not empty. Only a
+    /// range wholly before the stream start reads as empty.
+    #[test]
+    fn windows_skipped_after_the_stream_start_are_missing() {
+        let view: MaterializedView = serde_json::from_value(serde_json::json!({
+            "node_id": 1,
+            "refresh": "on_first_read",
+            "plan_id": "test-plan",
+            "view_state_key": {"definition_id": "test-view", "window": null,
+                "logical_properties": {"parameters": null}},
+            "coverage": {"definition_id": "test-view", "selection": []},
+            "inputs": {"materialized_views": []},
+            "retention_ms": 1_000_000,
+        }))
+        .unwrap();
+        let mut views = ViewStore::default().with_stream_start(Some(0));
+        for end in [270, 280] {
+            views.append(&view, (end - 10, end), Vec::new()).unwrap();
+        }
+        let context = RunContext::new(
+            asap_executor::runtime::Scope::Query {
+                evaluation_time_ms: 280,
+            },
+            asap_executor::runtime::Limits::default(),
+        )
+        .unwrap();
+        let schema = schema();
+        for (range, tiled) in [
+            ((0, 30), false),
+            ((250, 280), false),
+            ((260, 280), true),
+            ((-20, -10), true),
+        ] {
+            let request = MaterializedViewRequest {
+                time_range_ms: range,
+                schema: &schema,
+            };
+            assert_eq!(
+                views.read(&view, &request, context.clone()).is_ok(),
+                tiled,
+                "{range:?}"
+            );
         }
     }
 
