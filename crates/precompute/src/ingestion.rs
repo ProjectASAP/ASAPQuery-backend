@@ -192,6 +192,9 @@ struct RefreshGroup {
     /// It reads a collector view's group, directly or through other
     /// groups: its windows close only once those groups closed them.
     reads_collector: bool,
+    /// A collector view's group, or one reading it: the end of the window
+    /// before its first, once it started.
+    collector_start: Option<i64>,
 }
 
 impl RefreshGroup {
@@ -364,6 +367,7 @@ impl Ingestion {
                 retention_ms,
                 refreshed_through: None,
                 collector: from_collector,
+                collector_start: None,
             });
         }
         let pane_width_ms = clocks
@@ -696,7 +700,8 @@ impl Ingestion {
     /// window is skipped unless it starts at or after the declared stream
     /// start.
     fn start_groups(&mut self, metric: &str, timestamp_ms: i64) {
-        for group in &mut self.groups {
+        for index in 0..self.groups.len() {
+            let group = &mut self.groups[index];
             if group.refreshed_through.is_some() || !group.started_by.contains(metric) {
                 continue;
             }
@@ -712,6 +717,7 @@ impl Ingestion {
                     first_end
                 }
             });
+            self.align_to_collector_reads(index);
         }
     }
 
@@ -754,11 +760,8 @@ impl Ingestion {
     /// of the window ending at `end_ms`, at wall-clock time `now_ms`: that
     /// window is its first, or, when that window is still open by the
     /// clock, the first window not yet closed by the clock (a state of an
-    /// earlier open window may still come). Then each group reading it
-    /// (directly or through other such groups, in plan order) that no
-    /// metric starts starts at its first window boundary after the groups
-    /// it reads, and one already started skips to that boundary: its
-    /// windows before it would read collector windows that never come.
+    /// earlier open window may still come). Then aligns the groups reading
+    /// it ([`Self::align_to_collector_reads`]), in plan order.
     pub(crate) fn start_collector_group(&mut self, group: usize, end_ms: i64, now_ms: i64) {
         let started = &mut self.groups[group];
         if started.refreshed_through.is_some() {
@@ -769,32 +772,45 @@ impl Ingestion {
             .saturating_sub(self.commit_grace_ms)
             .div_euclid(width_ms)
             .saturating_mul(width_ms);
-        started.refreshed_through = Some((end_ms - width_ms).min(closed_by_clock));
+        let start = (end_ms - width_ms).min(closed_by_clock);
+        started.refreshed_through = Some(start);
+        started.collector_start = Some(start);
         for reader in group + 1..self.groups.len() {
-            let waiting = &self.groups[reader];
-            if !waiting.reads_collector || waiting.collector {
-                continue;
+            self.align_to_collector_reads(reader);
+        }
+    }
+
+    /// For group `reader`, reading collector views' groups (directly or
+    /// through other groups): once each of those started, its windows start
+    /// at its first boundary after all of them; it starts there if no
+    /// metric starts it, and skips there if it started earlier (its windows
+    /// before would read collector windows that never come).
+    fn align_to_collector_reads(&mut self, reader: usize) {
+        let waiting = &self.groups[reader];
+        if !waiting.reads_collector {
+            return;
+        }
+        let starts: Option<Vec<i64>> = waiting
+            .reads
+            .iter()
+            .filter(|&&read| self.groups[read].reads_collector || self.groups[read].collector)
+            .map(|&read| self.groups[read].collector_start)
+            .collect();
+        let Some(first) = starts.and_then(|starts| starts.into_iter().max()) else {
+            return;
+        };
+        let waiting = &mut self.groups[reader];
+        let first = waiting.window_end(first);
+        match waiting.refreshed_through {
+            None if waiting.started_by.is_empty() => waiting.refreshed_through = Some(first),
+            Some(through) if through < first => {
+                self.stats.windows_skipped_first += ((first - through) / waiting.width_ms) as u64;
+                waiting.refreshed_through = Some(first);
             }
-            let reads: Option<Vec<i64>> = waiting
-                .reads
-                .iter()
-                .filter(|&&read| self.groups[read].reads_collector || self.groups[read].collector)
-                .map(|&read| self.groups[read].refreshed_through)
-                .collect();
-            let Some(first) = reads.and_then(|reads| reads.into_iter().max()) else {
-                continue;
-            };
-            let waiting = &mut self.groups[reader];
-            let first = waiting.window_end(first);
-            match waiting.refreshed_through {
-                None if waiting.started_by.is_empty() => waiting.refreshed_through = Some(first),
-                Some(through) if through < first => {
-                    self.stats.windows_skipped_first +=
-                        ((first - through) / waiting.width_ms) as u64;
-                    waiting.refreshed_through = Some(first);
-                }
-                _ => {}
-            }
+            _ => {}
+        }
+        if waiting.collector_start.is_none() {
+            waiting.collector_start = waiting.refreshed_through;
         }
     }
 
@@ -845,6 +861,11 @@ impl Ingestion {
             .collect();
         for reader in (0..self.groups.len()).rev() {
             if expired[reader] == i64::MIN {
+                // A reader that closes nothing yet keeps every window it
+                // reads.
+                for &read in &self.groups[reader].reads {
+                    expired[read] = i64::MIN;
+                }
                 continue;
             }
             for &read in &self.groups[reader].reads {

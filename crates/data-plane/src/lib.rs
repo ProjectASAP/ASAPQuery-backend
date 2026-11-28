@@ -507,13 +507,10 @@ async fn write_otlp(
     metrics.otlp_decode.record(timer);
     let mut rejected_points = decoded.rejected_points;
     let mut message = decoded.rejection_message();
-    if !decoded.samples.is_empty() {
-        if let Some((status, message)) = ingest(&state, decoded.samples, "OTLP") {
-            return failed(status, &message);
-        }
-    }
-    // After the samples, so a request refused for them (503) stages no
-    // state; a retried state is then a duplicate.
+    // Before the samples: a request refused for them (503) is retried
+    // whole, and its states are then duplicates, which are ignored; the
+    // other way round, a request refused for its states would ingest its
+    // samples twice.
     if !decoded.view_states.is_empty() {
         match state
             .engine
@@ -546,6 +543,11 @@ async fn write_otlp(
                     &IngestError::Stopped.to_string(),
                 );
             }
+        }
+    }
+    if !decoded.samples.is_empty() {
+        if let Some((status, message)) = ingest(&state, decoded.samples, "OTLP") {
+            return failed(status, &message);
         }
     }
     let reply = otlp::export_response_body(rejected_points, message.as_deref());
