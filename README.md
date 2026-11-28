@@ -238,6 +238,21 @@ data kept by the data plane, and no query-time result kept across
 evaluations. For example `{"raw_data_retained": false}` makes the Planner
 build every input at ingestion time.
 
+Collector views (docs/design/collector-sketch-ingest.md): with
+`--collector-capabilities caps.json` (what the collector prints with
+`asap_sketches --print-capabilities`) and `--emit-collector-views cv.json`,
+the control plane also writes the part of the plan the collector runs: the
+views it builds instead of the data plane, the plan id, which metrics the
+data plane still reads raw, and the commit grace (the collector's close
+delay plus `--collector-export-interval-ms` and
+`--collector-clock-skew-allowance-ms`, default 2000). `--plan plan.json`
+reads a plan written before instead of planning `--workload`. The data
+plane started with `--collector-views cv.json` does not build those views:
+their states arrive from the collector on `/v1/metrics`, in metrics named
+`<metric>.asap_view.<node id>`, and each window is committed once the clock
+passes its end by the grace (`asap_collector_states_*` on `/metrics`). It
+refuses a file of another plan.
+
 `--cost-inputs costs.json` replaces the Planner's default `CostInputs`
 (Stage 3's cost model, resource speed and measured operation costs); an
 omitted field keeps its default, cost model 1 with illustrative unit costs.

@@ -8,6 +8,7 @@
 //! `asap-planner`, which defines `InstallablePlan`, still brings the
 //! executor and the frontends in at compile time.
 
+mod collector_views_file;
 mod fallback;
 mod plan;
 mod query_engine;
@@ -15,6 +16,7 @@ mod query_request;
 mod query_result;
 mod view_states;
 
+pub use collector_views_file::CollectorViewsFile;
 pub use fallback::{FallbackClient, FallbackError, FallbackResponse};
 pub use plan::{InstallError, InstalledPlan, PlanId};
 pub use query_engine::{AnswerSource, EngineQueryResult, QueryEngineError};

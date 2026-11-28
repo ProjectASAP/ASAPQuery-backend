@@ -1,0 +1,21 @@
+{"capabilities_version": 1,
+ "executor": {
+   "supported_summaries": [
+     {"summary": {"summary_type": "DDSketch", "readouts": []},               "input": "value", "parameters": {"alpha": {"gt": 0, "lt": 1}}},
+     {"summary": {"summary_type": "KLL", "readouts": []},                    "input": "value", "parameters": {"k": {"ge": 8, "le": 2147483647}}},
+     {"summary": {"summary_type": "HLL", "readouts": []},                    "input": "label", "parameters": {"precision": {"ge": 14, "le": 14}}},
+     {"summary": {"summary_type": "CountSketch", "readouts": []},            "input": "label", "parameters": {"width": {"ge": 1}, "depth": {"ge": 1}}},
+     {"summary": {"summary_type": "CountMinSketch", "readouts": []},         "input": "label", "parameters": {"width": {"ge": 1}, "depth": {"ge": 1}}},
+     {"summary": {"summary_type": "CountMinSketchWithHeap", "readouts": []}, "input": "label", "parameters": {"width": {"ge": 1}, "depth": {"ge": 1}, "heap_size": {"ge": 1}}}],
+   "raw_data_retained": false,
+   "query_time_results_retained": false,
+   "counter_semantics": {"reset_handling": false, "extrapolation": false},
+   "state_not_mergeable_across_windows": [],
+   "excluded_candidates": []},
+ "predicate_ops": ["Eq", "Ne"],
+ "operators": [
+   {"kind": "Scan", "sources": ["TimeSeries"]},
+   {"kind": "Filter"},
+   {"kind": "SummaryTumblingWindowChain", "reductions": ["PerEntity"]}],
+ "placement": {"partitioned_by": "series"},
+ "window_close_delay_ms": 6000}

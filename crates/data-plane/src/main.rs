@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use clap::Parser;
 
 /// jemalloc: Remote Write decoding and query runs allocate many small,
@@ -21,6 +22,7 @@ static malloc_conf: &[u8] =
     b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0,narenas:8\0";
 use data_plane::engine::EngineOptions;
 use data_plane::{router, DataPlane, DEFAULT_FORWARD_TIMEOUT};
+use precompute::collector::CollectorViewOptions;
 use precompute::engine::PrecomputeMode;
 use precompute::ingestion::IngestionOptions;
 use storage::persist::ViewRead;
@@ -113,6 +115,12 @@ struct Args {
     /// `--no-forward`.
     #[arg(long, conflicts_with = "no_forward")]
     raw_store_url: Option<String>,
+    /// The collector-views file the control plane wrote for the plan
+    /// (`--emit-collector-views`): its views are built by the collector,
+    /// whose states arrive on `/v1/metrics`, not by this data plane.
+    /// Refused when it is of another plan.
+    #[arg(long)]
+    collector_views: Option<PathBuf>,
     /// A ClickHouse server's HTTP interface base URL: serves ClickHouse's
     /// query route, `/clickhouse/query`, which forwards every query the plan
     /// does not answer to it. Cannot be used with `--no-forward`.
@@ -207,6 +215,16 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     let plan = std::fs::read_to_string(&args.plan)?;
+    let collector = match &args.collector_views {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let file: common::CollectorViewsFile = serde_json::from_str(&text)
+                .with_context(|| format!("parsing {}", path.display()))?;
+            CollectorViewOptions::from(&file)
+        }
+        None => CollectorViewOptions::default(),
+    };
     let forward_timeout = Duration::from_secs(args.forward_timeout_seconds);
     let mut state = DataPlane::with_options(
         plan,
@@ -244,6 +262,7 @@ async fn main() -> anyhow::Result<()> {
                 max_samples: args.push_batch_samples,
                 max_age_ms: args.push_batch_max_ms,
             },
+            collector,
             ..EngineOptions::default()
         },
     )?
