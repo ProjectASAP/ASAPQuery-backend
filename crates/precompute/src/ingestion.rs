@@ -26,6 +26,13 @@
 //! Raw samples are kept while a window still to be closed or a query-time
 //! `Scan` (back to its `retention_ms`) reads them.
 //!
+//! A view a collector builds ([`CollectorViewOptions`]) is a refresh group
+//! of its own that no run computes: its window closes once the wall clock
+//! passes its end by the commit grace, and its rows are the states the
+//! collector sent for it ([`crate::collector`]). Its `Scan`s keep no raw
+//! samples unless another reader needs them, and a group reading it closes
+//! a window only once that view's window has closed.
+//!
 //! [`Ingestion`] (the ingest coordinator) keeps the watermark and closes
 //! windows, and the ingest shards store the samples ([`Routing`]); each
 //! closed window is refreshed by [`Precompute`] (the precompute pool) over
@@ -51,6 +58,8 @@ use storage::store::{
 };
 
 use common::MAX_TIME_MS;
+
+use crate::collector::CollectorViewOptions;
 
 /// How ingestion treats sample times.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,7 +149,7 @@ const IDLE_GRACE_MS: i64 = 1_000;
 
 /// A refresh group's window `(end_ms - W, end_ms]` that the watermark has
 /// passed, to refresh; `group` indexes the plan's ingestion refresh groups.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ClosedWindow {
     pub group: usize,
     pub end_ms: i64,
@@ -175,8 +184,11 @@ struct RefreshGroup {
     /// The longest retention of its views.
     retention_ms: i64,
     /// End of the newest window closed or skipped; `None` before the
-    /// first sample of a metric it scans.
+    /// first sample of a metric it scans (a collector view's group: before
+    /// its first state).
     refreshed_through: Option<i64>,
+    /// A collector view's group: its windows close by the wall clock.
+    collector: bool,
 }
 
 impl RefreshGroup {
@@ -212,20 +224,26 @@ pub(crate) struct Ingestion {
     /// Groups whose windows the ingest shards build by push: they read no
     /// raw data, so they keep none.
     push_groups: Vec<bool>,
+    /// How long after its end a collector view's window closes.
+    commit_grace_ms: i64,
     pub stats: IngestionStats,
 }
 
 impl Ingestion {
     /// Compiles one ingestion run per refresh group of `dag`'s `views`,
-    /// for the [`Precompute`] returned with the ingestion. Refuses views
-    /// refreshed on first read, which the data plane does not refresh yet,
-    /// and groups without a bounded window.
+    /// for the [`Precompute`] returned with the ingestion; each of
+    /// `collector`'s views is a group of its own, compiled only for its
+    /// output schema. Refuses views refreshed on first read, which the data
+    /// plane does not refresh yet, groups without a bounded window, and a
+    /// collector view that is not refreshed at ingestion on windows that
+    /// end on multiples of their width.
     pub fn new(
         dag: &PhysicalASAPDAG,
         views: &[MaterializedView],
         groups: Vec<IngestionRefreshGroup>,
         options: IngestionOptions,
         limits: Limits,
+        collector: &CollectorViewOptions,
     ) -> Result<(Self, Precompute), IngestionError> {
         if let Some(view) = views
             .iter()
@@ -237,28 +255,30 @@ impl Ingestion {
             )));
         }
         let index = DagIndex::new(dag);
+        let groups = split_collector_views(groups, &collector.views)?;
         let group_of: HashMap<PhysicalASAPNodeId, usize> = groups
             .iter()
             .enumerate()
-            .flat_map(|(index, group)| group.views.iter().map(move |v| (v.node_id, index)))
+            .flat_map(|(index, (group, _))| group.views.iter().map(move |v| (v.node_id, index)))
             .collect();
         let mut runs = Vec::new();
         let mut clocks = Vec::new();
         let mut tasks = RefreshTaskGraph::default();
-        for group in groups {
+        for (group, from_collector) in groups {
             let ids: Vec<PhysicalASAPNodeId> = group.views.iter().map(|v| v.node_id).collect();
             let Some(window) = group.refresh_window else {
                 return Err(IngestionError::Unsupported(format!(
                     "views {ids:?} are refreshed over an unbounded window"
                 )));
             };
-            // The views of other groups it reads are view slots.
+            // The views of other groups it reads are view slots. A
+            // collector view reads none: its inputs are on the collector.
             let in_group: HashSet<PhysicalASAPNodeId> = ids.iter().copied().collect();
             let read: BTreeSet<PhysicalASAPNodeId> = group
                 .views
                 .iter()
                 .flat_map(|v| v.inputs.materialized_views.iter().copied())
-                .filter(|id| !in_group.contains(id))
+                .filter(|id| !in_group.contains(id) && !from_collector)
                 .collect();
             let read_views: Vec<MaterializedView> = views
                 .iter()
@@ -277,7 +297,8 @@ impl Ingestion {
                     .iter()
                     .any(|id| carries_state_across_windows(&index.nodes[id].payload)),
             );
-            let by_series = read.is_empty()
+            let by_series = !from_collector
+                && read.is_empty()
                 && below
                     .iter()
                     .all(|id| computes_each_series_alone(&index.nodes[id].payload));
@@ -298,8 +319,17 @@ impl Ingestion {
                     views: ids.clone(),
                     error,
                 })?;
-            let metrics = index.metrics_below(&ids, &read);
-            let started_by = index.metrics_below(&ids, &BTreeSet::new());
+            // A collector view's group scans nothing here and starts with
+            // its first state; a group reading one is not started by the
+            // metrics scanned below it.
+            let (metrics, started_by) = if from_collector {
+                (BTreeSet::new(), BTreeSet::new())
+            } else {
+                (
+                    index.metrics_below(&ids, &read),
+                    index.metrics_below(&ids, &collector.views),
+                )
+            };
             let margin_ms = options.view_retention_margin_ms;
             let views = group
                 .views
@@ -326,6 +356,7 @@ impl Ingestion {
                 started_by,
                 retention_ms,
                 refreshed_through: None,
+                collector: from_collector,
             });
         }
         let pane_width_ms = clocks
@@ -334,6 +365,7 @@ impl Ingestion {
             .fold(MAX_PANE_WIDTH_MS, gcd);
         // The `Scan`s the query run reads: below the roots, outside views.
         let view_ids: HashSet<PhysicalASAPNodeId> = views.iter().map(|v| v.node_id).collect();
+        let scanned_metrics = index.scanned_metrics_here(dag, &collector.views);
         let mut query_time_lookback_ms: HashMap<String, Option<i64>> = HashMap::new();
         for scan in index.below(&dag.roots, &view_ids) {
             let node = index.nodes[&scan];
@@ -357,7 +389,7 @@ impl Ingestion {
         }
         let ingestion = Self {
             groups: clocks,
-            scanned_metrics: Arc::new(storage::store::scanned_metrics(&dag.nodes)),
+            scanned_metrics: Arc::new(scanned_metrics),
             pane_width_ms,
             query_time_lookback_ms,
             options,
@@ -367,6 +399,7 @@ impl Ingestion {
             arrived_ms: None,
             idle_watermark_ms: None,
             push_groups: Vec::new(),
+            commit_grace_ms: millis(collector.commit_grace_ms),
             stats: IngestionStats::default(),
         };
         // Each view's readers: the groups whose runs read it.
@@ -510,10 +543,12 @@ impl Ingestion {
         let Some(idle) = self.idle_watermark_at(now_ms) else {
             return false;
         };
+                // A collector view's windows close by the clock, every tick.
         self.groups.iter().any(|group| {
-            group
-                .refreshed_through
-                .is_some_and(|through| through.saturating_add(group.width_ms) <= idle)
+            !group.collector
+                && group
+                    .refreshed_through
+                    .is_some_and(|through| through.saturating_add(group.width_ms) <= idle)
         })
     }
 
@@ -574,7 +609,10 @@ impl Ingestion {
             max_future_ms: millis(self.options.max_future_ms),
             cutoffs,
             late_through,
-            groups_waiting: self.groups.iter().any(|g| g.refreshed_through.is_none()),
+            groups_waiting: self
+                .groups
+                .iter()
+                .any(|g| g.refreshed_through.is_none() && !g.collector),
             views_closed_through: self
                 .scanned_metrics
                 .iter()
@@ -614,11 +652,17 @@ impl Ingestion {
         self.newest_sample_ms = self.newest_sample_ms.max(newest_ms);
     }
 
-    /// Closes and returns every window the watermark has passed, oldest
+        /// Closes and returns every window the watermark has passed (a
+    /// collector view's: wall-clock `now_ms` less the commit grace), oldest
     /// first within each group, groups in plan order (a group may read the
     /// views of an earlier one).
-    pub(crate) fn close(&mut self) -> Vec<ClosedWindow> {
-        self.close_windows()
+    pub(crate) fn close(&mut self, now_ms: i64) -> Vec<ClosedWindow> {
+        self.close_windows_at(now_ms)
+    }
+
+    /// Whether group `group` is a collector view's.
+    pub(crate) fn is_collector(&self, group: usize) -> bool {
+        self.groups[group].collector
     }
 
     /// An event-time barrier: the producer states that every sample at or
@@ -638,7 +682,7 @@ impl Ingestion {
             return (current, Vec::new());
         }
         self.barrier_ms = Some(barrier_ms);
-        (barrier_ms, self.close_windows())
+                (barrier_ms, self.close_windows_at(now_ms))
     }
 
     /// Starts each group scanning `metric` at its first sample: its first
@@ -699,12 +743,61 @@ impl Ingestion {
         cutoff
     }
 
-    /// Closes every window the watermark has passed and compacts the
-    /// panes it has passed.
-    fn close_windows(&mut self) -> Vec<ClosedWindow> {
-        let Some(watermark) = self.watermark_ms() else {
+    /// Starts collector view group `group` at its first state, of the
+    /// window ending at `end_ms`: that window is its first. A group started
+    /// by no metric, reading collector views only, starts once each of
+    /// those has, at its first window boundary after all of them.
+    pub(crate) fn start_collector_group(&mut self, group: usize, end_ms: i64) {
+        let started = &mut self.groups[group];
+        if started.refreshed_through.is_some() {
+            return;
+        }
+        started.refreshed_through = Some(end_ms - started.width_ms);
+        for reader in 0..self.groups.len() {
+            let waiting = &self.groups[reader];
+            if waiting.refreshed_through.is_some()
+                || !waiting.started_by.is_empty()
+                || !waiting.reads.contains(&group)
+            {
+                continue;
+            }
+            let reads_started: Option<Vec<i64>> = waiting
+                .reads
+                .iter()
+                .map(|&read| self.groups[read].refreshed_through)
+                .collect();
+            if let Some(start) = reads_started.and_then(|starts| starts.into_iter().max()) {
+                let waiting = &mut self.groups[reader];
+                waiting.refreshed_through = Some(waiting.window_end(start));
+            }
+        }
+    }
+
+    /// End of group `group`'s newest window closed or skipped.
+    pub(crate) fn closed_through(&self, group: usize) -> Option<i64> {
+        self.groups[group].refreshed_through
+    }
+
+        /// Closes every window the watermark has passed, and every collector
+    /// view's window wall-clock `now_ms` has passed by the commit grace.
+    pub(crate) fn close_windows_at(&mut self, now_ms: i64) -> Vec<ClosedWindow> {
+        let watermark = self.watermark_ms();
+        let collector_through = now_ms.saturating_sub(self.commit_grace_ms);
+        // Per group, the time its windows close through.
+        let closes_through: Vec<Option<i64>> = self
+            .groups
+            .iter()
+            .map(|group| {
+                if group.collector {
+                    Some(collector_through)
+                } else {
+                    watermark
+                }
+            })
+            .collect();
+        if closes_through.iter().all(Option::is_none) {
             return Vec::new();
-        };
+        }
         // Windows ending after this close only by the idle watermark.
         let event_watermark = self.event_watermark_ms();
         // Per group, the windows ending at or before this would already be
@@ -717,11 +810,18 @@ impl Ingestion {
         let mut expired: Vec<i64> = self
             .groups
             .iter()
-            .map(|group| {
-                group.window_end(watermark.saturating_sub(group.retention_ms)) - group.width_ms
+            .zip(&closes_through)
+            .map(|(group, through)| match through {
+                Some(through) => {
+                    group.window_end(through.saturating_sub(group.retention_ms)) - group.width_ms
+                }
+                None => i64::MIN,
             })
             .collect();
         for reader in (0..self.groups.len()).rev() {
+            if expired[reader] == i64::MIN {
+                continue;
+            }
             for &read in &self.groups[reader].reads {
                 let group = &self.groups[read];
                 // The latest boundary of `group` at or before the reader's.
@@ -732,8 +832,28 @@ impl Ingestion {
         let mut closed = Vec::new();
         // Per group, how far this pass skipped its expired windows.
         let mut skipped_to: Vec<Option<i64>> = vec![None; self.groups.len()];
-        for (index, group) in self.groups.iter_mut().enumerate() {
-            let Some(mut through) = group.refreshed_through else {
+        for index in 0..self.groups.len() {
+            // A group reading a collector view's group closes a window only
+            // once that group closed it: the two close by different clocks.
+            // One that scans no raw data itself follows those groups alone.
+            let mut closes_through = closes_through[index];
+            let group = &self.groups[index];
+            let collector_reads: Vec<usize> = group
+                .reads
+                .iter()
+                .copied()
+                .filter(|&read| self.groups[read].collector)
+                .collect();
+            if !collector_reads.is_empty() && group.metrics.is_empty() {
+                closes_through = Some(i64::MAX);
+            }
+            for read in collector_reads {
+                closes_through = closes_through.min(self.groups[read].refreshed_through);
+            }
+            let group = &mut self.groups[index];
+            let (Some(mut through), Some(closes_through)) =
+                (group.refreshed_through, closes_through)
+            else {
                 continue;
             };
             let mut expired_through = expired[index];
@@ -753,9 +873,9 @@ impl Ingestion {
             }
             while let Some(end) = through
                 .checked_add(group.width_ms)
-                .filter(|e| *e <= watermark)
+                .filter(|e| *e <= closes_through)
             {
-                if event_watermark.is_none_or(|w| end > w) {
+                                if !group.collector && event_watermark.is_none_or(|w| end > w) {
                     self.stats.windows_closed_by_wall_clock += 1;
                 }
                 closed.push(ClosedWindow {
@@ -1270,6 +1390,31 @@ impl<'a> DagIndex<'a> {
         seen
     }
 
+    /// The metrics a `Scan` of `dag` reads that a node not built by a
+    /// collector reads: not those only `collector_views` (and the nodes
+    /// below them) read.
+    fn scanned_metrics_here(
+        &self,
+        dag: &PhysicalASAPDAG,
+        collector_views: &BTreeSet<PhysicalASAPNodeId>,
+    ) -> BTreeSet<String> {
+        if collector_views.is_empty() {
+            return storage::store::scanned_metrics(&dag.nodes);
+        }
+        let on_collector = self.below(
+            &collector_views.iter().copied().collect::<Vec<_>>(),
+            &HashSet::new(),
+        );
+        let here: Vec<PhysicalASAPNodeId> = dag
+            .nodes
+            .iter()
+            .map(|node| node.id)
+            .filter(|id| !on_collector.contains(id))
+            .collect();
+        let stop: HashSet<PhysicalASAPNodeId> = collector_views.iter().copied().collect();
+        storage::store::scanned_metrics(self.below(&here, &stop).iter().map(|id| self.nodes[id]))
+    }
+
     /// The metrics scanned below `views`, not reading through `read_views`.
     fn metrics_below(
         &self,
@@ -1294,6 +1439,62 @@ fn with_retention_margin(
     let mut value = serde_json::to_value(view).map_err(error)?;
     value["retention_ms"] = (view.retention_ms().saturating_add(margin_ms)).into();
     serde_json::from_value(value).map_err(error)
+}
+
+/// `groups` with each of `collector`'s views taken out as a group of its
+/// own, before the rest of its group (which may read it). Errs for a
+/// collector view that is not in a group, or whose windows do not end on
+/// multiples of their width (a collector state's window does).
+fn split_collector_views(
+    groups: Vec<IngestionRefreshGroup>,
+    collector: &BTreeSet<PhysicalASAPNodeId>,
+) -> Result<Vec<(IngestionRefreshGroup, bool)>, IngestionError> {
+    if collector.is_empty() {
+        return Ok(groups.into_iter().map(|group| (group, false)).collect());
+    }
+    let mut split = Vec::with_capacity(groups.len() + collector.len());
+    let mut found = BTreeSet::new();
+    for group in groups {
+        let (on_collector, here): (Vec<MaterializedView>, Vec<MaterializedView>) = group
+            .views
+            .into_iter()
+            .partition(|view| collector.contains(&view.node_id));
+        for view in on_collector {
+            if group
+                .refresh_window
+                .is_none_or(|window| window.phase_ms != 0)
+            {
+                return Err(IngestionError::Unsupported(format!(
+                    "collector view {}: its windows do not end on multiples of their width",
+                    view.node_id
+                )));
+            }
+            found.insert(view.node_id);
+            let views = vec![view];
+            split.push((
+                IngestionRefreshGroup {
+                    refresh_window: group.refresh_window,
+                    views,
+                },
+                true,
+            ));
+        }
+        if !here.is_empty() {
+            split.push((
+                IngestionRefreshGroup {
+                    refresh_window: group.refresh_window,
+                    views: here,
+                },
+                false,
+            ));
+        }
+    }
+    if let Some(missing) = collector.iter().find(|id| !found.contains(id)) {
+        return Err(IngestionError::Unsupported(format!(
+            "collector view {missing} is not a materialized view refreshed at ingestion"
+        )));
+    }
+    Ok(split)
 }
 
 fn gcd(a: i64, b: i64) -> i64 {

@@ -462,11 +462,13 @@ async fn write_victoriametrics(State(state): State<Arc<DataPlane>>, body: Bytes)
 }
 
 /// `POST /v1/metrics`: an OTLP/HTTP metrics body (protobuf, gzip when its
-/// `Content-Encoding` says so), each data point ingested as a sample
-/// ([`otlp`]). Replies as OTLP/HTTP asks: 200 with an
-/// `ExportMetricsServiceResponse` once the engine has the samples, its
-/// `partial_success` counting the points rejected (sums with DELTA
-/// temporality); 400 for a malformed body, 415 for OTLP/JSON, which is not
+/// `Content-Encoding` says so), each data point ingested as a sample, or,
+/// under a collector view's metric, staged as that view's state
+/// ([`otlp`], [`precompute::collector`]). Replies as OTLP/HTTP asks: 200 with
+/// an `ExportMetricsServiceResponse` once the engine has the samples and
+/// states, its `partial_success` counting the points rejected (sums with
+/// DELTA temporality, states failing a check); 400 for a malformed body or
+/// view identity, 415 for OTLP/JSON, which is not
 /// decoded, and 503 or 500 as Remote Write, each with a `google.rpc.Status`
 /// body, encoded as the request was. Not served in forward mode (see
 /// [`router`]).
@@ -503,15 +505,41 @@ async fn write_otlp(
     };
     let metrics = state.engine.metrics();
     metrics.otlp_decode.record(timer);
-    let reply = otlp::export_response_body(
-        decoded.rejected_points,
-        decoded.rejection_message().as_deref(),
-    );
+    let mut rejected_points = decoded.rejected_points;
+    let mut message = decoded.rejection_message();
     if !decoded.samples.is_empty() {
         if let Some((status, message)) = ingest(&state, decoded.samples, "OTLP") {
             return failed(status, &message);
         }
     }
+    // After the samples, so a request refused for them (503) stages no
+    // state; a retried state is then a duplicate.
+    if !decoded.view_states.is_empty() {
+        match state
+            .engine
+            .ingest_collector_states(decoded.view_states)
+            .await
+        {
+            Ok(report) if report.rejected_total() > 0 => {
+                rejected_points += report.rejected_total();
+                let states = format!(
+                    "{} collector view states were rejected: {:?}",
+                    report.rejected_total(),
+                    report.rejected
+                );
+                message = Some(match message {
+                    Some(points) => format!("{points}; {states}"),
+                    None => states,
+                });
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!("OTLP collector states refused: {error}");
+                return failed(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+            }
+        }
+    }
+    let reply = otlp::export_response_body(rejected_points, message.as_deref());
     // Counted once the request is accepted, so a retried 503 counts once.
     metrics
         .otlp_rejected_points

@@ -13,6 +13,7 @@ mod plan;
 mod query_engine;
 mod query_request;
 mod query_result;
+mod view_states;
 
 pub use fallback::{FallbackClient, FallbackError, FallbackResponse};
 pub use plan::{InstallError, InstalledPlan, PlanId};
@@ -21,6 +22,10 @@ pub use query_request::{QueryEval, QueryRequest};
 pub use query_result::{
     Answer, InstantVector, InstantVectorElement, QueryResult, RangeVector, RangeVectorElement,
     ResultSample, Sample, Table, TableValue,
+};
+pub use view_states::{
+    view_identity, CollectorSeriesStates, CollectorViewStates, ViewStateBatch, ViewStateKey,
+    ViewStateRecord, ViewWindow,
 };
 
 /// The largest time, in milliseconds either side of the epoch, the data

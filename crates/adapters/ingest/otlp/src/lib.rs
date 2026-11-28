@@ -55,6 +55,21 @@
 //! - Points with a sketch payload attribute (`kll.`, `cms.` or
 //!   `countsketch.sketch_payload`) are skipped, as ASAPQuery skips them.
 //!
+//! # Collector view states
+//!
+//! A metric whose metadata names a view of the installed plan
+//! (`asap.plan_id`, `asap.node_id`, `asap.view_state_key`) carries collector
+//! view states, not samples (docs/design/collector-sketch-ingest.md, §4):
+//! each data point is one series' state in the window `(start_time_unix_nano,
+//! time_unix_nano]`, its ASAPv1 bytes in the `sketch.envelope` attribute and
+//! its sample count in `count`. Resource, scope and the other point
+//! attributes give the series' labels as for a sample, `__name__` being the
+//! metric's name before `.asap_view.`. They are decoded into
+//! [`Decoded::view_states`]; the state bytes are not read. A request whose
+//! view identity is missing in part or does not parse, or that has a
+//! `sketch.envelope` point outside such a metric, is refused
+//! ([`OtlpError::ViewIdentity`]).
+//!
 //! # Decoding
 //!
 //! As the Remote Write decoder, [`Decoder`] walks the protobuf in place,
@@ -66,9 +81,14 @@
 
 use std::borrow::Cow;
 use std::collections::btree_map::Entry;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 
+use common::view_identity::{ENVELOPE_ATTRIBUTE, NAME_INFIX, NODE_ID, PLAN_ID, VIEW_STATE_KEY};
+use common::{
+    CollectorSeriesStates, CollectorViewStates, LabelSet, ViewStateBatch, ViewStateKey,
+    ViewStateRecord,
+};
 use prometheus_remote_write::series_cache::SeriesCache;
 use prometheus_remote_write::wire::{Reader, Value};
 use prometheus_remote_write::RemoteWriteError;
@@ -108,6 +128,10 @@ pub enum OtlpError {
     Protobuf(String),
     #[error("request has more than {0} points")]
     TooManyPoints(usize),
+    /// A collector view's metric whose metadata lacks or misstates the view
+    /// identity, or a `sketch.envelope` point outside such a metric.
+    #[error("metric {metric}: view identity: {reason}")]
+    ViewIdentity { metric: String, reason: String },
 }
 
 /// The protobuf reader's errors ([`RemoteWriteError::Protobuf`]).
@@ -129,6 +153,8 @@ pub struct Decoded<S> {
     /// Data points refused, which the reply reports as rejected: the points
     /// of sums with DELTA temporality.
     pub rejected_points: u64,
+    /// The collector view states, by view and series, in request order.
+    pub view_states: ViewStateBatch,
 }
 
 impl<S> Decoded<S> {
@@ -217,11 +243,14 @@ fn walk<B: SampleBuilder>(
         key_buffer,
         options,
         max_points: limits.max_points,
+        states: 0,
+        series_of_state: HashMap::new(),
         decoded: Decoded {
             // Room for one sample per 50 encoded bytes, about one gauge
             // point with a few short attributes.
             samples: Vec::with_capacity(request.len() / 50),
             rejected_points: 0,
+            view_states: ViewStateBatch::default(),
         },
     };
     walk.request(request)?;
@@ -355,6 +384,12 @@ struct Walk<'a, B: SampleBuilder> {
     key_buffer: &'a mut Vec<u8>,
     options: &'a LabelOptions,
     max_points: usize,
+    /// Collector states decoded so far; with the samples, at most
+    /// `max_points`.
+    states: usize,
+    /// Each series' place in `decoded.view_states`: by view index and
+    /// labels, its index in the view's series.
+    series_of_state: HashMap<(usize, LabelSet), usize>,
     decoded: Decoded<B::Sample>,
 }
 
@@ -396,17 +431,20 @@ impl<B: SampleBuilder> Walk<'_, B> {
         Ok(())
     }
 
-    /// An encoded `Metric`: its name (field 1) and its data, one of gauge
+    /// An encoded `Metric`: its name (field 1), its data, one of gauge
     /// (5), sum (7), histogram (9), exponential histogram (10) or summary
-    /// (11), whose points (field 1) each give samples.
+    /// (11), whose points (field 1) each give samples, and its metadata
+    /// (12): with a view identity, its points are collector states.
     fn metric(&mut self, resource: &ResourceLabels, bytes: &[u8]) -> Result<(), OtlpError> {
         let mut name = "";
         let mut data = None;
+        let mut metadata = Vec::new();
         let mut reader = Reader::new(bytes);
         while let Some((field, value)) = reader.field()? {
             match (field, value) {
                 (1, Value::Bytes(text)) => name = utf8(text)?,
                 (5 | 7 | 9 | 10 | 11, Value::Bytes(found)) => data = Some((field, found)),
+                (12, Value::Bytes(key_value)) => metadata.push(key_value),
                 _ => {}
             }
         }
@@ -422,6 +460,18 @@ impl<B: SampleBuilder> Walk<'_, B> {
             10 => PointKind::ExponentialHistogram,
             _ => PointKind::Summary,
         };
+        if let Some(view) = self.view_of(name, &metadata)? {
+            let source_metric = name
+                .split_once(NAME_INFIX)
+                .map_or(name, |(source, _)| source);
+            let mut reader = Reader::new(data);
+            while let Some((field, value)) = reader.field()? {
+                if let (1, Value::Bytes(point)) = (field, value) {
+                    self.state_point(resource, name, source_metric, view, kind, point)?;
+                }
+            }
+            return Ok(());
+        }
         let delta_sum = field == 7 && {
             let mut temporality = 0;
             let mut reader = Reader::new(data);
@@ -555,7 +605,7 @@ impl<B: SampleBuilder> Walk<'_, B> {
                     series
                 }
             };
-            if self.decoded.samples.len() >= self.max_points {
+            if self.decoded.samples.len() + self.states >= self.max_points {
                 return Err(OtlpError::TooManyPoints(self.max_points));
             }
             self.decoded
@@ -594,6 +644,14 @@ impl<B: SampleBuilder> Walk<'_, B> {
                 pairs.push(key_value(attribute)?);
             }
         }
+        if pairs.iter().any(|(key, _)| *key == ENVELOPE_ATTRIBUTE) {
+            return Err(OtlpError::ViewIdentity {
+                metric: name.to_string(),
+                reason: format!(
+                    "a point has {ENVELOPE_ATTRIBUTE}, but the metric's metadata names no view"
+                ),
+            });
+        }
         if pairs
             .iter()
             .any(|(key, value)| is_sketch_payload(key, value))
@@ -608,6 +666,138 @@ impl<B: SampleBuilder> Walk<'_, B> {
         let series = self.builder.intern(&labels);
         self.series.insert(key, series);
         Ok(Some(series))
+    }
+}
+
+impl<B: SampleBuilder> Walk<'_, B> {
+    /// The index in `decoded.view_states` of the view metric `name`'s
+    /// `metadata` (encoded `KeyValue`s) names, added on first sight; `None`
+    /// for a metric whose metadata names no view (none of the identity
+    /// keys).
+    fn view_of(&mut self, name: &str, metadata: &[&[u8]]) -> Result<Option<usize>, OtlpError> {
+        let (mut plan_id, mut node_id, mut key) = (None, None, None);
+        for entry in metadata {
+            let (entry_key, value) = key_value(entry)?;
+            match entry_key {
+                PLAN_ID => plan_id = Some(value.text().into_owned()),
+                NODE_ID => node_id = Some(value.text().into_owned()),
+                VIEW_STATE_KEY => key = Some(value.text().into_owned()),
+                _ => {}
+            }
+        }
+        if plan_id.is_none() && node_id.is_none() && key.is_none() {
+            return Ok(None);
+        }
+        let refused = |reason: String| OtlpError::ViewIdentity {
+            metric: name.to_string(),
+            reason,
+        };
+        let missing = |key: &str| refused(format!("no {key} in the metric's metadata"));
+        let plan_id = plan_id
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| missing(PLAN_ID))?;
+        let node_id: usize = node_id
+            .ok_or_else(|| missing(NODE_ID))?
+            .parse()
+            .map_err(|e| refused(format!("{NODE_ID}: {e}")))?;
+        let key: ViewStateKey = serde_json::from_str(&key.ok_or_else(|| missing(VIEW_STATE_KEY))?)
+            .map_err(|e| refused(format!("{VIEW_STATE_KEY}: {e}")))?;
+        let views = &mut self.decoded.view_states.views;
+        if let Some(index) = views.iter().position(|view| {
+            view.node_id == node_id
+                && view.plan_id == plan_id
+                && view.key == key
+                && view.metric == name
+        }) {
+            return Ok(Some(index));
+        }
+        views.push(CollectorViewStates {
+            plan_id,
+            node_id,
+            key,
+            metric: name.to_string(),
+            series: Vec::new(),
+        });
+        Ok(Some(views.len() - 1))
+    }
+
+    /// An encoded data point of `kind` of the view metric `name` (over
+    /// `source_metric`), view `view` of `decoded.view_states`: one series'
+    /// state in one window.
+    fn state_point(
+        &mut self,
+        resource: &ResourceLabels,
+        name: &str,
+        source_metric: &str,
+        view: usize,
+        kind: PointKind,
+        point: &[u8],
+    ) -> Result<(), OtlpError> {
+        let (attributes_field, flags_field) = kind.attributes_and_flags_fields();
+        let (mut start_nanos, mut time_nanos, mut count, mut flags) = (0u64, 0u64, 0u64, 0u64);
+        let mut envelope = None;
+        let mut pairs = Vec::new();
+        let mut reader = Reader::new(point);
+        while let Some((field, value)) = reader.field()? {
+            match (field, value) {
+                (field, Value::Bytes(attribute)) if field == attributes_field => {
+                    match key_value(attribute)? {
+                        (ENVELOPE_ATTRIBUTE, AttributeValue::Bytes(bytes)) => {
+                            envelope = Some(bytes)
+                        }
+                        (ENVELOPE_ATTRIBUTE, AttributeValue::Text(_)) => {
+                            return Err(OtlpError::ViewIdentity {
+                                metric: name.to_string(),
+                                reason: format!("{ENVELOPE_ATTRIBUTE} is not bytes"),
+                            })
+                        }
+                        pair => pairs.push(pair),
+                    }
+                }
+                (2, Value::Fixed64(found)) => start_nanos = found,
+                (3, Value::Fixed64(found)) => time_nanos = found,
+                (4, Value::Fixed64(found)) if kind != PointKind::Number => count = found,
+                (field, Value::Varint(found)) if field == flags_field => flags = found,
+                _ => {}
+            }
+        }
+        // A view's window with no recorded value holds no state: nothing to
+        // stage (its window stays unstored unless another state comes).
+        if flags & FLAG_NO_RECORDED_VALUE != 0 {
+            return Ok(());
+        }
+        let Some(envelope) = envelope else {
+            return Err(OtlpError::ViewIdentity {
+                metric: name.to_string(),
+                reason: format!("a point has no {ENVELOPE_ATTRIBUTE} bytes"),
+            });
+        };
+        if self.decoded.samples.len() + self.states >= self.max_points {
+            return Err(OtlpError::TooManyPoints(self.max_points));
+        }
+        self.states += 1;
+        let labels: LabelSet = series_labels(resource, source_metric, &mut pairs)
+            .into_iter()
+            .map(|(name, value)| (name.into_owned(), value))
+            .collect();
+        let series = &mut self.decoded.view_states.views[view].series;
+        let index = *self
+            .series_of_state
+            .entry((view, labels))
+            .or_insert_with_key(|(_, labels)| {
+                series.push(CollectorSeriesStates {
+                    labels: labels.clone(),
+                    records: Vec::new(),
+                });
+                series.len() - 1
+            });
+        series[index].records.push(ViewStateRecord {
+            window_start_ms: (start_nanos / 1_000_000) as i64,
+            window_end_ms: (time_nanos / 1_000_000) as i64,
+            asapv1: envelope.to_vec(),
+            sample_count: count,
+        });
+        Ok(())
     }
 }
 
