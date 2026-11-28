@@ -81,9 +81,9 @@ Scope:
    asap_sketches --print-capabilities ─▶ capabilities.json            ▲ collector-views.json          │
                                                │                      │                               ▼
  workload ─▶ control-plane ─▶ InstallablePlan ─┼──────────────────────┼──────▶ data-plane  POST /v1/metrics
-              │ (asap-planner)                 ▼                      │         ├─ point without sketch.envelope ─▶ otlp ─▶ IngestEngine
+              │ (asap-planner)                 ▼                      │         ├─ point without sketch.envelope ─▶ otlp ─▶ PrecomputeEngine::try_ingest
               └─ collector view rule (reads capabilities.json) ───────┘         └─ point with sketch.envelope ─▶ asap-sketch-otlp ─▶ ViewStateBatch
-                 (same collector-views.json) ────────────────────────────▶ data-plane      ─▶ ViewStateIngest ─▶ precompute committer ─▶ view store
+                 (same collector-views.json) ────────────────────────────▶ data-plane      ─▶ PrecomputeEngine::ingest_collector_states ─▶ committer ─▶ storage::ViewStore
 ```
 
 | Component | Crate or repository | Role |
@@ -436,7 +436,8 @@ use asap_types::plan::materialized_view::ViewStateKey;
 use asap_types::ir::properties::selection::SelectionBox;
 
 /// Collector states from one collector stream: what the sketch-path ingest
-/// adapter hands the ingest engine. Nested by OTAP tier, so a view's key and
+/// adapter hands `PrecomputeEngine`. In `common` because the adapter depends only on `common`
+/// and must produce it. Nested by OTAP tier, so a view's key and
 /// a series' labels appear once, not per record. Never data between operators.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewStateBatch {
@@ -470,7 +471,7 @@ pub struct ViewStateRecord {
 
 /// What happened to a batch's records.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ViewStateIngestReport {
+pub struct CollectorStateIngestReport {
     pub staged: u64,
     pub duplicate: u64,
     pub merged: u64,
@@ -479,17 +480,16 @@ pub struct ViewStateIngestReport {
     pub rejected: BTreeMap<&'static str, u64>,
 }
 
-/// Takes collector states. Implemented by the ingest engine, next to `IngestEngine`.
-#[async_trait]
-pub trait ViewStateIngest: Send + Sync {
+impl PrecomputeEngine {
     /// Checks, stages or merges each record; waits under backpressure as
-    /// `IngestEngine::ingest` does.
-    async fn ingest_view_states(&self, batch: ViewStateBatch)
-        -> Result<ViewStateIngestReport, IngestError>;
+    /// `try_ingest` does. A method, not a trait: a trait is added with its
+    /// second implementation, and there is one.
+    pub async fn ingest_collector_states(&self, batch: ViewStateBatch)
+        -> Result<CollectorStateIngestReport, IngestError>;
 }
 ```
 
-`ViewStore` is unchanged: every collector view window is `put` once, at commit.
+`storage::ViewStore` is unchanged: every collector view window is written once, at commit.
 
 ### `crates/adapters/ingest/asap-sketch-otlp`
 
@@ -718,7 +718,7 @@ Pins (all three repositories):
 Backend:
 
 2. This document.
-3. `ViewStateBatch` and `ViewStateIngest` in `common`; the
+3. `ViewStateBatch` in `common`, `PrecomputeEngine::ingest_collector_states` and `CollectorStateIngestReport` in `precompute`; the
    `asap-sketch-otlp` adapter; the `/v1/metrics` split; lookup by key and
    selection, the series cache, staging, the hash set, merge before commit,
    commit at grace, late drop. Test data: real ASAPv1 records the collector
