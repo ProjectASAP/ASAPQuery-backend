@@ -632,7 +632,7 @@ keeps a rollup result cache for this; the data plane keeps one too
 - Key and value: (planned query root, evaluation time T) → the answer
   vector (`Arc`). An instant query at T and a range step at T share the
   entry. Not aligned start/end are still correct, with fewer hits.
-- Only final answers are kept (`QueryEngine::evaluate`): the run succeeded,
+- Only final answers are kept (`CompiledQueries::evaluate`): the run succeeded,
   so every view window it read was stored (a window is appended once, when
   the watermark closes it, and never changes; a missing one fails the run);
   and, when the root reaches a `Scan` without passing a view (it reads raw

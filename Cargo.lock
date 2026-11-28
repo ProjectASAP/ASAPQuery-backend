@@ -2924,6 +2924,7 @@ dependencies = [
  "anyhow",
  "asap-executor",
  "common",
+ "control_plane",
  "futures",
  "internal_metrics",
  "serde_json",

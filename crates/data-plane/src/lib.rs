@@ -2,25 +2,30 @@
 //! the Prometheus query API for an installed plan.
 //!
 //! The installed plan is ASAPPlanner's `InstallablePlan`: one selected
-//! physical ASAP DAG. The engine's ingest shards store the raw samples its
-//! `Scan`s read, its precompute pool refreshes the materialized views in
-//! ingestion runs, and query worker threads answer the plan's instant and
-//! range queries with query runs, all through the Planner's executor
-//! ([`engine`]); every other query, and any planned query it cannot
-//! answer, is forwarded to Prometheus (or refused with `--no-forward`).
+//! physical ASAP DAG. The precompute engine's ingest shards store the raw
+//! samples its `Scan`s read and its precompute pool refreshes the
+//! materialized views in ingestion runs ([`precompute`]); the query
+//! engine's worker threads answer the plan's instant and range queries
+//! with query runs ([`query`]), all through the Planner's executor. The
+//! HTTP routes run queries through the [`dispatcher`]: every other query,
+//! and any planned query the plan cannot answer, is forwarded to
+//! Prometheus (or refused with `--no-forward`).
 //!
 //! Forward mode (`--raw-store-url`, [`raw_forward`]): every accepted Remote
 //! Write request is also delivered to a raw store (VictoriaMetrics), which
 //! then answers every query the plan does not and every other API path
 //! (labels, series, metadata), proxied with `x-asap-execution: forwarded`.
 
+mod dispatcher;
 pub mod engine;
+mod installer;
 mod metrics_endpoint;
 pub mod prometheus;
 pub mod raw_forward;
 pub mod remote_write;
+#[cfg(test)]
+mod test_support;
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,6 +35,7 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use dispatcher::{Fallback, NotAnswerableReason, QueryOutcome};
 use engine::{EngineHandle, EngineOptions};
 use precompute::engine::IngestError;
 use prometheus::{InstantQuery, RangeQuery};
@@ -342,41 +348,32 @@ async fn query(
             return (StatusCode::BAD_REQUEST, body).into_response();
         }
     };
-    let reason = match answer(&state, instant).await {
-        Ok(response) => {
+    // At its time, or now.
+    let time_ms = instant
+        .time_ms
+        .unwrap_or_else(precompute::ingestion::wall_clock_ms);
+    let dispatcher = state.engine.dispatcher();
+    let reason = match dispatcher.instant(&instant.query, time_ms).await {
+        QueryOutcome::Ready(samples) => {
+            let response = prometheus::VectorResponse { time_ms, samples };
             let mut response = axum::Json(response).into_response();
             response
                 .headers_mut()
                 .insert(EXECUTION_HEADER, HeaderValue::from_static("plan"));
             return response;
         }
-        Err(reason) if state.no_forward => return not_answered(&reason.to_string()),
-        Err(Unanswered::NotPlanned(_)) => None,
-        Err(reason) => {
-            tracing::debug!(%reason, "forwarding a planned query");
-            Some(header_value(&reason.to_string()))
+        QueryOutcome::NotAnswerable(reason) => reason,
+    };
+    match Fallback::new(reason, &instant.query, state.no_forward) {
+        Fallback::Refuse { reason } => not_answered(&reason),
+        Fallback::Forward { reason } => {
+            if let Some(reason) = &reason {
+                tracing::debug!(%reason, "forwarding a planned query");
+            }
+            let response = forward(state, "query", method, query, headers, body).await;
+            with_forward_reason(response, reason)
         }
-    };
-    let mut response = forward(state, "query", method, query, headers, body).await;
-    if let Some(reason) = reason {
-        response.headers_mut().insert(FORWARD_REASON_HEADER, reason);
     }
-    response
-}
-
-/// Runs a planned instant query at its time, or now.
-async fn answer(
-    state: &DataPlane,
-    query: InstantQuery,
-) -> Result<prometheus::VectorResponse, Unanswered> {
-    let time_ms = query
-        .time_ms
-        .unwrap_or_else(precompute::ingestion::wall_clock_ms);
-    let samples = match state.engine.cached(&query.query, time_ms) {
-        Some(samples) => samples,
-        None => state.engine.evaluate(query.query, time_ms).await?,
-    };
-    Ok(prometheus::VectorResponse { time_ms, samples })
 }
 
 /// Answers a planned range query from the plan, one evaluation per step;
@@ -401,7 +398,7 @@ async fn query_range(
             return (StatusCode::BAD_REQUEST, body).into_response();
         }
     };
-    let reason = match answer_range(&state, range).await {
+    let reason = match answer_range(&state, &range).await {
         Ok(body) => {
             let mut response = (
                 [(
@@ -416,75 +413,46 @@ async fn query_range(
                 .insert(EXECUTION_HEADER, HeaderValue::from_static("plan"));
             return response;
         }
-        Err(reason) if state.no_forward => return not_answered(&reason.to_string()),
-        Err(Unanswered::NotPlanned(_)) => None,
-        Err(reason) => {
-            tracing::debug!(%reason, "forwarding a planned range query");
-            Some(header_value(&reason.to_string()))
-        }
+        Err(reason) => reason,
     };
-    let mut response = forward(state, "query_range", method, query, headers, body).await;
+    match Fallback::new(reason, &range.query, state.no_forward) {
+        Fallback::Refuse { reason } => not_answered(&reason),
+        Fallback::Forward { reason } => {
+            if let Some(reason) = &reason {
+                tracing::debug!(%reason, "forwarding a planned range query");
+            }
+            let response = forward(state, "query_range", method, query, headers, body).await;
+            with_forward_reason(response, reason)
+        }
+    }
+}
+
+/// A forwarded response, with why the plan did not answer its planned
+/// query (`x-asap-forward-reason`).
+fn with_forward_reason(mut response: Response, reason: Option<String>) -> Response {
     if let Some(reason) = reason {
-        response.headers_mut().insert(FORWARD_REASON_HEADER, reason);
+        response
+            .headers_mut()
+            .insert(FORWARD_REASON_HEADER, header_value(&reason));
     }
     response
 }
 
-/// Runs a planned query at every step of `range`, the steps in parallel on
-/// the query workers; unanswered if any step is.
-async fn answer_range(state: &DataPlane, range: RangeQuery) -> Result<Vec<u8>, Unanswered> {
-    use futures::StreamExt;
-    let started = std::time::Instant::now();
-    let query = &range.query;
-    // The steps the result cache answers; only the others run.
-    let cached: Vec<(i64, Option<_>)> = range
-        .times_ms()
-        .map(|time_ms| (time_ms, state.engine.cached(query, time_ms)))
-        .collect();
-    let from_cache = cached.iter().filter(|(_, hit)| hit.is_some()).count();
-    // Every step reads the same snapshot, so the raw data they share is
-    // converted once ([`store::RawReads`]).
-    let snapshot = state.engine.snapshot();
-    // At most one step per query worker in flight, so a long range neither
-    // floods the workers' queue nor starves instant queries; the client
-    // going away drops the rest unrun. Every step runs even when one fails:
-    // with `final_query_results_cached` the plan keeps a step's inputs only
-    // for the refresh interval, so the older steps of a span are answered
-    // from the result cache, and a request whose older steps are not cached
-    // yet (the first span after a start) still caches the steps it can
-    // answer; a dashboard refreshing the range fills the cache within one
-    // span.
-    let results: Vec<Result<_, Unanswered>> = futures::stream::iter(cached)
-        .map(|(time_ms, hit)| {
-            let snapshot = snapshot.clone();
-            async move {
-                let samples = match hit {
-                    Some(samples) => samples,
-                    None => {
-                        state
-                            .engine
-                            .evaluate_range_step(query.clone(), time_ms, snapshot)
-                            .await?
-                    }
-                };
-                Ok::<_, Unanswered>((time_ms, samples))
-            }
-        })
-        .buffered(state.engine.query_threads())
-        .collect()
-        .await;
-    let steps: Vec<_> = results.into_iter().collect::<Result<_, _>>()?;
-    if let Some(metrics) = state.engine.metrics().query(query) {
-        metrics
-            .range_latency
-            .observe(started.elapsed().as_secs_f64());
-        metrics
-            .range_steps_cached
-            .fetch_add(from_cache as u64, Ordering::Relaxed);
-        metrics
-            .range_steps
-            .fetch_add(steps.len() as u64, Ordering::Relaxed);
-    }
+/// Runs a planned query at every step of `range` through the dispatcher
+/// and writes the response body; why not, if any step is unanswered.
+async fn answer_range(
+    state: &DataPlane,
+    range: &RangeQuery,
+) -> Result<Vec<u8>, NotAnswerableReason> {
+    let steps = match state
+        .engine
+        .dispatcher()
+        .range(&range.query, range.times_ms())
+        .await
+    {
+        QueryOutcome::Ready(steps) => steps,
+        QueryOutcome::NotAnswerable(reason) => return Err(reason),
+    };
     // Grouping every step's answer by series and writing the JSON takes
     // long for a long range of many series (241 steps of 2,800 series:
     // about 0.85 s), all of it without an await, even when every step is
@@ -492,12 +460,13 @@ async fn answer_range(state: &DataPlane, range: RangeQuery) -> Result<Vec<u8>, U
     // on that worker, instant queries and Remote Write included, and with
     // every worker so busy no timer or socket is polled: built on the
     // blocking pool instead.
+    let failed = |error: String| NotAnswerableReason::new(Unanswered::Execution(error));
     tokio::task::spawn_blocking(move || {
         prometheus::range_response_body(&steps)
-            .map_err(|error| Unanswered::Execution(format!("the range response: {error}")))
+            .map_err(|error| failed(format!("the range response: {error}")))
     })
     .await
-    .map_err(|error| Unanswered::Execution(format!("building the range response: {error}")))?
+    .map_err(|error| failed(format!("building the range response: {error}")))?
 }
 
 /// With `--no-forward`, the answer to a query the plan does not answer: a

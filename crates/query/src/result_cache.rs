@@ -4,7 +4,7 @@
 //! An instant query at `T` and a range step at `T` share one entry.
 //!
 //! Only a final answer is kept: one whose inputs can no longer change
-//! ([`crate::QueryEngine`] decides). Entries are dropped once `T`
+//! ([`crate::CompiledQueries`] decides). Entries are dropped once `T`
 //! falls further behind the watermark than any planned evaluation reaches
 //! back (the plan's longest retention plus the view retention margin), and
 //! the least recently used while more than `max_bytes` are held.
@@ -79,7 +79,7 @@ impl ResultCache {
     /// longest retention (every view and raw-data `Scan` keeps its rows
     /// that far back from the newest evaluation time) plus `margin_ms`;
     /// `None` when a `Scan` reads its rows unbounded.
-    pub fn horizon_ms(dag: &PhysicalASAPDAG, margin_ms: u64) -> Option<i64> {
+    pub(crate) fn horizon_ms(dag: &PhysicalASAPDAG, margin_ms: u64) -> Option<i64> {
         let unbounded_scan = dag.nodes.iter().any(|node| {
             node.retention_ms.is_none()
                 && matches!(node.payload, Operator::NonASAP(NonASAPOp::Scan { .. }))
