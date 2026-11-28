@@ -155,47 +155,54 @@ the backend holds no table of the collector's operators or sketches.
 {"capabilities_version": 1,
  "executor": {
    "supported_summaries": [
-     {"summary_type": "DDSketch",               "readouts": []},
-     {"summary_type": "KLL",                    "readouts": []},
-     {"summary_type": "HLL",                    "readouts": []},
-     {"summary_type": "CountSketch",            "readouts": []},
-     {"summary_type": "CountMinSketch",         "readouts": []},
-     {"summary_type": "CountMinSketchWithHeap", "readouts": []}],
+     {"summary": {"summary_type": "DDSketch", "readouts": []},               "input": "value", "parameters": {"alpha": {"gt": 0, "lt": 1}}},
+     {"summary": {"summary_type": "KLL", "readouts": []},                    "input": "value", "parameters": {"k": {"ge": 8, "le": 2147483647}}},
+     {"summary": {"summary_type": "HLL", "readouts": []},                    "input": "label", "parameters": {"precision": {"ge": 14, "le": 14}}},
+     {"summary": {"summary_type": "CountSketch", "readouts": []},            "input": "label", "parameters": {"width": {"ge": 1}, "depth": {"ge": 1}}},
+     {"summary": {"summary_type": "CountMinSketch", "readouts": []},         "input": "label", "parameters": {"width": {"ge": 1}, "depth": {"ge": 1}}},
+     {"summary": {"summary_type": "CountMinSketchWithHeap", "readouts": []}, "input": "label", "parameters": {"width": {"ge": 1}, "depth": {"ge": 1}, "heap_size": {"ge": 1}}}],
    "raw_data_retained": false,
    "query_time_results_retained": false,
    "counter_semantics": {"reset_handling": false, "extrapolation": false},
    "state_not_mergeable_across_windows": [],
    "excluded_candidates": []},
+ "predicate_ops": ["Eq", "Ne"],
  "operators": [
-   {"kind": "Scan",   "sources": ["TimeSeries"], "predicate_ops": ["Eq", "Ne"]},
-   {"kind": "Filter", "predicate_ops": ["Eq", "Ne"]},
-   {"kind": "SummaryTumblingWindowChain", "reductions": ["PerEntity"], "predicate_ops": ["Eq", "Ne"],
-    "summaries": [
-      {"summary_type": {"Sketch": "DDSketch"},               "input": "value", "parameters": {"alpha": {"gt": 0, "lt": 1}}},
-      {"summary_type": {"Sketch": "KLL"},                    "input": "value", "parameters": {"k": {"ge": 8, "le": 2147483647}}},
-      {"summary_type": {"Sketch": "HLL"},                    "input": "label", "parameters": {"precision": {"ge": 14, "le": 14}}},
-      {"summary_type": {"Sketch": "CountSketch"},            "input": "label", "parameters": {"width": {"ge": 1}, "depth": {"ge": 1}}},
-      {"summary_type": {"Sketch": "CountMinSketch"},         "input": "label", "parameters": {"width": {"ge": 1}, "depth": {"ge": 1}}},
-      {"summary_type": {"Sketch": "CountMinSketchWithHeap"}, "input": "label", "parameters": {"width": {"ge": 1}, "depth": {"ge": 1}, "heap_size": {"ge": 1}}}]}],
+   {"kind": "Scan", "sources": ["TimeSeries"]},
+   {"kind": "Filter"},
+   {"kind": "SummaryTumblingWindowChain", "reductions": ["PerEntity"]}],
  "placement": {"partitioned_by": "series"},
  "window_close_delay_ms": 6000}
 ```
 
-- `executor`: ASAPPlanner's `DeploymentCapabilities`, with its own serde
-  (`asap_types::deployment_capabilities`). Today's collector builds states
-  but answers no readout (no `SummaryEstimate`), keeps no raw data and no
-  query-time result, and has no counter functions.
-- `operators`: each entry is a planner `OperatorKind` with the argument
-  constraints the collector accepts; an operator not listed is not run.
-  `predicate_ops` are `CompareOpKind`s of a label column with a `Utf8`
-  literal (PromQL `=`, `!=`; no regular expressions), for a `Scan`'s
-  `predicates`, a `Filter`'s `pred` and a chain's `filter`. A chain's
-  `summary_type`, `input` and every `parameters` value must match one
-  `summaries` entry. `input: "value"`: the summary's `input` is `{"item":
-  null, "weight": {"Column": "SampleValue"}}`; `input: "label"`: `item` is
-  one label column. The ranges are the ones the collector's config
-  validation enforces; the command prints them from that code, so the two
-  cannot drift.
+Each capability is stated once. The sketches, with their parameter ranges,
+input kind and readouts, are only in `executor.supported_summaries`; the
+predicates every operator accepts are only in `predicate_ops`; `operators`
+lists operator kinds and the limits that belong to one operator.
+
+- `executor`: ASAPPlanner's `DeploymentCapabilities`, with its serde
+  (`asap_types::deployment_capabilities`), except that the planner's
+  `SupportedSummary` (`summary_type` and `readouts`; unchanged, it has no
+  field for the rest) is wrapped by the collector's own entry
+  `{"summary": <SupportedSummary>, "input": ..., "parameters": ...}`. The
+  control plane reads the entries, builds the planner's
+  `DeploymentCapabilities` from their `summary` fields, and keeps `input`
+  and `parameters` for the rule. `input: "value"`: the summary's `input` is
+  `{"item": null, "weight": {"Column": "SampleValue"}}`; `input: "label"`:
+  `item` is one label column. `parameters` are the ranges the collector's
+  config validation enforces; the command prints them from that code, so
+  the two cannot drift. `readouts: []` because the collector reads no value
+  from a sketch yet; a sketch's readouts are filled when `SummaryEstimate`
+  is supported. Today's collector keeps no raw data and no query-time
+  result, and has no counter functions.
+- `predicate_ops`: `CompareOpKind`s of a label column with a `Utf8` literal
+  (PromQL `=`, `!=`; no regular expressions), for every operator that takes
+  a predicate: a `Scan`'s `predicates`, a `Filter`'s `pred`, a chain's
+  `filter`.
+- `operators`: each entry is a planner `OperatorKind`; an operator not
+  listed is not run. Its other fields are limits of that operator only:
+  `sources` (`Scan`: the source variants), `reductions` (a chain: `Reduction`
+  variant names).
 - `placement`: how series are partitioned across collector instances.
   `"series"`: all samples of one series reach one instance (a restart or
   handoff may split a window, which the backend merges, §6).
@@ -211,9 +218,9 @@ from their planner fields only (no cost comparison, decision 6). A node is
 assigned if and only if all of these hold:
 
 1. **Within the capabilities.** Its `OperatorKind` is in `operators` and its
-   arguments meet that entry's constraints; any summary it builds is in
-   `executor.supported_summaries`, and any readout it answers is listed
-   there.
+   arguments meet that entry's limits and `predicate_ops`; any summary it
+   builds is in `executor.supported_summaries` with its `input` and
+   `parameters` in range, and any readout it answers is listed there.
 2. **Inputs on the collector.** Every input is a `Scan` of raw data
    (`TimeSeries { metric }`) or a node already assigned.
 3. **At ingestion.** It runs at ingestion time (`output_state.timing` is
@@ -246,6 +253,33 @@ label `Filter`s, chain), and the `TimeRange`, `SummaryMerge` and
 `sum`, `max` or counter state, and it is not in the capabilities. Views of
 `ExactAggregate` become collector views when the collector declares them
 (§7: with the executor embedded, it declares what the executor runs).
+
+**Moving the cut: one line per operator.** Take `quantile_over_time(0.99,
+data[1m])` with the rule unchanged. Today the cut is the chain: the merge of
+a minute of windows and the quantile run in the backend. If the collector
+supports more, only the capabilities change, and the planner (reading the
+same `executor` capabilities) may then put these nodes at ingestion:
+
+```text
+n1  SummaryTumblingWindowChain  DDSketch            -> a view today
+n2  SummaryMergeWindows         last 60 s, per series  (IngestionTime)
+n3  SummaryEstimate Quantile(0.99)                     (IngestionTime)
+```
+
+- Add `{"kind": "SummaryMergeWindows"}` to `operators`: n2 meets rule 1, so
+  the cut moves up to n2 and the view is the merged state.
+- Also set DDSketch's `"readouts": ["Quantile"]` in
+  `executor.supported_summaries` and add `{"kind": "SummaryEstimate"}`: n3
+  is assigned, the cut moves to n3 and the view is an exact value. The
+  statistic is stated once, as the sketch's readout.
+
+No code changes: the rule, the file formats and the views file are the same.
+`placement` keeps what is not local in the backend. For `sum by (region)
+(quantile_over_time(0.99, data[1m]))` the `Aggregate` over regions needs
+`{"kind": "Aggregate"}` listed, and rule 4 then decides: with
+`"partitioned_by": "series"` a region's series are on several instances, so
+the `sum by (region)` stays on the backend; with `{"labels": ["region"]}`
+each region is on one instance and the `Aggregate` is assigned too.
 
 **Known limitation: sparse series.** The rule ignores size. A series with
 few samples per window can produce a state larger than its raw samples (a
@@ -669,15 +703,20 @@ branch.
 #[serde(deny_unknown_fields)]
 pub struct CollectorCapabilities {
     pub capabilities_version: u32,
-    /// The planner's own executor capabilities, unchanged serde.
-    pub executor: DeploymentCapabilities,
+    /// The planner's `DeploymentCapabilities` serde, with each
+    /// `supported_summaries` entry a `CollectorSummary`; the control plane
+    /// builds the planner type from the entries' `summary` fields.
+    pub executor: CollectorExecutor,
+    /// Label comparisons with a `Utf8` literal, for every operator that
+    /// takes a predicate.
+    pub predicate_ops: Vec<CompareOpKind>,
     pub operators: Vec<OperatorCapability>,
     pub placement: Placement,
     pub window_close_delay_ms: u64,
 }
 
-/// One operator the collector runs, with its argument constraints. A
-/// constraint that does not apply to `kind` is a load error.
+/// One operator the collector runs, with the limits of that operator only.
+/// A limit that does not apply to `kind` is a load error.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorCapability {
@@ -685,23 +724,26 @@ pub struct OperatorCapability {
     /// `Scan`: the source variants, e.g. `TimeSeries`.
     #[serde(default)]
     pub sources: Vec<String>,
-    /// Label comparisons with a `Utf8` literal, in `Scan.predicates`,
-    /// `Filter.pred` or a chain's `filter`.
-    #[serde(default)]
-    pub predicate_ops: Vec<CompareOpKind>,
     /// Chain: `Reduction` variant names, e.g. `PerEntity`.
     #[serde(default)]
     pub reductions: Vec<String>,
-    /// Chain: the summary types it builds, with parameter ranges.
-    #[serde(default)]
-    pub summaries: Vec<SummaryCapability>,
 }
 
+/// `executor`: every `DeploymentCapabilities` field with its planner serde,
+/// except `supported_summaries`, whose entries are `CollectorSummary`s.
+pub struct CollectorExecutor {
+    pub supported_summaries: Vec<CollectorSummary>,
+    #[serde(flatten)]
+    pub rest: DeploymentCapabilities, // its own `supported_summaries` stays `None`
+}
+
+/// An entry of `executor.supported_summaries`: the planner's
+/// `SupportedSummary` (unchanged) plus what only the collector states.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SummaryCapability {
-    pub summary_type: FieldDataType,
-    pub input: SummaryInputKind, // Value | Label
+pub struct CollectorSummary {
+    pub summary: SupportedSummary, // summary_type + readouts
+    pub input: SummaryInputKind,   // Value | Label
     pub parameters: BTreeMap<String, ParameterRange>, // gt, ge, lt, le: Option<f64>
 }
 
@@ -755,8 +797,8 @@ pub fn collector_sub_dag(
 ) -> (CollectorViewsFile, Vec<(PhysicalASAPNodeId, NotOnCollector)>);
 ```
 
-`DeploymentCapabilities`, `OperatorKind`, `FieldDataType` (the chain's
-`summary_type`) and `CompareOpKind` are the planner's types. CLI:
+`DeploymentCapabilities`, `SupportedSummary`, `OperatorKind` and
+`CompareOpKind` are the planner's types, unchanged. CLI:
 `control_plane --plan <plan.json> --collector-capabilities
 <capabilities.json> [--collector-export-interval-ms <ms>]
 --emit-collector-views <collector-views.json>`; the data plane takes
@@ -1078,11 +1120,14 @@ arrival-delay histogram. Cost-based choice of collector views. The OTAP Arrow ad
     and they are correct on one instance's partition. The maximal such
     sub-DAG is cut; its outputs are listed in the file. Today's leaf rule is
     the case of today's capabilities, so v1's scope is unchanged.
-24. **Capabilities in the planner's vocabulary.** `executor` is the
-    planner's `DeploymentCapabilities`, `operators` are `OperatorKind`s with
-    argument constraints, and `placement` says how series are partitioned,
-    so a new collector operator is a capabilities change, not a backend
-    change.
+24. **Capabilities in the planner's vocabulary, each stated once.**
+    `executor` is the planner's `DeploymentCapabilities`, each sketch once
+    with its parameter ranges, input kind and readouts (the planner's
+    `SupportedSummary` wrapped by the collector's entry, planner type
+    unchanged); `predicate_ops` is shared by every operator that takes a
+    predicate; `operators` are `OperatorKind`s with only their own limits;
+    `placement` says how series are partitioned. A new collector operator
+    is one line, not a backend change.
 25. **Target: the collector embeds `asap-executor`.** It compiles and
     instantiates its sub-DAG as the backend does, so its capabilities are
     the executor's and both sides run the same code. v1 maps leaf views
