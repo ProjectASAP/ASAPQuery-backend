@@ -14,7 +14,7 @@ use control_plane::plan_workload;
 use data_plane::engine::EngineOptions;
 use data_plane::{router, DataPlane};
 use http_body_util::BodyExt;
-use precompute::ingestion::IngestionOptions;
+use precompute::ingestion::{IngestionOptions, WallClock};
 use prometheus_remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use serde_json::json;
 use tower::ServiceExt;
@@ -147,6 +147,7 @@ async fn range_requests_do_not_hold_up_instant_queries_or_writes() {
     let dir = std::env::temp_dir().join(format!("range-isolation-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let options = EngineOptions {
+        clock: WallClock::stopped(),
         no_forward: true,
         query_threads: std::env::var("RANGE_ISOLATION_QUERY_THREADS")
             .map_or(8, |n| n.parse().unwrap()),

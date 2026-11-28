@@ -40,6 +40,9 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:8088")]
     listen: String,
     /// How long after the newest sample passes a window's end it is refreshed.
+    /// While no sample arrives, event time is taken to advance with the wall
+    /// clock: a window closes once no sample has come for its end less the
+    /// newest sample time, plus this, plus 1 s.
     #[arg(long, default_value_t = IngestionOptions::default().allowed_lateness_ms)]
     allowed_lateness_ms: u64,
     /// Samples further ahead of the wall clock than this are dropped.

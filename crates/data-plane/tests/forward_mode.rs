@@ -22,7 +22,7 @@ use data_plane::engine::EngineOptions;
 use data_plane::raw_forward::RawForwardOptions;
 use data_plane::{router, DataPlane, EXECUTION_HEADER};
 use http_body_util::BodyExt;
-use precompute::ingestion::IngestionOptions;
+use precompute::ingestion::{IngestionOptions, WallClock};
 use prometheus_remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
@@ -48,6 +48,7 @@ fn plan_json() -> String {
 
 fn options() -> EngineOptions {
     EngineOptions {
+        clock: WallClock::stopped(),
         ingest_threads: 2,
         ingestion: IngestionOptions {
             allowed_lateness_ms: 0,

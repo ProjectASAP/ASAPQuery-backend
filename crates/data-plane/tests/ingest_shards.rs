@@ -12,7 +12,7 @@ use axum::Router;
 use control_plane::plan_workload;
 use data_plane::engine::EngineOptions;
 use data_plane::{router, DataPlane};
-use precompute::ingestion::IngestionOptions;
+use precompute::ingestion::{IngestionOptions, WallClock};
 use prometheus_remote_write::{encode, Label, Sample, TimeSeries, WriteRequest};
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -532,4 +532,98 @@ async fn a_sample_beyond_the_time_range_is_dropped() {
     assert!(state.engine.is_running());
     assert_eq!(state.engine.stats().samples_dropped_late, 2);
     answer(&app, 600).await;
+}
+
+/// A data plane of `QUERY` over two shards whose ingestion reads `clock`:
+/// no allowed lateness, the stream starting at 0.
+fn idle_data_plane(clock: &WallClock) -> (Router, Arc<DataPlane>) {
+    let options = EngineOptions {
+        ingest_threads: 2,
+        clock: clock.clone(),
+        ..common::no_forward_options()
+    };
+    let state = Arc::new(
+        DataPlane::with_options(plan_json(), "http://127.0.0.1:1".into(), options).unwrap(),
+    );
+    (router(state.clone()), state)
+}
+
+/// One coordinator pass at the clock's time, flushing every shard, with
+/// every window it closes committed when it returns: a barrier at 0, which
+/// closes nothing itself.
+async fn pass(app: &Router) {
+    common::barrier(app, 0).await;
+}
+
+/// Writes series `0..64` at 1..=40 s while the clock reads `written_ms`, and
+/// runs them: the window `(30, 40]` is still open, as its end is the newest
+/// sample.
+async fn write_through_40s(app: &Router, clock: &WallClock, written_ms: i64) {
+    clock.set(written_ms);
+    write_seconds(app, 0..64, 1..=40).await;
+    pass(app).await;
+    assert_ne!(status_and_answer(app, 40).await.0, StatusCode::OK);
+}
+
+/// The window `(30, 40]` closed: answered from every sample at 1..=40 s.
+/// Then one more pass, so the counters and the routing of the pass that
+/// closed it are published (its refresh may commit before they are).
+async fn wait_for_answer_at_40s(app: &Router, state: &DataPlane) {
+    let started = std::time::Instant::now();
+    while status_and_answer(app, 40).await.0 != StatusCode::OK {
+        assert!(
+            started.elapsed().as_secs() < 10,
+            "{:?}",
+            state.engine.stats()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(common::per_job(&answer(app, 40).await), expected(40));
+    pass(app).await;
+}
+
+/// A stream that stops: once no sample has come for the allowed lateness
+/// (0) and the 1 s grace past the last window's end, that window closes
+/// without a sample or a barrier, and is answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_last_window_of_a_stopped_stream_closes_by_wall_clock_time() {
+    let clock = WallClock::manual(0);
+    let (app, state) = idle_data_plane(&clock);
+    write_through_40s(&app, &clock, 40_000).await;
+    clock.set(41_000);
+    wait_for_answer_at_40s(&app, &state).await;
+    assert!(state.engine.stats().windows_closed_by_wall_clock > 0);
+}
+
+/// A replayed stream an hour behind the wall clock: its windows close by
+/// wall-clock time counted from its newest sample, never by the wall clock
+/// itself, so the window `(30, 40]` waits as long as for a live stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lagging_stream_closes_no_window_early() {
+    let hour_ms = 3_600_000;
+    let clock = WallClock::manual(0);
+    let (app, state) = idle_data_plane(&clock);
+    write_through_40s(&app, &clock, hour_ms + 40_000).await;
+    clock.set(hour_ms + 40_999);
+    pass(&app).await;
+    assert_ne!(status_and_answer(&app, 40).await.0, StatusCode::OK);
+    assert_eq!(state.engine.stats().windows_closed_by_wall_clock, 0);
+    clock.set(hour_ms + 41_000);
+    wait_for_answer_at_40s(&app, &state).await;
+}
+
+/// A sample for a window closed by wall-clock time is late: dropped and
+/// counted, and the window keeps its answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sample_after_a_wall_clock_close_is_late() {
+    let clock = WallClock::manual(0);
+    let (app, state) = idle_data_plane(&clock);
+    write_through_40s(&app, &clock, 40_000).await;
+    clock.set(41_000);
+    wait_for_answer_at_40s(&app, &state).await;
+    let dropped = state.engine.stats().samples_dropped_late;
+    write_seconds(&app, 5..6, 35..=35).await;
+    pass(&app).await;
+    assert_eq!(state.engine.stats().samples_dropped_late, dropped + 1);
+    assert_eq!(common::per_job(&answer(&app, 40).await), expected(40));
 }

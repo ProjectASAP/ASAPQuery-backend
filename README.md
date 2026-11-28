@@ -92,6 +92,14 @@ wall clock) is refreshed. A repeated or lower `T` does nothing. The response is
 `{"barrier_ms": B}`, the barrier in force. With several producers, send the
 barrier only after all of them have written through `T`.
 
+When no sample arrives at all, the last windows still close by wall-clock
+time: event time is taken to advance with the wall clock from the newest
+sample, so a window closes once no sample has come for `e - t` plus
+`--allowed-lateness-ms` plus 1 s, `e` the window's end and `t` the newest
+sample time. A stream behind the wall clock (a replay) waits as long as a
+live one. A later sample for such a window is late. These windows are
+counted in `asap_windows_closed_by_wall_clock_total`.
+
 **Queries.** An instant query whose text is one of the plan's queries is
 answered by one query run of its root at its evaluation time `T`
 (`x-asap-execution: plan`). The run reads the views the root reaches,

@@ -10,7 +10,7 @@ use axum::Router;
 use control_plane::plan_workload;
 use data_plane::engine::EngineOptions;
 use data_plane::{router, DataPlane};
-use precompute::ingestion::IngestionOptions;
+use precompute::ingestion::{IngestionOptions, WallClock};
 use prometheus_remote_write::{Label, Sample, TimeSeries};
 use serde_json::json;
 
@@ -189,6 +189,7 @@ async fn a_refreshed_range_reads_its_older_steps_from_the_result_cache() {
     let plan = serde_json::to_string(&plan_workload(&workload, &inputs).unwrap().0).unwrap();
     let start = || {
         let options = EngineOptions {
+            clock: WallClock::stopped(),
             no_forward: true,
             ingestion: IngestionOptions {
                 allowed_lateness_ms: 0,

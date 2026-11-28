@@ -44,7 +44,7 @@ use tokio::sync::oneshot;
 
 use crate::ingestion::{
     ClosedWindow, Computed, Ingestion, IngestionOptions, IngestionStats, Precompute,
-    RefreshTaskGraph, Refreshed, Routing,
+    RefreshTaskGraph, Refreshed, Routing, WallClock,
 };
 use crate::push::{Partial, PushGroup, PushShard};
 
@@ -116,6 +116,9 @@ struct ShardReport {
     /// Samples of the batch reported, counted out of the queues when the
     /// coordinator applies the report.
     samples: u64,
+    /// Whether the batch had a sample ingestion kept (not unrouted, late
+    /// or in the future): a sample arrived, so the stream is not idle.
+    accepted_any: bool,
 }
 
 /// What an ingest shard does next.
@@ -198,6 +201,7 @@ struct Shared {
     /// keep a refresh from finishing.
     precompute_gate: Mutex<()>,
     metrics: Arc<Metrics>,
+    clock: WallClock,
 }
 
 /// Marks the engine stopped when its thread exits, panics included.
@@ -240,6 +244,9 @@ pub struct PrecomputeOptions {
     pub precompute_memory_budget_bytes: Option<u64>,
     /// For tests, push mode: the combine of the window ending here panics.
     pub panic_in_combine_of_window_end_ms: Option<i64>,
+    /// The wall clock the precompute engine reads (the system clock but in
+    /// tests).
+    pub clock: WallClock,
 }
 
 /// Where the views are persisted, when they are: the view files'
@@ -451,6 +458,7 @@ impl InstalledPrecompute {
             published,
             precompute_gate: Mutex::new(()),
             metrics,
+            clock: options.clock.clone(),
         });
         let (commands, command_receiver) = channel();
         let (jobs, job_receiver) = sync_channel(options.max_precompute_backlog.max(1));
@@ -752,7 +760,7 @@ const _: fn() = || {
 /// samples stamped later (a sender stamps before it sends).
 fn flush(shards: &[Sender<ShardMessage>], shared: &Shared) -> i64 {
     let _admission = shared.admission.write().unwrap_or_else(|e| e.into_inner());
-    let sent_ms = crate::ingestion::wall_clock_ms();
+    let sent_ms = shared.clock.now_ms();
     for shard in shards {
         let _ = shard.send(ShardMessage::Flush);
     }
@@ -816,6 +824,7 @@ fn serve_shard(
         // report (and so at most one coordinator pass) per drained queue,
         // not per request.
         let mut count = 0;
+        let mut accepted_any = false;
         let mut first_seen = Vec::new();
         loop {
             if !delay.is_zero() {
@@ -828,8 +837,9 @@ fn serve_shard(
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
-            let routed = routing.route(samples, crate::ingestion::wall_clock_ms());
+            let routed = routing.route(samples, shared.clock.now_ms());
             Arc::make_mut(&mut raw_data).append(&routed.accepted);
+            accepted_any |= !routed.accepted.is_empty();
             newest_ms = newest_ms.max(routed.newest_ms);
             if let Some(push) = &mut push {
                 push.push(&routed.accepted, &shared.metrics);
@@ -858,6 +868,7 @@ fn serve_shard(
             newest_ms,
             first_seen,
             samples: count,
+            accepted_any,
         };
         // The coordinator counts the samples out of the queues when it
         // applies the report, so samples stay counted while it cannot keep
@@ -880,7 +891,9 @@ fn serve_shard(
 /// was sent (a request admitted later holds samples stamped later), never
 /// a report's time. Barriers that come during a flush take the next pass.
 /// Shards with nothing queued answer the flush at once, so idle shards
-/// never hold the watermark; the coordinator also wakes every tick.
+/// never hold the watermark; the coordinator also wakes every tick, and
+/// flushes when the idle watermark would close a window
+/// ([`Ingestion::idle_closes_at`]).
 fn serve_ingest(
     mut ingestion: Ingestion,
     mut raw_shards: Vec<Arc<RawData>>,
@@ -893,6 +906,7 @@ fn serve_ingest(
     const TICK: std::time::Duration = std::time::Duration::from_millis(100);
     let mut newest: Vec<Option<i64>> = vec![None; shards.len()];
     let mut sealed_through: Option<i64> = None;
+    // Takes in a report; whether it ran a sample ingestion kept.
     let apply = |report: ShardReport, ingestion: &mut Ingestion, newest: &mut Vec<Option<i64>>| {
         ingestion.observe(&report.first_seen);
         shared.shard_queued[report.shard].fetch_sub(report.samples, Ordering::SeqCst);
@@ -900,6 +914,7 @@ fn serve_ingest(
             .queued_samples
             .fetch_sub(report.samples, Ordering::SeqCst);
         newest[report.shard] = report.newest_ms;
+        report.accepted_any
     };
     // Barriers that came while a flush was waited for: written after it,
     // so they take the next pass, behind its own flush.
@@ -923,13 +938,15 @@ fn serve_ingest(
         // sample, the wall clock a report carries (the watermark is capped
         // at it), a metric's first sample, or a barrier.
         let mut moved = !barriers.is_empty() || !held.is_empty();
+        // Whether a report taken this pass ran a sample.
+        let mut arrived = false;
         for report in held.drain(..) {
-            apply(report, &mut ingestion, &mut newest);
+            arrived |= apply(report, &mut ingestion, &mut newest);
         }
         if !moved {
             match commands.recv_timeout(TICK) {
                 Ok(Command::Report(report)) => {
-                    apply(report, &mut ingestion, &mut newest);
+                    arrived |= apply(report, &mut ingestion, &mut newest);
                     moved = true;
                 }
                 Ok(Command::Flushed(..)) => {}
@@ -948,7 +965,7 @@ fn serve_ingest(
         while let Ok(command) = commands.try_recv() {
             match command {
                 Command::Report(report) => {
-                    apply(report, &mut ingestion, &mut newest);
+                    arrived |= apply(report, &mut ingestion, &mut newest);
                     moved = true;
                 }
                 Command::Flushed(..) => {}
@@ -959,10 +976,14 @@ fn serve_ingest(
                 Command::Stop => break 'serve,
             }
         }
+        // An idle stream: when the idle watermark would close a window, the
+        // shards are flushed first and it is taken at that flush, so
+        // samples still queued count before it.
+        moved = moved || ingestion.idle_closes_at(shared.clock.now_ms());
         // Before the watermark moves, every shard runs the samples queued to
         // it, so the windows it closes hold every sample admitted so far
         // and the raw data they read is every shard's as of then.
-        let flushed = moved;
+        let mut flushed_at = None;
         if moved {
             let flushed_ms = flush(&shards, shared);
             let mut flushed = vec![false; shards.len()];
@@ -974,7 +995,9 @@ fn serve_ingest(
                     {
                         held.push(report)
                     }
-                    Ok(Command::Report(report)) => apply(report, &mut ingestion, &mut newest),
+                    Ok(Command::Report(report)) => {
+                        arrived |= apply(report, &mut ingestion, &mut newest)
+                    }
                     Ok(Command::Flushed(shard, raw_data)) => {
                         flushed[shard] = true;
                         raw_shards[shard] = raw_data;
@@ -994,16 +1017,27 @@ fn serve_ingest(
                 }
             }
             ingestion.advance_clock(flushed_ms);
+            if arrived {
+                ingestion.sample_arrived(flushed_ms);
+            }
+            flushed_at = Some(flushed_ms);
         }
         let newest_ms = newest.iter().flatten().copied().max();
         ingestion.advance_newest_sample(newest_ms);
-        let mut closed = ingestion.close();
+        if let Some(flushed_ms) = flushed_at {
+            ingestion.advance_idle(flushed_ms);
+        }
+        // The barriers first, so a window one of them closes is not
+        // counted as closed by wall-clock time.
+        let mut closed = Vec::new();
         let mut answered = Vec::new();
         for (barrier_ms, reply) in barriers {
-            let (barrier_ms, more) = ingestion.advance_watermark(barrier_ms);
+            let (barrier_ms, more) =
+                ingestion.advance_watermark_at(barrier_ms, shared.clock.now_ms());
             closed.extend(more);
             answered.push((barrier_ms, reply));
         }
+        closed.extend(ingestion.close());
         let snapshot: RawShards = Arc::new(raw_shards.clone());
         let sealed: Vec<ClosedWindow> = closed
             .iter()
@@ -1038,7 +1072,7 @@ fn serve_ingest(
         if let Some(watermark_ms) = watermark_ms {
             metrics.watermark_ms.store(watermark_ms, Ordering::Relaxed);
         }
-        if flushed {
+        if flushed_at.is_some() {
             let sum = |f: fn(&RawData) -> usize| snapshot.iter().map(|r| f(r) as u64).sum::<u64>();
             metrics
                 .raw_data_bytes
@@ -1072,6 +1106,7 @@ fn serve_ingest(
             let mut stats = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
             stats.windows_skipped_first = ingestion.stats.windows_skipped_first;
             stats.windows_skipped_expired = ingestion.stats.windows_skipped_expired;
+            stats.windows_closed_by_wall_clock = ingestion.stats.windows_closed_by_wall_clock;
         }
         for (barrier_ms, reply) in answered {
             if jobs
@@ -1640,7 +1675,7 @@ fn commit_window(
         if let (true, Some(push)) = (task.pushed, &shared.metrics.push) {
             push.commit.record(timer);
             push.commit_lag_ms.store(
-                (crate::ingestion::wall_clock_ms() - window.end_ms).max(0),
+                (shared.clock.now_ms() - window.end_ms).max(0),
                 Ordering::Relaxed,
             );
         }
@@ -1651,7 +1686,7 @@ fn commit_window(
     latency.record(
         task.times.started.saturating_duration_since(task.closed_at),
         now.saturating_duration_since(task.times.computed),
-        (crate::ingestion::wall_clock_ms() - window.end_ms).max(0),
+        (shared.clock.now_ms() - window.end_ms).max(0),
     );
     {
         let mut stats = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
@@ -2169,6 +2204,7 @@ mod tests {
             push_batching: crate::push::MorselBatching::default(),
             precompute_memory_budget_bytes: None,
             panic_in_combine_of_window_end_ms: None,
+            clock: WallClock::stopped(),
         };
         PrecomputeEngine::new(options, None, Arc::new(PublishedStore::new(Arc::default())))
     }

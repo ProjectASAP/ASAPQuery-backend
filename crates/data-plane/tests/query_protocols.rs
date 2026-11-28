@@ -20,7 +20,7 @@ use data_plane::engine::EngineOptions;
 use data_plane::{router, DataPlane, EXECUTION_HEADER};
 use elastic_http::fallback::ElasticHttpFallback;
 use http_body_util::BodyExt;
-use precompute::ingestion::IngestionOptions;
+use precompute::ingestion::{IngestionOptions, WallClock};
 use prometheus_remote_write::{Label, Sample, TimeSeries};
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -82,6 +82,7 @@ async fn upstream(received: Received) -> String {
 /// Forwarding allowed, every window refreshed.
 fn options() -> EngineOptions {
     EngineOptions {
+        clock: WallClock::stopped(),
         ingestion: IngestionOptions {
             allowed_lateness_ms: 0,
             stream_start_ms: Some(0),
