@@ -1,0 +1,15 @@
+[package]
+name = "otlp"
+version.workspace = true
+edition.workspace = true
+
+# OTLP (OpenTelemetry) metrics over HTTP: request decoding into data
+# points. An adapter: no workspace dependency, so it never sees an engine
+# or a store.
+[dependencies]
+# The OTLP protobuf messages (no gRPC server; the crate still builds
+# tonic's codegen types and the OpenTelemetry SDK it depends on).
+opentelemetry-proto = { version = "0.28", default-features = false, features = ["gen-tonic-messages", "metrics"] }
+prost = "0.13"
+flate2 = "1.0"
+thiserror.workspace = true

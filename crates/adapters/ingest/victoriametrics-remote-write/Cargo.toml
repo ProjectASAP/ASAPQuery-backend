@@ -1,0 +1,14 @@
+[package]
+name = "victoriametrics_remote_write"
+version.workspace = true
+edition.workspace = true
+
+# VictoriaMetrics Remote Write: Prometheus Remote Write v1's protobuf,
+# zstd-compressed. An adapter: it depends only on the adapter whose
+# protobuf it reads, so it never sees an engine or a store.
+[dependencies]
+prometheus_remote_write.workspace = true
+zstd = "0.13"
+# `encode`, for senders and tests.
+prost = "0.13"
+thiserror.workspace = true

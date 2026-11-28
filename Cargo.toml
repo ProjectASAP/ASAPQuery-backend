@@ -1,7 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/adapters/ingest/otlp",
     "crates/adapters/ingest/prometheus-remote-write",
+    "crates/adapters/ingest/victoriametrics-remote-write",
     "crates/adapters/query/prometheus-http",
     "crates/common",
     "crates/control-plane",
@@ -45,11 +47,13 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 control_plane = { path = "crates/control-plane" }
 common = { path = "crates/common" }
 internal_metrics = { path = "crates/internal-metrics" }
+otlp = { path = "crates/adapters/ingest/otlp" }
 precompute = { path = "crates/precompute" }
 prometheus_http = { path = "crates/adapters/query/prometheus-http" }
 prometheus_remote_write = { path = "crates/adapters/ingest/prometheus-remote-write" }
 query = { path = "crates/query" }
 storage = { path = "crates/storage" }
+victoriametrics_remote_write = { path = "crates/adapters/ingest/victoriametrics-remote-write" }
 
 # asap_sketchlib#271's head, ahead of the Planner's pin (389530c): DDSketch
 # view merges in place, with width-specialized loops (a 1 h quantile over
