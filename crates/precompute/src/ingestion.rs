@@ -554,7 +554,7 @@ impl Ingestion {
         let Some(idle) = self.idle_watermark_at(now_ms) else {
             return false;
         };
-                // A collector view's windows close by the clock, every tick.
+        // A collector view's windows close by the clock, every tick.
         self.groups.iter().any(|group| {
             !group.collector
                 && group
@@ -663,7 +663,7 @@ impl Ingestion {
         self.newest_sample_ms = self.newest_sample_ms.max(newest_ms);
     }
 
-        /// Closes and returns every window the watermark has passed (a
+    /// Closes and returns every window the watermark has passed (a
     /// collector view's: wall-clock `now_ms` less the commit grace), oldest
     /// first within each group, groups in plan order (a group may read the
     /// views of an earlier one).
@@ -693,7 +693,7 @@ impl Ingestion {
             return (current, Vec::new());
         }
         self.barrier_ms = Some(barrier_ms);
-                (barrier_ms, self.close_windows_at(now_ms))
+        (barrier_ms, self.close_windows_at(now_ms))
     }
 
     /// Starts each group scanning `metric` at its first sample: its first
@@ -819,7 +819,7 @@ impl Ingestion {
         self.groups[group].refreshed_through
     }
 
-        /// Closes every window the watermark has passed, and every collector
+    /// Closes every window the watermark has passed, and every collector
     /// view's window wall-clock `now_ms` has passed by the commit grace.
     pub(crate) fn close_windows_at(&mut self, now_ms: i64) -> Vec<ClosedWindow> {
         let watermark = self.watermark_ms();
@@ -917,7 +917,7 @@ impl Ingestion {
                 .checked_add(group.width_ms)
                 .filter(|e| *e <= closes_through)
             {
-                                if !group.collector && event_watermark.is_none_or(|w| end > w) {
+                if !group.collector && event_watermark.is_none_or(|w| end > w) {
                     self.stats.windows_closed_by_wall_clock += 1;
                 }
                 closed.push(ClosedWindow {

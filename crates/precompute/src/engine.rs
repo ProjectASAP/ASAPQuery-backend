@@ -1036,7 +1036,7 @@ fn serve_ingest(
                     let _ = reply.send(staging.stage(
                         states,
                         &mut ingestion,
-                        crate::ingestion::wall_clock_ms(),
+                        shared.clock.now_ms(),
                         &shared.metrics,
                     ));
                 }
@@ -1063,7 +1063,7 @@ fn serve_ingest(
                     let _ = reply.send(staging.stage(
                         states,
                         &mut ingestion,
-                        crate::ingestion::wall_clock_ms(),
+                        shared.clock.now_ms(),
                         &shared.metrics,
                     ));
                 }
@@ -1103,7 +1103,7 @@ fn serve_ingest(
                         let _ = reply.send(staging.stage(
                             states,
                             &mut ingestion,
-                            crate::ingestion::wall_clock_ms(),
+                            shared.clock.now_ms(),
                             &shared.metrics,
                         ));
                     }
