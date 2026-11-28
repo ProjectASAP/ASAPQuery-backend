@@ -15,8 +15,16 @@ struct Args {
     /// Planner `PlanningWorkload` (JSON).
     #[arg(long, required_unless_present = "plan", requires = "out")]
     workload: Option<PathBuf>,
-    /// A plan this command wrote before, in place of planning `--workload`.
-    #[arg(long, conflicts_with = "workload")]
+    /// A plan this command wrote before, in place of planning `--workload`:
+    /// only its collector views are written.
+    #[arg(
+        long,
+        requires = "collector_capabilities",
+        conflicts_with_all = [
+            "workload", "out", "report", "deployment_capabilities", "cost_inputs",
+            "measured_operation_costs", "ignore_accuracy_guarantees",
+        ]
+    )]
     plan: Option<PathBuf>,
     /// What the collector runs (`asap_sketches --print-capabilities`):
     /// the views it can build in place of the data plane.
@@ -89,7 +97,7 @@ fn main() -> anyhow::Result<()> {
             export_interval_ms: args.collector_export_interval_ms,
             clock_skew_allowance_ms: args.collector_clock_skew_allowance_ms,
         };
-        let (file, not_on_collector) = collector_sub_dag(&plan, &capabilities, grace);
+        let (file, not_on_collector) = collector_sub_dag(&plan, &capabilities, grace)?;
         let text = serde_json::to_string_pretty(&file)?;
         std::fs::write(out, text).with_context(|| format!("writing {}", out.display()))?;
         for (node, reason) in &not_on_collector {

@@ -17,8 +17,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use asap_planner::{
-    DeploymentCapabilities, ExecutionTiming, InstallablePlan, PhysicalASAPDAG, PhysicalASAPNodeId,
-    SupportedSummary, INSTALLABLE_PLAN_WIRE_VERSION,
+    DeploymentCapabilities, ExecutionTiming, InstallablePlan, InstallablePlanError,
+    PhysicalASAPDAG, PhysicalASAPNodeId, SupportedSummary, INSTALLABLE_PLAN_WIRE_VERSION,
 };
 use asap_types::ir::operator::arguments::{Reduction, Source};
 use asap_types::ir::operator::kind::OperatorKind;
@@ -31,7 +31,7 @@ use common::CollectorViewsFile;
 use serde::Deserialize;
 
 /// The `capabilities_version` this control plane reads.
-pub const CAPABILITIES_VERSION: u32 = 1;
+const CAPABILITIES_VERSION: u32 = 1;
 
 /// What `asap_sketches --print-capabilities` prints: what the collector can
 /// run, in the planner's vocabulary, each capability stated once.
@@ -54,25 +54,14 @@ pub struct CollectorCapabilities {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CollectorExecutor {
     pub supported_summaries: Vec<CollectorSummary>,
-    /// Every other field; its own `supported_summaries` is `None`.
+    /// Every other field, with the planner's serde (unknown fields
+    /// refused); its own `supported_summaries` is `None`. The rule reads
+    /// none of them yet.
     pub rest: DeploymentCapabilities,
 }
 
-impl CollectorExecutor {
-    /// The planner's `DeploymentCapabilities` of the collector.
-    pub fn deployment_capabilities(&self) -> DeploymentCapabilities {
-        DeploymentCapabilities {
-            supported_summaries: Some(
-                self.supported_summaries
-                    .iter()
-                    .map(|entry| entry.summary.clone())
-                    .collect(),
-            ),
-            ..self.rest.clone()
-        }
-    }
-}
-
+/// By hand, not `#[serde(flatten)]`: `DeploymentCapabilities` denies
+/// unknown fields, which a flattened struct cannot.
 impl<'de> Deserialize<'de> for CollectorExecutor {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error;
@@ -137,9 +126,41 @@ pub struct OperatorCapability {
     #[serde(default)]
     pub sources: Vec<String>,
     /// `SummaryTumblingWindowChain` and `SummaryAgg`: the `Reduction`
-    /// variants it builds, e.g. `PerEntity`.
+    /// variants it builds (`PerEntity`, `Reduce`).
     #[serde(default)]
     pub reductions: Vec<String>,
+}
+
+impl OperatorCapability {
+    /// `Err` for a limit that does not apply to its kind or names no
+    /// variant.
+    fn check(&self) -> Result<(), String> {
+        let summary_build = matches!(
+            self.kind,
+            OperatorKind::SummaryTumblingWindowChain | OperatorKind::SummaryAgg
+        );
+        if !self.sources.is_empty() && self.kind != OperatorKind::Scan {
+            return Err(format!("sources on {:?}", self.kind));
+        }
+        if !self.reductions.is_empty() && !summary_build {
+            return Err(format!("reductions on {:?}", self.kind));
+        }
+        if let Some(unknown) = self
+            .sources
+            .iter()
+            .find(|s| !["TimeSeries", "Table"].contains(&s.as_str()))
+        {
+            return Err(format!("unknown source {unknown}"));
+        }
+        if let Some(unknown) = self
+            .reductions
+            .iter()
+            .find(|r| !["PerEntity", "Reduce"].contains(&r.as_str()))
+        {
+            return Err(format!("unknown reduction {unknown}"));
+        }
+        Ok(())
+    }
 }
 
 /// How series are partitioned across collector instances.
@@ -173,9 +194,9 @@ pub enum NotOnCollector {
     OutputNotAView,
 }
 
-/// How long after a window's end the data plane commits a collector view's
-/// window: the collector's close delay, its export interval and a clock
-/// skew allowance.
+/// What the commit grace of a collector view's window adds to the
+/// collector's declared close delay (`window_close_delay_ms`): its export
+/// interval and a clock skew allowance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommitGrace {
     pub export_interval_ms: u64,
@@ -200,6 +221,8 @@ pub enum CapabilitiesError {
     Version(u32),
     #[error("{0}")]
     Parse(#[from] serde_json::Error),
+    #[error("operators: {0}")]
+    Operators(String),
 }
 
 impl CollectorCapabilities {
@@ -212,6 +235,16 @@ impl CollectorCapabilities {
                 capabilities.capabilities_version,
             ));
         }
+        let mut kinds = BTreeSet::new();
+        for operator in &capabilities.operators {
+            operator.check().map_err(CapabilitiesError::Operators)?;
+            if !kinds.insert(format!("{:?}", operator.kind)) {
+                return Err(CapabilitiesError::Operators(format!(
+                    "{:?} listed twice",
+                    operator.kind
+                )));
+            }
+        }
         Ok(capabilities)
     }
 
@@ -222,21 +255,27 @@ impl CollectorCapabilities {
 
 /// The installed plan's collector sub-DAG, as the collector-views file
 /// carries it, and why each other node is not on the collector (in node
-/// order).
+/// order; the first rule it fails, in the order (a)–(d)). Errs for a plan
+/// whose views do not derive, or whose cut does not stand as a DAG of its
+/// own.
 pub fn collector_sub_dag(
     plan: &InstallablePlan,
     capabilities: &CollectorCapabilities,
     grace: CommitGrace,
-) -> (
-    CollectorViewsFile,
-    Vec<(PhysicalASAPNodeId, NotOnCollector)>,
-) {
+) -> Result<
+    (
+        CollectorViewsFile,
+        Vec<(PhysicalASAPNodeId, NotOnCollector)>,
+    ),
+    InstallablePlanError,
+> {
     let dag = &plan.dag;
     let index = Index::new(dag);
     let views: BTreeSet<PhysicalASAPNodeId> = plan
-        .materialized_views()
-        .map(|views| views.into_iter().map(|view| view.node_id).collect())
-        .unwrap_or_default();
+        .materialized_views()?
+        .into_iter()
+        .map(|view| view.node_id)
+        .collect();
     let mut assigned: BTreeSet<PhysicalASAPNodeId> = BTreeSet::new();
     let mut reasons: BTreeMap<PhysicalASAPNodeId, NotOnCollector> = BTreeMap::new();
     for &id in &index.bottom_up {
@@ -272,7 +311,7 @@ pub fn collector_sub_dag(
     // and every assigned node above it go back to the backend.
     loop {
         let bad = assigned.iter().copied().find(|&id| {
-            !index.is_scan(id) && index.is_output(id, &assigned, dag) && !views.contains(&id)
+            !index.is_scan(id) && index.is_output(id, &assigned) && !views.contains(&id)
         });
         let Some(bad) = bad else { break };
         for id in index.above(bad) {
@@ -284,7 +323,7 @@ pub fn collector_sub_dag(
     let outputs: Vec<PhysicalASAPNodeId> = assigned
         .iter()
         .copied()
-        .filter(|&id| !index.is_scan(id) && index.is_output(id, &assigned, dag))
+        .filter(|&id| !index.is_scan(id) && index.is_output(id, &assigned))
         .collect();
     // The sub-DAG: the assigned nodes other than `Scan`s, and the `Scan`s
     // that feed one.
@@ -328,13 +367,19 @@ pub fn collector_sub_dag(
         {
             let read_here = node.output_state.timing != ExecutionTiming::IngestionTime
                 || !assigned.contains(&node.id)
-                || dag.roots.contains(&node.id)
+                || index.roots.contains(&node.id)
                 || index
                     .consumers(node.id)
                     .iter()
                     .any(|c| !on_collector.contains(c));
             *backend_reads_raw.entry(metric.clone()).or_default() |= read_here;
         }
+    }
+    if !sub_dag.roots.is_empty() {
+        // The collector loads it into the planner's types (decision 18).
+        sub_dag
+            .materialized_views()
+            .map_err(InstallablePlanError::from)?;
     }
     let file = CollectorViewsFile {
         planner_wire_version: INSTALLABLE_PLAN_WIRE_VERSION,
@@ -346,7 +391,7 @@ pub fn collector_sub_dag(
         outputs,
         dag: sub_dag,
     };
-    (file, reasons.into_iter().collect())
+    Ok((file, reasons.into_iter().collect()))
 }
 
 /// The DAG's nodes by id, each node's inputs and consumers, and the nodes
@@ -356,6 +401,8 @@ struct Index<'a> {
     inputs: HashMap<PhysicalASAPNodeId, Vec<PhysicalASAPNodeId>>,
     consumers: HashMap<PhysicalASAPNodeId, Vec<PhysicalASAPNodeId>>,
     bottom_up: Vec<PhysicalASAPNodeId>,
+    /// The query roots, operator and scalar: their outputs leave the DAG.
+    roots: BTreeSet<PhysicalASAPNodeId>,
 }
 
 impl<'a> Index<'a> {
@@ -389,11 +436,23 @@ impl<'a> Index<'a> {
         for node in &dag.nodes {
             visit(node.id, &inputs, &mut placed, &mut bottom_up);
         }
+        let roots = dag
+            .roots
+            .iter()
+            .copied()
+            .chain(
+                dag.scalar_roots
+                    .iter()
+                    .flat_map(|(_, expr)| expr.operator_refs())
+                    .copied(),
+            )
+            .collect();
         Self {
             nodes: dag.nodes.iter().map(|node| (node.id, node)).collect(),
             inputs,
             consumers,
             bottom_up,
+            roots,
         }
     }
 
@@ -414,13 +473,8 @@ impl<'a> Index<'a> {
 
     /// Whether assigned node `id`'s output leaves the collector: a consumer
     /// is not assigned, or it is a query root.
-    fn is_output(
-        &self,
-        id: PhysicalASAPNodeId,
-        assigned: &BTreeSet<PhysicalASAPNodeId>,
-        dag: &PhysicalASAPDAG,
-    ) -> bool {
-        dag.roots.contains(&id) || self.consumers(id).iter().any(|c| !assigned.contains(c))
+    fn is_output(&self, id: PhysicalASAPNodeId, assigned: &BTreeSet<PhysicalASAPNodeId>) -> bool {
+        self.roots.contains(&id) || self.consumers(id).iter().any(|c| !assigned.contains(c))
     }
 
     /// `id` and every node above it.
@@ -459,7 +513,7 @@ fn within_capabilities(
         .operator(kind)
         .ok_or_else(|| format!("operator {kind:?}"))?;
     let predicate = |predicate: &ScalarExpr<PhysicalASAPNodeId>| {
-        label_comparisons_only(predicate, &capabilities.predicate_ops)
+        literal_comparisons_only(predicate, &capabilities.predicate_ops)
     };
     let reduction = |reduction: &Reduction| {
         let name = match reduction {
@@ -486,7 +540,6 @@ fn within_capabilities(
             predicates.iter().try_for_each(|p| predicate(&p.0))
         }
         Operator::NonASAP(NonASAPOp::Filter { pred, .. }) => predicate(&pred.0),
-        Operator::NonASAP(NonASAPOp::Aggregate { reduction: r, .. }) => reduction(r),
         Operator::ASAP(
             ASAPOp::SummaryTumblingWindowChain {
                 summary_type,
@@ -566,7 +619,9 @@ fn within_summaries(
     if input_kind != Some(entry.input) {
         return Err(format!("input {input:?} of {algorithm:?}"));
     }
-    // θ as `{"<Algorithm>": {"<parameter>": value, ..}}`.
+    // θ by parameter name through its serde form, `{"<Algorithm>":
+    // {"<parameter>": value, ..}}`: the planner's `SketchParams` has no
+    // accessor by name.
     let theta = serde_json::to_value(&node.parameters).map_err(|e| e.to_string())?;
     let values = theta
         .as_object()
@@ -585,15 +640,16 @@ fn within_summaries(
 }
 
 /// A predicate the collector evaluates: a conjunction of comparisons of a
-/// column with a `Utf8` literal, each with an op of `ops`.
-fn label_comparisons_only<C>(
+/// column with a `Utf8` literal (a label matcher), each with an op of
+/// `ops`.
+fn literal_comparisons_only<C>(
     predicate: &ScalarExpr<C>,
     ops: &[CompareOpKind],
 ) -> Result<(), String> {
     match predicate {
         ScalarExpr::BoolAnd(all) => all
             .iter()
-            .try_for_each(|part| label_comparisons_only(part, ops)),
+            .try_for_each(|part| literal_comparisons_only(part, ops)),
         ScalarExpr::Compare {
             left, op, right, ..
         } => match (&**left, &**right) {
@@ -610,43 +666,66 @@ fn label_comparisons_only<C>(
 }
 
 /// Rule (d): whether `node` is correct on one instance's series, as
-/// `partitioned_by` places them. Per-series operators always are; one
-/// reducing to groups `G` only when each group is on one instance
-/// (`{"labels": L}` with `L ⊆ G`).
+/// `partitioned_by` places them. Operators that keep each series' rows to
+/// that series are; one grouping series into groups `G` only when each
+/// group is on one instance (`{"labels": L}` with `L ⊆ G`); any other
+/// operator (joins, binary operators, sorting, limits, populations, ...)
+/// is not.
 fn local_to_partition(
     node: &PhysicalASAPDAGNode,
     index: &Index,
     partitioned_by: &PartitionedBy,
 ) -> bool {
-    let reduction = match &node.payload {
-        Operator::NonASAP(NonASAPOp::Scan { .. } | NonASAPOp::Filter { .. }) => return true,
-        Operator::NonASAP(NonASAPOp::Aggregate { reduction, .. })
+    // The input grouped and the group keys' column indexes in it.
+    let (child, keys, without): (PhysicalASAPNodeId, Vec<usize>, bool) = match &node.payload {
+        Operator::NonASAP(
+            NonASAPOp::Scan { .. }
+            | NonASAPOp::Filter { .. }
+            | NonASAPOp::Project { .. }
+            | NonASAPOp::TimeRange { .. }
+            | NonASAPOp::TimeShift { .. }
+            | NonASAPOp::TimeRangeCover { .. },
+        )
         | Operator::ASAP(
-            ASAPOp::SummaryTumblingWindowChain { reduction, .. }
-            | ASAPOp::SummaryAgg { reduction, .. },
-        ) => reduction,
-        // Every other operator: per series only if its input is (it keeps
-        // the rows' series), which rule (b) leaves to its inputs.
-        _ => return true,
-    };
-    let Reduction::Reduce(keys) = reduction else {
-        return true;
+            ASAPOp::SummaryEstimate { .. }
+            | ASAPOp::FinalizeExactAccumulator { .. }
+            | ASAPOp::SummaryMergeWindows { .. }
+            | ASAPOp::SummaryMerge { group_by: None, .. },
+        ) => return true,
+        Operator::NonASAP(NonASAPOp::Aggregate {
+            reduction, child, ..
+        })
+        | Operator::ASAP(
+            ASAPOp::SummaryTumblingWindowChain {
+                reduction, child, ..
+            }
+            | ASAPOp::SummaryAgg {
+                reduction, child, ..
+            },
+        ) => match reduction {
+            Reduction::PerEntity => return true,
+            Reduction::Reduce(keys) => (*child, keys.keys().to_vec(), keys.is_without()),
+        },
+        Operator::ASAP(ASAPOp::SummaryMerge {
+            children,
+            group_by: Some(keys),
+        }) => match children.as_slice() {
+            [child] => (*child, keys.clone(), false),
+            _ => return false,
+        },
+        _ => return false,
     };
     let PartitionedBy::Labels(labels) = partitioned_by else {
         return false;
     };
-    let Some(&input) = index.inputs(node.id).first() else {
-        return false;
-    };
-    let columns = index.column_names(input);
+    let columns = index.column_names(child);
     let named: BTreeSet<&str> = keys
-        .keys()
         .iter()
         .filter_map(|&column| columns.get(column).copied())
         .collect();
     labels.iter().all(|label| {
         let in_keys = named.contains(label.as_str());
-        if keys.is_without() {
+        if without {
             columns.contains(&label.as_str()) && !in_keys
         } else {
             in_keys

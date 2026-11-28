@@ -108,7 +108,7 @@ fn a_leaf_sketch_chain_is_the_collector_view() {
         export_interval_ms: 500,
         clock_skew_allowance_ms: 2_000,
     };
-    let (file, reasons) = collector_sub_dag(&plan, &parse(&capabilities()), grace);
+    let (file, reasons) = collector_sub_dag(&plan, &parse(&capabilities()), grace).unwrap();
     let chain = chain(&plan);
     assert_eq!(file.outputs, [chain]);
     assert_eq!(file.dag.roots, [chain]);
@@ -145,7 +145,8 @@ fn a_metric_another_view_reads_stays_raw() {
         ],
         false,
     );
-    let (file, reasons) = collector_sub_dag(&plan, &parse(&capabilities()), CommitGrace::default());
+    let (file, reasons) =
+        collector_sub_dag(&plan, &parse(&capabilities()), CommitGrace::default()).unwrap();
     let chains = nodes_of(&plan, "SummaryTumblingWindowChain");
     assert_eq!(chains.len(), 2);
     assert_eq!(file.outputs.len(), 1);
@@ -163,7 +164,8 @@ fn a_metric_another_view_reads_stays_raw() {
 fn what_the_capabilities_lack_stays_in_the_backend() {
     let quantile = plan(&["quantile_over_time(0.99, data[5m])"], false);
     let not_in = |capabilities: &Value, plan: &InstallablePlan, node| {
-        let (file, reasons) = collector_sub_dag(plan, &parse(capabilities), CommitGrace::default());
+        let (file, reasons) =
+            collector_sub_dag(plan, &parse(capabilities), CommitGrace::default()).unwrap();
         assert!(file.outputs.is_empty());
         match reason(&reasons, node) {
             Some(NotOnCollector::NotInCapabilities(what)) => what.clone(),
@@ -187,14 +189,15 @@ fn what_the_capabilities_lack_stays_in_the_backend() {
         false,
     );
     let selected = plan(&[r#"quantile_over_time(0.99, data{job="a"}[5m])"#], false);
-    let (file, _) = collector_sub_dag(&selected, &parse(&capabilities()), CommitGrace::default());
+    let (file, _) =
+        collector_sub_dag(&selected, &parse(&capabilities()), CommitGrace::default()).unwrap();
     assert_eq!(
         file.outputs,
         [chain(&selected)],
         "an equality matcher is in the capabilities"
     );
     let (file, reasons) =
-        collector_sub_dag(&regex, &parse(&capabilities()), CommitGrace::default());
+        collector_sub_dag(&regex, &parse(&capabilities()), CommitGrace::default()).unwrap();
     assert!(file.outputs.is_empty());
     assert!(
         reasons.iter().any(
@@ -237,13 +240,13 @@ fn a_reducing_chain_is_local_only_when_its_groups_are() {
     let mut reducing = capabilities();
     reducing["operators"][2]["reductions"] = json!(["PerEntity", "Reduce"]);
 
-    let (_, reasons) = collector_sub_dag(&plan, &parse(&reducing), CommitGrace::default());
+    let (_, reasons) = collector_sub_dag(&plan, &parse(&reducing), CommitGrace::default()).unwrap();
     assert_eq!(
         reason(&reasons, chain),
         Some(&NotOnCollector::NotLocalToPartition)
     );
     reducing["placement"] = json!({"partitioned_by": {"labels": [scan_columns[0]]}});
-    let (_, reasons) = collector_sub_dag(&plan, &parse(&reducing), CommitGrace::default());
+    let (_, reasons) = collector_sub_dag(&plan, &parse(&reducing), CommitGrace::default()).unwrap();
     assert!(
         !matches!(
             reason(&reasons, chain),
@@ -253,7 +256,7 @@ fn a_reducing_chain_is_local_only_when_its_groups_are() {
         reason(&reasons, chain)
     );
     reducing["placement"] = json!({"partitioned_by": {"labels": ["no_such_label"]}});
-    let (_, reasons) = collector_sub_dag(&plan, &parse(&reducing), CommitGrace::default());
+    let (_, reasons) = collector_sub_dag(&plan, &parse(&reducing), CommitGrace::default()).unwrap();
     assert_eq!(
         reason(&reasons, chain),
         Some(&NotOnCollector::NotLocalToPartition)
@@ -268,7 +271,8 @@ fn an_operator_line_moves_the_cut_up() {
     let plan = plan(&["quantile_over_time(0.99, data[5m])"], true);
     let levels = nodes_of(&plan, "SummaryMergeWindows");
     assert!(!levels.is_empty(), "the plan has no wider level");
-    let (file, reasons) = collector_sub_dag(&plan, &parse(&capabilities()), CommitGrace::default());
+    let (file, reasons) =
+        collector_sub_dag(&plan, &parse(&capabilities()), CommitGrace::default()).unwrap();
     assert_eq!(file.outputs, [chain(&plan)]);
     assert!(matches!(
         reason(&reasons, levels[0]),
@@ -279,7 +283,7 @@ fn an_operator_line_moves_the_cut_up() {
         .as_array_mut()
         .unwrap()
         .push(json!({"kind": "SummaryMergeWindows"}));
-    let (file, _) = collector_sub_dag(&plan, &parse(&merging), CommitGrace::default());
+    let (file, _) = collector_sub_dag(&plan, &parse(&merging), CommitGrace::default()).unwrap();
     for level in &levels {
         assert!(file.outputs.contains(level), "{:?}", file.outputs);
     }
@@ -290,7 +294,8 @@ fn an_operator_line_moves_the_cut_up() {
 #[test]
 fn the_file_reads_back_and_its_views_keep_their_keys() {
     let plan = plan(&["quantile_over_time(0.99, data[5m])"], false);
-    let (file, _) = collector_sub_dag(&plan, &parse(&capabilities()), CommitGrace::default());
+    let (file, _) =
+        collector_sub_dag(&plan, &parse(&capabilities()), CommitGrace::default()).unwrap();
     let text = serde_json::to_string(&file).unwrap();
     let read: common::CollectorViewsFile = serde_json::from_str(&text).unwrap();
     // Equal as written (the nodes' in-memory provenance is not in the file).
@@ -305,7 +310,9 @@ fn the_file_reads_back_and_its_views_keep_their_keys() {
     }
 }
 
-/// Capabilities of another version, or with an unknown field, are refused.
+/// Capabilities of another version, with an unknown field, or with an
+/// operator limit that does not apply to its kind or names no variant, are
+/// refused.
 #[test]
 fn unknown_capabilities_are_refused() {
     let mut newer = capabilities();
@@ -314,4 +321,24 @@ fn unknown_capabilities_are_refused() {
     let mut unknown = capabilities();
     unknown["operators"][0]["reductions_typo"] = json!([]);
     assert!(CollectorCapabilities::from_json(&unknown.to_string()).is_err());
+    for (operator, limits) in [
+        (2, json!({"reductions": ["PerEnity"]})),
+        (0, json!({"reductions": ["PerEntity"]})),
+        (1, json!({"sources": ["TimeSeries"]})),
+    ] {
+        let mut wrong = capabilities();
+        for (limit, value) in limits.as_object().unwrap() {
+            wrong["operators"][operator][limit] = value.clone();
+        }
+        assert!(
+            CollectorCapabilities::from_json(&wrong.to_string()).is_err(),
+            "{limits}"
+        );
+    }
+    let mut twice = capabilities();
+    twice["operators"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"kind": "Filter"}));
+    assert!(CollectorCapabilities::from_json(&twice.to_string()).is_err());
 }

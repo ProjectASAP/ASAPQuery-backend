@@ -1,7 +1,8 @@
 //! The data plane's boundary types and the `FallbackClient` trait, with the
 //! names and shapes of ASAPQuery's engine-boundary design
-//! (docs/design/repo-layout.md). Adapters and engines meet here; this crate
-//! holds no implementation.
+//! (docs/design/repo-layout.md). Adapters and engines meet here, and the
+//! control plane meets the data plane in the collector-views file it writes
+//! (`CollectorViewsFile`); this crate holds no implementation.
 //!
 //! It names ASAPPlanner's plan types only (`InstallablePlan`, the DAG's node
 //! ids, `QueryLanguage`) and no executor item.

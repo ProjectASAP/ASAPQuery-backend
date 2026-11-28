@@ -572,7 +572,7 @@ async fn the_collector_views_file_makes_the_chain_a_collector_view() {
         .join("../control-plane/tests/data/collector-capabilities.json");
     let capabilities =
         CollectorCapabilities::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
-    let (file, _) = collector_sub_dag(&plan, &capabilities, CommitGrace::default());
+    let (file, _) = collector_sub_dag(&plan, &capabilities, CommitGrace::default()).unwrap();
     let file: ::common::CollectorViewsFile =
         serde_json::from_str(&serde_json::to_string(&file).unwrap()).unwrap();
     assert_eq!(file.outputs, [node]);
