@@ -118,7 +118,7 @@ default 1 GiB) and queued requests.
 **Measurements.** `GET /metrics` exports, in the Prometheus text format,
 the thread CPU and wall time of each phase
 (`asap_phase_cpu_seconds_total{phase=...}`: `remote_write_decode`,
-`append`, `precompute` per refresh group, `query` per query text), query
+`otlp_decode`, `append`, `precompute` per refresh group, `query` per query text), query
 latency, sample and window counters, the backlogs, the watermark lag, the
 bytes held by raw panes and views, RSS, and each thread's CPU time by
 name; the view tier and push precompute add `asap_view_cache_*`,
@@ -207,9 +207,22 @@ Remote Write (the same protobuf, zstd-compressed) on `/api/v1/import` and
 OTLP/HTTP metrics (protobuf, optionally gzip) on `/v1/metrics`, the routes
 ASAPQuery serves them on. An OTLP data point becomes a sample of the series
 named by its metric (`<name>_sum` and `<name>_count` for histograms and
-summaries) and labeled by its scope's, resource's and own attributes. Both
-routes answer as Remote Write does (400, 503, 500), and are not served in
-forward mode, which delivers only Remote Write bodies to the raw store.
+summaries), labeled as Prometheus' OTLP receiver labels it by default: the
+point's attributes, their names escaped (`http.method` is `http_method`),
+plus `job` from the resource's `service.namespace`/`service.name` and
+`instance` from its `service.instance.id`. Other resource attributes are
+labels only when named by `--otlp-promote-resource-attributes a,b` (as
+Prometheus' `promote_resource_attributes`); scope attributes are not labels.
+Sums with DELTA temporality are rejected, counted on `/metrics`
+(`asap_otlp_rejected_points_total`); a point flagged "no recorded value"
+gives Prometheus' stale marker, as Prometheus writes it and as Remote Write
+stale markers are kept. The `otlp` crate's docs list the rules and where
+they differ from Prometheus. `/api/v1/import` answers as
+Remote Write does (400, 503, 500); `/v1/metrics` answers as OTLP/HTTP asks:
+200 with a protobuf `ExportMetricsServiceResponse` (its `partial_success`
+counting rejected points), or a `google.rpc.Status` body with 400, 415
+(OTLP/JSON, not decoded), 503 or 500. Neither route is served in forward
+mode, which delivers only Remote Write bodies to the raw store.
 
 `--deployment-capabilities caps.json` replaces the default
 `DeploymentCapabilities`: every summary the Planner's executor builds, raw
@@ -260,9 +273,9 @@ not stored) with a Prometheus `execution` error (422,
 | `crates/query/` | package `query`: planned queries on the query workers, and the result cache |
 | `crates/storage/` | package `storage`: raw samples and views in memory, the view cache, segments, persistence and the persist threads |
 | `crates/internal-metrics/` | package `internal_metrics`: the backend's measurements of itself, exported on `/metrics` |
-| `crates/adapters/ingest/prometheus-remote-write/` | package `prometheus_remote_write`: Remote Write v1 decoding and validation |
+| `crates/adapters/ingest/prometheus-remote-write/` | package `prometheus_remote_write`: Remote Write v1 decoding and validation; its protobuf reader and series cache also serve `otlp` |
 | `crates/adapters/ingest/victoriametrics-remote-write/` | package `victoriametrics_remote_write`: VictoriaMetrics Remote Write (the Remote Write protobuf, zstd-compressed), `POST /api/v1/import` |
-| `crates/adapters/ingest/otlp/` | package `otlp`: OTLP/HTTP metrics decoding into samples, `POST /v1/metrics` |
+| `crates/adapters/ingest/otlp/` | package `otlp`: OTLP/HTTP metrics decoding into samples, and the OTLP/HTTP replies, `POST /v1/metrics` |
 | `crates/adapters/query/clickhouse-http/` | package `clickhouse_http`: the `query` parameter, TabSeparated bodies and the fallback client of a ClickHouse server, `/clickhouse/query` |
 | `crates/adapters/query/elastic-http/` | package `elastic_http`: `_sql` and `_search` bodies and the fallback client of an Elasticsearch server, `POST /_sql`, `POST /_search` |
 | `crates/adapters/query/prometheus-http/` | package `prometheus_http`: query parameters, response bodies and the fallback client of a Prometheus-compatible server |

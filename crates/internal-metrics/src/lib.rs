@@ -1,5 +1,5 @@
 //! The data plane's own measurements, for profiling and benchmarks: thread
-//! CPU time and wall time of each phase (Remote Write decode, append,
+//! CPU time and wall time of each phase (Remote Write and OTLP decode, append,
 //! precompute per refresh group, query run per query text), query latency,
 //! the watermark, bytes held, and each thread's CPU time by name. The data
 //! plane renders them, with the stores' and the engine's gauges, on
@@ -289,6 +289,10 @@ pub struct Metrics {
     pub push: Option<PushMetrics>,
     /// Remote Write decode and series interning, on the HTTP threads.
     pub remote_write_decode: PhaseStats,
+    /// OTLP decode and series interning, on the HTTP threads.
+    pub otlp_decode: PhaseStats,
+    /// OTLP data points rejected: points of sums with DELTA temporality.
+    pub otlp_rejected_points: AtomicU64,
     /// Storing one ingest command's samples on the ingest thread: routing,
     /// appending, closing windows, compacting and evicting panes.
     pub append: PhaseStats,
@@ -330,6 +334,8 @@ impl Metrics {
         Self {
             push: None,
             remote_write_decode: PhaseStats::default(),
+            otlp_decode: PhaseStats::default(),
+            otlp_rejected_points: AtomicU64::new(0),
             append: PhaseStats::default(),
             precompute: groups
                 .iter()

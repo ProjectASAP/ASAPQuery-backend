@@ -34,6 +34,7 @@ pub mod remote_write;
 #[cfg(test)]
 mod test_support;
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,6 +67,8 @@ pub struct DataPlane {
     pub queries: Vec<String>,
     pub engine: EngineHandle,
     pub limits: prometheus_remote_write::Limits,
+    /// How OTLP resource attributes become labels (`/v1/metrics`).
+    otlp_label_options: otlp::LabelOptions,
     /// Never forward a query to Prometheus: a query the plan cannot answer
     /// gets an error with the reason ([`EngineOptions::no_forward`]).
     pub no_forward: bool,
@@ -110,6 +113,7 @@ impl DataPlane {
             queries,
             engine,
             limits: prometheus_remote_write::Limits::default(),
+            otlp_label_options: otlp::LabelOptions::default(),
             fallback: PrometheusHttpFallback::new(&prometheus_url, DEFAULT_FORWARD_TIMEOUT),
             raw_forward: None,
             clickhouse_fallback: None,
@@ -161,6 +165,13 @@ impl DataPlane {
         self.fallback = self.fallback.with_base_url(&options.url);
         self.raw_forward = Some(raw_forward::RawForwarder::start(options)?);
         Ok(self)
+    }
+
+    /// Labels OTLP series with the resource attributes `options` promotes
+    /// (`--otlp-promote-resource-attributes`).
+    pub fn with_otlp_label_options(mut self, options: otlp::LabelOptions) -> Self {
+        self.otlp_label_options = options;
+        self
     }
 
     /// Bounds each forwarded query by `timeout`, from sending the request to
@@ -422,7 +433,7 @@ async fn write(State(state): State<Arc<DataPlane>>, body: Bytes) -> Response {
                 None => None,
             };
             if let Some(refused) = ingest(&state, samples, "Remote Write") {
-                return refused;
+                return refused.into_response();
             }
             if let Some(reservation) = reservation {
                 reservation.commit(body);
@@ -444,7 +455,7 @@ async fn write_victoriametrics(State(state): State<Arc<DataPlane>>, body: Bytes)
     };
     if !samples.is_empty() {
         if let Some(refused) = ingest(&state, samples, "VictoriaMetrics Remote Write") {
-            return refused;
+            return refused.into_response();
         }
     }
     StatusCode::NO_CONTENT.into_response()
@@ -452,36 +463,70 @@ async fn write_victoriametrics(State(state): State<Arc<DataPlane>>, body: Bytes)
 
 /// `POST /v1/metrics`: an OTLP/HTTP metrics body (protobuf, gzip when its
 /// `Content-Encoding` says so), each data point ingested as a sample
-/// ([`otlp`]); 200 with `{"rejected": 0}` once the engine has them, as
-/// ASAPQuery answers. Not served in forward mode (see [`router`]).
+/// ([`otlp`]). Replies as OTLP/HTTP asks: 200 with an
+/// `ExportMetricsServiceResponse` once the engine has the samples, its
+/// `partial_success` counting the points rejected (sums with DELTA
+/// temporality); 400 for a malformed body, 415 for OTLP/JSON, which is not
+/// decoded, and 503 or 500 as Remote Write, each with a `google.rpc.Status`
+/// body, encoded as the request was. Not served in forward mode (see
+/// [`router`]).
 async fn write_otlp(
     State(state): State<Arc<DataPlane>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let content_encoding = headers
-        .get(header::CONTENT_ENCODING)
-        .and_then(|value| value.to_str().ok());
-    let samples = match remote_write::decode_otlp_samples(&body, content_encoding, &state.limits) {
-        Ok(samples) => samples,
-        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    let header_text = |name| headers.get(name).and_then(|value| value.to_str().ok());
+    let encoding = otlp::Encoding::of_content_type(header_text(header::CONTENT_TYPE));
+    let failed = |status: StatusCode, message: &str| {
+        (
+            status,
+            [(header::CONTENT_TYPE, encoding.content_type())],
+            otlp::status_body(encoding, message),
+        )
+            .into_response()
     };
-    if !samples.is_empty() {
-        if let Some(refused) = ingest(&state, samples, "OTLP") {
-            return refused;
+    if encoding == otlp::Encoding::Json {
+        return failed(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "OTLP/JSON is not supported: send application/x-protobuf",
+        );
+    }
+    let timer = internal_metrics::Timer::start();
+    let decoded = match remote_write::decode_otlp_samples(
+        &body,
+        header_text(header::CONTENT_ENCODING),
+        &state.otlp_label_options,
+        &state.limits,
+    ) {
+        Ok(decoded) => decoded,
+        Err(error) => return failed(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    let metrics = state.engine.metrics();
+    metrics.otlp_decode.record(timer);
+    let reply = otlp::export_response_body(
+        decoded.rejected_points,
+        decoded.rejection_message().as_deref(),
+    );
+    if !decoded.samples.is_empty() {
+        if let Some((status, message)) = ingest(&state, decoded.samples, "OTLP") {
+            return failed(status, &message);
         }
     }
-    axum::Json(serde_json::json!({ "rejected": 0 })).into_response()
+    // Counted once the request is accepted, so a retried 503 counts once.
+    metrics
+        .otlp_rejected_points
+        .fetch_add(decoded.rejected_points, Ordering::Relaxed);
+    ([(header::CONTENT_TYPE, encoding.content_type())], reply).into_response()
 }
 
 /// Hands decoded samples to the engine: `None` once it has them, or the
-/// response refusing them when it is busy (503, which senders retry) or has
-/// stopped (500).
+/// status and reason refusing them when it is busy (503, which senders
+/// retry) or has stopped (500).
 fn ingest(
     state: &DataPlane,
     samples: Vec<storage::store::RawSample>,
     protocol: &str,
-) -> Option<Response> {
+) -> Option<(StatusCode, String)> {
     let refused = match state.engine.try_ingest(samples).err()? {
         IngestError::Busy => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -495,7 +540,7 @@ fn ingest(
             )
         }
     };
-    Some(refused.into_response())
+    Some(refused)
 }
 
 /// `POST /api/v1/precompute/watermark?time_ms=T`: the producer states that

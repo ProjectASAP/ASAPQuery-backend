@@ -3,13 +3,18 @@ name = "otlp"
 version.workspace = true
 edition.workspace = true
 
-# OTLP (OpenTelemetry) metrics over HTTP: request decoding into data
-# points. An adapter: no workspace dependency, so it never sees an engine
-# or a store.
+# OTLP (OpenTelemetry) metrics over HTTP: request decoding into the
+# caller's samples, and the replies. An adapter: it never sees an engine or
+# a store. It depends on `prometheus-remote-write` alone, for the caller's
+# sample types (`SampleBuilder`), the in-place protobuf reader and the
+# series cache its decoder shares.
 [dependencies]
-# The OTLP protobuf messages (no gRPC server; the crate still builds
-# tonic's codegen types and the OpenTelemetry SDK it depends on).
+prometheus_remote_write.workspace = true
+# The OTLP protobuf messages, for senders, tests and the replies (no gRPC
+# server; the crate still builds tonic's codegen types and the
+# OpenTelemetry SDK it depends on).
 opentelemetry-proto = { version = "0.28", default-features = false, features = ["gen-tonic-messages", "metrics"] }
 prost = "0.13"
 flate2 = "1.0"
+serde_json.workspace = true
 thiserror.workspace = true

@@ -115,6 +115,13 @@ struct Args {
     /// does not answer to it. Cannot be used with `--no-forward`.
     #[arg(long, conflicts_with = "no_forward")]
     clickhouse_url: Option<String>,
+    /// OTLP resource attributes, by their OTLP names, that are labels of
+    /// every series of their resource (comma-separated), as Prometheus'
+    /// `otlp.promote_resource_attributes`. Without it, a resource gives only
+    /// `job` (from `service.namespace` and `service.name`) and `instance`
+    /// (from `service.instance.id`).
+    #[arg(long, value_delimiter = ',')]
+    otlp_promote_resource_attributes: Vec<String>,
     /// The database forwarded ClickHouse queries run in.
     #[arg(long, default_value = "default")]
     clickhouse_database: String,
@@ -237,7 +244,15 @@ async fn main() -> anyhow::Result<()> {
             ..EngineOptions::default()
         },
     )?
-    .with_forward_timeout(forward_timeout);
+    .with_forward_timeout(forward_timeout)
+    .with_otlp_label_options(otlp::LabelOptions {
+        promote_resource_attributes: args
+            .otlp_promote_resource_attributes
+            .iter()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect(),
+    });
     if let Some(url) = &args.clickhouse_url {
         let fallback = clickhouse_http::fallback::ClickHouseHttpFallback::new(
             url,

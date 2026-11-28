@@ -9,6 +9,12 @@
 
 use prost::Message;
 
+pub mod series_cache;
+pub mod wire;
+
+use series_cache::SeriesCache;
+use wire::{Reader, Value};
+
 #[derive(Clone, PartialEq, Message)]
 pub struct WriteRequest {
     #[prost(message, repeated, tag = "1")]
@@ -97,14 +103,14 @@ pub struct Decoder<B: SampleBuilder> {
     /// A request's decompressed bytes are written over the last one's,
     /// with no allocation, zeroing or page faults once it has grown.
     decompressed: Vec<u8>,
-    cache: SeriesCache<B>,
+    interner: Interner<B>,
 }
 
 impl<B: SampleBuilder> Decoder<B> {
     pub fn new(builder: B) -> Self {
         Self {
             decompressed: Vec::new(),
-            cache: SeriesCache::new(builder),
+            interner: Interner::new(builder),
         }
     }
 
@@ -127,10 +133,10 @@ impl<B: SampleBuilder> Decoder<B> {
     ) -> Result<Vec<B::Sample>, RemoteWriteError> {
         let Self {
             decompressed: buffer,
-            cache,
+            interner,
         } = self;
         let decoded = decompress_into(body, limits, buffer)
-            .and_then(|request| decode_request(request, cache, limits));
+            .and_then(|request| decode_request(request, interner, limits));
         // An unusually large request's buffer is not kept, whether or not the
         // request decoded: a short body claiming a large size and then failing
         // to decompress must not leave the decoder holding that buffer.
@@ -156,7 +162,7 @@ impl<B: SampleBuilder> Decoder<B> {
                 limits.max_decompressed_bytes,
             ));
         }
-        decode_request(request, &mut self.cache, limits)
+        decode_request(request, &mut self.interner, limits)
     }
 }
 
@@ -167,7 +173,7 @@ impl<B: SampleBuilder> Decoder<B> {
 #[inline(always)]
 fn decode_request<B: SampleBuilder>(
     request: &[u8],
-    cache: &mut SeriesCache<B>,
+    cache: &mut Interner<B>,
     limits: &Limits,
 ) -> Result<Vec<B::Sample>, RemoteWriteError> {
     // Room for one sample per 40 encoded bytes: a sender's one-sample
@@ -221,7 +227,7 @@ fn decompress_into<'a>(
 /// Appends the samples of one encoded `TimeSeries` to `samples`.
 fn decode_series<B: SampleBuilder>(
     series: &[u8],
-    cache: &mut SeriesCache<B>,
+    cache: &mut Interner<B>,
     samples: &mut Vec<B::Sample>,
     limits: &Limits,
 ) -> Result<(), RemoteWriteError> {
@@ -360,95 +366,33 @@ fn sample_generic(sample: &[u8]) -> Result<(i64, f64), RemoteWriteError> {
     Ok((timestamp_ms, value))
 }
 
-/// A decoder's series by the bytes of their encoded labels. A sender
-/// writes its series in the same order request after request, so each
-/// entry remembers the entry looked up after it last time, and a lookup
-/// first compares the key with that prediction: a hit costs one compare,
-/// no hash. Every hit is a byte-for-byte match of the key.
-struct SeriesCache<B: SampleBuilder> {
-    entries: Vec<CacheEntry<B::Series>>,
-    /// Entries by the hash of their key.
-    by_key: hashbrown::HashTable<u32>,
-    /// The entry looked up last.
-    last: Option<u32>,
-    /// Interns each series seen for the first time.
+/// A decoder's series cache with the builder that interns a series seen
+/// for the first time.
+struct Interner<B: SampleBuilder> {
+    cache: SeriesCache<B::Series>,
     builder: B,
 }
 
-impl<B: SampleBuilder> SeriesCache<B> {
+impl<B: SampleBuilder> Interner<B> {
     fn new(builder: B) -> Self {
         Self {
-            entries: Vec::new(),
-            by_key: hashbrown::HashTable::new(),
-            last: None,
+            cache: SeriesCache::new(),
             builder,
         }
     }
-}
 
-struct CacheEntry<S> {
-    key: Box<[u8]>,
-    series: S,
-    /// The entry looked up right after this one, last time.
-    next: Option<u32>,
-}
-
-impl<B: SampleBuilder> SeriesCache<B> {
     /// The series of the encoded labels `key` (a run of `TimeSeries`
     /// field-1 entries): from the cache, or parsed, validated and interned
-    /// by the builder.
+    /// by the builder. `#[inline(always)]`: without it, one series per
+    /// sample decodes about 3% slower than with the cache inside `lib.rs`.
+    #[inline(always)]
     fn get_or_intern(&mut self, key: &[u8]) -> Result<B::Series, RemoteWriteError> {
-        if let Some(series) = self.get(key) {
+        if let Some(series) = self.cache.get(key) {
             return Ok(series);
         }
         let series = parse_labels(key, |labels| self.builder.intern(labels))?;
-        self.insert(key, series);
+        self.cache.insert(key, series);
         Ok(series)
-    }
-
-    fn hash(key: &[u8]) -> u64 {
-        static STATE: std::sync::OnceLock<ahash::RandomState> = std::sync::OnceLock::new();
-        STATE.get_or_init(ahash::RandomState::new).hash_one(key)
-    }
-
-    #[inline]
-    fn get(&mut self, key: &[u8]) -> Option<B::Series> {
-        let predicted = self.last.and_then(|last| self.entries[last as usize].next);
-        if let Some(index) = predicted {
-            let entry = &self.entries[index as usize];
-            if *entry.key == *key {
-                self.last = Some(index);
-                return Some(entry.series);
-            }
-        }
-        let entries = &self.entries;
-        let index = *self
-            .by_key
-            .find(Self::hash(key), |&i| *entries[i as usize].key == *key)?;
-        self.follow(index);
-        Some(self.entries[index as usize].series)
-    }
-
-    fn insert(&mut self, key: &[u8], series: B::Series) {
-        let index = u32::try_from(self.entries.len()).expect("fewer than 2^32 series");
-        self.entries.push(CacheEntry {
-            key: key.into(),
-            series,
-            next: None,
-        });
-        let entries = &self.entries;
-        self.by_key.insert_unique(Self::hash(key), index, |&i| {
-            Self::hash(&entries[i as usize].key)
-        });
-        self.follow(index);
-    }
-
-    /// Records that `index` was looked up after the last entry.
-    fn follow(&mut self, index: u32) {
-        if let Some(last) = self.last {
-            self.entries[last as usize].next = Some(index);
-        }
-        self.last = Some(index);
     }
 }
 
@@ -486,116 +430,6 @@ fn parse_labels<S>(
         return Err(RemoteWriteError::MissingMetricName);
     }
     Ok(intern(&pairs))
-}
-
-/// One protobuf field value.
-enum Value<'a> {
-    Varint(u64),
-    Fixed64(u64),
-    Bytes(&'a [u8]),
-    Fixed32,
-}
-
-/// A protobuf reader over borrowed bytes.
-struct Reader<'a> {
-    bytes: &'a [u8],
-    position: usize,
-    /// Where the field read last starts (its tag).
-    field_start: usize,
-}
-
-impl<'a> Reader<'a> {
-    #[inline(always)]
-    fn new(bytes: &'a [u8]) -> Self {
-        Self {
-            bytes,
-            position: 0,
-            field_start: 0,
-        }
-    }
-
-    #[cold]
-    fn error(message: &str) -> RemoteWriteError {
-        RemoteWriteError::Protobuf(message.into())
-    }
-
-    #[inline(always)]
-    fn varint(&mut self) -> Result<u64, RemoteWriteError> {
-        // One byte: most tags and lengths.
-        if let Some(&byte) = self.bytes.get(self.position) {
-            if byte < 0x80 {
-                self.position += 1;
-                return Ok(u64::from(byte));
-            }
-        }
-        let (value, position) = varint_slow(self.bytes, self.position)?;
-        self.position = position;
-        Ok(value)
-    }
-
-    #[inline(always)]
-    fn take(&mut self, len: usize) -> Result<&'a [u8], RemoteWriteError> {
-        let end = self
-            .position
-            .checked_add(len)
-            .filter(|&end| end <= self.bytes.len())
-            .ok_or_else(|| Self::error("field runs past the end of its message"))?;
-        let taken = &self.bytes[self.position..end];
-        self.position = end;
-        Ok(taken)
-    }
-
-    /// The next field number and value; `None` at the end.
-    #[inline(always)]
-    fn field(&mut self) -> Result<Option<(u64, Value<'a>)>, RemoteWriteError> {
-        if self.position == self.bytes.len() {
-            return Ok(None);
-        }
-        self.field_start = self.position;
-        let tag = self.varint()?;
-        let field = tag >> 3;
-        if field == 0 {
-            return Err(Self::error("field number 0"));
-        }
-        let value = match tag & 7 {
-            0 => Value::Varint(self.varint()?),
-            1 => Value::Fixed64(u64::from_le_bytes(
-                self.take(8)?.try_into().expect("8 bytes"),
-            )),
-            2 => {
-                let len =
-                    usize::try_from(self.varint()?).map_err(|_| Self::error("length too large"))?;
-                Value::Bytes(self.take(len)?)
-            }
-            5 => {
-                self.take(4)?;
-                Value::Fixed32
-            }
-            wire => return Err(Self::error(&format!("unsupported wire type {wire}"))),
-        };
-        Ok(Some((field, value)))
-    }
-}
-
-/// The varint at `position` of `bytes` and the position after it, for a
-/// varint of more than one byte. A free function of plain values, not a
-/// `Reader` method: the reader then never escapes to this out-of-line,
-/// cross-crate call, so its position stays in a register in the callers'
-/// loops.
-#[inline(never)]
-fn varint_slow(bytes: &[u8], mut position: usize) -> Result<(u64, usize), RemoteWriteError> {
-    let mut value = 0u64;
-    for shift in (0..64).step_by(7) {
-        let byte = *bytes
-            .get(position)
-            .ok_or_else(|| Reader::error("truncated varint"))?;
-        position += 1;
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte < 0x80 {
-            return Ok((value, position));
-        }
-    }
-    Err(Reader::error("varint too long"))
 }
 
 /// Snappy-compressed encoding of `request`, as a Remote Write sender sends it.
@@ -672,7 +506,7 @@ mod tests {
                 .into_iter()
                 .map(|(series, timestamp_ms, value)| {
                     (
-                        self.cache.builder.series[series].clone(),
+                        self.interner.builder.series[series].clone(),
                         timestamp_ms,
                         value.to_bits(),
                     )
@@ -811,7 +645,7 @@ mod tests {
         }
         // Each series interned once: the second request, and the repeated
         // series in the first, are cache hits.
-        assert_eq!(decoder.cache.builder.series.len(), 3);
+        assert_eq!(decoder.interner.builder.series.len(), 3);
         let unnamed = WriteRequest {
             timeseries: vec![series(&[("job", "api")], &[(1, 1.0)])],
         };
@@ -866,7 +700,7 @@ mod tests {
             .into_iter()
             .map(|(series, timestamp_ms, value)| {
                 (
-                    decoder.cache.builder.series[series].clone(),
+                    decoder.interner.builder.series[series].clone(),
                     timestamp_ms,
                     value.to_bits(),
                 )
