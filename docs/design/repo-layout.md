@@ -458,7 +458,9 @@ PRs, each reviewed on its own:
    sample arrives, event time is taken to advance with the wall clock. The
    coordinator keeps an idle watermark `t + (now − a) − L − G`: `t` the
    newest sample time (capped at `a`), `a` the wall-clock time of the flush
-   that last ran a sample, `L` `--allowed-lateness-ms`, `G` a 1 s grace. A
+   that last ran a sample, `L` `--allowed-lateness-ms`, `G` a 1 s grace;
+   `now − a` is measured on the monotonic clock (`Instant`), so a step of
+   the system clock does not move it. A
    window `(e − W, e]` so closes once no sample has come for
    `e − t + L + G`, at most `W + L + G`. Counting from `t`, not from `now`,
    a stream whose event time lags the wall clock (a replay or backfill)
