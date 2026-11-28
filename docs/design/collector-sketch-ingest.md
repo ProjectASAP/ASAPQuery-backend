@@ -22,8 +22,12 @@ metric's raw samples, the collector stops sending them to the backend.
 The collector is told what to build in the planner's own terms: for each
 collector view the control plane sends the view's sub-DAG of the installed
 ASAPPlanner plan, and the collector depends on ASAPPlanner's types crate to
-read it. Every state carries the planner's **view state key**, so the backend
-finds the view by what the state is, not by a number both sides agree on.
+read it. Collector view states travel in exactly the OTAP structure of raw
+samples: the same Schema, Dictionary and Record tiers, with the same
+Dictionary entries; only the Record content differs (a window state instead
+of a sample). The view identity (plan id, node id and the planner's **view
+state key**) is Schema-level metric metadata, so every state names its view
+through its metric.
 
 Terms, as in ASAPPlanner (`asap-types`):
 
@@ -45,9 +49,10 @@ Terms, as in ASAPPlanner (`asap-types`):
   }
   ```
 
-  Two views with equal key and equal concrete selection (the rows that went
-  in: `view_coverage.selection`) hold the same state, in any plan. Refresh
-  mode, retention and storage medium are not in the key.
+  Refresh mode, retention and storage medium are not in the key.
+- **View identity**: `(plan_id, node_id, view state key)`, what a collector
+  state carries. `(plan_id, node_id)` finds the view; the key must equal
+  that node's key.
 - **Leaf view**: a view whose child is a raw `Scan`.
 - **Sub-DAG**: a leaf view's node, its `Scan` node and the edge between
   them, as a `PhysicalASAPDAG` with `roots = [view node]`.
@@ -65,11 +70,13 @@ Scope:
   the planner's main. The remaining prerequisite is the backend's planner
   and `asap_sketchlib` pin bump (Plan, step 1). It needs no other planner
   change.
-- The backend changes in four places: a new ingest adapter, new `common`
-  types, the collector-state ingest in precompute, and the control plane.
+- The backend changes in four places: the OTLP ingest adapter (the Record
+  branch), new `common` types, the collector-state ingest in precompute, and
+  the control plane.
 - The collector changes in its own repository: a capabilities command, the
-  `asap-types` dependency and a sub-DAG loader, key stamping, the
-  window-boundary, out-of-order and matcher fixes, and a raw-forward filter.
+  `asap-types` dependency and a sub-DAG loader, view identity in metric
+  metadata, the window-boundary, out-of-order and matcher fixes, and a
+  raw-forward filter.
 
 ## Components
 
@@ -81,9 +88,10 @@ Scope:
    asap_sketches --print-capabilities ─▶ capabilities.json            ▲ collector-views.json          │
                                                │                      │                               ▼
  workload ─▶ control-plane ─▶ InstallablePlan ─┼──────────────────────┼──────▶ data-plane  POST /v1/metrics
-              │ (asap-planner)                 ▼                      │         ├─ point without sketch.envelope ─▶ otlp ─▶ PrecomputeEngine::try_ingest
-              └─ collector view rule (reads capabilities.json) ───────┘         └─ point with sketch.envelope ─▶ asap-sketch-otlp ─▶ ViewStateBatch
-                 (same collector-views.json) ────────────────────────────▶ data-plane      ─▶ PrecomputeEngine::ingest_collector_states ─▶ committer ─▶ storage::ViewStore
+              │ (asap-planner)                 ▼                      │         otlp: one walk, Schema + Dictionary decoded once; branch at the Record:
+              └─ collector view rule (reads capabilities.json) ───────┘         ├─ point without sketch.envelope ─▶ Point ─▶ PrecomputeEngine::try_ingest
+                 (same collector-views.json) ────────────────────────────▶      └─ point with sketch.envelope ─▶ ViewStateBatch
+                                                                                    ─▶ PrecomputeEngine::ingest_collector_states ─▶ committer ─▶ storage::ViewStore
 ```
 
 | Component | Crate or repository | Role |
@@ -91,10 +99,10 @@ Scope:
 | Capabilities | ASAPCollector-public (`asap_sketches --print-capabilities`) | Declares what the collector can build (§1) |
 | Collector view rule | `crates/control-plane` | Picks the leaf views of the installed plan the collector can build against the capabilities; the only copy of the rule |
 | Collector-views file | `crates/control-plane` (`--emit-collector-views`) | Each collector view's sub-DAG, the plan id, which metrics the backend still reads raw, the commit grace |
-| `asap_sketches` processor | ASAPCollector-public | Loads the file at start, builds each view's per-series states, stamps the view state key, exports OTLP summary points with `sketch.envelope` |
+| `asap_sketches` processor | ASAPCollector-public | Loads the file at start, builds each view's per-series states, writes the view identity into metric metadata, exports summary points with `sketch.envelope` |
 | Raw forward | ASAPCollector-public | Forwards raw samples to the backend, except metrics the file marks `false` |
-| `asap-sketch-otlp` | `crates/adapters/ingest/asap-sketch-otlp` (new) | Turns those points into `common::ViewStateBatch`es; never reads the sketch bytes |
-| Collector-state ingest | `crates/precompute` | Finds the view by key and selection, stages, deduplicates and merges until commit, drops late states |
+| OTLP adapter | `crates/adapters/ingest/otlp` | Decodes Schema and Dictionary as for raw samples; a point with `sketch.envelope` becomes a `common::ViewStateBatch` record; never reads the sketch bytes |
+| Collector-state ingest | `crates/precompute` | Finds the view by `(plan_id, node_id)`, checks the key, stages, deduplicates and merges until commit, drops late states |
 
 **Raw path.** The raw path stays (decision 3) for every metric the backend
 still reads raw: a metric is marked `backend_reads_raw: true` when a `Scan`
@@ -112,13 +120,13 @@ Following the layout rules (adapters see no engine and no store):
 ```text
 crate / repository   depends on
 -------------------  ------------------------------------------------------
-asap-sketch-otlp     common (ViewStateBatch), otlp (its protobuf types)
+otlp                 + common (ViewStateBatch); adapters may depend on common only
 precompute           + decoding ASAPv1 through storage's existing codec (persist.rs decode_sketch)
 control-plane        unchanged dependencies (asap-planner, common)
 ASAPCollector-public + asap-types (ASAPPlanner's types crate), pinned git rev
 ```
 
-The adapter does not decode ASAPv1. The ingest engine decodes each state
+The OTLP adapter does not decode ASAPv1. The ingest engine decodes each state
 into the view's kernel with `storage`'s `decode_sketch`, because the store
 holds engine-native states and a second state of one window is merged.
 Decoding is not an identity check: θ is already in the key.
@@ -232,12 +240,21 @@ At start, with `planner_views: <path>` in its processor config, the
    rule, written once.
 3. **Reads each view's key** with `materialized_views()` on the sub-DAG and
    `view_state_key()`: the key depends only on the view node, so it equals
-   the installed plan's. The selection is `coverage().selection()`.
+   the installed plan's.
 4. **Builds** each view: sketch and parameters from θ (an out-of-range
    value is a load error, never replaced by a default), window =
    `ViewWindow::Tumbling.width_ms`, matchers = `__name__ = metric` plus each
-   `Scan` predicate, one state per series with every label in the key.
-5. **Stamps** every emitted state with the key and selection (§4).
+   `Scan` predicate, one state per series. A series is what it is for the
+   raw forward: the received Resource, Scope and point attributes, kept as
+   received (no flattening, no label dropping).
+5. **Stamps** the view identity: each view is one Metric entry per
+   Resource and Scope, whose `metadata` carries `(plan_id, node_id, key)`
+   and whose name is `<metric>.asap_view.<node_id>` (§4). The series'
+   Resource, Scope and point attributes are copied unchanged, so the
+   Dictionary entries are the raw forward's. `SketchEnvelope` carries the
+   view identity in place of `agg_id`; the OTAP codec writes it through
+   `MetricView::metadata` (empty today) and reads it back, and
+   `window_merge` keys series by it.
 
 With `planner_views` set, the per-sketch fields of the processor config
 (`sketch_type`, `sketch_params`, `window_size`, `window_slide`,
@@ -252,22 +269,65 @@ plan does not read).
 
 ### 4. OTAP tiers: Schema, Dictionary, Record
 
-The collector's data model (its `docs/data_model.md`) splits a sketch
-stream into OTAP's three tiers by rate of change: **Schema** (once per
-stream and view), **Dictionary** (once per series), **Record** (once per
-state). The backend's `ViewStateBatch` keeps the same nesting, so Schema and
-Dictionary are not repeated in every record:
+OTAP splits a metrics stream into three tiers by rate of change: **Schema**
+(per metric), **Dictionary** (per series), **Record** (per point).
+Collector view states use exactly the structure of raw samples; only the
+Record content differs:
 
-| Tier | Planner source | OTLP placement | `ViewStateBatch` field | Backend handling |
+| Tier | Raw samples | Collector view states | `ViewStateBatch` | Backend handling |
 |---|---|---|---|---|
-| Stream | none | `sketch.stream_id` (Resource; random 128-bit per collector start) | `stream_id` | Key of the series cache |
-| Schema | `view_state_key()` | `sketch.view_state_key` (Resource; the key's JSON) | `views[].key` | Find the view, with the selection |
-| Schema | `coverage().selection()` (lifted label matchers) | `sketch.selection` (Resource; the planner's JSON) | `views[].selection` | as above |
-| Schema | ASAPv1 format version | `sketch.schema_version` (Resource) | none (checked by the adapter) | ≤ highest supported |
-| Schema | none | `sketch.type` (Resource) | none | Not read (decision 11) |
-| Dictionary | `Scan` metric + the series' labels (`$promql_series_identity`) | metric name; `sketch.series_id` and labels (Scope) | `views[].series: (series_id, labels)` | Interned once per `(stream_id, view, series_id)` |
-| Record | the window `(end − w, end]`, `w` from the key | point `start_time_unix_nano` (exclusive), `time_unix_nano` (inclusive) | `records[].window_end_ms` | Window key; `end` must be a multiple of `w` |
-| Record | the view's `state` column | point `sketch.envelope` (ASAPv1 bytes), `count` | `records[].asapv1`, `sample_count` | Stage, dedup, merge, commit (§6) |
+| Schema (per metric) | `Metric`: name, type, unit | the source metric's unit and description; name `<metric>.asap_view.<node_id>`, type Summary; `metadata`: `asap.plan_id`, `asap.node_id`, `asap.view_state_key` | `views[]`: `plan_id`, `node_id`, `key` | Find the view, check the key and name |
+| Dictionary (per series) | Resource + Scope + point attributes → labels | identical: the source samples' Resource, Scope and point attributes, as received | `views[].series[].labels` | The raw path's label function; interned as the raw path interns |
+| Record (per point) | `time_unix_nano` + value | window `(start_time_unix_nano, time_unix_nano]`; point attribute `sketch.envelope` (ASAPv1 bytes); `count` (samples) | `series[].records[]`: `window_end_ms`, `asapv1`, `sample_count` | Stage, dedup, merge, commit (§6) |
+
+**Which view.** A record belongs to its Metric entry, whose metadata
+carries the view identity, so every record names its view through its
+metric, with no per-record identity attribute. Two views over one source
+metric (DDSketch α 0.05 and KLL, or two window widths) are two Metric
+entries. `sketch.envelope` is the only attribute a state adds to its
+point.
+
+**Metric metadata survives the path.** OTLP `Metric.metadata` is
+`repeated KeyValue metadata = 12` in the protobuf both sides build
+(`opentelemetry-proto` 0.28 in the backend; otel-arrow's pdata protos in
+the collector). OTAP Arrow keeps it: the encoder writes `metric.metadata()`
+into the `METRIC_ATTRS` table keyed by metric id, and the OTAP-to-OTLP
+conversion writes those rows back as field 12. No processor between
+`asap_sketches` and the exporter merges metrics.
+
+**Why the name changes.** The proto defines metric metadata as
+"non-identifying; consumers SHOULD NOT need to be aware of these
+attributes". Two Metric entries `data` that differ only in metadata, with
+equal point attributes and window times, are one stream to a consumer that
+follows the specification, and a Summary `data` next to the raw gauge `data`
+is a type conflict. The view's own name keeps them apart without relying on
+metadata: `<metric>.asap_view.<node_id>`. The backend reads identity from
+the metadata only, checks the name, and stores the rows under the `Scan`'s
+metric (`__name__ = data`), so `$promql_series_identity` is exactly what a
+raw sample of that series gets and queries are unaffected. Names containing
+`.asap_view.` are reserved.
+
+**Labels.** The backend builds a state's labels with the raw OTLP path's
+function, with the Prometheus convention for resource attributes: they are
+not copied into labels; `service.name` (prefixed by `service.namespace/`
+when set) becomes `job`, `service.instance.id` becomes `instance`, and an
+optional allow-list promotes named resource attributes (Prometheus's
+`promote_resource_attributes`). Equal Dictionary entries therefore give
+equal labels on both paths.
+
+Where each planner field travels:
+
+| Planner field | Where |
+|---|---|
+| `PhysicalASAPDAG::plan_id()` | Schema: `asap.plan_id` |
+| view node id | Schema: `asap.node_id` and the name suffix |
+| `view_coverage.definition_id` | Schema: in `asap.view_state_key` |
+| `parameters` (θ) | Schema: the key's `logical_properties` |
+| `tumbling_window_width_ms` | Schema: the key's `window`; each window's end in the Record |
+| `view_coverage.selection` | not sent: the collector applies the `Scan`'s predicates; the backend knows the view's selection from `(plan_id, node_id)` |
+| `Scan` `TimeSeries.metric` | Schema: the name prefix; `__name__` of the stored labels |
+| `$promql_series_identity` | Dictionary: built by the label function |
+| the view's `state` column | Record: `sketch.envelope` |
 
 A chain view's selection carries no time column: its rows are indexed by
 `window_end`, and the time part appears only on the `TimeRange` above it.
@@ -276,43 +336,33 @@ Prometheus's `(t − range, t]` form (§5).
 
 ```mermaid
 erDiagram
-    STREAM ||--o{ VIEW : views
-    VIEW ||--o{ SERIES : series
+    SCHEMA ||--o{ SERIES : series
     SERIES ||--o{ RECORD : records
-    STREAM{
-        stream_id u128 "random per collector start"
-    }
-    VIEW{
+    SCHEMA{
+        plan_id string "PhysicalASAPDAG::plan_id()"
+        node_id PhysicalASAPNodeId "the view node"
         key ViewStateKey "definition_id, window, logical_properties"
-        selection json "coverage selection"
+        name string "metric.asap_view.node_id"
     }
     SERIES{
-        series_id u32 "per stream and view"
-        labels LabelSet "__name__ included"
+        labels LabelSet "raw path's label function; __name__ = Scan metric"
     }
     RECORD{
-        series_id u32 "references SERIES"
         window_end_ms i64 "inclusive; start = end - width"
-        asapv1 bytes "full state"
-        sample_count u64
+        asapv1 bytes "sketch.envelope, the full state"
+        sample_count u64 "count"
     }
 ```
 
-**Transport.** OTAP Arrow keeps the tiers on the wire: over one stream,
-Schema and Dictionary are sent once and Records reference them. OTLP HTTP
-repeats the Resource (Schema) and Scope (labels) in every request. v1
+**Transport.** Over OTLP HTTP each request carries the full Resource,
+Scope and point attributes, as for raw samples. Over OTAP Arrow the tiers
+are tables joined by native ids (`parent_id`), with dictionary-encoded
+strings. Neither needs an ASAP series id or a stream-scoped cache. v1
 accepts OTLP HTTP (every collector deployment exports with
 `urn:otel:exporter:otlp_http` today, and the backend already serves
-`/v1/metrics`); the OTLP adapter builds the nesting above, and the series
-cache still interns each series once per stream. A later OTAP Arrow
-adapter fills the same `ViewStateBatch` (decision 16).
-
-**Collector restart.** A restart starts a new stream: new `stream_id`, and
-`series_id` starts again at 1. The backend never reuses a translation
-across streams, so a reset counter cannot alias two series; the new
-stream's series are interned again (to the same backend series, since the
-labels are the same). Entries of a stream not seen for the longest view
-retention are dropped.
+`/v1/metrics`); a later OTAP Arrow adapter fills the same `ViewStateBatch`
+(decision 16). A restarted collector sends the same Dictionary entries, so
+its states land on the same backend series.
 
 ### 5. Window semantics: Prometheus's `(t − range, t]`
 
@@ -355,34 +405,32 @@ The collector change:
 
 ### 6. The sketch path in the data plane
 
-`POST /v1/metrics` decodes the request once. Each summary data point that
-carries a `sketch.envelope` bytes attribute is a collector state; every other
-point is a raw sample, as today. A request may carry both.
+`POST /v1/metrics` decodes the request once, in the `otlp` adapter's one
+walk: Resource, Scope and Metric (Schema) and the point attributes
+(Dictionary) are read by the raw path's code. The walk branches only at the
+Record: a data point with a `sketch.envelope` bytes attribute is a
+collector state, every other point a raw sample, as today. A request may
+carry both.
 
-The adapter groups the collector-state points by `sketch.stream_id`, then by
-(`sketch.view_state_key`, `sketch.selection`), into one `ViewStateBatch`
-per stream. It refuses the request (400) when a Resource lacks one of these
-attributes or they do not parse, or `sketch.schema_version` is newer than
-supported. Labels are Resource attributes, then Scope attributes, then
-point attributes, without any `sketch.*` key, with `__name__` = metric name
-(the raw OTLP adapter's merge order).
+For a state, the adapter reads the view identity from its Metric's
+`metadata` and refuses the request (400) when one of `asap.plan_id`,
+`asap.node_id`, `asap.view_state_key` is missing or does not parse. Labels
+come from the raw path's label function (§4), without `sketch.envelope`,
+with `__name__` = the source metric (the name before `.asap_view.`). States
+are grouped by `(plan_id, node_id)`, then by labels, into one
+`ViewStateBatch` per request.
 
 The ingest engine then, per view and record:
 
-1. **View.** Looks up the installed views with this key and selection
-   (an index built at install from `materialized_views()`). None → rejected
-   (`reason="unknown_view"`), whatever differs: another definition, θ or
-   width, or a view the installed plan no longer has. Views of one plan
-   with equal key and selection hold the same state; the record is stored
-   for each.
+1. **View.** `plan_id` must be the installed plan's; otherwise rejected
+   (`reason="other_plan"`). `node_id` must be a collector view of that plan
+   whose `view_state_key()` equals the key and whose `Scan` metric and node
+   id give the Metric's name; otherwise rejected (`reason="unknown_view"`).
 2. **Window.** `window_end_ms` must be a multiple of the key's width;
    otherwise rejected (`reason="window"`).
-3. **Series.** Translates `(stream_id, view, series_id)` through the series
-   cache, filled from the batch's `series` table; on a miss, interns the
-   labels into the store's series table, as the raw path does, so the row's
-   `$promql_series_identity` is the same canonical JSON a raw sample of
-   that series gets. A `series_id` in neither → rejected
-   (`reason="unknown_series"`).
+3. **Series.** Interns the labels into the store's series table, as the raw
+   path does, so the row's `$promql_series_identity` is the same canonical
+   JSON a raw sample of that series gets.
 4. **Decode.** Decodes the ASAPv1 bytes into the view's kernel; failure →
    rejected (`reason="decode"`).
 5. **Stage, dedup, merge, commit**, below.
@@ -433,35 +481,39 @@ committer, the same path that commits a window it built (readers,
 
 ```rust
 use asap_types::plan::materialized_view::ViewStateKey;
-use asap_types::ir::properties::selection::SelectionBox;
+use asap_types::plan::PhysicalASAPNodeId;
 
-/// Collector states from one collector stream: what the sketch-path ingest
-/// adapter hands `PrecomputeEngine`. In `common` because the adapter depends only on `common`
-/// and must produce it. Nested by OTAP tier, so a view's key and
-/// a series' labels appear once, not per record. Never data between operators.
-#[derive(Debug, Clone, PartialEq)]
+/// The collector states of one OTLP request: what the OTLP adapter hands
+/// `PrecomputeEngine`. In `common` because the adapter depends only on
+/// `common` and must produce it. Nested as the OTAP tiers (Schema →
+/// Dictionary → Record). Never data between operators.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ViewStateBatch {
-    /// Random per collector start; scopes `series_id`.
-    pub stream_id: u128,
     pub views: Vec<CollectorViewStates>,
 }
 
-/// One collector view's states in the batch.
+/// One collector view's states (Schema tier: the Metric's metadata).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CollectorViewStates {
+    /// `PhysicalASAPDAG::plan_id()` of the plan the collector loaded.
+    pub plan_id: String,
+    pub node_id: PhysicalASAPNodeId,
     pub key: ViewStateKey,
-    /// The view's coverage selection, as the planner serializes it.
-    pub selection: Vec<SelectionBox>,
-    /// Series of this view's records: the OTLP adapter lists every series in
-    /// the request, an OTAP adapter only new Dictionary entries.
-    pub series: Vec<(u32, LabelSet)>,
+    pub series: Vec<CollectorSeriesStates>,
+}
+
+/// One series' states (Dictionary tier).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollectorSeriesStates {
+    /// Built by the raw OTLP path's label function; `__name__` is the
+    /// source metric.
+    pub labels: LabelSet,
     pub records: Vec<ViewStateRecord>,
 }
 
-/// One series' state in one window `(window_end_ms − width, window_end_ms]`.
+/// One state in one window `(window_end_ms − width, window_end_ms]` (Record tier).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewStateRecord {
-    pub series_id: u32,
     pub window_end_ms: i64,
     /// ASAPv1 bytes from `asap_sketchlib`: the full state.
     pub asapv1: Vec<u8>,
@@ -476,7 +528,7 @@ pub struct CollectorStateIngestReport {
     pub duplicate: u64,
     pub merged: u64,
     pub late_dropped: u64,
-    /// By reason: `unknown_view`, `window`, `unknown_series`, `decode`.
+    /// By reason: `other_plan`, `unknown_view`, `window`, `decode`.
     pub rejected: BTreeMap<&'static str, u64>,
 }
 
@@ -491,36 +543,31 @@ impl PrecomputeEngine {
 
 `storage::ViewStore` is unchanged: every collector view window is written once, at commit.
 
-### `crates/adapters/ingest/asap-sketch-otlp`
+### `crates/adapters/ingest/otlp`
 
 ```rust
-/// Why a request's collector states could not be read; the whole request is
-/// refused with 400. Per-record problems are counted, not errors.
-#[derive(Debug, thiserror::Error, PartialEq)]
-pub enum SketchOtlpError {
-    #[error("sketch Resource without {0}")]
-    MissingAttribute(&'static str),
-    #[error("sketch.view_state_key is not a planner view state key: {0}")]
-    ViewStateKey(String),
-    #[error("sketch.selection is not a planner selection: {0}")]
-    Selection(String),
-    #[error("sketch.schema_version {0} is newer than supported")]
-    SchemaVersion(u64),
+/// A decoded request: raw samples and collector states, from one walk.
+pub struct Decoded {
+    pub points: Vec<Point>,
+    pub view_states: ViewStateBatch,
 }
 
-/// Whether an OTLP data point carries a collector state (a `sketch.envelope`
-/// bytes attribute): the route's test for the sketch path.
-pub fn is_sketch_point(attributes: &[KeyValue]) -> bool;
+pub fn decode(body: &[u8], content_encoding: Option<&str>, limits: &Limits)
+    -> Result<Decoded, OtlpError>;   // was -> Vec<Point>
 
-/// The collector states of a decoded OTLP request, one batch per stream; points
-/// without `sketch.envelope` are left to the raw `otlp` decoder.
-pub fn decode_view_states(
-    request: &ExportMetricsServiceRequest,
-) -> Result<Vec<ViewStateBatch>, SketchOtlpError>;
+pub enum OtlpError {
+    // ... existing variants ...
+    /// A point with `sketch.envelope` under a Metric whose metadata lacks
+    /// or misstates the view identity; the whole request is refused (400).
+    #[error("metric {metric}: view identity: {reason}")]
+    ViewIdentity { metric: String, reason: String },
+}
 ```
 
-The raw `otlp` decoder already skips points that carry a sketch payload; it
-learns `sketch.envelope` as one more, so each point is read once.
+The raw points' label function is the one states use, and it follows the
+resource-attribute convention of §4. The raw decoder's skip list of sketch
+payload attributes learns `sketch.envelope`, which now selects the Record
+branch.
 
 ### `crates/control-plane`
 
@@ -652,30 +699,40 @@ sketch:
     planner_views: /etc/asap/collector-views.json
 ```
 
-For one series `data{region="r0",service="s0",job="j0",label_0="l0"}`, the
-collector folds the 50 samples with timestamps in `(T − 5 s, T]` into one
-DDSketch and exports one summary point:
+For one series, received with Resource `service.name = "j0"` and point
+attributes `region="r0"`, `service="s0"`, `label_0="l0"`, the collector
+folds the 50 samples with timestamps in `(T − 5 s, T]` into one DDSketch and
+exports, under the same Resource and Scope as the raw samples (OTLP JSON,
+shortened):
 
-| Where (tier) | Attribute | Value |
-|---|---|---|
-| Resource (stream) | `sketch.stream_id` | `"9b1e…"` (random at collector start) |
-| Resource (Schema) | `sketch.view_state_key` | n1's key above, as JSON |
-| Resource (Schema) | `sketch.selection` | `"[{\"columns\":[]}]"` |
-| Resource (Schema) | `sketch.schema_version` | `1` |
-| Resource (Schema) | `sketch.type` | `"DDSketch"` (not read by the backend) |
-| Scope (Dictionary) | `sketch.series_id` | `17` |
-| Scope (Dictionary) | labels | `region="r0"`, `service="s0"`, `job="j0"`, `label_0="l0"` |
-| Metric | name | `data` |
-| Point (Record) | `start_time_unix_nano` | `T − 5 s` (exclusive) |
-| Point (Record) | `time_unix_nano` | `T` (inclusive) |
-| Point (Record) | `sketch.envelope` | ASAPv1 bytes |
-| Point (Record) | `count` | `50` |
+```json
+{"name": "data.asap_view.1",
+ "unit": "",
+ "metadata": [
+   {"key": "asap.plan_id",        "value": {"stringValue": "…"}},
+   {"key": "asap.node_id",        "value": {"intValue": "1"}},
+   {"key": "asap.view_state_key", "value": {"stringValue":
+     "{\"definition_id\":\"5597d603bdf9f1a148d7c7e5344c1a97\",\"window\":{\"tumbling\":{\"width_ms\":5000}},\"logical_properties\":{\"parameters\":{\"DDSketch\":{\"alpha\":0.05}}}}"}}],
+ "summary": {"dataPoints": [{
+   "attributes": [
+     {"key": "region",          "value": {"stringValue": "r0"}},
+     {"key": "service",         "value": {"stringValue": "s0"}},
+     {"key": "label_0",         "value": {"stringValue": "l0"}},
+     {"key": "sketch.envelope", "value": {"bytesValue": "<ASAPv1 bytes>"}}],
+   "startTimeUnixNano": "<T − 5 s>",
+   "timeUnixNano": "<T>",
+   "count": "50"}]}}
+```
 
-The adapter makes one `ViewStateBatch` with one `CollectorViewStates` (n1's
-key and selection), one series `(17, labels)` and one record `(17, T,
-bytes, 50)`. The backend finds n1 by key and selection, checks that `T` is
-a multiple of 5 s, translates `(stream_id, n1, 17)` to its series id,
-decodes the state and stages it; at `T + 8 s` it commits the window. It
+The Resource, Scope and the first three point attributes are exactly the
+raw samples'; the labels are `data{job="j0",region="r0",service="s0",label_0="l0"}`
+on both paths.
+
+The adapter makes one `ViewStateBatch` with one `CollectorViewStates`
+(plan id, node 1, n1's key), one series (those labels) and one record `(T,
+bytes, 50)`. The backend finds n1 by `(plan_id, 1)`, checks the key and the
+name, checks that `T` is a multiple of 5 s, interns the labels, decodes the
+state and stages it; at `T + 8 s` it commits the window. It
 keeps exactly what its own precompute keeps for n1: per series, one
 DDSketch state per 5 s window, for 60 s (12 windows). At evaluation time
 `T`, q01 runs at query time as before: n2 selects the 12 windows ending in
@@ -719,13 +776,15 @@ Backend:
 
 2. This document.
 3. `ViewStateBatch` in `common`, `PrecomputeEngine::ingest_collector_states` and `CollectorStateIngestReport` in `precompute`; the
-   `asap-sketch-otlp` adapter; the `/v1/metrics` split; lookup by key and
-   selection, the series cache, staging, the hash set, merge before commit,
-   commit at grace, late drop. Test data: real ASAPv1 records the collector
-   emits (captured OTLP bodies, checked in with the collector commit that
-   wrote them), for each of the six sketch types, including one unknown key
-   (other θ), one duplicate after a merge, one late state and one restart
-   (new `stream_id`, reused `series_id`).
+   `otlp` adapter's Record branch and the resource-attribute convention in
+   its label function (raw path included); lookup by `(plan_id, node_id)`
+   and key check, staging, the hash set, merge before commit, commit at
+   grace, late drop. Test data: real ASAPv1 records the collector emits
+   (captured OTLP bodies, checked in with the collector commit that wrote
+   them), for each of the six sketch types, including two views over one
+   metric, one key that differs from the node's (other θ), one state of
+   another plan id, one duplicate after a merge, one late state, and one
+   series sent raw and as a state that gets equal labels.
 4. The control plane's rule with `--collector-capabilities`,
    `--emit-collector-views` (sub-DAGs, `plan_id`, `backend_reads_raw`,
    `commit_grace_ms`); the data plane's `--collector-views` with the plan-id
@@ -747,10 +806,13 @@ Collector (ASAPCollector-public):
 
 6. `--print-capabilities`, printed from the config validation code.
 7. `asap-types` as a pinned git dependency (the backend's planner pin); the
-   `planner_views` loader with the executability check; key and selection
-   stamping (`sketch.view_state_key`, `sketch.selection`, `sketch.stream_id`
-   on the Resource, replacing `sketch.agg_id`); `series_id` per (view,
-   series); config errors for the per-sketch fields when it is set.
+   `planner_views` loader with the executability check; the view identity
+   in `SketchEnvelope` (replacing `agg_id`), written as metric metadata and
+   the view name by the OTAP codec, read back on decode, and keyed on by
+   `window_merge`; each series' received Resource, Scope and point
+   attributes kept and emitted unchanged (the Resource-level `sketch.*`
+   attributes and `sketch.series_id` removed); config errors for the
+   per-sketch fields when it is set.
 8. The window boundary `(e − w, e]` in `SketchEnvelope` and the point
    times (window attributes removed), placement by sample timestamp with
    drop-and-count after close, and matchers (§5). It lands before step 5,
@@ -764,12 +826,13 @@ arrival-delay histogram. Cost-based choice of collector views. The OTAP Arrow ad
 
 ## Decisions
 
-1. **The planner's identity, no other planner change.** A collector state is
-   identified by the planner's view state key plus its concrete selection;
-   within the installed plan a view is `(plan_id, node_id)`. θ and window
-   width are in the key, so a state of another θ or width is simply
-   `unknown_view`. Which views the collector builds is a deployment decision
-   the backend's control plane makes on the installed plan.
+1. **The planner's identity, no other planner change.** A collector state
+   names its view by `(plan_id, node_id)` and carries the planner's view
+   state key, which must equal that node's key; θ and window width are in
+   the key, so a state of another θ or width is `unknown_view`. The
+   selection is not sent: the node defines it. Which views the collector
+   builds is a deployment decision the backend's control plane makes on the
+   installed plan.
 2. **The collector is ASAPCollector-public (OTAP), sending full ASAPv1
    states.** No deltas: each record holds the whole state of one series in
    one window.
@@ -798,13 +861,18 @@ arrival-delay histogram. Cost-based choice of collector views. The OTAP Arrow ad
 10. **Raw forwarding follows the readers.** The file lists, per metric,
     whether the backend still reads it raw; the collector drops raw
     samples to the backend for metrics marked `false`.
-11. **`sketch.type` is informational.** The collector keeps emitting it
-    (its data model and its other sinks use it); the backend never reads it,
-    since the key's θ names the sketch and the ASAPv1 bytes carry their own
-    kind.
-12. **`ViewStateBatch` is nested by OTAP tier** (stream → view → series →
-    records); the OTLP adapter builds the nesting, an OTAP adapter fills the
-    same type.
+11. **The raw samples' OTAP structure.** Collector view states use the
+    Schema, Dictionary and Record tiers exactly as raw samples do; only the
+    Record differs (window times, `sketch.envelope`, `count`). The view
+    identity is metric metadata (`asap.plan_id`, `asap.node_id`,
+    `asap.view_state_key`); the Dictionary entries are the received ones.
+    No Resource-level `sketch.*` attributes (`definition_id`, `selection`,
+    `stream_id`, `type`, `schema_version`), no `sketch.series_id`, no
+    stream-scoped series cache: ASAPv1 bytes carry their own kind and
+    version.
+12. **`ViewStateBatch` mirrors the tiers** (view → series → records); the
+    OTLP adapter builds it in the raw path's walk, branching only at the
+    Record, and an OTAP adapter fills the same type.
 13. **One planner and one sketchlib, the latest.** The backend and the
     collector pin the same ASAPPlanner revision, the latest main; the
     planner, the backend and the collector pin the same `asap_sketchlib`
@@ -816,11 +884,12 @@ arrival-delay histogram. Cost-based choice of collector views. The OTAP Arrow ad
     step 4 checks in the benchmark's `collector-views.json` and tests that it
     deserializes, so a format change fails a test. No sketch type, HLL
     included, is left out on version grounds.
-14. **Plan reinstall.** A view whose definition, θ and width did not change
-    keeps its key across plans. The control plane rewrites the file and the
-    collector restarts on every reinstall. Until then, states of unchanged
-    views keep matching, states of removed views are `unknown_view`, and new
-    views are `NotReady` (forwarded). A live reload is later work.
+14. **Plan reinstall.** The control plane rewrites the file and the
+    collector restarts on every reinstall. Until then the collector's states
+    carry the old `plan_id` and are rejected (`other_plan`); the collector
+    views' windows in between are `NotReady` (forwarded). Matching unchanged
+    views across plans would need the selection on the wire; a live reload
+    is later work.
 15. **Dependency weight on the collector build.** `asap-types` adds
     `serde_json` and `thiserror` 2; with one `asap_sketchlib` pin (Decision
     13) it adds no second sketchlib. Accept it. Measure the collector's clean build
@@ -830,9 +899,12 @@ arrival-delay histogram. Cost-based choice of collector views. The OTAP Arrow ad
     `arrow-ipc` and `tonic` the backend already builds, rather than the
     collector's `otel-arrow-dfe-*` crates, which would add a second
     `datafusion` (53 next to 54) and `tonic` (0.14 next to 0.12).
-17. **Stream identity on OTLP.** OTLP HTTP has no stream.
-    `sketch.stream_id`, a random 128-bit value drawn at collector start; on
-    OTAP Arrow the gRPC stream is the stream.
+17. **View metric name `<metric>.asap_view.<node_id>`.** OTLP defines
+    metric metadata as non-identifying, so a consumer that follows the
+    specification may treat two views over one metric, or a view and the
+    raw metric, as one stream. The name keeps them distinct; identity is
+    still read from the metadata, and the backend stores the rows under the
+    `Scan`'s metric, so queries are unaffected. `.asap_view.` is reserved.
 18. **Sub-DAG validity.** No planner function extracts a sub-DAG. The loader
     calls `materialized_views()` on each sub-DAG, which validates it, and
     step 4 tests this on the benchmark plan. If the planner refuses such a DAG,
@@ -847,6 +919,11 @@ arrival-delay histogram. Cost-based choice of collector views. The OTAP Arrow ad
 21. **Clock-skew allowance.** 2 s by default (hosts run NTP, which keeps
     them within milliseconds); raise it if the arrival-delay histogram or
     `late_dropped` shows skew.
+22. **One label function for both paths**, with Prometheus's convention for
+    resource attributes: not copied into labels; `service.name` (with
+    `service.namespace/`) → `job`, `service.instance.id` → `instance`; an
+    optional allow-list promotes named attributes. Equal Dictionary entries
+    give equal labels whichever path carried them.
 
 ## Open questions
 
