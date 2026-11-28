@@ -25,13 +25,13 @@ version = "0.1.0"
 # `asap-planner` to plan, `asap-executor` to execute, and `asap-types` for
 # the plan types `common`'s boundary names (such as `QueryLanguage`).
 # Elsewhere, Planner IR types are reached through `asap_executor::planner`.
-asap-planner = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "f2da99956c2b0407e17d561d4641ed95036904fe" }
-asap-executor = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "f2da99956c2b0407e17d561d4641ed95036904fe" }
-asap-types = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "f2da99956c2b0407e17d561d4641ed95036904fe" }
+asap-planner = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "566b35ca771e2283b1e93385105cd0401a9a67e6" }
+asap-executor = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "566b35ca771e2283b1e93385105cd0401a9a67e6" }
+asap-types = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "566b35ca771e2283b1e93385105cd0401a9a67e6" }
 # The sketch library the Planner's executor pins, for the byte encodings of
 # the sketch states the data plane persists; keep it at exactly the Planner's
 # rev, so cargo builds one copy for both.
-asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", rev = "01f3333cbdc7c55a36642e0938aa7f0040f2cfa8" }
+asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", rev = "d050037bb127d425cb4160ea9b5960856ef3188c" }
 
 serde = { version = "1.0", features = ["derive"] }
 # `float_roundtrip`: a plan file reloads to the plan it was written from
