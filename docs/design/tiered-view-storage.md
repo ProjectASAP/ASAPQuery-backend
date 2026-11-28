@@ -217,7 +217,7 @@ it is deleted whole. A segment holds the existing framing (a little-endian
 8-byte boundary (zero padding; format 2 borrowed fixed-width columns in
 place, format 4 decompresses each fragment):
 
-- a header frame (MessagePack): plan hash, group, **format version 4**,
+- a header frame (MessagePack): plan hash, group, **format version 5**,
   and the segment start;
 - one record frame per refreshed window. Its head is a small MessagePack
   map, followed by the parts it points at:
@@ -275,7 +275,7 @@ dictionary; on disk it saves 4 B per row per label column.
 **Compact, compressed fragments (format version 4).** The mapped state
 layout is large for the small states of narrow panes. In the live demo a
 DDSketch of the ten samples one series has in a 1 s pane took 160 B a
-row on disk (an 88-byte head with `alpha`, the admission rate and a count
+row on disk (an 88-byte head, 64 bytes from format 5, with `alpha`, the admission rate and a count
 that every row repeats, then sparse `u32` keys), more than the raw samples;
 an exact counter took 72 B. Format 4 keeps the columnar fragment and
 changes two things (format 3 added the label columns above):
@@ -329,6 +329,12 @@ finish. Disk use is then retention plus one segment, not unbounded.
 
 A file in the old format (`group-<g>.log`, version 1) is renamed
 `*.stale` and not loaded, as a file of another plan is today.
+
+**Format version 5.** The same layout as format 4, over the sketch library
+version in which a DDSketch keeps no sum, minimum or maximum (`asap_sketchlib`
+ASAPv1 kind `0x05 0x01`): its view head is 64 bytes, and a compact DDSketch
+column has no float streams. The data plane sets a format 4 segment aside
+(renamed `.stale`) when it opens it, and does not migrate it.
 
 ### Read path
 
@@ -718,9 +724,10 @@ here changes the Planner.
   `pread` only for the active segment and as a fallback option. B3 still
   compares the two.
 - **Hot policy:** recency (CLOCK, idle time, byte budget).
-- **Fragment encoding:** columnar, format version 4: label columns are
+- **Fragment encoding:** columnar, format version 5: label columns are
   read back from the series identity, not stored (format 3); compact state
-  and text columns, zstd level 1 per fragment (format 4).
+  and text columns, zstd level 1 per fragment (format 4); DDSketch states
+  without sum, minimum or maximum (format 5).
 - **No cgroup limit:** no budget, plus idle eviction.
 - **Old view files:** renamed `*.stale`.
 - **Zero-copy revision:** states are used from the mapping

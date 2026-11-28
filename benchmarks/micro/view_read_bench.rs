@@ -35,7 +35,7 @@ fn main() {
     let _ = std::fs::remove_dir_all(&dir);
 
     let family = match family_name {
-        "kll" => FieldDataType::Sketch(SketchAlgorithm::Kll),
+        "kll" => FieldDataType::Sketch(SketchAlgorithm::KLL),
         "ddsketch" => FieldDataType::Sketch(SketchAlgorithm::DDSketch),
         "counter" => FieldDataType::ExactAggregate(ExactKind::Counter, ExactParams::Counter),
         other => panic!("unknown family {other}: kll, ddsketch or counter"),
