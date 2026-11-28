@@ -17,15 +17,8 @@ use common::{
 };
 use query::{ExecutorQueryEngine, Unanswered};
 
-/// The dispatcher's verdict on one query.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum QueryOutcome<T> {
-    /// The plan answered.
-    Ready(T),
-    NotAnswerable(NotAnswerableReason),
-}
-
-/// Why the plan did not answer a query; the query falls back.
+/// Why the plan did not answer a query (the dispatcher's `Err`); the query
+/// falls back.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum NotAnswerableReason {
     /// No plan is installed, or its query texts hold no such query.
@@ -134,14 +127,18 @@ impl QueryDispatcher {
     }
 
     /// `query` at `time_ms`.
-    pub(crate) async fn instant(&self, query: &str, time_ms: i64) -> QueryOutcome<Answer> {
+    pub(crate) async fn instant(
+        &self,
+        query: &str,
+        time_ms: i64,
+    ) -> Result<Answer, NotAnswerableReason> {
         let (Some(source), Some(engine)) = (self.resolve(query), self.engine.installed()) else {
-            return QueryOutcome::NotAnswerable(NotAnswerableReason::Unmatched);
+            return Err(NotAnswerableReason::Unmatched);
         };
-        match engine.instant(&source, query, time_ms).await {
-            Ok(result) => QueryOutcome::Ready(result),
-            Err(unanswered) => QueryOutcome::NotAnswerable(NotAnswerableReason::new(unanswered)),
-        }
+        engine
+            .instant(&source, query, time_ms)
+            .await
+            .map_err(NotAnswerableReason::new)
     }
 
     /// `query` at each of `times_ms`: every step's answer, or why some step
@@ -150,14 +147,14 @@ impl QueryDispatcher {
         &self,
         query: &str,
         times_ms: impl Iterator<Item = i64>,
-    ) -> QueryOutcome<Vec<(i64, Answer)>> {
+    ) -> Result<Vec<(i64, Answer)>, NotAnswerableReason> {
         let (Some(source), Some(engine)) = (self.resolve(query), self.engine.installed()) else {
-            return QueryOutcome::NotAnswerable(NotAnswerableReason::Unmatched);
+            return Err(NotAnswerableReason::Unmatched);
         };
-        match engine.range(&source, query, times_ms).await {
-            Ok(result) => QueryOutcome::Ready(result),
-            Err(unanswered) => QueryOutcome::NotAnswerable(NotAnswerableReason::new(unanswered)),
-        }
+        engine
+            .range(&source, query, times_ms)
+            .await
+            .map_err(NotAnswerableReason::new)
     }
 
     /// `request` through [`ExecutorQueryEngine::execute`]. Only a PromQL query can
@@ -165,21 +162,22 @@ impl QueryDispatcher {
     /// the data plane stores time series only, which SQL and Query DSL
     /// plans do not read. A query in another language is unmatched, even
     /// when its text equals a planned query's.
-    pub async fn dispatch(&self, request: &QueryRequest) -> QueryOutcome<QueryResult> {
+    pub async fn dispatch(
+        &self,
+        request: &QueryRequest,
+    ) -> Result<QueryResult, NotAnswerableReason> {
         if request.language != QueryLanguage::PromQL {
-            return QueryOutcome::NotAnswerable(NotAnswerableReason::Unmatched);
+            return Err(NotAnswerableReason::Unmatched);
         }
         let Some(source) = self.resolve(&request.query) else {
-            return QueryOutcome::NotAnswerable(NotAnswerableReason::Unmatched);
+            return Err(NotAnswerableReason::Unmatched);
         };
         match self.engine.execute(&source, request).await {
-            Ok(EngineQueryResult::Ready { result }) => QueryOutcome::Ready(result),
-            Ok(EngineQueryResult::NotReady) => {
-                QueryOutcome::NotAnswerable(NotAnswerableReason::NotReady(
-                    "the stored data does not cover the query, or the plan changed".into(),
-                ))
-            }
-            Err(error) => QueryOutcome::NotAnswerable(NotAnswerableReason::EngineError(error)),
+            Ok(EngineQueryResult::Ready { result }) => Ok(result),
+            Ok(EngineQueryResult::NotReady) => Err(NotAnswerableReason::NotReady(
+                "the stored data does not cover the query, or the plan changed".into(),
+            )),
+            Err(error) => Err(NotAnswerableReason::EngineError(error)),
         }
     }
 }
@@ -191,6 +189,7 @@ mod tests {
     use super::*;
     use crate::engine::EngineHandle;
     use crate::test_support;
+    use control_plane::test_support::one_query_plan;
 
     const QUERY: &str = "sum_over_time(data[10s])";
 
@@ -209,19 +208,15 @@ mod tests {
     /// trimmed; another text is unmatched, and forwarded without a reason.
     #[tokio::test]
     async fn answers_a_planned_query_and_leaves_others_unmatched() {
-        let engine = engine(&test_support::plan(QUERY, false)).await;
+        let engine = engine(&one_query_plan(QUERY, false)).await;
         let dispatcher = engine.dispatcher();
-        let QueryOutcome::Ready(answer) = dispatcher.instant(&format!(" {QUERY} "), 30_000).await
-        else {
+        let Ok(answer) = dispatcher.instant(&format!(" {QUERY} "), 30_000).await else {
             panic!("not answered");
         };
         let values: Vec<f64> = answer.iter().map(|sample| sample.value).collect();
         assert_eq!(values, [10.0]);
         let unmatched = dispatcher.instant("up", 30_000).await;
-        assert_eq!(
-            unmatched,
-            QueryOutcome::NotAnswerable(NotAnswerableReason::Unmatched)
-        );
+        assert_eq!(unmatched, Err(NotAnswerableReason::Unmatched));
         assert_eq!(
             Fallback::new(NotAnswerableReason::Unmatched, "up", false),
             Fallback::Forward { reason: None }
@@ -232,10 +227,10 @@ mod tests {
     /// ready; a range with such a step is not ready either.
     #[tokio::test]
     async fn a_window_not_stored_yet_is_not_ready() {
-        let engine = engine(&test_support::plan(QUERY, false)).await;
+        let engine = engine(&one_query_plan(QUERY, false)).await;
         let dispatcher = engine.dispatcher();
         let outcome = dispatcher.instant(QUERY, 60_000).await;
-        let QueryOutcome::NotAnswerable(reason @ NotAnswerableReason::NotReady(_)) = outcome else {
+        let Err(reason @ NotAnswerableReason::NotReady(_)) = outcome else {
             panic!("expected not ready, got {outcome:?}");
         };
         assert_eq!(
@@ -245,10 +240,7 @@ mod tests {
             }
         );
         let range = dispatcher.range(QUERY, [30_000, 40_000].into_iter()).await;
-        assert!(matches!(
-            range,
-            QueryOutcome::NotAnswerable(NotAnswerableReason::NotReady(_))
-        ));
+        assert!(matches!(range, Err(NotAnswerableReason::NotReady(_))));
     }
 
     /// A planned query whose run does not compile is an engine error:
@@ -257,7 +249,7 @@ mod tests {
     async fn a_query_the_engine_cannot_run_is_an_engine_error() {
         // Raw data kept, so the query runs read the `Scan`, and a predicate
         // on a column it does not have.
-        let mut plan = test_support::plan(QUERY, true);
+        let mut plan = one_query_plan(QUERY, true);
         let scan = plan
             .dag
             .nodes
@@ -270,8 +262,7 @@ mod tests {
         predicates.push(Predicate(ScalarExpr::Column(99)));
         let engine = engine(&plan).await;
         let outcome = engine.dispatcher().instant(QUERY, 30_000).await;
-        let QueryOutcome::NotAnswerable(reason @ NotAnswerableReason::EngineError(_)) = outcome
-        else {
+        let Err(reason @ NotAnswerableReason::EngineError(_)) = outcome else {
             panic!("expected an engine error, got {outcome:?}");
         };
         let message = reason.clone().into_message(QUERY);
@@ -291,14 +282,14 @@ mod tests {
     /// unmatched.
     #[tokio::test]
     async fn dispatches_a_query_request_by_language() {
-        let engine = engine(&test_support::plan(QUERY, false)).await;
+        let engine = engine(&one_query_plan(QUERY, false)).await;
         let dispatcher = engine.dispatcher();
         let request = |language, time_ms| QueryRequest {
             language,
             query: QUERY.into(),
             eval: common::QueryEval::Instant { time_ms },
         };
-        let QueryOutcome::Ready(QueryResult::Vector(vector)) = dispatcher
+        let Ok(QueryResult::Vector(vector)) = dispatcher
             .dispatch(&request(QueryLanguage::PromQL, 30_000))
             .await
         else {
@@ -310,12 +301,12 @@ mod tests {
             dispatcher
                 .dispatch(&request(QueryLanguage::PromQL, 60_000))
                 .await,
-            QueryOutcome::NotAnswerable(NotAnswerableReason::NotReady(_))
+            Err(NotAnswerableReason::NotReady(_))
         ));
         let sql = QueryLanguage::SQL(common::SqlDialect::ClickhouseSQL);
         assert_eq!(
             dispatcher.dispatch(&request(sql, 30_000)).await,
-            QueryOutcome::NotAnswerable(NotAnswerableReason::Unmatched)
+            Err(NotAnswerableReason::Unmatched)
         );
     }
 

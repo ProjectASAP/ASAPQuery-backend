@@ -1919,6 +1919,8 @@ impl WindowTasks {
 
 #[cfg(test)]
 mod tests {
+    use control_plane::test_support::one_query_plan;
+
     use super::*;
 
     /// A request is admitted while the queue stays within its bound, and
@@ -2148,24 +2150,6 @@ mod tests {
         assert_eq!(routed.accepted.len(), 1, "{:?}", routed.stats);
     }
 
-    fn plan(query: &str) -> InstallablePlan {
-        let workload = serde_json::from_value(serde_json::json!({
-            "query_workload": {"language": "promql", "repeating_queries": [{
-                "query": query,
-                "demand": {"fixed_interval_at": {"interval": 10000, "evaluation_phase": 0}},
-                "requirements": {},
-                "predictability": {"predictable": {"known_at": null}},
-            }]},
-            "data_workload": {"arrival": {"ingesting": {"rows_per_second": 1.0}},
-              "sources": {"data": {"series_count": 1, "sample_interval": 1000,
-                "metric_type": "gauge", "column_signs": {"value": "non_negative"}}}},
-        }))
-        .unwrap();
-        let mut inputs = control_plane::DeploymentInputs::default();
-        inputs.deployment_capabilities.raw_data_retained = false;
-        control_plane::plan_workload(&workload, &inputs).unwrap().0
-    }
-
     fn engine() -> PrecomputeEngine {
         let options = PrecomputeOptions {
             ingestion: IngestionOptions {
@@ -2209,7 +2193,7 @@ mod tests {
         assert!(engine.installed().is_none());
         let installed = |id| InstalledPlan {
             id: PlanId(id),
-            plan: plan("sum_over_time(data[10s])"),
+            plan: one_query_plan("sum_over_time(data[10s])", false),
         };
         assert_eq!(engine.install(installed(1)), Ok(()));
         assert!(engine.install(installed(2)).is_err());

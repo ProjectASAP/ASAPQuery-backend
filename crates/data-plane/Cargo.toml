@@ -33,7 +33,7 @@ form_urlencoded = "1"
 asap-planner.workspace = true
 asap-executor.workspace = true
 futures = "0.3"
-control_plane.workspace = true
+control_plane = { workspace = true, features = ["test-support"] }
 asap_sketchlib.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

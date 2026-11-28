@@ -29,6 +29,13 @@ pub use query_result::{
 /// represent. Leaves room for any window offset.
 pub const MAX_TIME_MS: i64 = i64::MAX / 4;
 
+/// The most steps after its start one range query may have, as Prometheus
+/// allows (`(end - start) / step`). The plan never evaluates a longer
+/// range: the Prometheus routes refuse it with 400, and
+/// `ExecutorQueryEngine::execute` with an error (the ClickHouse and
+/// Elasticsearch routes send it instant queries only today).
+pub const MAX_RANGE_STEPS: i64 = 11_000;
+
 /// One series' labels, name to value, `__name__` included, as query results
 /// carry them.
 pub type LabelSet = std::collections::BTreeMap<String, String>;

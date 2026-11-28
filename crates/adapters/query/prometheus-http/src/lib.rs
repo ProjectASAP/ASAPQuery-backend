@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
 
-use common::{Answer, LabelSet, ResultSample, MAX_TIME_MS};
+use common::{Answer, LabelSet, ResultSample, MAX_RANGE_STEPS, MAX_TIME_MS};
 
 pub mod fallback;
 
@@ -52,9 +52,6 @@ impl InstantQuery {
         }))
     }
 }
-
-/// The most steps one range query may have, as Prometheus allows.
-const MAX_RANGE_STEPS: i64 = 11_000;
 
 /// Parameters of a range query: evaluated at `start_ms` and every
 /// `step_ms` after, up to and including `end_ms`.

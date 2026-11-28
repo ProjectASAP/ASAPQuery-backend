@@ -9,7 +9,7 @@ use asap_executor::runtime::Limits;
 use common::{
     Answer, AnswerSource, EngineQueryResult, InstallError, InstalledPlan, InstantVector,
     InstantVectorElement, LabelSet, QueryEngineError, QueryEval, QueryRequest, QueryResult,
-    RangeVector, RangeVectorElement, Sample,
+    RangeVector, RangeVectorElement, Sample, MAX_RANGE_STEPS,
 };
 use storage::store::{PublishedStore, QueryTimeResults};
 
@@ -118,12 +118,31 @@ impl ExecutorQueryEngine {
 
     /// One query's answer, resolved by the dispatcher to `source`: not
     /// ready before the install, for another plan, or while its data is
-    /// not stored yet.
+    /// not stored yet. A range whose step is not positive, or with more
+    /// than [`MAX_RANGE_STEPS`] steps after its start, is an error.
     pub async fn execute(
         &self,
         source: &AnswerSource,
         request: &QueryRequest,
     ) -> Result<EngineQueryResult, QueryEngineError> {
+        if let QueryEval::Range {
+            start_ms,
+            end_ms,
+            step_ms,
+        } = request.eval
+        {
+            if step_ms <= 0 {
+                return Err(QueryEngineError::new(format!(
+                    "range step {step_ms} ms is not positive"
+                )));
+            }
+            // As the Prometheus routes refuse it (`RangeQuery::parse`).
+            if end_ms.saturating_sub(start_ms) / step_ms > MAX_RANGE_STEPS {
+                return Err(QueryEngineError::new(format!(
+                    "exceeded maximum resolution of {MAX_RANGE_STEPS} points per timeseries"
+                )));
+            }
+        }
         let Some(workers) = self.installed() else {
             return Ok(EngineQueryResult::NotReady);
         };
@@ -137,11 +156,6 @@ impl ExecutorQueryEngine {
                 end_ms,
                 step_ms,
             } => {
-                if step_ms <= 0 {
-                    return Err(QueryEngineError::new(format!(
-                        "range step {step_ms} ms is not positive"
-                    )));
-                }
                 let times = (0..)
                     .map_while(|i: i64| i.checked_mul(step_ms)?.checked_add(start_ms))
                     .take_while(|time_ms| *time_ms <= end_ms);
@@ -215,26 +229,9 @@ fn range_vector(steps: &[(i64, Answer)]) -> RangeVector {
 #[cfg(test)]
 mod tests {
     use common::{PlanId, QueryLanguage};
+    use control_plane::test_support::one_query_plan;
 
     use super::*;
-
-    fn plan(query: &str) -> common::InstallablePlan {
-        let workload = serde_json::from_value(serde_json::json!({
-            "query_workload": {"language": "promql", "repeating_queries": [{
-                "query": query,
-                "demand": {"fixed_interval_at": {"interval": 10000, "evaluation_phase": 0}},
-                "requirements": {},
-                "predictability": {"predictable": {"known_at": null}},
-            }]},
-            "data_workload": {"arrival": {"ingesting": {"rows_per_second": 1.0}},
-              "sources": {"data": {"series_count": 1, "sample_interval": 1000,
-                "metric_type": "gauge", "column_signs": {"value": "non_negative"}}}},
-        }))
-        .unwrap();
-        let mut inputs = control_plane::DeploymentInputs::default();
-        inputs.deployment_capabilities.raw_data_retained = false;
-        control_plane::plan_workload(&workload, &inputs).unwrap().0
-    }
 
     const QUERY: &str = "sum_over_time(data[10s])";
 
@@ -257,7 +254,7 @@ mod tests {
         };
         let engine =
             ExecutorQueryEngine::new(options, Arc::new(PublishedStore::new(Arc::default())));
-        let plan = plan(QUERY);
+        let plan = one_query_plan(QUERY, false);
         let root = plan.dag.roots[0];
         let source = |id| AnswerSource::Planned {
             plan: PlanId(id),
@@ -294,6 +291,32 @@ mod tests {
                 Ok(EngineQueryResult::NotReady)
             );
         }
+        // At most `MAX_RANGE_STEPS` steps after the start, as the Prometheus
+        // routes allow: a longer range is refused, not evaluated.
+        let steps = |steps: i64| {
+            request(QueryEval::Range {
+                start_ms: 0,
+                end_ms: steps * 1_000,
+                step_ms: 1_000,
+            })
+        };
+        assert_eq!(
+            engine
+                .execute(&source(1), &steps(common::MAX_RANGE_STEPS))
+                .await,
+            Ok(EngineQueryResult::NotReady)
+        );
+        let refused = engine
+            .execute(&source(1), &steps(common::MAX_RANGE_STEPS + 1))
+            .await
+            .unwrap_err();
+        assert!(
+            refused
+                .message
+                .contains("exceeded maximum resolution of 11000 points"),
+            "{}",
+            refused.message
+        );
     }
 
     /// Answers become an instant vector, and steps a matrix of each
