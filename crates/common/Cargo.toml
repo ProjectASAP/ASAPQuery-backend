@@ -1,0 +1,21 @@
+[package]
+name = "common"
+version.workspace = true
+edition.workspace = true
+
+# The data plane's boundary types and the fallback trait
+# (docs/design/repo-layout.md).
+# Only ASAPPlanner's plan types: `asap-planner` for `InstallablePlan` and
+# `asap-types` for the IR types it does not re-export. No executor item is
+# named here; `asap-planner` still compiles the executor and the frontends
+# as its own dependencies.
+[dependencies]
+asap-planner.workspace = true
+asap-types.workspace = true
+# `FallbackClient` is used as `Arc<dyn …>`, so its async method must be
+# object safe; native `async fn` in traits is not.
+async-trait.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
